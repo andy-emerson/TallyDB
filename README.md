@@ -54,7 +54,7 @@ Development right now targets the **native build only** — Linux/Mac/Windows, l
 Every architectural choice follows one rule: **take mature, narrow, well-tested dependencies as-is where they exist; write only the part that's actually novel.**
 
 - **Taken as-is, no modification:** `sqlparser-rs` (SQL parsing), LuaJIT (scripting), native BLAS/LAPACK (OpenBLAS/MKL/Accelerate). Stable, narrow, embedding-oriented libraries — linking them whole is safe because their entire purpose is being called into by a host program.
-- **Used as a differential correctness oracle, not vendored:** DuckDB and/or DataFusion. For the portion of SQL semantics that overlaps standard behavior (aggregates, joins, window functions), we run the same query against an oracle and diff the output. We do **not** vendor DataFusion's executor — its useful parts are coupled to its own general-purpose planner, and extracting a piece drags the planner in. We write our own small, scoped executor and check it against DuckDB/DataFusion's *output*.
+- **Used as a differential correctness oracle, not vendored:** DuckDB and/or DataFusion. For the portion of SQL semantics that overlaps standard behavior (aggregates, joins, window functions), we run the same query against an oracle and diff the output. We do **not** vendor DataFusion's executor — its useful parts are coupled to its own general-purpose planner, and extracting a piece drags the planner in. We write our own small, scoped executor and check it against DuckDB/DataFusion's *output*. The same pattern covers `arrow-lite`: its hand-rolled Arrow layout is round-trip tested against arrow-rs and PyArrow as dev-only oracles, never linked at runtime.
 - **Original, unoracled work:** the storage/compaction layer and the numeric-or-key schema invariant. No existing project enforces this specific rule or this specific append/ordered/tombstone-correction design — validated by our own test suite, not a diff against someone else's behavior.
 
 ### Numbers: `f64` and `i64`, with roles
@@ -70,7 +70,7 @@ The schema declares which flavor each numeric column is. We considered and **rej
 
 This isn't a naming convention — it's enforced in the type system. A column is either:
 - **Numeric** (`f64` or `i64`): usable in arithmetic, aggregation, comparison, and — for `f64` — passed directly into BLAS/LAPACK/Lua as raw numeric buffers.
-- **Key**: dictionary-encoded to an integer at ingest (string interning, similar to kdb+'s symbol type or Arrow's dictionary encoding), usable in equality/grouping/joins and string *predicates*, never in arithmetic.
+- **Key**: dictionary-encoded to an integer at ingest (string interning, similar to kdb+'s symbol type or Arrow's dictionary encoding), usable in equality/grouping/joins and string *predicates*, never in arithmetic. Keys assume *repeating* labels: the dictionary is sized by distinct values, not rows, which is what keeps the variable-width strings off the per-row fast path. A never-repeating identifier (an order id, a sequence number) is a number — store it as `i64`, not a key.
 
 There is no third column type. A column that can't be classified as one or the other is rejected at schema-definition time, not silently coerced — and this holds for query results and intermediates, not just stored columns.
 
@@ -112,8 +112,9 @@ TallyDB is a single Cargo workspace — each crate has a clean boundary and can 
 ```
 tallydb/
   crates/
-    arrow-lite/     # Arrow-layout-compatible columnar in-memory format
-                    #   (f64 + i64 numeric buffers, key/dictionary columns)
+    arrow-lite/     # hand-rolled Arrow-compatible columnar format (f64/i64
+                    #   buffers, u32-dictionary keys, C Data Interface export;
+                    #   arrow-rs/PyArrow as dev-only round-trip oracles)
     storage-lite/   # append-optimized segments partitioned on the ordering
                     #   key; compaction; zone maps; native backend = mmap
                     #   today, behind a trait so an OPFS/WASM backend can be

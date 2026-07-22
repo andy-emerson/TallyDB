@@ -1,56 +1,86 @@
-//! `arrow-lite` — Arrow-layout-compatible columnar in-memory format.
+//! `arrow-lite` — hand-rolled, Arrow-layout-compatible columnar in-memory
+//! format.
 //!
 //! ## Why this crate exists
 //! TallyDB's numeric-or-key invariant means every value column is a flat,
-//! fixed-width numeric buffer. If that buffer's memory layout matches
-//! Apache Arrow's columnar spec, query results are directly usable by
-//! NumPy/Arrow-aware tooling with zero copying — no conversion step between
-//! "database result" and "numeric array." That's the property this crate
-//! exists to guarantee.
+//! fixed-width buffer. If that layout matches Apache Arrow's columnar spec,
+//! the *same bytes* serve three consumers with zero copying: compute (raw
+//! pointers into BLAS/LAPACK/Lua), storage (serialize/mmap into segments),
+//! and the outside world (query results handed to NumPy/Polars/DuckDB via
+//! the Arrow C Data Interface with no conversion step). That third boundary
+//! is the reason to be *Arrow*-shaped specifically — the first two only need
+//! "contiguous." Being Arrow internally is what makes "no conversion step"
+//! true by construction rather than by an export routine.
 //!
-//! ## Scope (deliberately narrow)
-//! - Numeric column types — **`f64` and `i64`** — each stored as a contiguous
-//!   fixed-width buffer plus a validity/null bitmap, per Arrow's layout.
-//!   `f64` is the analytic type (what BLAS/LAPACK consume as raw buffers);
-//!   `i64` is the exact/stored type (nanosecond timestamps, money as scaled
-//!   integers, counts) — nanosecond epochs do **not** fit in `f64`, so `i64`
-//!   is not optional. Both are Arrow primitive layouts, so the zero-copy
-//!   NumPy/Arrow interop property holds for either.
-//! - A key column type: dictionary-encoded to `u32`/`u64` indices plus a
-//!   string-interning table, per Arrow's dictionary encoding.
-//! - NOT a general Arrow implementation. No variable-length lists, no
-//!   nested/struct types, no non-numeric primitive types beyond `f64`/`i64`.
-//!   If a type isn't numeric or key, it doesn't belong here — see the root
-//!   README.
+//! ## Decision (issue #2, resolved): hand-rolled, oracle-tested
+//! We implement the layout ourselves rather than wrapping `arrow-array`/
+//! `arrow-buffer`. Reasons: the subset we need is tiny and Arrow's layout
+//! spec is frozen; arrow-rs is a large, fast-churning dependency sitting
+//! under every other crate; and the two-variant wrapper layer must exist
+//! either way (arrow-rs happily builds string columns, so it could never be
+//! the public type). The risk this buys — hand-written unsafe C Data
+//! Interface export (release callbacks, LSB bitmaps, buffer counts, format
+//! strings) — is narrow and cold, and is covered by **round-trip tests
+//! against arrow-rs and PyArrow as dev-only oracles** (build → export →
+//! import with the real implementation → diff, and the reverse). They play
+//! the same role DuckDB plays for `query-lite`: validate our output in
+//! tests, never linked at runtime.
 //!
-//! ## Lock these two views early (they're the whole contract)
-//! Everything downstream inherits this crate's layout, so pin two interfaces
-//! before adding features: (1) the **raw-pointer / FFI view** — how a
-//! contiguous numeric buffer is handed to `compute-*` as a pointer for
-//! zero-copy compute; and (2) the **serialize-to-segment view** — how a
-//! column (including a key's dictionary) is written into a `storage-lite`
-//! segment. The load-bearing decisions are the boring ones: dictionary index
-//! width (`u32` vs `u64`), null-bitmap presence, and the `f64`/`i64` subtype
-//! tag. Get those right; defer anything fancier.
+//! ## The pieces
+//! - **Numeric columns:** `f64` and `i64` contiguous buffers (64-byte
+//!   aligned), one entry per row. The subtype tag is an extensible enum so
+//!   a future `F32` (GPU/bandwidth path — issue #3) is additive, not a
+//!   format migration.
+//! - **Validity:** an optional side `Bitmap`, present only for columns the
+//!   schema declares nullable. A `NOT NULL` column has no bitmap and is
+//!   BLAS-ready by construction. The ordering key is always `NOT NULL`.
+//! - **`Bitmap` as a first-class shared type:** LSB-ordered per Arrow, with
+//!   and/or/not, popcount, and set-bit iteration. Used for validity here,
+//!   for row selections in `query-lite` (WHERE, dictionary-LIKE bitmaps),
+//!   and plausibly for tombstone masks in `storage-lite` — one
+//!   implementation, shared by all three.
+//! - **Key columns:** `u32` dictionary codes per row (u32 only — no u64
+//!   variant) plus an interning table of distinct values.
+//! - **Views:** zero-copy slices (offset + length) over any column —
+//!   Arrow-native offsets. This is what lets window functions feed compute
+//!   with pointer arithmetic instead of a copy per window.
+//! - **Logical-type annotations:** an optional tag (`Timestamp(ns)`,
+//!   `Decimal64(scale)`) over the same physical `i64` buffer, consulted
+//!   only at export, so ecosystem consumers see datetimes and decimals
+//!   instead of opaque integers. No effect on in-engine representation.
+//! - **Export:** the Arrow **C Data Interface only**, including the
+//!   `ArrowArrayStream` variant — results leave as a stream of record
+//!   batches, matching segment-at-a-time execution with no final
+//!   concatenation copy.
 //!
-//! ## Open question for whoever implements this (see conversation history
-//! / README "Design philosophy" section)
-//! Two viable paths, either is acceptable, pick one and document why:
-//! 1. Hand-roll the buffer/bitmap structs ourselves, matching Arrow's
-//!    layout spec exactly but with zero external dependency.
-//! 2. Take a thin dependency on the real `arrow-array`/`arrow-buffer`
-//!    crates and wrap them.
-//! Either way: the crate's own tests should validate real interop (e.g.
-//! round-tripping through `arrow-rs` or PyArrow in a test) — memory layout
-//! bugs here are silent and expensive to find later, so don't skip this.
+//! ## The one variable-width structure (and why it's fine)
+//! The dictionary's values are strings — the single variable-width buffer in
+//! the system. It is *reference data, not row data*: sized by distinct
+//! values, not rows; touched at intern time and once-per-distinct-value
+//! predicate evaluation, never on the per-row scan/compute path. Corollary
+//! (see CLAUDE.md): keys assume repeating, low-cardinality labels. A
+//! never-repeating identifier is a number — it belongs in an `i64` column,
+//! not a key.
 //!
-//! ## What NOT to pull in
-//! Do not depend on `arrow-compute` or `datafusion` here. This crate is
-//! the *data format* only. Compute lives in `compute-lua` / `compute-blas`,
-//! and query execution lives in `query-lite`.
+//! ## What NOT to pull in or build
+//! - No `arrow-compute`, no `datafusion` — this crate is the data format
+//!   only. Compute lives in `compute-*`; execution lives in `query-lite`.
+//! - No Arrow IPC / Flight / Parquet — the C Data Interface is the entire
+//!   interop surface. File formats are the application's job via ecosystem
+//!   tools that already speak C-Data.
+//! - No matrix/column-group arena for LAPACK-shaped allocations —
+//!   considered and deferred (issue #4): the design-matrix gather is
+//!   O(n·k) against an O(n·k²) solve. Revisit only with profiling evidence.
 
-// TODO: numeric column buffer types (f64 and i64, each with validity bitmap)
-// TODO: key column type (dictionary-encoded, string interning table)
-// TODO: column enum wrapping numeric (f64/i64) + key variants, nothing else
-// TODO: round-trip test against a real Arrow implementation (both numeric
-//       subtypes and dictionary columns)
+// TODO: Bitmap (LSB-ordered; and/or/not, popcount, set-bit iteration)
+// TODO: numeric column buffers (f64, i64; 64-byte aligned; optional
+//       validity per schema nullability)
+// TODO: key column (u32 codes + interning table)
+// TODO: column enum wrapping numeric + key variants, nothing else
+// TODO: zero-copy views (offset + len) over columns
+// TODO: logical-type tags (Timestamp(ns), Decimal64(scale)) on i64 columns,
+//       consulted at export only
+// TODO: C Data Interface export/import, incl. ArrowArrayStream
+// TODO: round-trip tests against arrow-rs and PyArrow (dev-only oracles),
+//       covering both numeric subtypes, dictionaries, nulls, logical-type
+//       annotations, and batch streams
