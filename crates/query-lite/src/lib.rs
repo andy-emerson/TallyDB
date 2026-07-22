@@ -12,11 +12,16 @@
 //! The executor (turning a parsed AST into results over `storage-lite`
 //! data) is our own code — DataFusion's executor is deliberately NOT
 //! vendored, because its useful parts are coupled to its own general
-//! planner (see README). Instead: DuckDB and/or DataFusion are used as a
-//! **differential correctness oracle** in this crate's test suite — run
-//! the same query against the oracle and against this executor, diff the
-//! output. That's the primary correctness strategy for this crate. Write
-//! tests this way from the start, not as an afterthought.
+//! planner (see README). Instead: DuckDB (primary) and DataFusion
+//! (secondary) are used as a **differential correctness oracle** in this
+//! crate's test suite — run the same query against the oracle and against
+//! this executor, diff the output. DuckDB is primary because it has the
+//! broadest standard analytic-SQL semantics (windows, statistical
+//! aggregates) and runs in-process inside `cargo test`; DataFusion as
+//! secondary also covers InfluxDB-compatible semantics directly, since
+//! Influx v3's SQL engine is DataFusion. That's the primary correctness
+//! strategy for this crate. Write tests this way from the start, not as an
+//! afterthought.
 //!
 //! ## SQL surface — inclusion principle
 //! Any standard SQL function or verb is in scope as long as it (a) doesn't

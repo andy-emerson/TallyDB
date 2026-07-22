@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-# Native backend: a LuaJIT FFI binding crate (e.g. `mlua` with the luajit
-# feature, or hand-rolled bindgen bindings) goes here, likely behind a
-# `cfg(not(target_arch = "wasm32"))` feature gate.
+# Native backend: a LuaJIT binding goes here, likely behind a
+# `cfg(not(target_arch = "wasm32"))` feature gate. Whether that binding is
+# `mlua` (luajit feature) or hand-rolled Lua 5.1 C API declarations is a
+# deferred decision tracked in issues — prototype the zero-copy buffer
+# hand-off before picking; do not choose silently.
 #
 # WASM backend (future, not current milestone): lua.wasm
 # (github.com/andy-emerson/lua-wasi), behind
