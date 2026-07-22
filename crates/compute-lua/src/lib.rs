@@ -15,9 +15,10 @@
 //! hand-written binding layer, numeric arrays passed as raw pointers into
 //! the *same memory* the query engine already holds (arrow-lite buffers).
 //! This is exactly how the original Torch (pre-PyTorch) worked: LuaJIT +
-//! BLAS-backed tensors over FFI. `compute-blas`'s curated ops should be
-//! callable from Lua through this same mechanism, sharing buffers, not
-//! copying between the two.
+//! BLAS-backed tensors over FFI. The ops in `compute-blas`
+//! (multiplication-class) and `compute-lapack` (curated solves/
+//! decompositions) should be callable from Lua through this same mechanism,
+//! sharing buffers, not copying between them.
 //!
 //! ## Backend split
 //! - **Native (current milestone):** LuaJIT, linked as-is via FFI. No
@@ -51,7 +52,7 @@
 // TODO: Lua backend trait (native LuaJIT-via-FFI implementation first)
 // TODO: batch calling convention: hand a whole column/window buffer to
 //       a Lua chunk in one call
-// TODO: expose compute-blas's curated ops as callable Lua functions,
-//       sharing buffers (no copy)
+// TODO: expose compute-blas and compute-lapack ops as callable Lua
+//       functions, sharing buffers (no copy)
 // TODO: pure-Lua module loader (package.path-style); explicitly do NOT
 //       wire up package.loadlib / C extension loading

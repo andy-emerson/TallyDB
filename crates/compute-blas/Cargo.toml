@@ -10,12 +10,14 @@ license.workspace = true
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-# Native backend: link OpenBLAS (or MKL/Accelerate) via FFI. See this
-# crate's src/lib.rs docs for the TARGET=SANDYBRIDGE note on avoiding FMA
-# for eventual native/WASM numerical consistency.
+# Native backend: link the BLAS (multiplication-class) routines from OpenBLAS
+# (or MKL/Accelerate) via FFI. See this crate's src/lib.rs docs for the
+# TARGET=SANDYBRIDGE note on avoiding FMA for eventual native/WASM numerical
+# consistency. LAPACK-class routines live in the sibling `compute-lapack`
+# crate, not here.
 #
 # WASM backend (future, not current milestone): blas.wasm
-# (github.com/andy-emerson/blas.wasm) + a LAPACK-in-WASM layer once one
-# exists. Do not add this dependency until the WASM milestone starts.
+# (github.com/andy-emerson/blas.wasm). Do not add this dependency until the
+# WASM milestone starts.
 
 [dev-dependencies]

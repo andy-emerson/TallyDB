@@ -13,13 +13,19 @@
 //!    literally row-major or a set of column arrays appended at the tail
 //!    is an implementation detail — either is fine, the goal is cheap
 //!    per-event append, not a specific memory layout at this stage.
-//! 2. **Ordered.** Segments are time-partitioned; data is expected to
-//!    arrive roughly in order. Zone maps (min/max per column per segment)
-//!    exist to exploit this for query pruning.
+//! 2. **Ordered.** Segments are partitioned on a declared **ordering key**;
+//!    data is expected to arrive roughly sorted on it. The ordering key is
+//!    usually a timestamp but need not be — any monotonic-on-ingest key
+//!    (sequence id, event id, ledger offset) works, so partition on the
+//!    *declared* key, don't hardcode "time." Zone maps (min/max per column
+//!    per segment) exploit this ordering for query pruning, and delta /
+//!    delta-of-delta compression exploits it to shrink ordered columns. This
+//!    is why "ordered" is load-bearing: lose the clustering and both pruning
+//!    and compression collapse.
 //! 3. **Numeric-or-key.** Every column here is an `arrow-lite` column —
-//!    numeric or key, nothing else. This crate should never need to know
-//!    about a third type; if it looks like it does, that's a signal
-//!    something is wrong upstream, not a reason to add one here.
+//!    numeric (`f64` or `i64`) or key, nothing else. This crate should never
+//!    need to know about a third type; if it looks like it does, that's a
+//!    signal something is wrong upstream, not a reason to add one here.
 //!
 //! ## Mutation model — one mechanism, reused everywhere
 //! Segments are immutable once flushed. There is no in-place update.
@@ -29,6 +35,16 @@
 //! if there is one, resolve at the next compaction. Do not build a
 //! second mutation path for any of these cases; if something seems to
 //! need one, that's a design smell worth raising, not implementing around.
+//!
+//! **Open decision that gates the tombstone format (tracked in issues):**
+//! what makes "newest version wins" well-defined — the row-identity rule.
+//! Two candidates: an InfluxDB-style `(key-set, ordering-key)` primary key
+//! with overwrite-on-collision (identity is closed, but two distinct events
+//! sharing keys+ordering-key can't coexist without a disambiguating key), or
+//! a kdb+-style pure-append model with an internal monotonic row id and
+//! predicate-scoped deletes (duplicates allowed, deletes address rows by
+//! predicate). These produce different tombstone records — decide before
+//! fixing the segment/tombstone format, don't hardcode one meanwhile.
 //!
 //! ## Backend split (native today, WASM later)
 //! I/O should sit behind a trait from the start. The native implementation
