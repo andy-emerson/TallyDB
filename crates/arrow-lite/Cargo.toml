@@ -1,0 +1,12 @@
+[package]
+name = "arrow-lite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Deliberately minimal. If we take a dependency on the real `arrow-array`
+# crate instead of hand-rolling the layout, it goes here — see the open
+# question in src/lib.rs before adding one.
+
+[dev-dependencies]

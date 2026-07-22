@@ -1,0 +1,21 @@
+[package]
+name = "compute-blas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+# `cc`/`bindgen` (or a maintained wrapper crate) for linking system BLAS/
+# LAPACK go here once the native backend is implemented.
+
+[dependencies]
+arrow-lite = { path = "../arrow-lite" }
+# Native backend: link OpenBLAS (or MKL/Accelerate) via FFI. See this
+# crate's src/lib.rs docs for the TARGET=SANDYBRIDGE note on avoiding FMA
+# for eventual native/WASM numerical consistency.
+#
+# WASM backend (future, not current milestone): blas.wasm
+# (github.com/andy-emerson/blas.wasm) + a LAPACK-in-WASM layer once one
+# exists. Do not add this dependency until the WASM milestone starts.
+
+[dev-dependencies]

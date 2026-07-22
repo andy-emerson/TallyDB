@@ -1,0 +1,53 @@
+//! `query-lite` — scoped SQL parsing and execution over `storage-lite`.
+//!
+//! ## Parsing: taken as-is
+//! Use `sqlparser-rs` for parsing. Do not write a parser from scratch and
+//! do not fork/vendor `sqlparser-rs` — it's a mature, MIT-licensed,
+//! narrow-purpose dependency, exactly the kind of thing this project takes
+//! whole rather than reimplementing (see root README, "Design philosophy").
+//! We use a *subset* of what it can parse; the subsetting happens in what
+//! AST nodes this crate's executor handles, not in the parser itself.
+//!
+//! ## Execution: original work, validated against an oracle
+//! The executor (turning a parsed AST into results over `storage-lite`
+//! data) is our own code — DataFusion's executor is deliberately NOT
+//! vendored, because its useful parts are coupled to its own general
+//! planner (see README). Instead: DuckDB and/or DataFusion are used as a
+//! **differential correctness oracle** in this crate's test suite — run
+//! the same query against the oracle and against this executor, diff the
+//! output. That's the primary correctness strategy for this crate. Write
+//! tests this way from the start, not as an afterthought.
+//!
+//! ## SQL surface — inclusion principle
+//! Any standard SQL function or verb is in scope as long as it (a) doesn't
+//! require a non-numeric, non-key column type, and (b) doesn't require a
+//! general-purpose cost-based optimizer. That's the actual filter — "can
+//! we think of a quant use case for it" is NOT the filter, and is not a
+//! reason to exclude something otherwise in scope. Concretely in scope:
+//! `SELECT` / `WHERE` / `GROUP BY` / `ORDER BY`, equi-joins, window
+//! functions, and `UPDATE` / `DELETE` (implemented as tombstone +
+//! reinsert against `storage-lite`, not a separate mutation path — see
+//! that crate's docs). Concretely out of scope for now: general
+//! subqueries/CTEs, arbitrary string manipulation functions (no third
+//! column type to support them), a cost-based join planner beyond
+//! star-schema equi-joins.
+//!
+//! ## Window functions
+//! These are the highest-value part of the SQL surface for the target
+//! workload (rolling aggregates over ordered numeric data) and deserve
+//! first-class, hand-written implementations here — not a generic,
+//! bolted-on afterthought. Where a window function's inner loop is
+//! numeric-heavy, this is exactly the shape of work `compute-blas` is
+//! built to accelerate; keep that seam in mind rather than reimplementing
+//! matrix-shaped math by hand.
+
+// TODO: sqlparser-rs integration, pin a version
+// TODO: AST -> logical plan for the supported subset
+// TODO: executor: filter / project / group-by / aggregate over
+//       storage-lite segments
+// TODO: executor: equi-join (star-schema shape: one fact table, small
+//       dimension tables)
+// TODO: executor: window functions over ordered numeric columns
+// TODO: UPDATE / DELETE -> storage-lite tombstone + reinsert
+// TODO: differential test harness against DuckDB/DataFusion (dev-only
+//       dependency, never a runtime one)
