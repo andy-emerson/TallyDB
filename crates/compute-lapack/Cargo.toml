@@ -1,0 +1,22 @@
+[package]
+name = "compute-lapack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+# `cc`/`bindgen` (or a maintained wrapper crate) for linking system LAPACK
+# go here once the native backend is implemented.
+
+[dependencies]
+arrow-lite = { path = "../arrow-lite" }
+# Native backend: link LAPACK (from OpenBLAS/MKL/Accelerate) via FFI. Note
+# this crate does NOT depend on `compute-blas` at the Rust level — it calls
+# the LAPACK library, which internally calls its own BLAS.
+#
+# WASM backend (future, not current milestone): a LAPACK-in-WASM layer that
+# does not yet exist as of this writing (it is the next planned milestone of
+# the blas.wasm project). Do not add this dependency until it exists and the
+# WASM milestone actually starts.
+
+[dev-dependencies]

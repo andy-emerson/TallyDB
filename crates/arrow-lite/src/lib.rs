@@ -9,13 +9,29 @@
 //! exists to guarantee.
 //!
 //! ## Scope (deliberately narrow)
-//! - A numeric column type (default `f64`), stored as a contiguous buffer
-//!   plus a validity/null bitmap, per Arrow's layout.
+//! - Numeric column types — **`f64` and `i64`** — each stored as a contiguous
+//!   fixed-width buffer plus a validity/null bitmap, per Arrow's layout.
+//!   `f64` is the analytic type (what BLAS/LAPACK consume as raw buffers);
+//!   `i64` is the exact/stored type (nanosecond timestamps, money as scaled
+//!   integers, counts) — nanosecond epochs do **not** fit in `f64`, so `i64`
+//!   is not optional. Both are Arrow primitive layouts, so the zero-copy
+//!   NumPy/Arrow interop property holds for either.
 //! - A key column type: dictionary-encoded to `u32`/`u64` indices plus a
 //!   string-interning table, per Arrow's dictionary encoding.
 //! - NOT a general Arrow implementation. No variable-length lists, no
-//!   nested/struct types, no non-numeric primitive types. If a type isn't
-//!   numeric or key, it doesn't belong here — see the root README.
+//!   nested/struct types, no non-numeric primitive types beyond `f64`/`i64`.
+//!   If a type isn't numeric or key, it doesn't belong here — see the root
+//!   README.
+//!
+//! ## Lock these two views early (they're the whole contract)
+//! Everything downstream inherits this crate's layout, so pin two interfaces
+//! before adding features: (1) the **raw-pointer / FFI view** — how a
+//! contiguous numeric buffer is handed to `compute-*` as a pointer for
+//! zero-copy compute; and (2) the **serialize-to-segment view** — how a
+//! column (including a key's dictionary) is written into a `storage-lite`
+//! segment. The load-bearing decisions are the boring ones: dictionary index
+//! width (`u32` vs `u64`), null-bitmap presence, and the `f64`/`i64` subtype
+//! tag. Get those right; defer anything fancier.
 //!
 //! ## Open question for whoever implements this (see conversation history
 //! / README "Design philosophy" section)
@@ -33,7 +49,8 @@
 //! the *data format* only. Compute lives in `compute-lua` / `compute-blas`,
 //! and query execution lives in `query-lite`.
 
-// TODO: numeric column buffer type (f64 default, validity bitmap)
+// TODO: numeric column buffer types (f64 and i64, each with validity bitmap)
 // TODO: key column type (dictionary-encoded, string interning table)
-// TODO: column enum wrapping the above two variants and nothing else
-// TODO: round-trip test against a real Arrow implementation
+// TODO: column enum wrapping numeric (f64/i64) + key variants, nothing else
+// TODO: round-trip test against a real Arrow implementation (both numeric
+//       subtypes and dictionary columns)

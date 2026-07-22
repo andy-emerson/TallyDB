@@ -28,9 +28,23 @@
 //! functions, and `UPDATE` / `DELETE` (implemented as tombstone +
 //! reinsert against `storage-lite`, not a separate mutation path — see
 //! that crate's docs). Concretely out of scope for now: general
-//! subqueries/CTEs, arbitrary string manipulation functions (no third
-//! column type to support them), a cost-based join planner beyond
+//! subqueries/CTEs, string-*producing* functions (`SUBSTRING`, `CONCAT`,
+//! `CAST AS VARCHAR`, `GROUP_CONCAT` — a produced string is a value that is
+//! neither numeric nor key), and a cost-based join planner beyond
 //! star-schema equi-joins.
+//!
+//! ## Strings: predicates in, production out
+//! numeric-or-key holds across the whole pipeline (results and intermediates,
+//! not just stored columns), but that does NOT mean "no string operations."
+//! Key columns are dictionary-encoded interned strings, so string
+//! **predicates** on keys — `=`, `IN`, `LIKE`, regex — are in scope: they
+//! emit a row selection, not a string. Implement them efficiently: evaluate
+//! the predicate once per *distinct* value in the small dictionary to get a
+//! bitmap over dictionary indices, then filter rows by integer set
+//! membership — never re-run the string match per row. What's out is any
+//! function that *emits* a string value (see the out-of-scope list above); a
+//! key result leaves the engine as its integer code plus the dictionary
+//! needed to render it.
 //!
 //! ## Window functions
 //! These are the highest-value part of the SQL surface for the target
