@@ -61,6 +61,18 @@ projection, `CONCAT`, `CAST AS VARCHAR`, `GROUP_CONCAT`). A key result comes
 back as its integer code plus the dictionary to render it; formatting is the
 application's job.
 
+### Keys assume repeating labels (low cardinality)
+
+The dictionary is the one variable-width structure in the system, and it's
+acceptable because it is *reference data, not row data*: sized by distinct
+values, not rows, and never on the per-row scan/compute path. That holds
+only while keys are repeating labels (symbols, sensor ids, exchange codes).
+A key column fed never-repeating values (a UUID per row) degenerates — the
+dictionary grows with row count and `u32` codes exhaust at ~4.3B distinct
+values. A never-repeating identifier is a number: declare it `i64` numeric,
+not key. (`engine` should eventually warn when distinct/rows approaches 1
+on a large table.)
+
 ## Current milestone: native only
 
 We are building the **native build first**. A WASM build is a real future
@@ -94,6 +106,10 @@ from scratch — that work already exists and is already correct.
   pull in DataFusion code to solve an execution problem, stop — write the
   narrow thing ourselves and check it against DuckDB/DataFusion's output
   instead.
+- **arrow-rs / PyArrow.** Dev-dependency / CI-only, used as the round-trip
+  oracle for `arrow-lite`'s hand-rolled layout and C Data Interface export
+  (issue #2). Same pattern: the mature implementation validates our bytes
+  in tests and is never linked at runtime.
 
 ## What's genuinely original here (no oracle exists — our tests are the spec)
 
@@ -146,6 +162,10 @@ one until it's decided.
 - **A general query optimizer / cost-based planner.** Query shapes are
   assumed simple (one fact table + small dimension tables, star-schema
   equi-joins).
+- **Arrow IPC / Flight / Parquet in `arrow-lite`.** The interop surface is
+  the C Data Interface (including the stream variant), nothing else — IPC
+  drags in FlatBuffers and a much larger spec. Parquet in/out is the
+  application's job via ecosystem tools that already speak C-Data.
 
 If something on this list seems newly justified, that's a conversation to
 have explicitly (update this file and the README together), not a decision
@@ -194,9 +214,13 @@ that the rest is a wide front, and the ordering below is a **risk**-ordering
 
 1. `arrow-lite` — smallest, clearest spec (Arrow's public layout), no
    internal dependencies. Lock its two interfaces early: the raw-pointer/FFI
-   view (for compute) and the serialize-to-segment view (for storage), plus
-   the `f64`/`i64` numeric subtypes and dictionary index width. Round-trip
-   test against a real Arrow impl. Get this right before anything else.
+   view (for compute) and the serialize-to-segment view (for storage).
+   **Resolved (issue #2):** hand-rolled, no runtime arrow-rs dependency;
+   `u32` dictionary codes; optional validity bitmaps (`NOT NULL` columns
+   have none; the ordering key is always `NOT NULL`); logical-type export
+   annotations (`Timestamp(ns)`, `Decimal64(scale)`); C Data Interface
+   only, including the batch-stream variant. Round-trip test against
+   arrow-rs/PyArrow (dev-only). Get this right before anything else.
 2. `storage-lite` — the highest-risk, most original crate. Deserves the
    most scrutiny and the most tests, precisely because there's no oracle.
    (Gated on the row-identity decision above for its tombstone format.)
