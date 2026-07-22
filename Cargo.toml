@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arrow-lite",
+    "crates/storage-lite",
+    "crates/query-lite",
+    "crates/engine",
+    "crates/compute-lua",
+    "crates/compute-blas",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/REPLACE_ME/tallydb"
+
+# Shared lint/config knobs go here as the project matures.

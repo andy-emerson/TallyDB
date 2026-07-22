@@ -1,0 +1,13 @@
+[package]
+name = "storage-lite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow-lite = { path = "../arrow-lite" }
+# memmap2 (or similar) for the native mmap backend goes here once that
+# backend is implemented — keep it behind the I/O trait, not a hard
+# dependency of the whole crate, so a future wasm32 build isn't blocked.
+
+[dev-dependencies]
