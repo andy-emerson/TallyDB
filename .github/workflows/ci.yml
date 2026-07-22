@@ -1,0 +1,33 @@
+# CI — the "CI-enforced" durability tier of AGENTS.md, made real.
+# Every push to main and every pull request re-earns the claims below:
+# formatting, lints, build, tests (including doctests), and rustdoc.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Documentation is a first-class artifact here (see AGENTS.md): a rustdoc
+  # warning is a failing doc claim, not a nit.
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain versions
+        run: rustc --version && cargo --version
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Test (includes doctests)
+        run: cargo test --workspace
+      - name: Docs
+        run: cargo doc --workspace --no-deps
