@@ -15,14 +15,23 @@
 //! hand-written binding layer, numeric arrays passed as raw pointers into
 //! the *same memory* the query engine already holds (arrow-lite buffers).
 //! This is exactly how the original Torch (pre-PyTorch) worked: LuaJIT +
-//! BLAS-backed tensors over FFI. `compute-blas`'s curated ops should be
-//! callable from Lua through this same mechanism, sharing buffers, not
-//! copying between the two.
+//! BLAS-backed tensors over FFI. The ops in `compute-blas`
+//! (multiplication-class) and `compute-lapack` (curated solves/
+//! decompositions) should be callable from Lua through this same mechanism,
+//! sharing buffers, not copying between them.
 //!
 //! ## Backend split
 //! - **Native (current milestone):** LuaJIT, linked as-is via FFI. No
 //!   fork, no rebuild — this is a mature, narrow, embedding-oriented
-//!   dependency, take it whole.
+//!   dependency, take it whole. *How* Rust binds to it — the `mlua` crate
+//!   vs. hand-rolled bindings to the (frozen) Lua 5.1 C API — is a
+//!   deferred decision tracked in issues; the load-bearing criterion is
+//!   zero-copy buffer hand-off, and the arrow-lite hand-roll precedent
+//!   could legitimately cut either way here (the safety burden — longjmp
+//!   across FFI, GC interaction — is heavier than a memory layout).
+//!   Prototype the buffer hand-off in mlua before choosing. The trait
+//!   shape, batch convention, and module loader are binding-agnostic and
+//!   don't wait on this.
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — LuaJIT cannot run in WASM at
 //!   all (no runtime codegen in the sandbox); `lua.wasm` provides a stock
@@ -46,12 +55,12 @@
 //! No autodiff, no general tensor/NN framework (i.e. no "build our own
 //! Torch"). If a real, specific, repeatedly-requested need shows up later,
 //! it gets a narrow, scoped addition — not a new paradigm bolted on. See
-//! root README / project history for the reasoning.
+//! DESIGN.md for the reasoning.
 
 // TODO: Lua backend trait (native LuaJIT-via-FFI implementation first)
 // TODO: batch calling convention: hand a whole column/window buffer to
 //       a Lua chunk in one call
-// TODO: expose compute-blas's curated ops as callable Lua functions,
-//       sharing buffers (no copy)
+// TODO: expose compute-blas and compute-lapack ops as callable Lua
+//       functions, sharing buffers (no copy)
 // TODO: pure-Lua module loader (package.path-style); explicitly do NOT
 //       wire up package.loadlib / C extension loading

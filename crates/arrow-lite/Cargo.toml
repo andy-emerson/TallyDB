@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# Deliberately minimal. If we take a dependency on the real `arrow-array`
-# crate instead of hand-rolling the layout, it goes here — see the open
-# question in src/lib.rs before adding one.
+# None at runtime, deliberately and permanently: the layout is hand-rolled
+# (issue #2, resolved — see src/lib.rs). Do not add arrow-rs here.
 
 [dev-dependencies]
+# arrow (arrow-rs) belongs here, dev-only, as the round-trip oracle for the
+# hand-rolled layout and C Data Interface export. PyArrow round-trips run as
+# test scripts/CI. Neither ever becomes a runtime dependency.
