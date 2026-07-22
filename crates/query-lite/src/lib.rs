@@ -4,7 +4,7 @@
 //! Use `sqlparser-rs` for parsing. Do not write a parser from scratch and
 //! do not fork/vendor `sqlparser-rs` — it's a mature, MIT-licensed,
 //! narrow-purpose dependency, exactly the kind of thing this project takes
-//! whole rather than reimplementing (see root README, "Design philosophy").
+//! whole rather than reimplementing (see DESIGN.md, "Design philosophy").
 //! We use a *subset* of what it can parse; the subsetting happens in what
 //! AST nodes this crate's executor handles, not in the parser itself.
 //!
@@ -12,7 +12,7 @@
 //! The executor (turning a parsed AST into results over `storage-lite`
 //! data) is our own code — DataFusion's executor is deliberately NOT
 //! vendored, because its useful parts are coupled to its own general
-//! planner (see README). Instead: DuckDB (primary) and DataFusion
+//! planner (see DESIGN.md). Instead: DuckDB (primary) and DataFusion
 //! (secondary) are used as a **differential correctness oracle** in this
 //! crate's test suite — run the same query against the oracle and against
 //! this executor, diff the output. DuckDB is primary because it has the

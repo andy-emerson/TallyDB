@@ -58,7 +58,7 @@
 //! the system. It is *reference data, not row data*: sized by distinct
 //! values, not rows; touched at intern time and once-per-distinct-value
 //! predicate evaluation, never on the per-row scan/compute path. Corollary
-//! (see CLAUDE.md): keys assume repeating, low-cardinality labels. A
+//! (see DESIGN.md): keys assume repeating, low-cardinality labels. A
 //! never-repeating identifier is a number — it belongs in an `i64` column,
 //! not a key.
 //!

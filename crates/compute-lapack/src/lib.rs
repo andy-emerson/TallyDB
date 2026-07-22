@@ -23,12 +23,12 @@
 //! them." The bar for adding an op is a real, specific, repeated workflow
 //! need, not "LAPACK has it so we could." If this crate's op list is growing
 //! without a named workflow driving each addition, that's scope drift — stop
-//! and check against the root README / CLAUDE.md.
+//! and check against DESIGN.md.
 //!
 //! ## `f64`, not integers or rationals
 //! These routines produce irrational results in general (eigenvalues, √ in
 //! correlations, least-squares coefficients), so the analytic numeric type is
-//! `f64` — see the numeric-type discussion in the root docs. `i64` columns
+//! `f64` — see the numeric-type discussion in DESIGN.md. `i64` columns
 //! (timestamps, money, counts) are the exact/stored type and are converted to
 //! `f64` on the way into these routines, not fed in raw.
 //!
@@ -50,7 +50,7 @@
 //!
 //! ## Batch, not per-row
 //! Every entry point takes whole columns / windows (matrices) per call, per
-//! the batch rule in the root docs. There is no per-element calling
+//! the batch rule in DESIGN.md. There is no per-element calling
 //! convention here.
 //!
 //! ## Explicitly NOT in scope

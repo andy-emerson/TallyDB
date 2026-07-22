@@ -32,7 +32,7 @@
 //! consume these primitives are floating-point anyway. `i64` columns
 //! (timestamps, money, counts) are the exact/stored type — they are converted
 //! to `f64` before being handed to a BLAS routine, not passed in raw. See the
-//! numeric-type discussion in the root docs.
+//! numeric-type discussion in DESIGN.md.
 //!
 //! ## Capability negotiation
 //! Expose ops through a trait that can answer "unavailable on this backend"
@@ -49,7 +49,7 @@
 //!
 //! ## Batch, not per-row
 //! Every entry point takes whole columns / windows per call, per the batch
-//! rule in the root docs. If the API makes per-row calls easy, that's a bug
+//! rule in DESIGN.md. If the API makes per-row calls easy, that's a bug
 //! in the API shape.
 //!
 //! ## Explicitly NOT in scope
