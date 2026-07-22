@@ -7,12 +7,7 @@ license.workspace = true
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
 storage-lite = { path = "../storage-lite" }
-# sqlparser = "0"
-# ^ pin a real version once we start implementing. Taken as-is, per the
-# root README's "Design philosophy" section — do not fork or vendor this.
-# (Commented out for now: this repo was scaffolded on an old cargo/rustc
-# for verification purposes, and current sqlparser's transitive deps need
-# a newer edition. Uncomment and pin once you're on a current toolchain.)
+sqlparser = "0.62.0"
 
 [dev-dependencies]
 # A DuckDB (or DataFusion) dependency belongs here, dev-only, used purely
