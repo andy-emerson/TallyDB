@@ -23,7 +23,15 @@
 //! ## Backend split
 //! - **Native (current milestone):** LuaJIT, linked as-is via FFI. No
 //!   fork, no rebuild — this is a mature, narrow, embedding-oriented
-//!   dependency, take it whole.
+//!   dependency, take it whole. *How* Rust binds to it — the `mlua` crate
+//!   vs. hand-rolled bindings to the (frozen) Lua 5.1 C API — is a
+//!   deferred decision tracked in issues; the load-bearing criterion is
+//!   zero-copy buffer hand-off, and the arrow-lite hand-roll precedent
+//!   could legitimately cut either way here (the safety burden — longjmp
+//!   across FFI, GC interaction — is heavier than a memory layout).
+//!   Prototype the buffer hand-off in mlua before choosing. The trait
+//!   shape, batch convention, and module loader are binding-agnostic and
+//!   don't wait on this.
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — LuaJIT cannot run in WASM at
 //!   all (no runtime codegen in the sandbox); `lua.wasm` provides a stock

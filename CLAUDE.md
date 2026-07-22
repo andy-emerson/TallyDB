@@ -95,9 +95,15 @@ from scratch — that work already exists and is already correct.
 
 ## What's used as a correctness oracle, never linked at runtime
 
-- **DuckDB and/or DataFusion.** Dev-dependency only, used to differentially
-  test `query-lite`'s executor (run the same query against both, diff the
-  output). This oracle strategy is one more reason the analytic numeric type
+- **DuckDB (primary) and DataFusion (secondary).** Dev-dependency only, used
+  to differentially test `query-lite`'s executor (run the same query against
+  both, diff the output). Oracle criteria are **not** product criteria: the
+  oracle never ships, so its size is irrelevant — what matters is authority
+  on analytic-SQL semantics (window functions, statistical aggregates) and
+  running in-process inside `cargo test`. That's DuckDB. SQLite is too thin
+  exactly there (no statistical aggregates, weaker windows); InfluxDB is a
+  server, not a linkable library — and its v3 SQL engine *is* DataFusion,
+  which the secondary oracle covers directly, as a library. This oracle strategy is one more reason the analytic numeric type
   stays `f64` — the oracle computes in `f64`, so an integer/rational compute
   path would have nothing to diff against. We do **not** vendor DataFusion's
   executor — its useful parts
@@ -223,7 +229,9 @@ that the rest is a wide front, and the ordering below is a **risk**-ordering
    arrow-rs/PyArrow (dev-only). Get this right before anything else.
 2. `storage-lite` — the highest-risk, most original crate. Deserves the
    most scrutiny and the most tests, precisely because there's no oracle.
-   (Gated on the row-identity decision above for its tombstone format.)
+   (Gated on two tracked decisions: row identity — above — for its
+   tombstone format, and per-segment vs. global dictionary for its segment
+   format.)
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
 4. `compute-lua` / `compute-blas` / `compute-lapack` — native backends

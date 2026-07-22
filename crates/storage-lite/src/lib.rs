@@ -46,6 +46,16 @@
 //! predicate). These produce different tombstone records — decide before
 //! fixing the segment/tombstone format, don't hardcode one meanwhile.
 //!
+//! **Second open decision (tracked in issues): dictionary scope.** Key
+//! columns intern strings into a dictionary — per-table (global) or
+//! per-segment? Global keeps codes stable across segments (no remapping in
+//! cross-segment GROUP BY/joins) but adds a shared mutable structure
+//! alongside immutable segments. Per-segment keeps segments fully
+//! self-contained (clean immutability and compaction, maps 1:1 onto Arrow's
+//! per-batch dictionary export) but requires code remapping at query time.
+//! Interacts with the row-identity decision and compaction design — decide
+//! when the segment format is fixed, not before, and don't hardcode either.
+//!
 //! ## Backend split (native today, WASM later)
 //! I/O should sit behind a trait from the start. The native implementation
 //! (mmap'd files) is the only one being built right now — but the trait
