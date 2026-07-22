@@ -55,7 +55,7 @@
 //! No autodiff, no general tensor/NN framework (i.e. no "build our own
 //! Torch"). If a real, specific, repeatedly-requested need shows up later,
 //! it gets a narrow, scoped addition — not a new paradigm bolted on. See
-//! root README / project history for the reasoning.
+//! DESIGN.md for the reasoning.
 
 // TODO: Lua backend trait (native LuaJIT-via-FFI implementation first)
 // TODO: batch calling convention: hand a whole column/window buffer to
