@@ -129,7 +129,7 @@ q language, minus the license, minus the server.
 **Prior art.** TallyDB borrows validated ideas rather than inventing them:
 
 - **InfluxDB** validates the key/numeric split directly — its tags-vs-fields
-  model is close in spirit to TallyDB's key-vs-numeric rule, and its more
+  model is close in spirit to TallyDB's numeric-or-key rule, and its more
   recent move to real SQL validates SQL-native as the right surface. (Note
   that InfluxDB is actually *more permissive* — it allows string and boolean
   *fields*; TallyDB deliberately takes a strict subset, which is where the
