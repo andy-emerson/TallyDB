@@ -121,7 +121,9 @@ boundary, not our own foresight.
 ## How you'll use it
 
 - Link it into your application like SQLite or DuckDB — no server process,
-  no separate database to administer.
+  no separate database to administer. (A standalone single-file CLI
+  binary per release — the `sqlite3`-shell shape, still no server — is
+  planned for native GA; see `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded
