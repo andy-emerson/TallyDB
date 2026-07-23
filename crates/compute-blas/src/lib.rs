@@ -35,11 +35,10 @@
 //! numeric-type discussion in DESIGN.md.
 //!
 //! ## Capability negotiation
-//! Expose ops through a trait that can answer "unavailable on this backend"
-//! as a first-class result rather than panicking — the same seam
-//! `compute-lapack` needs. It matters less here (BLAS has a WASM backend
-//! already) but keeping both compute crates on the same trait shape is what
-//! lets `engine` treat them uniformly.
+//! Ops are exposed through [`backend::BlasBackend`], which answers
+//! "unavailable on this backend" as a first-class result rather than
+//! panicking — the same seam `compute-lapack` uses, so `engine` treats
+//! both compute crates uniformly.
 //!
 //! ## WASM backend: future, not current milestone
 //! `blas.wasm` (github.com/andy-emerson/blas.wasm) already exists,
