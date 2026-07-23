@@ -71,6 +71,20 @@ Floating-point *done carefully* is the right tool; where reproducibility
 matters, it is handled at the BLAS build level (non-FMA kernels — see
 *Numerical consistency*), not by dropping floats.
 
+**Decision record — `f32` (considered and set aside, kept cheap to add).**
+A single-precision analytic subtype was rejected for now: 32 bits can never
+hold the ordering key or money (`f32`'s exact-integer ceiling is 2²⁴;
+`i32` nanoseconds span ±2.1 s), `f32` accumulation quietly loses
+million-row sums and variance to cancellation, and the whole oracle
+strategy (DuckDB, NumPy) speaks `f64`. What makes the rejection cheap:
+the numeric subtype tag is an extensible integer registry, so adding `F32`
+later is a new variant and buffer width — never a format migration. Reopen
+triggers: a GPU/WebGPU compute backend actually lands on the roadmap (WGSL
+has no `f64`, so there `f32` is the entry ticket), or profiling shows
+bandwidth-bound, precision-tolerant workloads dominating real usage. The
+adoption shape when triggered: per-op downconversion at the compute
+boundary or an opt-in stored subtype — never for ordering keys or money.
+
 ### Strings: predicates yes, production no
 
 The numeric-or-key rule holds across the *entire pipeline* — stored columns,
@@ -117,6 +131,15 @@ There is no third column type. A column that can't be classified as one or
 the other is rejected at schema-definition time, not silently coerced — and
 this holds for query results and intermediates, not just stored columns.
 
+The vocabulary is final (issue #7, decided 2026-07-23): the two species are
+**numeric** and **key**, chosen because the pair states the invariant and
+"key" matches SQL's own usage on a SQL-native surface. A key is a *label*,
+not a primary key — repeating values are the point, not a violation. For
+readers arriving from the BI/OLAP world: key columns play the *dimension*
+role in a star schema, numeric columns are the *measures*; the
+Kimball vocabulary was considered and set aside because "dimension" and
+"measure" collide with this document's mathematical audience.
+
 ## The inclusion principle for the SQL surface
 
 Include a standard SQL function or verb if it (a) doesn't require a
@@ -151,13 +174,30 @@ compaction resolves tombstones and merges segments. This means:
   small, well-understood cost, paid only when mutation has actually
   happened.
 
-> **Open decisions (tracked in issues, both gating `storage-lite`'s
-> formats):** (1) the *row-identity* rule that makes "newest version wins"
-> well-defined — an InfluxDB-style `(key-set, ordering-key)` primary key
-> with overwrite-on-collision, versus a kdb+-style pure-append model with an
-> internal row id and predicate-scoped deletes — gates the tombstone format;
-> (2) *per-segment vs. global dictionary* for key columns gates the segment
-> format. Don't hardcode either until decided.
+> **Decided (issues #1 and #6, 2026-07-23), settling `storage-lite`'s
+> formats:** (1) **Row identity is kdb+-style pure append** — rows carry an
+> internal monotonic row id, duplicates are first-class, `UPDATE`/`DELETE`
+> address rows by predicate, and corrections supersede by ingest sequence.
+> The rejected InfluxDB-style `(key-set, ordering-key)` primary key
+> silently collapses distinct same-tuple events — data loss with no error;
+> if user-visible overwrite semantics are ever needed, the path is an
+> opt-in declared uniqueness constraint on top, not a reversal. (2) **Key
+> dictionaries are per-segment** — segments are fully self-contained, which
+> keeps immutability pure, compaction simple, and matches Arrow's per-batch
+> dictionary export; with identity resolved by row id, compaction never
+> compares key values across segments, which is what made a global
+> dictionary attractive. The recorded extension: a process-lifetime
+> code-remap cache at query time, added only when profiling shows the
+> remap cost is material. (3) **The format carries a per-column codec
+> tag** (issue #28) — a one-byte, append-only integer registry
+> (`0 = uncompressed`), same pattern as the frozen type-tag registries —
+> so every codec is an additive entry, never a format migration.
+> **Ordered `i64` columns use delta-of-delta** (issue #29), the TSDB
+> standard for clock-like keys, with a confirm-against-plain-delta
+> measurement on the corpus at implementation. **`f64` columns ship
+> uncompressed behind the tag** — a legitimate answer for hot data, not
+> a placeholder — while the Gorilla-vs-zstd fork stays open (issue #30),
+> resolved by A/B when the corpus exists.
 
 ## Current milestone: native only
 
@@ -292,6 +332,20 @@ a WASM build lands with storage + query + Lua + BLAS-class ops working and
 LAPACK-class analytics gracefully degraded until LAPACK-in-WASM ships. The
 crate split itself is the honest expression of that boundary; don't hide
 LAPACK inside a crate named "blas."
+
+**Decision record — the honest zero-copy claim (column-group arena
+considered and set aside).** LAPACK wants column-major matrices in one
+allocation with uniform stride; table columns are separate allocations. So
+the zero-copy claim is stated precisely: **vector-shaped ops and window
+slices are zero-copy into compute; assembling a multi-column design matrix
+is one bounded gather** — an O(n·k) copy feeding an O(n·k²) solve, so the
+copy is asymptotically invisible exactly where it would matter most. The
+rejected alternative was a shared arena allocating a segment's same-length
+`NOT NULL` `f64` columns at uniform stride so a table chunk *is* a matrix;
+set aside because it couples `arrow-lite`'s allocator to `storage-lite`'s
+segment layout and constrains compaction. Reopen trigger: profiling on
+target workloads shows design-matrix assembly is a material fraction of
+query time.
 
 ## Batch, not per-row, for Lua and BLAS/LAPACK calls
 
@@ -456,8 +510,8 @@ after that the rest is a wide front, and the ordering below is a
    arrow-rs/PyArrow (dev-only). Get this right before anything else.
 2. `storage-lite` — the highest-risk, most original crate. Deserves the
    most scrutiny and the most tests, precisely because there's no oracle.
-   (Gated on two tracked decisions: row identity for its tombstone format,
-   and per-segment vs. global dictionary for its segment format.)
+   (Its two format-gating decisions are settled — row identity by internal
+   row id, per-segment dictionaries; see *Storage* above.)
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
 4. `compute-lua` / `compute-blas` / `compute-lapack` — native backends

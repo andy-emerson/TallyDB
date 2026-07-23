@@ -185,8 +185,10 @@ repo-specific half lives here:
   crate boundaries, settled decisions, build order, and the test plan's
   skeleton.
 - **Living status:** [GitHub Issues](https://github.com/andy-emerson/TallyDB/issues).
-  Open decisions carry the `decision` label; recorded alternatives with
-  reopen triggers carry `deferred`; everything else open is a todo or a bug.
+  Open decisions carry the `decision` label; everything else open is a todo
+  or a bug. Settled decisions — including rejected alternatives and their
+  reopen triggers — are recorded in the durable documents, not kept as open
+  issues.
 - **Roadmap:** [GitHub Milestones](https://github.com/andy-emerson/TallyDB/milestones)
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
   GA · M4 WASM parity.

@@ -4,8 +4,9 @@
 //! [`Column`] has exactly two variants. That is the numeric-or-key
 //! invariant enforced by construction: code holding a `Column` can be
 //! handed a number or a key, and the compiler makes any third case
-//! unrepresentable. (Naming per issue #7, decided provisionally as
-//! numeric-or-key; revisit scheduled before the M2 schema freeze.)
+//! unrepresentable. (Naming per issue #7, decided as numeric-or-key —
+//! final since the 2026-07-23 ruling; a key is a label, not a primary
+//! key.)
 //!
 //! ## The type-tag registry
 //!

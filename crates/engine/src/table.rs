@@ -244,8 +244,9 @@ enum RegressionOutput {
 }
 
 /// The M1 flagship: rolling least-squares of `y` on `x`, one solve per
-/// window through `compute-lapack` (QR via `dgels`, provisional per open
-/// decision #20).
+/// window through `compute-lapack` (QR via `dgels` today; decision #20
+/// ruled QR-fast-path-plus-SVD-fallback, and the SVD side arrives with
+/// the M2 work on that op).
 struct RollingRegression {
     backend: NativeLapack,
     output: RegressionOutput,
@@ -271,8 +272,8 @@ impl WindowAggregate for RollingRegression {
         // exactly regr_slope's definition. Checked here because QR
         // without pivoting cannot be trusted to flag it: rounding leaves
         // the triangular factor almost-but-not-exactly singular and dgels
-        // happily returns garbage coefficients (the QR weakness recorded
-        // in open decision #20).
+        // happily returns garbage coefficients (the QR weakness that
+        // decided #20: an SVD fallback joins the op at M2).
         if x.iter().all(|&value| value == x[0]) {
             return Ok(None);
         }
