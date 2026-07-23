@@ -240,6 +240,55 @@ mod tests {
         assert_eq!(decode_delta_of_delta(&[], 1), Err(CodecError::Truncated));
     }
 
+    /// Plain delta with the same zigzag varints — the comparator #29
+    /// asked to be measured against, deliberately NOT a registered codec.
+    fn encode_plain_delta(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() + 16);
+        let mut previous = 0i64;
+        for &value in values {
+            push_varint(&mut out, zigzag(value.wrapping_sub(previous)));
+            previous = value;
+        }
+        out
+    }
+
+    /// The #29 confirmation measurement (a measurement, not a decision —
+    /// the ruling chose delta-of-delta; this records the margin on the
+    /// corpus). Run explicitly, in release mode:
+    ///
+    /// ```text
+    /// cargo test -p storage-lite --release codec::tests::measure_29 \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement — run explicitly in release mode"]
+    fn measure_29_delta_of_delta_vs_plain_delta() {
+        for (name, spec) in [
+            ("ticks", corpus::Spec::ticks(1_000_000, 29)),
+            ("telemetry", corpus::Spec::telemetry(1_000_000, 29)),
+        ] {
+            let timestamps: Vec<i64> = spec.generate().iter().map(|row| row.ts).collect();
+            let raw = timestamps.len() * 8;
+            let dod = encode_delta_of_delta(&timestamps);
+            let delta = encode_plain_delta(&timestamps);
+            let start = std::time::Instant::now();
+            let decoded = decode_delta_of_delta(&dod, timestamps.len()).unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(decoded, timestamps);
+            println!(
+                "{name}: raw {raw} B; delta-of-delta {} B ({:.2}x vs raw); \
+                 plain delta {} B ({:.2}x vs raw); dod/delta {:.3}; \
+                 decode {:.0}M values/s",
+                dod.len(),
+                raw as f64 / dod.len() as f64,
+                delta.len(),
+                raw as f64 / delta.len() as f64,
+                delta.len() as f64 / dod.len() as f64,
+                timestamps.len() as f64 / elapsed.as_secs_f64() / 1e6,
+            );
+        }
+    }
+
     proptest! {
         #[test]
         fn any_sequence_round_trips(values in prop::collection::vec(any::<i64>(), 0..300)) {

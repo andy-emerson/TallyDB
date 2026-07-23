@@ -8,6 +8,7 @@ members = [
     "crates/compute-lua",
     "crates/compute-blas",
     "crates/compute-lapack",
+    "crates/corpus",
 ]
 
 [workspace.package]
