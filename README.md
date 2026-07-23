@@ -156,4 +156,4 @@ native-first build.
   decisions, build order.
 - **[`AGENTS.md`](AGENTS.md)** — how work happens in this repository.
 - **[Issues & milestones](https://github.com/andy-emerson/TallyDB/issues)**
-  — all open work: wants, decisions, and the roadmap.
+  — all open work: todos, decisions, and the roadmap.

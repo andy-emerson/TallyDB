@@ -19,6 +19,7 @@
 //! - Covariance / PCA -> symmetric eigendecomposition
 //! - Portfolio weights / factor models -> general linear solve
 //! - Fast path for positive-definite covariance work -> Cholesky
+//!
 //! That's the list. Do not add routines speculatively "in case someone wants
 //! them." The bar for adding an op is a real, specific, repeated workflow
 //! need, not "LAPACK has it so we could." If this crate's op list is growing

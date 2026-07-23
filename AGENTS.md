@@ -107,8 +107,9 @@ from becoming documented overstatement.
 The doc review makes the documentation an honest account of where the project
 actually is. It holds the docs to the standard science holds a result: **claim
 only what the evidence supports.** We aspire to that standard; we do not
-pretend to meet it. A want is a hypothesis — it goes to the issue tracker, not
-the docs. A documented claim is a result — it carries its evidence.
+pretend to meet it. A todo is work whose claim is not yet earned — it goes to
+the issue tracker, not the docs. A documented claim is a result — it carries
+its evidence.
 
 Where documentation can carry **executable evidence** — examples that compile
 and run as tests on every change — prefer that to prose: a prose claim rots
@@ -123,7 +124,7 @@ performance and compatibility can only be measured, so they stop at **Tested**
 (and a number must cite its run). A repo may add its own types and ceilings.
 
 **Strength — how much has been shown** (each level includes those below):
-- **Stated** — asserted; no evidence. (A claim stuck here is a want → issue.)
+- **Stated** — asserted; no evidence. (A claim stuck here is a todo → issue.)
 - **Built** — exists and runs, but not shown to meet the claim.
 - **Observed** — holds in at least one case.
 - **Tested** — holds across the cases that matter.
@@ -143,10 +144,10 @@ The review keeps two kinds of home honest:
 - **The descriptive documents** (named in *In this repository*) — where the
   project is now, in plain accurate prose (no grades on the page; a settled
   limitation is stated as plainly as a success).
-- **Issues** — the open work: every want, each carrying its grade (type,
+- **Issues** — the open work: every todo, each carrying its grade (type,
   strength, durability). The **grid** is not a separate document; it is the
-  open wants read through the two scales above, showing how far each still has
-  to climb.
+  open todos read through the two scales above, showing how far each still
+  has to climb.
 
 A claim above its evidence is **demoted**, **earned**, or **removed** (→
 issue). When an open item is settled, it closes — leaving the grid — and its
@@ -155,13 +156,13 @@ grading what it advanced — the issues it touched and any it newly filed —
 then fixing the descriptive documents' staleness; it does not re-grade issues
 it left untouched.
 
-## Wants and decisions
+## Todos and decisions
 
 Issues hold three species of open work, separated by label and never mixed
 into prose documents:
 
-- A **want** is work not yet done — the todo list. Each want carries its grade
-  (type, strength, durability) in its body; the grid is the open wants.
+- A **todo** is work not yet done. Each todo carries its grade (type,
+  strength, durability) in its body; the grid is the open todos.
 - A **decision** is a fork only the architect may close. It must name **what
   it gates**. Its deadline is not when its subject gets built — it is *before
   the first upstream work that would entrench an answer by accident* — and it
@@ -183,7 +184,9 @@ A working branch reaches `main` by integration:
 - Integrate in **small, frequent steps**, always ending on the repo-wide code
   pass and doc pass described above, doc pass last.
 - The integration is a **pull request**, which is where its review is
-  attached.
+  attached. **The engineer opens the pull request; the architect merges
+  it.** The merge is the architect's "verify" made literal — the author of
+  an integration is never the one who lands it.
 
 ## In this repository
 
@@ -196,7 +199,7 @@ instantiation.
   now, from the user's point of view. `CLAUDE.md` — the agent entry point; a
   pointer only.
 - **Labels:** `decision` and `deferred`, as defined above; open issues with
-  neither label are wants.
+  neither label are todos.
 - **Milestones:** M0 layout locked · M1 compute proven · M2 feature-complete ·
   M3 native GA · M4 WASM parity.
 - **Executable documentation** here means Rust doctests (`cargo test` runs
