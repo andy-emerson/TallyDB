@@ -476,9 +476,10 @@ tallydb/
                     #   buffers, u32-dictionary keys, C Data Interface export;
                     #   arrow-rs/PyArrow as dev-only round-trip oracles)
     storage-lite/   # append-optimized segments partitioned on the ordering
-                    #   key; compaction; zone maps; native backend = mmap
-                    #   today, behind a trait so an OPFS/WASM backend can be
-                    #   added later
+                    #   key; compaction; zone maps; I/O behind a backend
+                    #   trait (native = a directory of files; mmap/ranged
+                    #   reads when pruning or profiling asks; OPFS/WASM
+                    #   backend can be added later)
     query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
@@ -488,6 +489,9 @@ tallydb/
                     #   FFI for now (blas.wasm later)
     compute-lapack/ # curated LAPACK solves/decompositions behind a trait;
                     #   native LAPACK via FFI for now (LAPACK-wasm later)
+    corpus/         # dev-only: the seeded synthetic generators of "The
+                    #   corpus" above; measurement and differential-test
+                    #   data, never linked by the engine
   Cargo.toml
 ```
 

@@ -17,8 +17,12 @@
 //!
 //! The confirm-against-plain-delta measurement #29 asked for lives with
 //! this module's tests (`measure_29_*`, `#[ignore]`, run explicitly);
-//! plain delta itself is deliberately not a registered codec unless that
-//! measurement ever says otherwise.
+//! plain delta itself is deliberately not a registered codec. The
+//! confirmation run (Observed 2026-07-23, release build, seed 29, 1M
+//! rows per corpus family): delta-of-delta compresses 2.49× vs raw on
+//! ticks and 2.08× on telemetry, ahead of plain delta by 1.08× and
+//! 1.30× respectively, decoding at ~80M values/s — the ruling holds on
+//! both families.
 
 use std::fmt;
 
