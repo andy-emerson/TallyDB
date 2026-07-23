@@ -1,0 +1,21 @@
+# A deferred record is a decision already taken whose alternative stays
+# documented (AGENTS.md, "Todos and decisions"). It is not relitigated
+# without a named trigger firing.
+name: Deferred decision record
+description: A decision already taken; the alternative stays documented
+labels: ["deferred"]
+body:
+  - type: textarea
+    id: decision
+    attributes:
+      label: What was decided, and the alternative that was rejected
+      description: Include the reasoning and any numbers that drove it.
+    validations:
+      required: true
+  - type: textarea
+    id: triggers
+    attributes:
+      label: Reopen triggers
+      description: The specific, observable conditions under which this gets revisited.
+    validations:
+      required: true

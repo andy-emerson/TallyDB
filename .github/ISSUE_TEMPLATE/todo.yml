@@ -1,0 +1,30 @@
+# A todo is work whose claim is not yet earned (AGENTS.md, "Todos and
+# decisions"). Todos carry no label; the open todos, read through their
+# grades, are the grid.
+name: Todo
+description: Work whose claim is not yet earned — carries its grade
+body:
+  - type: input
+    id: grade
+    attributes:
+      label: Grade
+      description: "Type · current Strength · current Durability · target"
+      placeholder: "correctness · Stated · — · target: Tested, CI-enforced"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: The work, scoped. Reference the design contract it implements.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence to earn the target grade
+      description: >
+        Which tests, against which reference (see DESIGN.md's reference
+        map). Evidence lands in the same integration that closes this.
+    validations:
+      required: true

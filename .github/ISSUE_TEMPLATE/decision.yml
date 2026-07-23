@@ -1,0 +1,41 @@
+# A decision is a fork only the architect may close (AGENTS.md, "Todos and
+# decisions"). Its deadline is before the first upstream work that would
+# entrench an answer by accident — schedule it to the milestone containing
+# that work.
+name: Decision
+description: A fork only the architect may close
+labels: ["decision"]
+body:
+  - type: input
+    id: gates
+    attributes:
+      label: What it gates
+      description: The work that would entrench an answer, and the milestone holding it.
+      placeholder: "storage-lite tombstone format (M2)"
+    validations:
+      required: true
+  - type: textarea
+    id: candidates
+    attributes:
+      label: Candidates
+      description: Each option with its pros and cons. Steelman all of them.
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Decision criteria
+      description: What would make one candidate win.
+  - type: dropdown
+    id: method
+    attributes:
+      label: Resolution method
+      description: >
+        A/B (build both behind the same interface, measure) is the
+        escalation path for contested, hard-to-reverse, performance-relevant
+        forks — not the default.
+      options:
+        - argument
+        - A/B (build both, measure)
+    validations:
+      required: true
