@@ -27,14 +27,28 @@
 //! and readers that require order (the window executor) check instead of
 //! assuming, exactly as they did for a single segment.
 
+use crate::format::{decode_segment, encode_segment};
+use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
 use arrow_lite::Schema;
 use std::sync::Arc;
 
 /// Rows per segment before an automatic flush. Large enough that segment
 /// bookkeeping is noise, small enough that a segment is a reasonable unit
-/// of compaction and (at M2.2) I/O.
+/// of compaction and I/O.
 pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
+
+/// The backend object holding the table manifest — an encoded empty
+/// segment, which carries exactly what a manifest needs (schema and
+/// ordering key) with the segment format's own magic, CRC, and
+/// versioning.
+const MANIFEST: &str = "table.tlym";
+
+/// The backend object name for the segment based at `base_row_id`
+/// (zero-padded so lexicographic order is row-id order).
+fn segment_name(base_row_id: u64) -> String {
+    format!("seg-{base_row_id:020}.tlyseg")
+}
 
 /// A table's storage: an active write buffer plus frozen segments.
 ///
@@ -67,6 +81,8 @@ pub struct Store {
     buffer_base: u64,
     segments: Vec<Arc<Segment>>,
     rows: u64,
+    /// Where flushed segments also go, if the store is persistent.
+    backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl Store {
@@ -93,7 +109,90 @@ impl Store {
             buffer_base: 0,
             segments: Vec::new(),
             rows: 0,
+            backend: None,
         })
+    }
+
+    /// A persistent store over `backend`, flushing every
+    /// [`DEFAULT_SEGMENT_ROWS`] rows. Creates the table if the backend is
+    /// empty; otherwise reopens it, verifying the manifest against
+    /// `schema`/`ordering_key` and every stored segment's checksum,
+    /// schema, and row-id contiguity.
+    ///
+    /// **Durability boundary: [`Store::flush`].** Rows in the write
+    /// buffer exist only in memory until flushed (automatically at the
+    /// segment-row threshold, or explicitly); a crash loses them and
+    /// reopen sees exactly the flushed segments.
+    pub fn persistent(
+        backend: Arc<dyn StorageBackend>,
+        schema: Schema,
+        ordering_key: usize,
+    ) -> Result<Store, StorageError> {
+        Store::persistent_with_segment_rows(backend, schema, ordering_key, DEFAULT_SEGMENT_ROWS)
+    }
+
+    /// As [`Store::persistent`], with an explicit segment-row threshold.
+    pub fn persistent_with_segment_rows(
+        backend: Arc<dyn StorageBackend>,
+        schema: Schema,
+        ordering_key: usize,
+        segment_rows: usize,
+    ) -> Result<Store, StorageError> {
+        let mut store = Store::with_segment_rows(schema, ordering_key, segment_rows)?;
+        match backend.read(MANIFEST) {
+            Ok(bytes) => {
+                let manifest = decode_segment(&bytes)?;
+                if manifest.batch().schema() != &store.schema {
+                    return Err(StorageError::SchemaMismatch {
+                        reason: "manifest schema differs from the schema given".to_owned(),
+                    });
+                }
+                if manifest.ordering_key() != ordering_key {
+                    return Err(StorageError::SchemaMismatch {
+                        reason: format!(
+                            "manifest orders on column {}, caller asked for {ordering_key}",
+                            manifest.ordering_key()
+                        ),
+                    });
+                }
+            }
+            Err(IoError::NotFound(_)) => {
+                let empty = WriteBuffer::new(store.schema.clone(), ordering_key)?.freeze()?;
+                backend.write(MANIFEST, &encode_segment(&empty))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut segments = Vec::new();
+        for name in backend.list()? {
+            if !(name.starts_with("seg-") && name.ends_with(".tlyseg")) {
+                continue;
+            }
+            let segment = decode_segment(&backend.read(&name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!("segment '{name}' was written under a different schema"),
+                });
+            }
+            if segment.ordering_key() != ordering_key {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!("segment '{name}' orders on a different column"),
+                });
+            }
+            segments.push(Arc::new(segment));
+        }
+        segments.sort_by_key(|segment| segment.base_row_id());
+        let mut expected_base = 0u64;
+        for segment in &segments {
+            if segment.base_row_id() != expected_base {
+                return Err(StorageError::MissingRows { expected_base });
+            }
+            expected_base += segment.batch().num_rows() as u64;
+        }
+        store.segments = segments;
+        store.rows = expected_base;
+        store.buffer_base = expected_base;
+        store.backend = Some(backend);
+        Ok(store)
     }
 
     /// The store's schema.
@@ -135,15 +234,18 @@ impl Store {
     }
 
     /// Freezes the live buffer into a segment now (a no-op when empty).
-    ///
-    /// Flushing goes through a snapshot first, so a buffer that cannot
-    /// freeze (an all-null key column) returns the error with the buffer
-    /// — and its rows — intact.
+    /// On a persistent store this is the durability boundary: the
+    /// segment's bytes are published to the backend before the segment
+    /// is registered, so a failure at any point leaves both the backend
+    /// and the buffer — rows included — exactly as they were.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         if self.buffer.is_empty() {
             return Ok(());
         }
         let segment = self.buffer.snapshot_at(self.buffer_base)?;
+        if let Some(backend) = &self.backend {
+            backend.write(&segment_name(self.buffer_base), &encode_segment(&segment))?;
+        }
         self.segments.push(Arc::new(segment));
         self.buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
         self.buffer_base = self.rows;

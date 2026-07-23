@@ -57,6 +57,15 @@ pub enum StorageError {
     /// A nullable key column ended up all-null with an empty dictionary —
     /// not representable as a `KeyColumn` (known limitation, kept).
     AllNullKeyColumn { column: String },
+    /// The storage backend failed.
+    Io(crate::io::IoError),
+    /// Stored segment bytes failed to decode.
+    Format(crate::format::FormatError),
+    /// Stored data disagrees with the schema this store was opened with.
+    SchemaMismatch { reason: String },
+    /// The stored segments do not cover a contiguous row-id range — a
+    /// segment file is missing or duplicated.
+    MissingRows { expected_base: u64 },
 }
 
 impl fmt::Display for StorageError {
@@ -76,7 +85,28 @@ impl fmt::Display for StorageError {
                 f,
                 "key column '{column}' is entirely null; an all-null key column is unsupported"
             ),
+            StorageError::Io(error) => write!(f, "{error}"),
+            StorageError::Format(error) => write!(f, "{error}"),
+            StorageError::SchemaMismatch { reason } => {
+                write!(f, "stored data does not match the schema: {reason}")
+            }
+            StorageError::MissingRows { expected_base } => write!(
+                f,
+                "stored segments are not contiguous: no segment starts at row id {expected_base}"
+            ),
         }
+    }
+}
+
+impl From<crate::io::IoError> for StorageError {
+    fn from(error: crate::io::IoError) -> Self {
+        StorageError::Io(error)
+    }
+}
+
+impl From<crate::format::FormatError> for StorageError {
+    fn from(error: crate::format::FormatError) -> Self {
+        StorageError::Format(error)
     }
 }
 
