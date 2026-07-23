@@ -30,12 +30,14 @@ fn append_n(store: &mut Store, range: std::ops::Range<i64>) {
 }
 
 fn ts_values(store: &Store) -> Vec<i64> {
+    // Raw stored values, tombstoned or not.
     store
         .snapshot()
         .unwrap()
         .iter()
         .flat_map(|segment| {
-            let Column::Numeric(NumericData::I64(ts)) = &segment.batch().columns()[0] else {
+            let Column::Numeric(NumericData::I64(ts)) = &segment.segment.batch().columns()[0]
+            else {
                 panic!("ts type")
             };
             ts.values().as_slice().to_vec()
@@ -104,7 +106,7 @@ fn reopened_data_is_bit_identical() {
                 .snapshot()
                 .unwrap()
                 .iter()
-                .map(|segment| encode_segment(segment))
+                .map(|view| encode_segment(&view.segment))
                 .collect();
         }
         let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
@@ -112,7 +114,7 @@ fn reopened_data_is_bit_identical() {
             .snapshot()
             .unwrap()
             .iter()
-            .map(|segment| encode_segment(segment))
+            .map(|view| encode_segment(&view.segment))
             .collect();
         assert_eq!(before, after);
     });
@@ -220,4 +222,66 @@ fn backend_read_errors_surface() {
         StorageError::from(IoError::NotFound("x".into())),
         StorageError::Io(IoError::NotFound("x".into()))
     );
+}
+
+#[test]
+fn tombstones_survive_reopen() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+            append_n(&mut store, 0..9);
+            assert_eq!(store.tombstone(&[1, 4, 7]).unwrap(), 3);
+            // Idempotent: killing dead rows writes no new log.
+            assert_eq!(store.tombstone(&[1, 4]).unwrap(), 0);
+            // Two mutations, two logs.
+            assert_eq!(store.tombstone(&[8]).unwrap(), 1);
+        }
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+        assert_eq!(store.len(), 9);
+        assert_eq!(store.live_len(), 5);
+        assert_eq!(ts_values(&store), (0..9).collect::<Vec<_>>()); // raw rows remain
+        let live: Vec<i64> = store
+            .snapshot()
+            .unwrap()
+            .iter()
+            .flat_map(|view| {
+                let arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+                    &view.segment.batch().columns()[0]
+                else {
+                    panic!("ts type")
+                };
+                (0..view.segment.batch().num_rows())
+                    .filter(|&row| view.is_live(row))
+                    .map(|row| ts.values().as_slice()[row])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(live, vec![0, 2, 3, 5, 6]);
+        assert_eq!(
+            backend
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|name| name.starts_with("del-"))
+                .count(),
+            2
+        );
+    });
+}
+
+#[test]
+fn tombstone_bounds_are_checked() {
+    let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
+    append_n(&mut store, 0..3);
+    assert_eq!(
+        store.tombstone(&[3]),
+        Err(StorageError::TombstoneOutOfRange { id: 3 })
+    );
+    // Rows still in the write buffer can be tombstoned.
+    assert_eq!(store.tombstone(&[2]).unwrap(), 1);
+    assert_eq!(store.live_len(), 2);
+    let views = store.snapshot().unwrap();
+    assert!(!views[0].is_live(2));
+    assert!(views[0].is_live(0));
 }

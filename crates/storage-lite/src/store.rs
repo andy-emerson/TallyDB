@@ -30,7 +30,9 @@
 use crate::format::{decode_segment, encode_segment};
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
-use arrow_lite::Schema;
+use crate::tombstone::{decode_tombstones, encode_tombstones};
+use arrow_lite::{Bitmap, Schema};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Rows per segment before an automatic flush. Large enough that segment
@@ -48,6 +50,45 @@ const MANIFEST: &str = "table.tlym";
 /// (zero-padded so lexicographic order is row-id order).
 fn segment_name(base_row_id: u64) -> String {
     format!("seg-{base_row_id:020}.tlyseg")
+}
+
+/// The backend object name for the `sequence`-th delete log.
+fn delete_log_name(sequence: u64) -> String {
+    format!("del-{sequence:020}.tlyd")
+}
+
+/// One segment as a reader sees it: the immutable segment plus the live
+/// mask tombstones impose on it. `live: None` means every row is live —
+/// the common case, and the one downstream keeps zero-copy.
+#[derive(Clone)]
+pub struct SegmentView {
+    /// The stored segment.
+    pub segment: Arc<Segment>,
+    /// Bit per row, `true` = live; `None` when nothing is tombstoned.
+    pub live: Option<Bitmap>,
+}
+
+impl SegmentView {
+    /// A view with every row live.
+    pub fn all_live(segment: Arc<Segment>) -> SegmentView {
+        SegmentView {
+            segment,
+            live: None,
+        }
+    }
+
+    /// Rows a reader will actually see.
+    pub fn live_rows(&self) -> usize {
+        match &self.live {
+            None => self.segment.batch().num_rows(),
+            Some(mask) => mask.count_set(),
+        }
+    }
+
+    /// Whether local row `row` is live.
+    pub fn is_live(&self, row: usize) -> bool {
+        self.live.as_ref().is_none_or(|mask| mask.get(row))
+    }
 }
 
 /// A table's storage: an active write buffer plus frozen segments.
@@ -68,9 +109,9 @@ fn segment_name(base_row_id: u64) -> String {
 /// }
 /// let segments = store.snapshot().unwrap();
 /// // Two full segments plus the live buffer's single row.
-/// let rows: Vec<usize> = segments.iter().map(|s| s.batch().num_rows()).collect();
+/// let rows: Vec<usize> = segments.iter().map(|s| s.segment.batch().num_rows()).collect();
 /// assert_eq!(rows, [2, 2, 1]);
-/// assert_eq!(segments[2].base_row_id(), 4);
+/// assert_eq!(segments[2].segment.base_row_id(), 4);
 /// ```
 pub struct Store {
     schema: Schema,
@@ -81,6 +122,10 @@ pub struct Store {
     buffer_base: u64,
     segments: Vec<Arc<Segment>>,
     rows: u64,
+    /// Row ids the table has tombstoned (decision #1: ids, never keys).
+    tombstones: BTreeSet<u64>,
+    /// Sequence number for the next delete log.
+    delete_log_sequence: u64,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
 }
@@ -109,6 +154,8 @@ impl Store {
             buffer_base: 0,
             segments: Vec::new(),
             rows: 0,
+            tombstones: BTreeSet::new(),
+            delete_log_sequence: 0,
             backend: None,
         })
     }
@@ -163,7 +210,20 @@ impl Store {
             Err(error) => return Err(error.into()),
         }
         let mut segments = Vec::new();
+        let mut tombstones = BTreeSet::new();
+        let mut next_sequence = 0u64;
         for name in backend.list()? {
+            if let Some(sequence) = name
+                .strip_prefix("del-")
+                .and_then(|rest| rest.strip_suffix(".tlyd"))
+            {
+                let sequence: u64 = sequence.parse().map_err(|_| StorageError::SchemaMismatch {
+                    reason: format!("delete log '{name}' has a malformed name"),
+                })?;
+                tombstones.extend(decode_tombstones(&backend.read(&name)?)?);
+                next_sequence = next_sequence.max(sequence + 1);
+                continue;
+            }
             if !(name.starts_with("seg-") && name.ends_with(".tlyseg")) {
                 continue;
             }
@@ -191,6 +251,8 @@ impl Store {
         store.segments = segments;
         store.rows = expected_base;
         store.buffer_base = expected_base;
+        store.tombstones = tombstones;
+        store.delete_log_sequence = next_sequence;
         store.backend = Some(backend);
         Ok(store)
     }
@@ -205,10 +267,15 @@ impl Store {
         self.ordering_key
     }
 
-    /// Total rows appended over the store's lifetime — also the id the
-    /// next appended row will receive.
+    /// Total rows appended over the store's lifetime, tombstoned or not
+    /// — also the id the next appended row will receive.
     pub fn len(&self) -> u64 {
         self.rows
+    }
+
+    /// Rows a reader sees: appended minus tombstoned.
+    pub fn live_len(&self) -> u64 {
+        self.rows - self.tombstones.len() as u64
     }
 
     /// Whether no rows have ever been appended.
@@ -252,15 +319,63 @@ impl Store {
         Ok(())
     }
 
-    /// A point-in-time view: every frozen segment, plus (if the buffer
-    /// holds rows) a segment frozen from a copy of it. Appends after the
-    /// call don't affect the returned segments.
-    pub fn snapshot(&self) -> Result<Vec<Arc<Segment>>, StorageError> {
+    /// Tombstones rows by id: they disappear from every later snapshot,
+    /// and — on a persistent store — from every reopen, via one
+    /// append-only delete log per call. Already-dead ids are ignored
+    /// (idempotent); ids never assigned are an error. Returns how many
+    /// rows died. The physical rows remain until [`Store::compact`]
+    /// resolves them.
+    pub fn tombstone(&mut self, ids: &[u64]) -> Result<u64, StorageError> {
+        if let Some(&bad) = ids.iter().find(|&&id| id >= self.rows) {
+            return Err(StorageError::TombstoneOutOfRange { id: bad });
+        }
+        let newly: BTreeSet<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.tombstones.contains(id))
+            .collect();
+        if newly.is_empty() {
+            return Ok(0);
+        }
+        if let Some(backend) = &self.backend {
+            backend.write(
+                &delete_log_name(self.delete_log_sequence),
+                &encode_tombstones(&newly),
+            )?;
+            self.delete_log_sequence += 1;
+        }
+        let count = newly.len() as u64;
+        self.tombstones.extend(newly);
+        Ok(count)
+    }
+
+    /// A point-in-time view: every frozen segment plus (if the buffer
+    /// holds rows) a segment frozen from a copy of it, each carrying the
+    /// live mask its tombstones impose. Untombstoned segments come back
+    /// mask-free — the zero-copy common case. Appends and tombstones
+    /// after the call don't affect the returned views.
+    pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
         let mut segments = self.segments.clone();
         if !self.buffer.is_empty() {
             segments.push(Arc::new(self.buffer.snapshot_at(self.buffer_base)?));
         }
-        Ok(segments)
+        Ok(segments
+            .into_iter()
+            .map(|segment| {
+                let base = segment.base_row_id();
+                let end = base + segment.batch().num_rows() as u64;
+                if self.tombstones.range(base..end).next().is_none() {
+                    SegmentView::all_live(segment)
+                } else {
+                    let live =
+                        Bitmap::from_bools((base..end).map(|id| !self.tombstones.contains(&id)));
+                    SegmentView {
+                        segment,
+                        live: Some(live),
+                    }
+                }
+            })
+            .collect())
     }
 }
 
@@ -299,7 +414,7 @@ mod tests {
         assert_eq!(
             segments
                 .iter()
-                .map(|s| s.batch().num_rows())
+                .map(|s| s.segment.batch().num_rows())
                 .collect::<Vec<_>>(),
             [4, 4, 2]
         );
@@ -316,7 +431,10 @@ mod tests {
         }
         let segments = store.snapshot().unwrap();
         assert_eq!(
-            segments.iter().map(|s| s.base_row_id()).collect::<Vec<_>>(),
+            segments
+                .iter()
+                .map(|s| s.segment.base_row_id())
+                .collect::<Vec<_>>(),
             [0, 3, 6]
         );
         assert_eq!(store.len(), 8);
@@ -330,14 +448,14 @@ mod tests {
         append_n(&mut store, 5..9);
         // The old snapshot still sees exactly its five rows...
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].batch().num_rows(), 5);
-        let Column::Numeric(NumericData::I64(ts)) = &before[0].batch().columns()[0] else {
+        assert_eq!(before[0].segment.batch().num_rows(), 5);
+        let Column::Numeric(NumericData::I64(ts)) = &before[0].segment.batch().columns()[0] else {
             panic!("ts type")
         };
         assert_eq!(ts.values().as_slice(), &[0, 1, 2, 3, 4]);
         // ...and a fresh one sees all nine.
         let after = store.snapshot().unwrap();
-        assert_eq!(after[0].batch().num_rows(), 9);
+        assert_eq!(after[0].segment.batch().num_rows(), 9);
     }
 
     #[test]
@@ -354,7 +472,7 @@ mod tests {
             };
             x.values().as_ptr()
         };
-        assert_eq!(ptr(&first[0]), ptr(&second[0]));
+        assert_eq!(ptr(&first[0].segment), ptr(&second[0].segment));
     }
 
     #[test]
@@ -376,10 +494,10 @@ mod tests {
         let segments = store.snapshot().unwrap();
         let bounds: Vec<_> = segments
             .iter()
-            .map(|s| s.ordering_bounds().unwrap())
+            .map(|s| s.segment.ordering_bounds().unwrap())
             .collect();
         assert_eq!(bounds, [(0, 2), (3, 5), (6, 8)]);
-        assert!(segments.iter().all(|s| s.is_ordered()));
+        assert!(segments.iter().all(|s| s.segment.is_ordered()));
     }
 
     #[test]
@@ -401,7 +519,7 @@ mod tests {
             .append(&[RowValue::I64(2), RowValue::Key("A")])
             .unwrap();
         store.flush().unwrap();
-        assert_eq!(store.snapshot().unwrap()[0].batch().num_rows(), 2);
+        assert_eq!(store.snapshot().unwrap()[0].segment.batch().num_rows(), 2);
     }
 
     #[test]

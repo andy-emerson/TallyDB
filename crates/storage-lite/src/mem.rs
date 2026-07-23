@@ -66,6 +66,8 @@ pub enum StorageError {
     /// The stored segments do not cover a contiguous row-id range — a
     /// segment file is missing or duplicated.
     MissingRows { expected_base: u64 },
+    /// A tombstone names a row id that was never assigned.
+    TombstoneOutOfRange { id: u64 },
 }
 
 impl fmt::Display for StorageError {
@@ -94,6 +96,9 @@ impl fmt::Display for StorageError {
                 f,
                 "stored segments are not contiguous: no segment starts at row id {expected_base}"
             ),
+            StorageError::TombstoneOutOfRange { id } => {
+                write!(f, "tombstone names row id {id}, which was never assigned")
+            }
         }
     }
 }
