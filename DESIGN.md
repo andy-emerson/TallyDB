@@ -6,7 +6,39 @@ the project is now from the user's point of view; this document describes
 where it is going from the developer's. How we work — passes, reviews,
 issues, integration — is `AGENTS.md`.
 
-## What this is (positioning, so scope calls stay anchored)
+## Design philosophy
+
+Four commitments generate everything below; when a proposal conflicts with
+one of them, the proposal is wrong.
+
+1. **The three assumptions are held absolutely.** Append-optimized, ordered,
+   numeric-or-key (stated fully below). They are not constraints on the
+   design — they *are* the design: holding all three is what makes
+   fixed-width columns you can hand straight to a math library possible, and
+   every performance property this project promises follows from refusing to
+   relax them. Relaxing any one is what makes general-purpose databases
+   bigger, slower to start, and harder to embed.
+2. **Take mature, narrow dependencies whole; write only what's novel.**
+   Never fork, vendor, or reimplement what already exists and is already
+   correct. Where a mature implementation overlaps our behavior, it serves
+   as an oracle in tests; what remains — the genuinely novel part — is ours
+   to build and ours to prove.
+3. **The invariants, not our foresight, bound the scope.** A capability is
+   in scope if it violates no invariant and needs none of the machinery
+   we've excluded. "We can't imagine the use case" is never a reason to
+   exclude something — real usage regularly surprises the people who built
+   the tool.
+4. **Claim only what the evidence supports.** The working agreement
+   (`AGENTS.md`) governs this: documentation states what is, the tracker
+   holds what we want, and testing is how wants become claims.
+
+Everything else here is a consequence: the positioning falls out of holding
+the assumptions; the dependency registers and oracle strategy fall out of
+take-whole; the SQL surface and the settled no's fall out of
+invariants-bound-scope; the vocabulary of claims and the test plan's
+skeleton fall out of evidence-first.
+
+## What we're building
 
 An **append-ordered numeric store**: embeddable, SQL-native, with numeric
 compute (Lua + BLAS/LAPACK) running *inside* the engine on its own buffers,
@@ -34,12 +66,6 @@ or a general TSDB; the three assumptions are the moat.
    pipeline — stored columns, intermediates, and query results — not just
    storage. If a feature seems to need a third type, the feature is wrong,
    not the invariant.
-
-These assumptions aren't restrictions bolted on after the fact — they're the
-whole design. Relaxing any one of them is what makes general-purpose
-databases bigger, slower to start, and harder to embed; holding all three is
-what makes fixed-width columns you can hand straight to a math library
-possible.
 
 ### Numbers: `f64` and `i64`, with roles
 
@@ -111,7 +137,8 @@ is either:
   numeric buffers.
 - **Key**: dictionary-encoded to an integer at ingest (string interning,
   similar to kdb+'s symbol type or Arrow's dictionary encoding), usable in
-  equality/grouping/joins and string *predicates*, never in arithmetic.
+  equality/grouping/joins and string *predicates*, never in arithmetic. A
+  key is a label, not a primary key — keys are expected to repeat.
 
 There is no third column type. A column that can't be classified as one or
 the other is rejected at schema-definition time, not silently coerced — and
@@ -122,9 +149,8 @@ this holds for query results and intermediates, not just stored columns.
 Include a standard SQL function or verb if it (a) doesn't require a
 non-numeric, non-key column type, and (b) doesn't require a general-purpose
 cost-based optimizer. **"We can't think of a quant use case for it" is
-explicitly NOT a valid reason to exclude something otherwise in scope** —
-real usage regularly surprises the people who built the tool. The
-invariants are the boundary, not our own imagination.
+explicitly NOT a valid reason to exclude something otherwise in scope.**
+The invariants are the boundary, not our own imagination.
 
 ## Storage, ordering, corrections, and UPDATE/DELETE
 
@@ -175,11 +201,9 @@ WASM pieces — [`blas.wasm`](https://github.com/andy-emerson/blas.wasm) and
 `lua.wasm` — already exist, authored by the same author, with a
 LAPACK-in-WASM layer as their next milestone.
 
-## Design philosophy
+## Dependencies: taken whole, used as oracles, or ours to prove
 
-Every architectural choice follows one rule: **take mature, narrow,
-well-tested dependencies as-is where they exist; write only the part that's
-actually novel.**
+Commitment 2 sorts every piece of the system into one of three registers.
 
 ### Taken as-is (do not fork, vendor, or reimplement)
 
@@ -339,74 +363,76 @@ x86_64 CPU from 2011 onward — meaningfully faster than the more conservative
 off-the-shelf "non-FMA" package — it's a build-time `TARGET=` decision, not
 a switch, and a known low-effort one to make when it's actually needed.
 
+## The vocabulary of claims
+
+`AGENTS.md` grades claims by type; these are this repository's types, and
+what each word means here:
+
+- **Correctness** — conforms to its contract: the SQL semantics as we
+  specify them, the Arrow layout spec, `storage-lite`'s own spec. Oracles
+  and goldens are instruments that gather *evidence about* correctness;
+  they are not its definition. Ceiling: Proven.
+- **Determinism** — same inputs and same configuration produce the same
+  outputs, bit-level where promised (storage bytes always; `f64` results
+  per pinned backend). Distinct from correctness:
+  deterministic-and-wrong is possible. Ceiling: Tested.
+- **Performance** — the resource cost of being correct. Measured, pairwise
+  preferred. Ceiling: Tested.
+- **Compatibility** — our output is readable by the ecosystem tools we name
+  (Arrow consumers, via the C Data Interface). Ceiling: Tested.
+
+*Staleness* is not a claim type — it is a property of documentation, and
+the doc review owns it.
+
 ## How we test this repository
 
-This is the test plan's **skeleton**, per `AGENTS.md` (*Testing*). The
-schedule lives in the milestones; the executable detail lives in the test
-code and corpus; CI is the live status. Growing enumerations (case lists,
-corpus entries) belong at the executable leaf, not here.
-
-### What "correct" means here
-
-1. **Agrees with the oracle.** For the SQL semantics that overlap standard
-   behavior: same query, same data → same output as DuckDB (primary) /
-   DataFusion (secondary).
-2. **Round-trips with real Arrow.** Columns exported over the C Data
-   Interface import identically in arrow-rs and PyArrow, and vice versa —
-   dictionaries, nulls, and logical types intact.
-3. **Deterministic.** Same seeded input, same pinned compute backend →
-   bit-identical segment bytes and result buffers (goldens). `i64`-side
-   goldens and storage bytes are backend-independent; `f64` goldens are
-   pinned to the canonical non-FMA OpenBLAS build (see *Numerical
-   consistency*). A change that moves `f64` bits is by definition not a
-   refactor — it is a declared numeric-path change, and re-blessing the
-   goldens is part of its review.
-4. **Meets its own spec** where no reference exists — `storage-lite`'s
-   tests are the spec (see the reference map).
+The test plan's **skeleton**, per `AGENTS.md` (*Testing*): the schedule
+lives in the milestones, the executable detail in the test code and corpus,
+live status in CI. Growing enumerations (case lists, corpus entries) belong
+at the executable leaf, not here.
 
 ### The reference map
 
-| Subsystem | Reference | Tier |
+| Claim family | Reference | Tier |
 |---|---|---|
-| `query-lite` SQL semantics | DuckDB / DataFusion | independent oracle |
-| `arrow-lite` layout + C Data Interface | arrow-rs / PyArrow | independent oracle |
+| `query-lite` SQL semantics | DuckDB (primary) / DataFusion (secondary) | independent oracle |
+| `arrow-lite` layout + C Data Interface | arrow-rs / PyArrow round-trips, dev-only | independent oracle |
 | compute seam (our calls into BLAS/LAPACK) | NumPy/SciPy on the same inputs | independent oracle |
-| storage format + determinism | committed goldens | prior self |
-| dictionary scope (#6), compression scheme, QR-vs-SVD | sibling candidate | A/B |
+| determinism (storage bytes; pinned-backend results) | committed goldens | prior self |
 | `storage-lite` behavior (append, compaction, tombstones) | its own spec-tests | none — tests are the spec |
 
 `storage-lite` occupies the weakest tier — no independent reference exists
 for its behavior. That is why the build order front-loads it and why its
-tests deserve the most scrutiny; the crate docs have said "these tests ARE
-the spec" from the start, and this framework is why that's true.
+tests deserve the most scrutiny.
 
-### Peers (pairwise performance)
+Golden comparison here is **bit-exact**, because our goldens guard
+determinism claims (see *The vocabulary of claims*). A consequence worth
+knowing: a change that moves those bits is not a refactor — it is a
+declared behavioral change, and re-blessing the goldens is part of its
+review.
 
-- **DuckDB** — primary peer; also the correctness oracle and the control
-  group. One corpus, diffed for correctness and timed for performance —
-  which also guarantees we never benchmark a wrong answer.
-- **SQLite** — the floor: what "just use the simplest embeddable store"
-  costs on this workload.
-- **The exported-workflow pipeline** (DuckDB → pandas/NumPy) — the peer for
-  the headline benchmark: the same rolling analytics computed in-engine
-  versus exported-and-computed. The copy tax made visible; the
-  differentiator's claim lives or dies on this pair.
-- **kdb+** — excluded from *published* numbers pending a license review
-  (commercial database licenses commonly prohibit benchmark publication).
+### Peers, for pairwise performance
 
-Micro-level work (Bitmap ops, view arithmetic, segment flush) has no peer;
-it uses self-regression benches as engineering instruments from P2 onward.
+**DuckDB** — primary peer, also the oracle and the control group: one
+corpus, diffed for correctness and timed for performance, so we never
+benchmark a wrong answer. **SQLite** — the floor: what the simplest
+embeddable store costs on this workload. **The exported-workflow pipeline**
+(DuckDB → pandas/NumPy) — the peer for the headline pair: the same rolling
+analytics computed in-engine versus exported-and-computed, the copy tax
+made visible. **kdb+** is excluded from *published* numbers pending a
+license review (commercial database licenses commonly prohibit benchmark
+publication). Below the SQL surface there is no peer; micro-level work uses
+self-regression benches as engineering instruments.
 
 ### The corpus
 
-Seeded synthetic generators — tick-shaped data: ordered `i64` timestamps,
-low-cardinality keys, `f64` values, with disorder fraction and null density
-as parameters — checked into the repository as the executable leaf of the
-plan. One corpus, three uses: correctness diffing, pairwise timing, golden
-inputs. It grows two ways: new capabilities add case families, and **every
-closed bug adds the case that would have caught it.**
+Seeded synthetic generators — ordered `i64` timestamps, low-cardinality
+keys, `f64` values, with disorder fraction and null density as parameters —
+checked into the repository as the executable leaf of the plan. It grows
+two ways: new capabilities add case families, and **every closed bug adds
+the case that would have caught it.**
 
-### Blast-radius ranking (where evidence lands earliest and heaviest)
+### Blast radius (where evidence lands earliest and heaviest)
 
 1. **Storage bytes** — silent corruption; entrenches at format freeze.
    Golden-locked *before* the first real data exists in the format.
@@ -415,23 +441,6 @@ closed bug adds the case that would have caught it.**
 3. **Oracle-visible SQL semantics** — wrong answers, but loud under
    differential testing.
 4. Everything else.
-
-### A/B docket
-
-Decisions currently marked for possible evidence-resolution, each already
-behind a trait seam (the WASM-readiness discipline is what makes A/B
-cheap): dictionary scope (#6), the compression scheme for ordered `i64`
-columns, QR vs. SVD least-squares. The architect chooses argument vs. A/B
-when scheduling each.
-
-### CI tiers
-
-- **Per-PR (exists):** fmt, clippy, build, tests including doctests,
-  rustdoc — joined by golden checks and a fast corpus slice as those come
-  to exist.
-- **Scheduled (arrives around P1–P2):** the full oracle-corpus diff and the
-  pairwise benchmark run, nightly — ratios written to the job summary,
-  results kept as artifacts.
 
 ## Workspace layout
 
@@ -467,7 +476,8 @@ The dependency graph is shallow and wide, not a deep chain: everything
 depends on `arrow-lite`, almost nothing else depends on anything else. So
 the only *order-critical* thing is locking `arrow-lite`'s layout first;
 after that the rest is a wide front, and the ordering below is a
-**risk**-ordering (front-load the unoracled crates), not a dependency chain.
+**risk**-ordering (front-load the crates with no independent reference),
+not a dependency chain.
 
 1. `arrow-lite` — smallest, clearest spec (Arrow's public layout), no
    internal dependencies. Lock its two interfaces early: the raw-pointer/FFI

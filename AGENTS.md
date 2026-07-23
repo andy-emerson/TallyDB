@@ -6,6 +6,13 @@ is project-agnostic — it can be copied unchanged into any repository that
 works this way. Everything specific to this repository (companion documents,
 labels, milestones) lives in the final section, *In this repository*.
 
+## Vocabulary
+
+Prefer industry-standard terms, used bare and undefined. Coin a term only
+for a genuinely new concept; define it where it first appears, and never
+overload a term that already means something else. Grade names are
+capitalized when used as grades.
+
 ## Roles: architect and engineer
 
 - The **architect** (the person directing the work) decides *what* to build and
@@ -67,7 +74,7 @@ milestone boundary.
    you are unsure; do not hide uncertainty behind a tidy summary.
 2. **Where do we want to go?** Choose the milestone from the open issues. The
    architect owns this choice; the engineer proposes. Work that would entrench
-   an answer to one of the milestone's unsettled decisions (see *Wants and
+   an answer to one of the milestone's unsettled decisions (see *Todos and
    decisions*) cannot proceed until that decision is settled.
 3. **How do we get there?** The plan.
 
@@ -156,105 +163,43 @@ grading what it advanced — the issues it touched and any it newly filed —
 then fixing the descriptive documents' staleness; it does not re-grade issues
 it left untouched.
 
-## Where things live: match the medium to its rate of change
+## Where things live
 
-- **Files** hold *structure* — principles, invariants, organization. They
-  change slowly, through doc passes, and review is what keeps them true.
-- **Issues** hold *work* — anything with a lifecycle: it opens, it closes.
-  The tracker grooms itself; a file tracking the same state would rot.
-- **CI** holds *live status* — what builds, what passes, what the numbers
-  are right now. It is a status document that no one has to maintain.
-
-The rule: **no file may hand-track state that a lifecycle system already
-tracks.** A new file is justified when its content is structure; it is a
-mistake when its content is status wearing structure's clothes — beware
-growing enumerations, which are usually status.
+Structure lives in **files** and changes through doc passes. Work lives in
+the **tracker** and closes. Live status lives in **CI**. No file may
+hand-track state that one of the other two already tracks — a growing
+enumeration in a file is usually status wearing structure's clothes.
 
 ## Testing
 
-Testing runs as a pipeline: **design → test plan → claims.**
+Tests exist to move claims up the two scales, and testing runs as a
+pipeline: **design → test plan → claims.** The plan derives from the
+design's risk surface — probe hardest where the bets are riskiest, where
+failure is silent, and where a format or interface is about to freeze.
+Claims derive from the plan — nothing enters the documentation except what
+the plan's results support. The plan's skeleton lives in the design
+document, its schedule in the milestones, its executable detail in the
+tests themselves.
 
-- The **test plan derives from the design's risk surface**: what to probe,
-  and how hard, follows from where the design's bets are riskiest.
-- **Claims derive from the test plan**, never the reverse. Nothing enters
-  the documentation except through the plan; a claim is the distillate of
-  the tests that support it. This is "never grade a claim above its
-  evidence" applied at the planning level — many tests condense into few
-  claims, and exploration is allowed to run ahead of anything claimable.
+Evidence follows the claim's **type**:
 
-The plan lives at three altitudes, per the rate-of-change rule above: its
-**skeleton** (references, case families, corpus shape) in the design
-document; its **schedule** in the milestones — a milestone is not done
-until its slice of the plan has run; its **executable leaf** in the tests
-and corpus themselves, with CI as the plan's live status.
+- **Correctness-type** claims are checked by *comparison against a
+  reference*, the strongest available: an independent implementation (an
+  oracle); our own prior output (a golden — comparison strictness is set
+  per contract by the design document); or, where no reference exists,
+  tests written from intent — which then *are* the specification, and
+  deserve care in proportion to that burden.
+- **Performance-type** claims are *measured*, preferably as a ratio against
+  a named peer in the same run on the same hardware — ratios survive
+  hardware changes and noise that absolute numbers do not. A number cites
+  its run; a comparison documents both configurations and respects the
+  peer's license.
 
-### Every test compares against a reference — use the strongest available
-
-1. **An independent implementation** (an oracle or peer) — strongest,
-   because independence is exactly what "cross-checked" durability
-   measures.
-2. **Our own prior output** (golden tests). Bit-identity *defines* a
-   refactor: if committed goldens changed, the change was behavioral, and
-   re-blessing them is a declared, reviewed event — never silent.
-3. **A sibling candidate** (A/B). A performance-relevant decision may be
-   resolved by building both options behind the same interface and
-   measuring. This is an escalation path, not a default — reserve it for
-   decisions that are genuinely contested *and* expensive to reverse. The
-   losing implementation is deleted (the vestigial rule applies); its
-   numbers stay in the decision record.
-4. **No reference exists** — the tests *become* the reference, written from
-   intent with proportionate care. This is the weakest position; work that
-   must live here deserves the most scrutiny, and a harness that *creates*
-   a reference is worth more than any single test.
-
-### What enters the plan, and when
-
-Unlike passes, testing is conditional — the plan is chosen, not
-accumulated. Weigh:
-
-- **Silence of failure.** Silent corruption outranks loud crashes outranks
-  cosmetics. A panic half-tests itself; plausible garbage never does.
-- **Entrenchment.** Like decisions, tests are owed *before the freeze*: a
-  format wants its golden lock before real data exists in it; a public
-  interface wants its contract tests before anything depends on it.
-- **Where bugs hide.** Spend depth where bugs produce plausible output;
-  lean on integration coverage where bugs announce themselves.
-
-Timing: evidence lands in the **same integration** as the claim it earns —
-a doc pass cannot grade a claim whose test is "coming later." Once earned,
-CI keeps it earned. Exploratory probes (fuzzing, property tests) are plan
-line items with no claim attached — their product is *discovered* claims
-and bugs, and **every closed bug leaves a corpus case behind**: the
-regression test is the bug's tombstone.
-
-### What is deliberately not tested
-
-- **Unclaimed behavior.** No coverage quotas — line coverage is
-  supply-driven; the grid is the coverage metric (claims covered, not
-  lines). If a behavior matters, claim it; the claim then obligates the
-  test.
-- **Compiler-enforced properties.** Make invalid states unrepresentable,
-  then don't test for them.
-- **The internals of taken-as-is dependencies.** Take-whole implies
-  trust-whole; test the seam — that *we* call it correctly — not the
-  dependency.
-
-And test at **seams** — interfaces, formats, contracts — not internals:
-tests pinned to implementation details ossify code and rot under exactly
-the refactors that golden tests exist to permit.
-
-### Performance is measured pairwise
-
-Prefer **ratios against a named peer, measured in the same run on the same
-hardware**, over absolute numbers: hardware cancels out of a ratio, so the
-number stays meaningful across machines and time — and a stable peer
-doubles as a control, so a drifting ratio is regression detection for free.
-Absolute numbers, where used, cite their run (commit, environment,
-workload, methodology; medians, not best-of-N). Any CI performance gate
-names its proxy (instruction counts, allocations, trend tracking) —
-wall-clock in shared runners is noise, and pretending otherwise is a claim
-above evidence. Comparative claims document both sides' configurations and
-respect the peer's license terms for published benchmarks.
+The plan is chosen, not accumulated: nothing unclaimed, nothing the type
+system already enforces, nothing inside a taken-as-is dependency — test the
+seam, not the dependency, and test contracts, not internals. Evidence lands
+in the same integration as the claim it earns, and every closed bug leaves
+behind the test that would have caught it.
 
 ## Todos and decisions
 
@@ -266,14 +211,18 @@ into prose documents:
 - A **decision** is a fork only the architect may close. It must name **what
   it gates**. Its deadline is not when its subject gets built — it is *before
   the first upstream work that would entrench an answer by accident* — and it
-  is scheduled into the milestone containing that work.
+  is scheduled into the milestone containing that work. The architect
+  resolves a decision by argument or by evidence — an A/B test in the
+  bake-off sense: two implementations behind one interface, one benchmark,
+  no users. Evidence-resolution is reserved for forks that are contested and
+  expensive to reverse; the losing implementation is removed, and its
+  numbers stay in the decision record.
 - A **deferred** record is a decision already taken whose alternative remains
   documented: it names its **reopen triggers** and is not relitigated without
   one.
 
-**Milestones** group issues into roadmap phases and show progress. Any roadmap
-visualization is a generated view of the milestones, never a second source of
-truth.
+**Milestones** group issues into roadmap phases. Any roadmap visualization is
+a generated view of the milestones, never a second source of truth.
 
 ## Reaching `main`
 
@@ -294,10 +243,10 @@ The body above is project-agnostic; this section is this repository's
 instantiation.
 
 - **Companion documents:** `DESIGN.md` — what we are building and why: the
-  forward-looking developer companion (positioning, invariants, crate
-  boundaries, settled design, build order). `README.md` — where the project is
-  now, from the user's point of view. `CLAUDE.md` — the agent entry point; a
-  pointer only.
+  forward-looking developer companion (design philosophy, invariants, crate
+  boundaries, settled design, build order, and the test plan's skeleton).
+  `README.md` — where the project is now, from the user's point of view.
+  `CLAUDE.md` — the agent entry point; a pointer only.
 - **Labels:** `decision` and `deferred`, as defined above; open issues with
   neither label are todos.
 - **Milestones:** M0 layout locked · M1 compute proven · M2 feature-complete ·
@@ -305,10 +254,7 @@ instantiation.
 - **Executable documentation** here means Rust doctests (`cargo test` runs
   them); `cargo doc` output is the woven artifact the repo-wide doc pass
   reviews.
-- **The test plan:** skeleton in `DESIGN.md` (*How we test this
-  repository*); schedule in the milestones; executable leaf in the test
-  code and corpus; live status in CI.
 - **Issue forms** in `.github/ISSUE_TEMPLATE/` encode the three issue
   species and their required fields.
-- **Audience:** documentation and code are written for the reader described in
-  DESIGN.md's *Who we write for*.
+- **Audience:** documentation and code are written for the reader described
+  in DESIGN.md's *Who we write for*.
