@@ -76,14 +76,14 @@ pub mod bitmap;
 pub mod buffer;
 pub mod column;
 pub mod key;
+pub mod logical;
 
 pub use bitmap::Bitmap;
 pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
 pub use column::{Column, ColumnType, KeyView, NumericData, NumericView};
 pub use key::{Dictionary, KeyColumn};
+pub use logical::{LogicalType, DECIMAL64_PRECISION};
 
-// TODO: logical-type tags (Timestamp(ns), Decimal64(scale)) on i64 columns,
-//       consulted at export only
 // TODO: C Data Interface export/import, incl. ArrowArrayStream
 // TODO: round-trip tests against arrow-rs and PyArrow (dev-only oracles),
 //       covering both numeric subtypes, dictionaries, nulls, logical-type
