@@ -485,6 +485,21 @@ impl Segment {
         self.zone_maps.get(index).and_then(Option::as_ref)
     }
 
+    /// Wraps an already-built batch as a free-standing segment — the
+    /// doorway `query-lite`'s join uses to run the single-table pipeline
+    /// over a joined intermediate. Zone maps are computed; the row-id
+    /// base is 0 (these rows are query-lifetime, not stored).
+    pub fn from_batch(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {
+        let zone_maps = batch.columns().iter().map(compute_zone_map).collect();
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id: 0,
+            zone_maps,
+        }
+    }
+
     /// The segment's data.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch

@@ -14,6 +14,7 @@
 //! available) and diffs. That external recomputation — not this crate's
 //! own tests — is what earns M1's "compute proven" cross-check.
 
+use crate::database::Database;
 use crate::table::Table;
 use arrow_lite::{ArrowArrayStream, ColumnType, Field, Schema};
 use storage_lite::RowValue;
@@ -162,6 +163,53 @@ fn corpus_table() -> Table {
     table
 }
 
+/// The corpus database: the fact table plus a `sensors` dimension —
+/// seven of the eight sensors (K007 is deliberately missing, so INNER
+/// and LEFT joins differ), each with a site label and a calibration
+/// factor, split across segments so dictionary codes differ per side.
+fn corpus_database() -> Database {
+    let mut database = Database::new();
+    database
+        .add_table(corpus_table())
+        .expect("fact table registers");
+    let schema = Schema::new(vec![
+        Field::new("id", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("site", ColumnType::Key, false),
+        Field::new("calib", ColumnType::F64, false),
+    ]);
+    let mut sensors =
+        Table::with_segment_rows("sensors", schema, "id", 3).expect("dimension schema is valid");
+    for sensor in 0..7u32 {
+        let label = corpus::key_label(sensor);
+        sensors
+            .append(&[
+                RowValue::I64(i64::from(sensor)),
+                RowValue::Key(&label),
+                RowValue::Key(["north", "south", "east"][sensor as usize % 3]),
+                RowValue::F64(0.5 + f64::from(sensor) * 0.25),
+            ])
+            .expect("dimension rows are valid");
+    }
+    database.add_table(sensors).expect("dimension registers");
+    database
+}
+
+/// Exports the dimension table's rows, for the differential script to
+/// replicate into DuckDB.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_corpus_dimension_stream(out: *mut ArrowArrayStream) {
+    let database = corpus_database();
+    match database.query_stream("SELECT id, sym, site, calib FROM sensors") {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("dimension export failed: {error}"),
+    }
+}
+
 /// Exports the corpus fixture's raw rows (`ts, sym, x, y`), for the
 /// differential script to replicate into DuckDB.
 ///
@@ -198,8 +246,8 @@ pub unsafe extern "C" fn tallydb_corpus_query_stream(
             return 1;
         }
     };
-    let table = corpus_table();
-    match table.query_stream(sql) {
+    let database = corpus_database();
+    match database.query_stream(sql) {
         // SAFETY: the caller provides a valid, writable destination.
         Ok(stream) => {
             unsafe { out.write(stream) };

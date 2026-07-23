@@ -44,7 +44,7 @@ use arrow_lite::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use storage_lite::SegmentView;
+use storage_lite::{Segment, SegmentView};
 
 /// One window-aggregate implementation, registered by the embedder.
 pub trait WindowAggregate: Send + Sync {
@@ -104,6 +104,256 @@ impl QueryOutput {
 /// The embedder has already resolved the plan's table name to this
 /// snapshot; nothing here re-checks it.
 pub fn execute(
+    schema: &Schema,
+    views: &[SegmentView],
+    plan: &Plan,
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    if plan.join.is_some() {
+        return Err(QueryError::Unsupported(
+            "joins execute through the multi-table doorway (Database), not a single table"
+                .to_owned(),
+        ));
+    }
+    execute_single(schema, views, plan, registry)
+}
+
+/// Runs a star-schema join plan: `fact_views` joined against
+/// `dimension_views` on the plan's key columns, then the ordinary
+/// single-table pipeline over the joined intermediate.
+///
+/// The join is fact-driven: output stays one batch per fact segment;
+/// each fact segment's join-key codes are remapped **once per distinct
+/// dictionary value** into dimension row lookups (decision #6's
+/// pattern), and the dimension's columns are gathered per fact row —
+/// the bounded copy a join is. `INNER` drops unmatched fact rows
+/// through the live mask (the same mechanism as tombstones and WHERE);
+/// `LEFT` keeps them with null dimension cells. Null join keys match
+/// nothing, per SQL. Dimension columns join as nullable. The dimension
+/// key must be unique among its live rows — a star-schema dimension is
+/// a lookup table, and a duplicate key is an error, not a silent row
+/// multiplication.
+pub fn execute_join(
+    fact_schema: &Schema,
+    fact_views: &[SegmentView],
+    dimension_schema: &Schema,
+    dimension_views: &[SegmentView],
+    plan: &Plan,
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    let Some(join) = &plan.join else {
+        return execute(fact_schema, fact_views, plan, registry);
+    };
+    let (fact_key_index, fact_key_field) = resolve(fact_schema, &join.fact_key)?;
+    if fact_key_field.column_type() != ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "join column '{}' must be a key column — joining is what keys are for",
+            join.fact_key
+        )));
+    }
+    let (dimension_key_index, dimension_key_field) =
+        resolve(dimension_schema, &join.dimension_key)?;
+    if dimension_key_field.column_type() != ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "join column '{}' must be a key column — joining is what keys are for",
+            join.dimension_key
+        )));
+    }
+    // The dimension lookup: key value → (view, row), unique or bust.
+    let mut lookup: HashMap<String, (usize, usize)> = HashMap::new();
+    for (view_index, view) in dimension_views.iter().enumerate() {
+        let Column::Key(keys) = &view.segment.batch().columns()[dimension_key_index] else {
+            unreachable!("validated as a key column above")
+        };
+        for row in live_rows(view) {
+            let Some(value) = keys.value_at(row) else {
+                continue; // a null dimension key matches nothing
+            };
+            if lookup.insert(value.to_owned(), (view_index, row)).is_some() {
+                return Err(QueryError::TypeError(format!(
+                    "dimension key '{}' is not unique (value '{value}'): a star-schema \
+                     dimension is a lookup table",
+                    join.dimension_key
+                )));
+            }
+        }
+    }
+    // The joined schema: fact columns, then dimension columns minus its
+    // key (it duplicates the fact key), all nullable (LEFT produces
+    // nulls; INNER's placeholders sit under the dead mask).
+    let mut fields: Vec<Field> = fact_schema.fields().to_vec();
+    let mut dimension_columns: Vec<usize> = Vec::new();
+    for (index, field) in dimension_schema.fields().iter().enumerate() {
+        if index == dimension_key_index {
+            continue;
+        }
+        if fact_schema
+            .fields()
+            .iter()
+            .any(|fact_field| fact_field.name() == field.name())
+        {
+            return Err(QueryError::Unsupported(format!(
+                "column '{}' exists in both tables — star-schema dimensions need \
+                 distinct attribute names",
+                field.name()
+            )));
+        }
+        dimension_columns.push(index);
+        fields.push(Field::new(field.name(), field.column_type(), true));
+    }
+    let joined_schema = Schema::new(fields);
+    let mut joined_views = Vec::with_capacity(fact_views.len());
+    for view in fact_views {
+        let batch = view.segment.batch();
+        let Column::Key(keys) = &batch.columns()[fact_key_index] else {
+            unreachable!("validated as a key column above")
+        };
+        let dictionary = keys.dictionary();
+        // The once-per-distinct-value lookup.
+        let remap: Vec<Option<(usize, usize)>> = (0..dictionary.len() as u32)
+            .map(|code| lookup.get(dictionary.value(code)).copied())
+            .collect();
+        let codes = keys.codes().as_slice();
+        let picks: Vec<Option<(usize, usize)>> = (0..batch.num_rows())
+            .map(|row| {
+                if keys.is_valid(row) {
+                    remap[codes[row] as usize]
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let live = if join.left {
+            view.live.clone()
+        } else {
+            // INNER: unmatched rows die exactly like tombstoned ones.
+            let matched = Bitmap::from_bools(picks.iter().map(Option::is_some));
+            Some(match &view.live {
+                None => matched,
+                Some(live) => live.and(&matched),
+            })
+        };
+        let mut columns: Vec<Column> = batch.columns().to_vec();
+        for &dimension_column in &dimension_columns {
+            columns.push(gather_dimension_column(
+                dimension_views,
+                dimension_column,
+                &picks,
+            ));
+        }
+        let joined = RecordBatch::new(joined_schema.clone(), columns);
+        let segment = Segment::from_batch(
+            joined,
+            view.segment.ordering_key(),
+            view.segment.is_ordered(),
+        );
+        joined_views.push(SegmentView {
+            segment: Arc::new(segment),
+            live,
+        });
+    }
+    execute_single(&joined_schema, &joined_views, plan, registry)
+}
+
+/// One dimension column, gathered per fact row (`None` = no match:
+/// a null cell).
+fn gather_dimension_column(
+    dimension_views: &[SegmentView],
+    column_index: usize,
+    picks: &[Option<(usize, usize)>],
+) -> Column {
+    let cell = |view: usize| &dimension_views[view].segment.batch().columns()[column_index];
+    let first_kind = dimension_views
+        .first()
+        .map(|view| view.segment.batch().columns()[column_index].column_type());
+    match first_kind {
+        Some(ColumnType::F64) | None => {
+            let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
+            let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+            for pick in picks {
+                match *pick {
+                    Some((view, row)) => {
+                        let Column::Numeric(NumericData::F64(numeric)) = cell(view) else {
+                            unreachable!("batches share a schema")
+                        };
+                        values.push(numeric.values().as_slice()[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    None => {
+                        values.push(0.0);
+                        validity.push(false);
+                    }
+                }
+            }
+            assemble_numeric_f64(values, validity)
+        }
+        Some(ColumnType::I64) => {
+            let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
+            let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+            for pick in picks {
+                match *pick {
+                    Some((view, row)) => {
+                        let Column::Numeric(NumericData::I64(numeric)) = cell(view) else {
+                            unreachable!("batches share a schema")
+                        };
+                        values.push(numeric.values().as_slice()[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    None => {
+                        values.push(0);
+                        validity.push(false);
+                    }
+                }
+            }
+            assemble_numeric_i64(values, validity)
+        }
+        Some(ColumnType::Key) => {
+            let mut dictionary = Dictionary::new();
+            let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
+            let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+            for pick in picks {
+                let value = pick.and_then(|(view, row)| {
+                    let Column::Key(keys) = cell(view) else {
+                        unreachable!("batches share a schema")
+                    };
+                    keys.value_at(row)
+                });
+                match value {
+                    Some(value) => {
+                        codes.push(dictionary.intern(value));
+                        validity.push(true);
+                    }
+                    None => {
+                        codes.push(0);
+                        validity.push(false);
+                    }
+                }
+            }
+            Column::Key(assemble_key(codes, validity, dictionary))
+        }
+    }
+}
+
+/// Builds a nullable key column, keeping every code in dictionary range
+/// even when every row is null (an empty dictionary gets a placeholder
+/// entry that no valid row references).
+fn assemble_key(codes: Buffer<u32>, validity: Vec<bool>, mut dictionary: Dictionary) -> KeyColumn {
+    if dictionary.is_empty() && !codes.is_empty() {
+        dictionary.intern("");
+    }
+    if validity.iter().any(|&valid| !valid) {
+        KeyColumn::new_nullable(
+            codes,
+            Bitmap::from_bools(validity.iter().copied()),
+            dictionary,
+        )
+    } else {
+        KeyColumn::new_non_null(codes, dictionary)
+    }
+}
+
+/// The single-input pipeline `execute` and `execute_join` share.
+fn execute_single(
     schema: &Schema,
     views: &[SegmentView],
     plan: &Plan,
@@ -280,10 +530,15 @@ fn passthrough(
     Ok((out, columns))
 }
 
-/// The window slice for row `position` in a run of rows: `preceding` rows
-/// back through the current row, ragged at the start of the run.
-fn window_bounds(position: usize, preceding: usize) -> (usize, usize) {
-    (position.saturating_sub(preceding), position + 1)
+/// The window slice for row `position` in a run of rows: `preceding`
+/// rows back (`None` = from the start of the run) through the current
+/// row, ragged at the start of the run.
+fn window_bounds(position: usize, preceding: Option<usize>) -> (usize, usize) {
+    let start = match preceding {
+        Some(preceding) => position.saturating_sub(preceding),
+        None => 0,
+    };
+    (start, position + 1)
 }
 
 /// First and last live values of the ordering key, or `None` if no live
@@ -394,12 +649,22 @@ fn window_aggregate(
     arg_names: &[String],
     partition_by: Option<&str>,
     order_by: &str,
-    preceding: usize,
+    preceding: Option<usize>,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
-    let aggregate = registry
-        .get(function)
-        .ok_or_else(|| QueryError::UnknownFunction(function.to_owned()))?;
+    // The embedder's registry wins (explicit beats implicit); the
+    // standard aggregates are always available as window functions.
+    let builtin;
+    let aggregate: &Arc<dyn WindowAggregate> = match registry.get(function) {
+        Some(aggregate) => aggregate,
+        None => match builtin_window(function) {
+            Some(aggregate) => {
+                builtin = aggregate;
+                &builtin
+            }
+            None => return Err(QueryError::UnknownFunction(function.to_owned())),
+        },
+    };
     if arg_names.len() != aggregate.arity() {
         return Err(QueryError::TypeError(format!(
             "{function} takes {} arguments, got {}",
@@ -445,7 +710,7 @@ fn window_aggregate(
 fn unpartitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
-    preceding: usize,
+    preceding: Option<usize>,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
     let gathered: Vec<Vec<f64>>;
@@ -489,7 +754,7 @@ fn partitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
     partition_column: &str,
-    preceding: usize,
+    preceding: Option<usize>,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
     let (index, _) = resolve(schema, partition_column)?;
@@ -551,6 +816,52 @@ fn partitioned(
         }
     }
     Ok(())
+}
+
+/// The standard aggregates as window functions — always available, no
+/// registration needed (an embedder registration of the same name
+/// wins). Each sees the window's rows as one non-null `f64` slice, the
+/// executor's window-argument contract.
+struct BuiltinWindow(AggFunction);
+
+impl WindowAggregate for BuiltinWindow {
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        let window = args[0];
+        if window.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(match self.0 {
+            AggFunction::Count => window.len() as f64,
+            AggFunction::Sum => window.iter().sum(),
+            AggFunction::Avg => window.iter().sum::<f64>() / window.len() as f64,
+            AggFunction::Min => window
+                .iter()
+                .copied()
+                .min_by(|left, right| left.total_cmp(right))
+                .expect("window is non-empty"),
+            AggFunction::Max => window
+                .iter()
+                .copied()
+                .max_by(|left, right| left.total_cmp(right))
+                .expect("window is non-empty"),
+        }))
+    }
+}
+
+fn builtin_window(function: &str) -> Option<Arc<dyn WindowAggregate>> {
+    let function = match function {
+        "count" => AggFunction::Count,
+        "sum" => AggFunction::Sum,
+        "avg" => AggFunction::Avg,
+        "min" => AggFunction::Min,
+        "max" => AggFunction::Max,
+        _ => return None,
+    };
+    Some(Arc::new(BuiltinWindow(function)))
 }
 
 /// A group key's per-row code: a unified dictionary code, or the null
@@ -1074,16 +1385,7 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
                             }
                         }
                     }
-                    let column = if validity.iter().any(|&valid| !valid) {
-                        KeyColumn::new_nullable(
-                            codes,
-                            Bitmap::from_bools(validity.iter().copied()),
-                            dictionary,
-                        )
-                    } else {
-                        KeyColumn::new_non_null(codes, dictionary)
-                    };
-                    Column::Key(column)
+                    Column::Key(assemble_key(codes, validity, dictionary))
                 }
             }
         })
@@ -1792,6 +2094,84 @@ mod query1_tests {
             panic!("count type")
         };
         assert_eq!(n.values().as_slice()[0], 2);
+    }
+
+    #[test]
+    fn builtin_window_aggregates_match_hand_computation() {
+        let views = segment(&[(1, "A", 1.0), (2, "A", 2.0), (3, "A", 3.0), (4, "A", 4.0)]);
+        let output = run(
+            &views,
+            "SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, \
+             avg(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS a, \
+             min(x) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS lo, \
+             max(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hi, \
+             count(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS n FROM t",
+        )
+        .unwrap();
+        assert_eq!(
+            flatten(&output, 0),
+            [Some(1.0), Some(3.0), Some(5.0), Some(7.0)]
+        );
+        assert_eq!(
+            flatten(&output, 1),
+            [Some(1.0), Some(1.5), Some(2.0), Some(2.5)]
+        );
+        assert_eq!(
+            flatten(&output, 2),
+            [Some(1.0), Some(1.0), Some(1.0), Some(2.0)]
+        );
+        assert_eq!(
+            flatten(&output, 3),
+            [Some(1.0), Some(2.0), Some(3.0), Some(4.0)]
+        );
+        assert_eq!(
+            flatten(&output, 4),
+            [Some(1.0), Some(2.0), Some(2.0), Some(2.0)]
+        );
+        // An embedder registration of the same name wins over the
+        // builtin.
+        struct AlwaysNine;
+        impl WindowAggregate for AlwaysNine {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(9.0))
+            }
+        }
+        let mut registry = Registry::new();
+        registry.register("sum", Arc::new(AlwaysNine));
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(
+                "SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+            )
+            .unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(9.0); 4]);
+    }
+
+    #[test]
+    fn unbounded_windows_span_partitions_and_segments() {
+        let rows: Vec<(i64, &str, f64)> = (0..12)
+            .map(|i| (i, ["A", "B"][(i % 2) as usize], i as f64))
+            .collect();
+        let sql = "SELECT sum(x) OVER (PARTITION BY sym ORDER BY ts \
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t";
+        let reference = flatten(&run(&segment(&rows), sql).unwrap(), 0);
+        // A's running sums over 0,2,4,..; B's over 1,3,5,..
+        assert_eq!(reference[0], Some(0.0));
+        assert_eq!(reference[1], Some(1.0));
+        assert_eq!(reference[10], Some(0.0 + 2.0 + 4.0 + 6.0 + 8.0 + 10.0));
+        for segment_rows in [3, 5] {
+            assert_eq!(
+                flatten(&run(&segmented(&rows, segment_rows), sql).unwrap(), 0),
+                reference
+            );
+        }
     }
 
     #[test]
