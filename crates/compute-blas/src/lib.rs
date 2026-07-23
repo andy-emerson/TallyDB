@@ -56,10 +56,11 @@
 //! No LAPACK-class routines (see `compute-lapack`). No autodiff. No general
 //! tensor operations.
 
-// TODO: BLAS backend trait (native-OpenBLAS-via-FFI implementation first),
-//       with capability negotiation on the same trait shape as compute-lapack
-// TODO: dot product
-// TODO: matrix-vector multiply (gemv)
-// TODO: matrix-matrix multiply (gemm)
-// TODO: expose the above as functions callable from `compute-lua` (shared
-//       arrow-lite buffers, no copy) and, via `engine`, from SQL
+pub mod backend;
+
+pub use backend::{BlasBackend, BlasError, BlasOp, NativeBlas};
+
+// TODO: wire into the executor's numeric inner loops WHEN (and only
+//       when) profiling produces a number that asks for it — the crate
+//       docs' discipline
+// TODO: expose to `compute-lua` over shared arrow-lite buffers (M2.7)
