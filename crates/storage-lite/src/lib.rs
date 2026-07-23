@@ -36,25 +36,28 @@
 //! second mutation path for any of these cases; if something seems to
 //! need one, that's a design smell worth raising, not implementing around.
 //!
-//! **Open decision that gates the tombstone format (tracked in issues):**
-//! what makes "newest version wins" well-defined — the row-identity rule.
-//! Two candidates: an InfluxDB-style `(key-set, ordering-key)` primary key
-//! with overwrite-on-collision (identity is closed, but two distinct events
-//! sharing keys+ordering-key can't coexist without a disambiguating key), or
-//! a kdb+-style pure-append model with an internal monotonic row id and
-//! predicate-scoped deletes (duplicates allowed, deletes address rows by
-//! predicate). These produce different tombstone records — decide before
-//! fixing the segment/tombstone format, don't hardcode one meanwhile.
+//! **Row identity (issue #1, decided 2026-07-23): kdb+-style pure
+//! append.** Every row carries an internal monotonic row id; duplicates —
+//! including distinct events sharing keys and ordering-key value — are
+//! first-class. `UPDATE`/`DELETE` address rows by predicate; a correction
+//! supersedes by ingest sequence, which is what "newest version wins"
+//! means. Tombstones therefore reference row ids (or carry predicates),
+//! never key tuples. The rejected InfluxDB-style `(key-set, ordering-key)`
+//! primary key silently collapses same-tuple events; if user-visible
+//! overwrite semantics are ever needed, the path is an opt-in declared
+//! uniqueness constraint layered on top — additive, not a reversal.
 //!
-//! **Second open decision (tracked in issues): dictionary scope.** Key
-//! columns intern strings into a dictionary — per-table (global) or
-//! per-segment? Global keeps codes stable across segments (no remapping in
-//! cross-segment GROUP BY/joins) but adds a shared mutable structure
-//! alongside immutable segments. Per-segment keeps segments fully
-//! self-contained (clean immutability and compaction, maps 1:1 onto Arrow's
-//! per-batch dictionary export) but requires code remapping at query time.
-//! Interacts with the row-identity decision and compaction design — decide
-//! when the segment format is fixed, not before, and don't hardcode either.
+//! **Dictionary scope (issue #6, decided 2026-07-23): per-segment.** Each
+//! segment carries its own interning table, so segments are fully
+//! self-contained: immutability holds everywhere, crash consistency is
+//! trivial, compaction merges dictionaries as part of merging segments,
+//! and the layout maps 1:1 onto Arrow's per-batch dictionary export. With
+//! identity resolved by row id, compaction never compares key values
+//! across segments — which was the workload a global dictionary would
+//! have served. Cross-segment grouping/joins remap codes at query time,
+//! bounded by the low-cardinality assumption; the recorded extension is a
+//! process-lifetime remap cache, added only when profiling produces a
+//! number that asks for it.
 //!
 //! ## Backend split (native today, WASM later)
 //! I/O should sit behind a trait from the start. The native implementation
