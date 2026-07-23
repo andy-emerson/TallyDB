@@ -83,8 +83,9 @@ pub enum PlanItem {
         partition_by: Option<String>,
         /// ORDER BY column — must be the data's ordering key.
         order_by: String,
-        /// Frame: this many rows preceding, through the current row.
-        preceding: usize,
+        /// Frame start: this many rows preceding (`None` = UNBOUNDED
+        /// PRECEDING), through the current row.
+        preceding: Option<usize>,
         /// Output name, if aliased.
         alias: Option<String>,
     },
@@ -167,11 +168,28 @@ pub struct OrderBy {
     pub descending: bool,
 }
 
+/// A star-schema equi-join: the fact table joined to one small
+/// dimension table on a key column.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JoinPlan {
+    /// The dimension table's name.
+    pub dimension: String,
+    /// The fact-side join column (a key column).
+    pub fact_key: String,
+    /// The dimension-side join column (a key column, unique per row).
+    pub dimension_key: String,
+    /// `true` for LEFT (unmatched fact rows keep null dimension cells);
+    /// `false` for INNER (unmatched fact rows drop).
+    pub left: bool,
+}
+
 /// The SELECT plan.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Plan {
     /// The FROM table's name (resolved to a snapshot by the embedder).
     pub table: String,
+    /// The star-schema join, if the query has one.
+    pub join: Option<JoinPlan>,
     /// What the SELECT list computes.
     pub projection: Projection,
     /// The WHERE predicate, applied before everything else.
@@ -444,21 +462,48 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
             select.from.len()
         )));
     };
-    if !table.joins.is_empty() {
-        return Err(QueryError::Unsupported("JOIN (arrives at M2)".to_owned()));
-    }
-    let ast::TableFactor::Table { name, .. } = &table.relation else {
+    let ast::TableFactor::Table { name, alias, .. } = &table.relation else {
         return Err(QueryError::Unsupported(
             "derived tables / table functions".to_owned(),
         ));
     };
+    let fact_alias = alias.as_ref().map(|alias| ident(&alias.name));
+    let joins = &table.joins;
     let table = object_name(name)?;
-    let predicate = select.selection.as_ref().map(lower_predicate).transpose()?;
+    // With a join in play, qualified names (t.col) are stripped up
+    // front after validating their qualifier, so the rest of the
+    // lowering — and the executor's joined schema — see plain names.
+    let (join, projection_exprs, selection_expr) =
+        match lower_join(&table, fact_alias.as_deref(), joins)? {
+            Some((plan, dimension_alias)) => {
+                let mut known: Vec<&str> = vec![&table, &plan.dimension];
+                if let Some(alias) = &fact_alias {
+                    known.push(alias);
+                }
+                if let Some(alias) = &dimension_alias {
+                    known.push(alias);
+                }
+                let projection = select
+                    .projection
+                    .iter()
+                    .map(|item| strip_item_qualifiers(item, &known))
+                    .collect::<Result<Vec<ast::SelectItem>, QueryError>>()?;
+                let selection = select
+                    .selection
+                    .as_ref()
+                    .map(|expr| strip_qualifiers(expr, &known))
+                    .transpose()?;
+                (Some(plan), projection, selection)
+            }
+            None => (None, select.projection.clone(), select.selection.clone()),
+        };
+    let select_projection = &projection_exprs;
+    let predicate = selection_expr.as_ref().map(lower_predicate).transpose()?;
     let keys = lower_group_by(&select.group_by)?;
     // An aggregate projection is signaled by GROUP BY or by any plain
     // (no OVER) call to a standard aggregate in the SELECT list.
     let aggregate_shaped = !keys.is_empty()
-        || select.projection.iter().any(|item| {
+        || select_projection.iter().any(|item| {
             let expr = match item {
                 ast::SelectItem::UnnamedExpr(expr) => expr,
                 ast::SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -467,26 +512,208 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
             matches!(expr, ast::Expr::Function(function) if function.over.is_none())
         });
     let projection = if aggregate_shaped {
-        let mut items = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
+        let mut items = Vec::with_capacity(select_projection.len());
+        for item in select_projection {
             items.push(lower_agg_item(item, &keys)?);
         }
         Projection::Aggregate { keys, items }
     } else {
-        let mut items = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
+        let mut items = Vec::with_capacity(select_projection.len());
+        for item in select_projection {
             items.push(lower_item(item)?);
         }
         Projection::Items(items)
     };
     Ok(Plan {
         table,
+        join,
         projection,
         predicate,
         order_by: None,
         limit: None,
         offset: None,
     })
+}
+
+/// Rewrites `qualifier.column` to `column` when the qualifier names a
+/// table in scope; unknown qualifiers are errors. (Column-name
+/// collisions between the two tables are caught when the executor
+/// builds the joined schema.)
+fn strip_qualifiers(expr: &ast::Expr, known: &[&str]) -> Result<ast::Expr, QueryError> {
+    let recurse = |expr: &ast::Expr| strip_qualifiers(expr, known);
+    Ok(match expr {
+        ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [qualifier, column] if known.contains(&qualifier.value.as_str()) => {
+                ast::Expr::Identifier(column.clone())
+            }
+            [qualifier, _] => {
+                return Err(QueryError::Unsupported(format!(
+                    "qualifier '{}' names no table in this query",
+                    qualifier.value
+                )))
+            }
+            _ => {
+                return Err(QueryError::Unsupported(
+                    "column names may carry one table qualifier".to_owned(),
+                ))
+            }
+        },
+        ast::Expr::Nested(inner) => ast::Expr::Nested(Box::new(recurse(inner)?)),
+        ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(recurse(expr)?),
+        },
+        ast::Expr::BinaryOp { left, op, right } => ast::Expr::BinaryOp {
+            left: Box::new(recurse(left)?),
+            op: op.clone(),
+            right: Box::new(recurse(right)?),
+        },
+        ast::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => ast::Expr::InList {
+            expr: Box::new(recurse(expr)?),
+            list: list.iter().map(recurse).collect::<Result<_, _>>()?,
+            negated: *negated,
+        },
+        ast::Expr::Function(function) => {
+            let mut function = function.clone();
+            if let ast::FunctionArguments::List(list) = &mut function.args {
+                for argument in &mut list.args {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = argument {
+                        *expr = strip_qualifiers(expr, known)?;
+                    }
+                }
+            }
+            if let Some(ast::WindowType::WindowSpec(spec)) = &mut function.over {
+                for expr in &mut spec.partition_by {
+                    *expr = strip_qualifiers(expr, known)?;
+                }
+                for order in &mut spec.order_by {
+                    order.expr = strip_qualifiers(&order.expr, known)?;
+                }
+            }
+            ast::Expr::Function(function)
+        }
+        other => other.clone(),
+    })
+}
+
+fn strip_item_qualifiers(
+    item: &ast::SelectItem,
+    known: &[&str],
+) -> Result<ast::SelectItem, QueryError> {
+    Ok(match item {
+        ast::SelectItem::UnnamedExpr(expr) => {
+            ast::SelectItem::UnnamedExpr(strip_qualifiers(expr, known)?)
+        }
+        ast::SelectItem::ExprWithAlias { expr, alias } => ast::SelectItem::ExprWithAlias {
+            expr: strip_qualifiers(expr, known)?,
+            alias: alias.clone(),
+        },
+        other => other.clone(),
+    })
+}
+
+/// Lowers the optional star-schema join clause; returns the plan and
+/// the dimension's alias (for qualified-name resolution).
+fn lower_join(
+    fact: &str,
+    fact_alias: Option<&str>,
+    joins: &[ast::Join],
+) -> Result<Option<(JoinPlan, Option<String>)>, QueryError> {
+    match joins {
+        [] => Ok(None),
+        [join] => {
+            let constraint = match &join.join_operator {
+                ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => {
+                    (constraint, false)
+                }
+                ast::JoinOperator::LeftOuter(constraint) | ast::JoinOperator::Left(constraint) => {
+                    (constraint, true)
+                }
+                other => {
+                    return Err(QueryError::Unsupported(format!(
+                        "join type {other:?} (INNER and LEFT only)"
+                    )))
+                }
+            };
+            let (constraint, left) = constraint;
+            let ast::JoinConstraint::On(on) = constraint else {
+                return Err(QueryError::Unsupported(
+                    "JOIN must use ON fact.key = dim.key".to_owned(),
+                ));
+            };
+            let ast::TableFactor::Table { name, alias, .. } = &join.relation else {
+                return Err(QueryError::Unsupported(
+                    "JOIN target must be a plain table".to_owned(),
+                ));
+            };
+            let dimension = object_name(name)?;
+            let dimension_alias = alias.as_ref().map(|alias| ident(&alias.name));
+            // ON: an equality of two (possibly qualified) columns, one
+            // per side, in either order.
+            let ast::Expr::BinaryOp {
+                left: on_left,
+                op: ast::BinaryOperator::Eq,
+                right: on_right,
+            } = on
+            else {
+                return Err(QueryError::Unsupported(
+                    "JOIN ON must be a single equality".to_owned(),
+                ));
+            };
+            let side = |expr: &ast::Expr| -> Result<(Option<String>, String), QueryError> {
+                match expr {
+                    ast::Expr::Identifier(column) => Ok((None, ident(column))),
+                    ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                        [table, column] => Ok((Some(ident(table)), ident(column))),
+                        _ => Err(QueryError::Unsupported(
+                            "ON columns may carry one table qualifier".to_owned(),
+                        )),
+                    },
+                    other => Err(QueryError::Unsupported(format!(
+                        "ON side '{other}' (plain columns only)"
+                    ))),
+                }
+            };
+            let (left_side, right_side) = (side(on_left)?, side(on_right)?);
+            let is_fact = |qualifier: &Option<String>| {
+                qualifier
+                    .as_ref()
+                    .map(|name| name == fact || fact_alias.is_some_and(|alias| name == alias))
+            };
+            // Assign sides: qualified names decide; two unqualified
+            // names are ambiguous only if they can't be told apart —
+            // require at least one qualifier.
+            let (fact_key, dimension_key) = match (is_fact(&left_side.0), is_fact(&right_side.0)) {
+                (Some(true), Some(false)) | (Some(true), None) | (None, Some(false)) => {
+                    (left_side.1, right_side.1)
+                }
+                (Some(false), Some(true)) | (None, Some(true)) | (Some(false), None) => {
+                    (right_side.1, left_side.1)
+                }
+                _ => {
+                    return Err(QueryError::Unsupported(
+                        "qualify at least one ON column (fact.key = dim.key)".to_owned(),
+                    ))
+                }
+            };
+            Ok(Some((
+                JoinPlan {
+                    dimension,
+                    fact_key,
+                    dimension_key,
+                    left,
+                },
+                dimension_alias,
+            )))
+        }
+        _ => Err(QueryError::Unsupported(
+            "one JOIN per query (star schema: fact times one dimension at a time)".to_owned(),
+        )),
+    }
 }
 
 fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError> {
@@ -644,8 +871,9 @@ fn lower_window_call(
     })
 }
 
-/// Accepts exactly `ROWS BETWEEN <n> PRECEDING AND CURRENT ROW`.
-fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<usize, QueryError> {
+/// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW`;
+/// `None` is the unbounded start.
+fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryError> {
     let Some(frame) = frame else {
         return Err(QueryError::Unsupported(
             "window without a frame (write ROWS BETWEEN n PRECEDING AND CURRENT ROW)".to_owned(),
@@ -656,24 +884,31 @@ fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<usize, QueryError> {
             "RANGE / GROUPS frames (ROWS only)".to_owned(),
         ));
     }
-    let ast::WindowFrameBound::Preceding(Some(preceding)) = &frame.start_bound else {
-        return Err(QueryError::Unsupported(
-            "frame must start at n PRECEDING".to_owned(),
-        ));
+    let preceding = match &frame.start_bound {
+        ast::WindowFrameBound::Preceding(None) => None, // UNBOUNDED
+        ast::WindowFrameBound::Preceding(Some(preceding)) => {
+            let ast::Expr::Value(value) = preceding.as_ref() else {
+                return Err(QueryError::Unsupported(
+                    "frame bound must be a literal number".to_owned(),
+                ));
+            };
+            let ast::Value::Number(number, _) = &value.value else {
+                return Err(QueryError::Unsupported(
+                    "frame bound must be a literal number".to_owned(),
+                ));
+            };
+            Some(
+                number
+                    .parse::<usize>()
+                    .map_err(|_| QueryError::Unsupported(format!("frame bound '{number}'")))?,
+            )
+        }
+        _ => {
+            return Err(QueryError::Unsupported(
+                "frame must start at n PRECEDING or UNBOUNDED PRECEDING".to_owned(),
+            ))
+        }
     };
-    let ast::Expr::Value(value) = preceding.as_ref() else {
-        return Err(QueryError::Unsupported(
-            "frame bound must be a literal number".to_owned(),
-        ));
-    };
-    let ast::Value::Number(number, _) = &value.value else {
-        return Err(QueryError::Unsupported(
-            "frame bound must be a literal number".to_owned(),
-        ));
-    };
-    let preceding: usize = number
-        .parse()
-        .map_err(|_| QueryError::Unsupported(format!("frame bound '{number}'")))?;
     match &frame.end_bound {
         Some(ast::WindowFrameBound::CurrentRow) => Ok(preceding),
         _ => Err(QueryError::Unsupported(
@@ -746,7 +981,7 @@ mod tests {
                     args: vec!["y".into(), "x".into()],
                     partition_by: Some("sym".into()),
                     order_by: "ts".into(),
-                    preceding: 19,
+                    preceding: Some(19),
                     alias: Some("beta".into()),
                 },
             ])
@@ -766,7 +1001,7 @@ mod tests {
                 args: vec!["x".into()],
                 partition_by: None,
                 order_by: "ts".into(),
-                preceding: 2,
+                preceding: Some(2),
                 alias: None,
             }])
         );
@@ -776,11 +1011,23 @@ mod tests {
     fn rejections_name_the_construct() {
         for (sql, needle) in [
             ("SELECT * FROM t", "wildcard"),
-            ("SELECT x FROM t JOIN u ON t.a = u.a", "JOIN"),
+            (
+                "SELECT x FROM t JOIN u ON t.a = u.a JOIN v ON t.b = v.b",
+                "one JOIN",
+            ),
+            (
+                "SELECT x FROM t RIGHT JOIN u ON t.a = u.a",
+                "INNER and LEFT",
+            ),
+            ("SELECT x FROM t JOIN u ON a = b", "qualify at least one"),
+            ("SELECT w.x FROM t JOIN u ON t.a = u.a", "names no table"),
             ("SELECT x FROM t ORDER BY x, y", "one column"),
             ("SELECT x FROM t WHERE x > 1 HAVING x > 2", "HAVING"),
             ("SELECT DISTINCT x FROM t", "DISTINCT"),
-            ("SELECT x, sum(y) FROM t GROUP BY x, x + 1", "plain key columns"),
+            (
+                "SELECT x, sum(y) FROM t GROUP BY x, x + 1",
+                "plain key columns",
+            ),
             ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
             ("SELECT nope_agg(x) FROM t", "nope_agg"),
             ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
@@ -788,14 +1035,7 @@ mod tests {
                 "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
                 "ROWS only",
             ),
-            (
-                "SELECT sum(x) OVER (ORDER BY ts) FROM t",
-                "without a frame",
-            ),
-            (
-                "SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-                "n PRECEDING",
-            ),
+            ("SELECT sum(x) OVER (ORDER BY ts) FROM t", "without a frame"),
             ("INSERT INTO t VALUES (1)", "SELECT"),
         ] {
             let error = plan(sql).expect_err(sql);

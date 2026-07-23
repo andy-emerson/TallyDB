@@ -280,6 +280,25 @@ impl Table {
         )?)
     }
 
+    /// Runs a join plan with `self` as the fact table (the database
+    /// handle resolves the dimension and calls this).
+    pub(crate) fn execute_join_plan(
+        &self,
+        plan: &Plan,
+        dimension: &Table,
+    ) -> Result<QueryOutput, EngineError> {
+        let fact_views = self.store.snapshot()?;
+        let dimension_views = dimension.store.snapshot()?;
+        Ok(query_lite::execute_join(
+            self.store.schema(),
+            &fact_views,
+            dimension.store.schema(),
+            &dimension_views,
+            plan,
+            &self.registry,
+        )?)
+    }
+
     /// Runs one SQL query and exports the result as an
     /// `ArrowArrayStream` — one batch per segment, through the same
     /// doorway `arrow-lite`'s oracle harness proved against arrow-rs and

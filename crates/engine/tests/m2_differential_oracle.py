@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M2.4 differential oracle: generated query families vs DuckDB.
+"""Differential oracle: generated query families vs DuckDB (M2.4+).
 
 The generated side of the differential harness: this script owns query
 generation (there is no second list to keep in sync in Rust — the SQL
@@ -99,6 +99,34 @@ def families() -> list[str]:
         "x > 99 AND x < 100.5 AND sym IN ('K000', 'K001')",
     ]:
         queries.append(f"SELECT ts, sym, x, y FROM corpus WHERE {predicate} ORDER BY ts")
+    # Star-schema joins: lookup, misses under INNER vs LEFT, the full
+    # query surface over the joined shape. K007 is missing from sensors.
+    queries += [
+        "SELECT ts, site, calib FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, corpus.sym, calib FROM corpus LEFT JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, x, calib FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE calib > 1 AND x < 101 ORDER BY ts",
+        "SELECT site, count(*) AS n, avg(x) AS a FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym GROUP BY site ORDER BY site",
+        "SELECT ts, sum(calib) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING "
+        "AND CURRENT ROW) AS w FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+    ]
+    # The full window surface: standard aggregates as windows, mixed
+    # frames, several windows in one query.
+    queries += [
+        "SELECT ts, sum(x) OVER (PARTITION BY sym ORDER BY ts "
+        "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, avg(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING "
+        "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, min(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 4 PRECEDING "
+        "AND CURRENT ROW) AS lo, max(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED "
+        "PRECEDING AND CURRENT ROW) AS hi FROM corpus ORDER BY ts",
+        "SELECT ts, count(x) OVER (ORDER BY ts ROWS BETWEEN 99 PRECEDING AND "
+        "CURRENT ROW) AS n FROM corpus ORDER BY ts",
+    ]
     # Aggregates: global and grouped, nulls exercised through y.
     queries += [
         "SELECT count(*) AS n FROM corpus",
@@ -174,9 +202,12 @@ def main() -> None:
     lib = load_library()
     lib.tallydb_corpus_query_stream.restype = ctypes.c_int32
     inputs = read_stream_hook(lib, "tallydb_corpus_inputs_stream")
+    dimension = read_stream_hook(lib, "tallydb_corpus_dimension_stream")
     connection = duckdb.connect()
     connection.register("corpus_input", inputs)
     connection.execute("CREATE TABLE corpus AS SELECT * FROM corpus_input")
+    connection.register("sensors_input", dimension)
+    connection.execute("CREATE TABLE sensors AS SELECT * FROM sensors_input")
 
     passed = 0
     for sql in families():
@@ -212,7 +243,7 @@ def main() -> None:
         compare_tables(sql, engine, oracle, window=True)
         passed += 1
     print(
-        f"M2.4 differential: {passed} generated queries agree with DuckDB "
+        f"Differential: {passed} generated queries agree with DuckDB "
         f"{duckdb.__version__} over {inputs.num_rows} corpus rows"
     )
 

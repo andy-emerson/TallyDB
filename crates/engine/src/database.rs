@@ -84,14 +84,24 @@ impl Database {
             .append(row)
     }
 
-    /// Runs one SQL query against the table it names.
+    /// Runs one SQL query against the table(s) it names — including
+    /// star-schema joins, which resolve their dimension table here.
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
         let table = self
             .tables
             .get(&plan.table)
             .ok_or_else(|| EngineError::UnknownTable(plan.table.clone()))?;
-        table.execute_plan(&plan)
+        match &plan.join {
+            None => table.execute_plan(&plan),
+            Some(join) => {
+                let dimension = self
+                    .tables
+                    .get(&join.dimension)
+                    .ok_or_else(|| EngineError::UnknownTable(join.dimension.clone()))?;
+                table.execute_join_plan(&plan, dimension)
+            }
+        }
     }
 
     /// As [`Database::query`], exported as an `ArrowArrayStream`.
@@ -189,5 +199,203 @@ mod tests {
         // The configured threshold survives: 5 rows over 2-row segments
         // means a multi-batch result.
         assert_eq!(db.query("SELECT x FROM t").unwrap().batches.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use arrow_lite::{Column, ColumnType, Field, NumericData};
+
+    fn fact_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+        ])
+    }
+
+    fn dimension_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("sector", ColumnType::Key, false),
+            Field::new("weight", ColumnType::F64, false),
+        ])
+    }
+
+    /// Fact rows over four symbols; the dimension knows only three of
+    /// them (D is the miss), split across segments so dictionary codes
+    /// differ per segment on both sides.
+    fn database() -> Database {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", fact_schema(), "ts", 3).unwrap())
+            .unwrap();
+        db.add_table(Table::with_segment_rows("symbols", dimension_schema(), "id", 2).unwrap())
+            .unwrap();
+        for (i, sym) in ["A", "B", "C", "D", "B", "A", "D", "C"].iter().enumerate() {
+            db.append(
+                "trades",
+                &[
+                    RowValue::I64(i as i64),
+                    RowValue::Key(sym),
+                    RowValue::F64(i as f64),
+                ],
+            )
+            .unwrap();
+        }
+        for (i, (sym, sector, weight)) in
+            [("C", "tech", 0.5), ("A", "energy", 1.5), ("B", "tech", 2.5)]
+                .iter()
+                .enumerate()
+        {
+            db.append(
+                "symbols",
+                &[
+                    RowValue::I64(i as i64),
+                    RowValue::Key(sym),
+                    RowValue::Key(sector),
+                    RowValue::F64(*weight),
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn f64s(output: &QueryOutput, index: usize) -> Vec<Option<f64>> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::F64(column)) = &batch.columns()[index] else {
+                    panic!("expected f64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inner_join_looks_up_and_drops_misses() {
+        let db = database();
+        let output = db
+            .query(
+                "SELECT ts, sector, weight FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts",
+            )
+            .unwrap();
+        // Rows with sym D (ts 3 and 6) drop; six survive.
+        assert_eq!(output.num_rows(), 6);
+        assert_eq!(
+            f64s(&output, 2),
+            [1.5, 2.5, 0.5, 2.5, 1.5, 0.5].map(Some).to_vec()
+        );
+        // The joined sector renders correctly across per-segment codes.
+        let Column::Key(sector) = &output.batches[0].columns()[1] else {
+            panic!("sector type")
+        };
+        assert_eq!(sector.value_at(0), Some("energy"));
+    }
+
+    #[test]
+    fn left_join_keeps_misses_with_null_dimension_cells() {
+        let db = database();
+        let output = db
+            .query(
+                "SELECT ts, weight FROM trades LEFT JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts",
+            )
+            .unwrap();
+        assert_eq!(output.num_rows(), 8);
+        let weights = f64s(&output, 1);
+        assert_eq!(weights[3], None); // sym D
+        assert_eq!(weights[6], None);
+        assert_eq!(weights[0], Some(1.5));
+    }
+
+    #[test]
+    fn joined_tables_run_the_whole_query_surface() {
+        let db = database();
+        // WHERE on a dimension attribute, GROUP BY it, aggregate a fact
+        // column — the star-schema query shape.
+        let output = db
+            .query(
+                "SELECT sector, count(*) AS n, sum(x) AS s FROM trades \
+                 JOIN symbols ON trades.sym = symbols.sym \
+                 WHERE weight > 1 GROUP BY sector ORDER BY sector",
+            )
+            .unwrap();
+        let batch = &output.batches[0];
+        let Column::Key(sector) = &batch.columns()[0] else {
+            panic!("sector type")
+        };
+        assert_eq!(sector.value_at(0), Some("energy")); // A: ts 0, 5
+        assert_eq!(sector.value_at(1), Some("tech")); // B only (weight 2.5): ts 1, 4
+        let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
+            panic!("count type")
+        };
+        assert_eq!(n.values().as_slice(), &[2, 2]);
+        assert_eq!(f64s(&output, 2), [Some(5.0), Some(5.0)]);
+        // Windows run over the joined intermediate too.
+        let output = db
+            .query(
+                "SELECT ts, sum(weight) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING \
+                 AND CURRENT ROW) AS running FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym",
+            )
+            .unwrap();
+        assert_eq!(
+            f64s(&output, 1).last().copied().flatten(),
+            Some(1.5 + 2.5 + 0.5 + 2.5 + 1.5 + 0.5)
+        );
+    }
+
+    #[test]
+    fn join_errors_are_specific() {
+        let mut db = database();
+        // Unknown dimension table.
+        assert!(matches!(
+            db.query("SELECT ts FROM trades JOIN nope ON trades.sym = nope.sym"),
+            Err(EngineError::UnknownTable(_))
+        ));
+        // Non-key join column.
+        let error = db
+            .query("SELECT ts FROM trades JOIN symbols ON trades.x = symbols.sym")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key column"), "{error}");
+        // Column collision (both tables have plain 'id'? fact has none —
+        // fabricate via colliding attribute): x exists in fact; give the
+        // dimension an x by joining trades to itself conceptually —
+        // instead check the duplicate-dimension-key error.
+        db.append(
+            "symbols",
+            &[
+                RowValue::I64(9),
+                RowValue::Key("A"), // duplicate dimension key
+                RowValue::Key("tech"),
+                RowValue::F64(9.0),
+            ],
+        )
+        .unwrap();
+        let error = db
+            .query("SELECT ts FROM trades JOIN symbols ON trades.sym = symbols.sym")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not unique"), "{error}");
+        // Joins through a bare table handle are refused.
+        let table = Table::new("t", fact_schema(), "ts").unwrap();
+        let error = table
+            .query("SELECT ts FROM t JOIN u ON t.sym = u.sym")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multi-table"), "{error}");
     }
 }
