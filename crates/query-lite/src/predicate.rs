@@ -183,6 +183,14 @@ fn lower_comparison(
             "predicate must compare a plain column to a literal".to_owned(),
         ));
     };
+    // A negative number parses as unary minus over a literal.
+    let (negated_literal, right) = match right {
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        other => (false, other),
+    };
     let ast::Expr::Value(value) = right else {
         return Err(QueryError::Unsupported(
             "predicate must compare a plain column to a literal".to_owned(),
@@ -190,7 +198,13 @@ fn lower_comparison(
     };
     match &value.value {
         ast::Value::Number(text, _) => {
-            let value = parse_number(text)?;
+            let mut value = parse_number(text)?;
+            if negated_literal {
+                value = match value {
+                    Number::Int(value) => Number::Int(-value),
+                    Number::Float(value) => Number::Float(-value),
+                };
+            }
             Ok(Predicate::Compare {
                 column: column.value.clone(),
                 op,
@@ -479,6 +493,11 @@ mod tests {
         assert_eq!(matched("x < 0"), [2]);
         assert_eq!(matched("x = 2.5"), [1]);
         assert_eq!(matched("ts <> 2"), [0, 2, 3]);
+        // Negative literals parse as unary minus over a number — the
+        // gap the differential harness found.
+        assert_eq!(matched("x >= -1"), [0, 1, 2, 3]);
+        assert_eq!(matched("x = -1"), [2]);
+        assert_eq!(matched("y < -0.5"), [3]);
     }
 
     #[test]

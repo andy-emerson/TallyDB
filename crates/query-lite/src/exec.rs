@@ -946,9 +946,10 @@ enum SortCell {
 }
 
 /// Sorts the whole output by one column into a single batch — the
-/// materialization ORDER BY inherently asks for. Nulls follow the
-/// PostgreSQL (and DuckDB) default: last under ASC, first under DESC;
-/// `f64` uses total order, so NaN sorts above every number.
+/// materialization ORDER BY inherently asks for. Nulls sort **last in
+/// both directions**, DuckDB's default (PostgreSQL flips them under
+/// DESC; when the two disagree we follow our oracle); `f64` uses total
+/// order, so NaN sorts above every number.
 fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, QueryError> {
     let (column_index, _) = resolve(&output.schema, &order_by.column)?;
     let mut picks: Vec<(usize, usize)> = Vec::with_capacity(output.num_rows());
@@ -971,21 +972,22 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
         }
     }
     let mut order: Vec<usize> = (0..picks.len()).collect();
-    let compare = |left: &Option<SortCell>, right: &Option<SortCell>| match (left, right) {
+    let compare_values = |left: &SortCell, right: &SortCell| match (left, right) {
+        (SortCell::F64(left), SortCell::F64(right)) => left.total_cmp(right),
+        (left, right) => left.partial_cmp(right).expect("same variant per column"),
+    };
+    order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
+        // Nulls last in both directions — outside the reversal.
         (None, None) => std::cmp::Ordering::Equal,
-        // Nulls sort as the largest value (ASC last); DESC reversal
-        // below then puts them first — the PostgreSQL default.
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(SortCell::F64(left)), Some(SortCell::F64(right))) => left.total_cmp(right),
-        (Some(left), Some(right)) => left.partial_cmp(right).expect("same variant per column"),
-    };
-    order.sort_by(|&left, &right| {
-        let ordering = compare(&cells[left], &cells[right]);
-        if order_by.descending {
-            ordering.reverse()
-        } else {
-            ordering
+        (Some(left), Some(right)) => {
+            let ordering = compare_values(left, right);
+            if order_by.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
         }
     });
     let picks: Vec<(usize, usize)> = order.into_iter().map(|index| picks[index]).collect();
@@ -1706,7 +1708,7 @@ mod query1_tests {
     }
 
     #[test]
-    fn order_by_nulls_follow_postgres_defaults() {
+    fn order_by_nulls_sort_last_in_both_directions() {
         let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "C", 3.0)]);
         // A window column with a NULL first row provides the nulls.
         let sql_asc = "SELECT needs2(x) OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING AND \
@@ -1739,7 +1741,8 @@ mod query1_tests {
             &registry,
         )
         .unwrap();
-        assert_eq!(flatten(&descending, 0), [None, Some(3.0), Some(2.0)]); // nulls first
+        // DuckDB's default (our oracle): nulls last under DESC too.
+        assert_eq!(flatten(&descending, 0), [Some(3.0), Some(2.0), None]);
     }
 
     #[test]

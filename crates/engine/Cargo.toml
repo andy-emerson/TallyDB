@@ -11,7 +11,7 @@ crate-type = ["lib", "cdylib"]
 
 [features]
 # Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
-oracle-harness = []
+oracle-harness = ["dep:corpus"]
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
@@ -20,5 +20,6 @@ query-lite = { path = "../query-lite" }
 compute-lua = { path = "../compute-lua" }
 compute-blas = { path = "../compute-blas" }
 compute-lapack = { path = "../compute-lapack" }
+corpus = { path = "../corpus", optional = true }
 
 [dev-dependencies]
