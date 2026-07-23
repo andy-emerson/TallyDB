@@ -93,12 +93,13 @@ pub mod format;
 pub mod io;
 pub mod mem;
 pub mod store;
+pub mod tombstone;
 
 pub use codec::{Codec, CodecError};
 pub use format::{decode_segment, encode_segment, FormatError};
 pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
-pub use store::{Store, DEFAULT_SEGMENT_ROWS};
+pub use store::{SegmentView, Store, DEFAULT_SEGMENT_ROWS};
 
 // TODO: tombstone record + "newest version wins" read resolution
 // TODO: compaction: merge segments, drop resolved tombstones
