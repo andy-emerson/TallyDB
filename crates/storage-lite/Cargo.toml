@@ -11,3 +11,4 @@ arrow-lite = { path = "../arrow-lite" }
 # dependency of the whole crate, so a future wasm32 build isn't blocked.
 
 [dev-dependencies]
+proptest = "1"

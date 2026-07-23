@@ -81,9 +81,13 @@
 //! type decisions — that's `engine`. No BLAS/Lua — that's the compute
 //! crates.
 
+pub mod codec;
+pub mod format;
 pub mod mem;
 pub mod store;
 
+pub use codec::{Codec, CodecError};
+pub use format::{decode_segment, encode_segment, FormatError};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
 pub use store::{Store, DEFAULT_SEGMENT_ROWS};
 

@@ -367,6 +367,22 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Reassembles a segment from decoded parts (the format module's
+    /// doorway; nothing else constructs segments directly).
+    pub(crate) fn from_parts(
+        batch: RecordBatch,
+        ordering_key: usize,
+        ordered: bool,
+        base_row_id: u64,
+    ) -> Segment {
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id,
+        }
+    }
+
     /// The segment's data.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
