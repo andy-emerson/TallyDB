@@ -199,6 +199,43 @@ compaction resolves tombstones and merges segments. This means:
 > a placeholder — while the Gorilla-vs-zstd fork stays open (issue #30),
 > resolved by A/B when the corpus exists.
 
+## Deployment shapes
+
+> **Decided (2026-07-23): library first; a single-file shell binary at
+> M3; never a server.** TallyDB ships two ways: as an embeddable
+> library (the design center, unchanged), and — from M3 — as a
+> standalone single-file binary attached to each release: a CLI shell
+> over the same `engine::Database` doorway, the `sqlite3`/`duckdb`
+> precedent. Installation is copying one file. This is not a move
+> toward general purpose: the shell exposes exactly the library's SQL
+> surface, and the three assumptions bound it the same way.
+>
+> What the shell shape pulls in (all additive, none a refactor): DDL
+> (`CREATE TABLE` with the numeric-or-key types and the declared
+> ordering key) and ingest (`INSERT`, plus a bulk import) in SQL;
+> statically linked compute (which dovetails with the pinned
+> from-source OpenBLAS build recorded under *Numerical consistency*);
+> a process lock on the storage directory (two processes opening one
+> table is undefined until then); and per-platform release builds in
+> CI. Rendering key columns as text in the shell is fine — the shell
+> *is* an application, exactly where the strings-precisely rule says
+> display text belongs.
+>
+> **The rejected alternative is the engine growing a listener.** A
+> server needs a wire protocol, auth, TLS, sessions, backpressure,
+> multi-tenancy — general-purpose infrastructure orthogonal to the
+> three assumptions — and the differentiator dies at a network
+> boundary: compute-without-copying only exists in-process. If a
+> served deployment is ever wanted, it is a **separate product that
+> embeds TallyDB** (Arrow Flight is the natural seam — SQL in,
+> `ArrowArrayStream` out is already the engine's shape), the way
+> rqlite wraps SQLite and MotherDuck wraps DuckDB. The engine-side
+> obligation that keeps third-party servers viable is only this: stay
+> embeddable in a concurrent host — snapshot reads through `&self`,
+> single writer, a clean `Send`/`Sync` story. No reopen condition is
+> foreseen for the listener; the network-boundary argument is
+> structural.
+
 ## Current milestone: native only
 
 We are building the **native build first** — Linux/Mac/Windows, linked into
@@ -476,9 +513,10 @@ tallydb/
                     #   buffers, u32-dictionary keys, C Data Interface export;
                     #   arrow-rs/PyArrow as dev-only round-trip oracles)
     storage-lite/   # append-optimized segments partitioned on the ordering
-                    #   key; compaction; zone maps; native backend = mmap
-                    #   today, behind a trait so an OPFS/WASM backend can be
-                    #   added later
+                    #   key; compaction; zone maps; I/O behind a backend
+                    #   trait (native = a directory of files; mmap/ranged
+                    #   reads when pruning or profiling asks; OPFS/WASM
+                    #   backend can be added later)
     query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
@@ -488,6 +526,9 @@ tallydb/
                     #   FFI for now (blas.wasm later)
     compute-lapack/ # curated LAPACK solves/decompositions behind a trait;
                     #   native LAPACK via FFI for now (LAPACK-wasm later)
+    corpus/         # dev-only: the seeded synthetic generators of "The
+                    #   corpus" above; measurement and differential-test
+                    #   data, never linked by the engine
   Cargo.toml
 ```
 

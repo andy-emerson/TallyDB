@@ -62,15 +62,15 @@
 
 pub mod exec;
 pub mod plan;
+pub mod predicate;
 
-pub use exec::{execute, Registry, WindowAggregate};
-pub use plan::{plan, Plan, PlanItem, QueryError};
+pub use exec::{execute, execute_join, QueryOutput, Registry, WindowAggregate};
+pub use plan::{
+    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, DeletePlan, JoinPlan,
+    OrderBy, Plan, PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan,
+};
+pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 
-// TODO: executor: filter (WHERE) / group-by / aggregate over
-//       storage-lite segments
-// TODO: executor: equi-join (star-schema shape: one fact table, small
-//       dimension tables)
-// TODO: executor: window functions over ordered numeric columns
-// TODO: UPDATE / DELETE -> storage-lite tombstone + reinsert
-// TODO: differential test harness against DuckDB/DataFusion (dev-only
-//       dependency, never a runtime one)
+// TODO: DataFusion as a secondary differential oracle beside DuckDB
+// TODO: window ORDER BY beyond the ordering key; RANGE frames;
+//       DISTINCT aggregates — as the inclusion principle admits them
