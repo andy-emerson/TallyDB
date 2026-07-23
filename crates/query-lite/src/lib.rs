@@ -62,9 +62,14 @@
 
 pub mod exec;
 pub mod plan;
+pub mod predicate;
 
 pub use exec::{execute, QueryOutput, Registry, WindowAggregate};
-pub use plan::{plan, Plan, PlanItem, QueryError};
+pub use plan::{
+    parse_statement, plan, Assignment, DeletePlan, Plan, PlanItem, QueryError, SetValue, Statement,
+    UpdatePlan,
+};
+pub use predicate::{evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 
 // TODO: executor: filter (WHERE) / group-by / aggregate over
 //       storage-lite segments

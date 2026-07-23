@@ -10,7 +10,7 @@
 
 use crate::table::{EngineError, Table};
 use arrow_lite::{ArrowArrayStream, Schema};
-use query_lite::{plan, QueryOutput};
+use query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use std::collections::HashMap;
 use storage_lite::RowValue;
 
@@ -98,6 +98,32 @@ impl Database {
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
         Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+    }
+
+    /// Runs one SQL mutation (`UPDATE` / `DELETE`) against the table it
+    /// names; returns the rows affected.
+    pub fn mutate(&mut self, sql: &str) -> Result<u64, EngineError> {
+        let table = match parse_statement(sql)? {
+            Statement::Update(update) => update.table,
+            Statement::Delete(delete) => delete.table,
+            Statement::Select(_) => {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "SELECT runs through query, not mutate".to_owned(),
+                )))
+            }
+        };
+        self.tables
+            .get_mut(&table)
+            .ok_or_else(|| EngineError::UnknownTable(table.clone()))?
+            .mutate(sql)
+    }
+
+    /// Compacts the named table (see [`Table::compact`]).
+    pub fn compact(&mut self, table: &str) -> Result<(), EngineError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
+            .compact()
     }
 }
 
