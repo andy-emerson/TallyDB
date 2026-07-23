@@ -110,7 +110,6 @@ fn resolve<'a>(batch: &'a RecordBatch, name: &str) -> Result<(usize, &'a Field),
         .iter()
         .enumerate()
         .find(|(_, field)| field.name() == name)
-        .map(|(index, field)| (index, field))
         .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
 }
 
@@ -193,11 +192,11 @@ fn window_aggregate(
             // Unpartitioned: every window is a direct slice of the stored
             // buffers — the pure zero-copy path.
             let mut windows: Vec<&[f64]> = Vec::with_capacity(arg_slices.len());
-            for row in 0..num_rows {
+            for (row, result) in results.iter_mut().enumerate() {
                 let (start, end) = window_bounds(row, preceding);
                 windows.clear();
                 windows.extend(arg_slices.iter().map(|values| &values[start..end]));
-                results[row] = aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
+                *result = aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
             }
         }
         Some(partition_column) => {
