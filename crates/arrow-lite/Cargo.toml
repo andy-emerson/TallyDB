@@ -12,3 +12,4 @@ license.workspace = true
 # arrow (arrow-rs) belongs here, dev-only, as the round-trip oracle for the
 # hand-rolled layout and C Data Interface export. PyArrow round-trips run as
 # test scripts/CI. Neither ever becomes a runtime dependency.
+proptest = "1"
