@@ -10,6 +10,15 @@
 //! `Vec` work-alike over a 64-byte-aligned allocation. All other unsafe in
 //! this crate should stay confined to this module and the C Data Interface.
 //!
+//! ## Sharing: clone is O(1), mutation copies on write
+//!
+//! Handles share the allocation: cloning a buffer clones an `Arc`, not the
+//! bytes. Mutation (`push`, `extend`, `as_mut_slice`) first ensures the
+//! handle is the allocation's only owner, copying it if not — so clones
+//! behave exactly like independent buffers while reads stay zero-copy.
+//! This is what lets a query result carry a stored column, and the C Data
+//! export hand it out, without duplicating row data.
+//!
 //! ## Alignment guarantee
 //!
 //! [`Buffer::as_ptr`] is 64-byte aligned for every buffer, including an
@@ -22,6 +31,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// Alignment, in bytes, of every buffer allocation.
 pub const BUFFER_ALIGN: usize = 64;
@@ -45,35 +55,24 @@ impl Element for f64 {}
 impl Element for i64 {}
 impl Element for u32 {}
 
-/// A growable, contiguous, 64-byte-aligned buffer of one [`Element`] type.
-///
-/// ```
-/// use arrow_lite::buffer::{Buffer, BUFFER_ALIGN};
-///
-/// let mut buf = Buffer::<f64>::new();
-/// buf.extend_from_slice(&[1.0, 2.0, 3.0]);
-/// buf.push(4.0);
-/// assert_eq!(&buf[..], &[1.0, 2.0, 3.0, 4.0]);
-/// assert_eq!(buf.as_ptr() as usize % BUFFER_ALIGN, 0);
-/// ```
-pub struct Buffer<T: Element> {
+/// One owned, 64-byte-aligned allocation; deallocates on drop. Buffers
+/// share these through an `Arc`.
+struct RawBuf<T: Element> {
     /// 64-byte aligned; a placeholder address (no allocation) when
     /// `cap == 0`.
     ptr: NonNull<T>,
-    /// Elements in use.
-    len: usize,
     /// Elements allocated.
     cap: usize,
     _owns: PhantomData<T>,
 }
 
-// SAFETY: Buffer owns its allocation outright and Element requires
-// Send + Sync, so moving or sharing the handle across threads moves or
-// shares plain numeric data.
-unsafe impl<T: Element> Send for Buffer<T> {}
-unsafe impl<T: Element> Sync for Buffer<T> {}
+// SAFETY: RawBuf owns its allocation outright and Element requires
+// Send + Sync, so moving or sharing it across threads moves or shares
+// plain numeric data.
+unsafe impl<T: Element> Send for RawBuf<T> {}
+unsafe impl<T: Element> Sync for RawBuf<T> {}
 
-impl<T: Element> Buffer<T> {
+impl<T: Element> RawBuf<T> {
     /// The 64-aligned, non-null placeholder pointer used while unallocated.
     fn placeholder() -> NonNull<T> {
         // SAFETY: BUFFER_ALIGN is non-zero, so the pointer is non-null; it
@@ -82,30 +81,13 @@ impl<T: Element> Buffer<T> {
         unsafe { NonNull::new_unchecked(std::ptr::without_provenance_mut(BUFFER_ALIGN)) }
     }
 
-    /// An empty buffer. Does not allocate.
-    pub fn new() -> Self {
-        Buffer {
+    /// No allocation, zero capacity.
+    fn empty() -> Self {
+        RawBuf {
             ptr: Self::placeholder(),
-            len: 0,
             cap: 0,
             _owns: PhantomData,
         }
-    }
-
-    /// An empty buffer with room for `cap` elements.
-    pub fn with_capacity(cap: usize) -> Self {
-        let mut buf = Self::new();
-        if cap > 0 {
-            buf.grow_to(cap);
-        }
-        buf
-    }
-
-    /// A buffer holding a copy of `values`.
-    pub fn from_slice(values: &[T]) -> Self {
-        let mut buf = Self::with_capacity(values.len());
-        buf.extend_from_slice(values);
-        buf
     }
 
     /// The allocation layout for `cap` elements.
@@ -117,62 +99,125 @@ impl<T: Element> Buffer<T> {
         Layout::from_size_align(bytes, BUFFER_ALIGN).expect("layout overflow")
     }
 
-    /// Reallocates to exactly `new_cap` elements, copying `len` elements.
-    fn grow_to(&mut self, new_cap: usize) {
-        debug_assert!(new_cap > self.cap);
-        let new_layout = Self::layout(new_cap);
-        // SAFETY: new_layout has non-zero size (new_cap > cap >= 0 and T is
-        // never zero-sized for the sealed element types).
-        let raw = unsafe { alloc(new_layout) };
-        let Some(new_ptr) = NonNull::new(raw.cast::<T>()) else {
-            handle_alloc_error(new_layout);
+    /// A fresh allocation of `cap > 0` elements, uninitialized.
+    fn allocate(cap: usize) -> Self {
+        debug_assert!(cap > 0);
+        let layout = Self::layout(cap);
+        // SAFETY: layout has non-zero size (cap > 0, T never zero-sized).
+        let raw = unsafe { alloc(layout) };
+        let Some(ptr) = NonNull::new(raw.cast::<T>()) else {
+            handle_alloc_error(layout);
         };
-        if self.cap > 0 {
-            // SAFETY: both regions are valid for `len` elements and
-            // distinct (fresh allocation); old pointer came from `alloc`
-            // with `layout(self.cap)`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
-                dealloc(self.ptr.as_ptr().cast(), Self::layout(self.cap));
-            }
+        RawBuf {
+            ptr,
+            cap,
+            _owns: PhantomData,
         }
-        self.ptr = new_ptr;
-        self.cap = new_cap;
+    }
+}
+
+impl<T: Element> Drop for RawBuf<T> {
+    fn drop(&mut self) {
+        if self.cap > 0 {
+            // SAFETY: pointer came from `alloc` with this exact layout;
+            // elements are Copy, so no per-element drop is needed.
+            unsafe { dealloc(self.ptr.as_ptr().cast(), Self::layout(self.cap)) };
+        }
+    }
+}
+
+/// A growable, contiguous, 64-byte-aligned buffer of one [`Element`] type.
+/// Clones share the allocation; mutation copies on write.
+///
+/// ```
+/// use arrow_lite::buffer::{Buffer, BUFFER_ALIGN};
+///
+/// let mut buf = Buffer::<f64>::new();
+/// buf.extend_from_slice(&[1.0, 2.0, 3.0]);
+/// buf.push(4.0);
+/// assert_eq!(&buf[..], &[1.0, 2.0, 3.0, 4.0]);
+/// assert_eq!(buf.as_ptr() as usize % BUFFER_ALIGN, 0);
+///
+/// // A clone is a second handle to the same bytes — no copy...
+/// let shared = buf.clone();
+/// assert_eq!(shared.as_ptr(), buf.as_ptr());
+/// // ...until one side mutates, which copies first (the other survives).
+/// buf.push(5.0);
+/// assert_eq!(&shared[..], &[1.0, 2.0, 3.0, 4.0]);
+/// ```
+pub struct Buffer<T: Element> {
+    raw: Arc<RawBuf<T>>,
+    /// Elements in use by *this handle* (a shared allocation may hold
+    /// more capacity than any one handle uses).
+    len: usize,
+}
+
+impl<T: Element> Buffer<T> {
+    /// An empty buffer. Does not allocate.
+    pub fn new() -> Self {
+        Buffer {
+            raw: Arc::new(RawBuf::empty()),
+            len: 0,
+        }
     }
 
-    /// Ensures capacity for at least `additional` more elements.
-    fn reserve(&mut self, additional: usize) {
-        let needed = self.len.checked_add(additional).expect("capacity overflow");
-        if needed > self.cap {
-            // Geometric growth keeps amortized push O(1).
-            let new_cap = needed.max(self.cap * 2).max(8);
-            self.grow_to(new_cap);
+    /// An empty buffer with room for `cap` elements.
+    pub fn with_capacity(cap: usize) -> Self {
+        Buffer {
+            raw: Arc::new(if cap == 0 {
+                RawBuf::empty()
+            } else {
+                RawBuf::allocate(cap)
+            }),
+            len: 0,
         }
+    }
+
+    /// A buffer holding a copy of `values`.
+    pub fn from_slice(values: &[T]) -> Self {
+        let mut buf = Self::with_capacity(values.len());
+        buf.extend_from_slice(values);
+        buf
+    }
+
+    /// Ensures this handle solely owns an allocation with room for
+    /// `additional` more elements, copying the current contents into a
+    /// fresh allocation when shared or full.
+    fn make_mut(&mut self, additional: usize) {
+        let needed = self.len.checked_add(additional).expect("capacity overflow");
+        let unique = Arc::get_mut(&mut self.raw).is_some();
+        if unique && needed <= self.raw.cap {
+            return;
+        }
+        // Geometric growth keeps amortized push O(1); a shared allocation
+        // is copied at the same policy.
+        let new_cap = needed.max(self.raw.cap * 2).max(8);
+        let new = RawBuf::allocate(new_cap);
+        if self.len > 0 {
+            // SAFETY: source is valid for len elements; destination is a
+            // fresh allocation of new_cap >= len; the regions are
+            // distinct.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.raw.ptr.as_ptr(), new.ptr.as_ptr(), self.len);
+            }
+        }
+        self.raw = Arc::new(new);
     }
 
     /// Appends one element.
     pub fn push(&mut self, value: T) {
-        self.reserve(1);
-        // SAFETY: reserve guarantees len < cap, so the write is in bounds
-        // of the allocation.
-        unsafe { self.ptr.as_ptr().add(self.len).write(value) };
+        self.make_mut(1);
+        // SAFETY: make_mut guarantees sole ownership and len < cap, so the
+        // write is in bounds and unaliased.
+        unsafe { self.raw.ptr.as_ptr().add(self.len).write(value) };
         self.len += 1;
     }
 
     /// Appends a slice of elements.
     pub fn extend_from_slice(&mut self, values: &[T]) {
-        self.reserve(values.len());
-        // SAFETY: reserve guarantees room for `values.len()` elements past
-        // `len`; source and destination cannot overlap because we own the
-        // destination exclusively through &mut self.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                values.as_ptr(),
-                self.ptr.as_ptr().add(self.len),
-                values.len(),
-            );
-        }
-        self.len += values.len();
+        // SAFETY: make_mut (inside extend_from_raw) guarantees room and
+        // sole ownership; a slice is always valid for its own length.
+        unsafe { self.extend_from_raw(values.as_ptr(), values.len()) };
     }
 
     /// Number of elements.
@@ -189,19 +234,22 @@ impl<T: Element> Buffer<T> {
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: ptr is valid for `len` initialized elements (or a
         // well-aligned placeholder when len == 0, valid for an empty
-        // slice).
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        // slice); shared handles only ever read below their own len.
+        unsafe { std::slice::from_raw_parts(self.raw.ptr.as_ptr(), self.len) }
     }
 
-    /// The elements as a mutable slice.
+    /// The elements as a mutable slice (copies first if the allocation is
+    /// shared).
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        // SAFETY: as for `as_slice`, plus &mut self gives exclusivity.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        self.make_mut(0);
+        // SAFETY: as for `as_slice`, plus make_mut guarantees sole
+        // ownership and &mut self gives handle exclusivity.
+        unsafe { std::slice::from_raw_parts_mut(self.raw.ptr.as_ptr(), self.len) }
     }
 
     /// The base pointer — 64-byte aligned, non-null even when empty.
     pub fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr()
+        self.raw.ptr.as_ptr()
     }
 
     /// Appends `count` elements copied byte-wise from `src`.
@@ -214,27 +262,18 @@ impl<T: Element> Buffer<T> {
     /// represent initialized `T` values (any bit pattern is a valid f64/
     /// i64/u32, so this reduces to the range being readable).
     pub(crate) unsafe fn extend_from_raw(&mut self, src: *const T, count: usize) {
-        self.reserve(count);
-        // SAFETY: reserve guarantees room past len; caller guarantees src
-        // readable; regions cannot overlap (we own dst exclusively).
+        self.make_mut(count);
+        // SAFETY: make_mut guarantees sole ownership and room past len;
+        // caller guarantees src readable; a fresh or solely-owned
+        // destination cannot overlap a live source slice.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.cast::<u8>(),
-                self.ptr.as_ptr().add(self.len).cast::<u8>(),
+                self.raw.ptr.as_ptr().add(self.len).cast::<u8>(),
                 count * size_of::<T>(),
             );
         }
         self.len += count;
-    }
-}
-
-impl<T: Element> Drop for Buffer<T> {
-    fn drop(&mut self) {
-        if self.cap > 0 {
-            // SAFETY: pointer came from `alloc` with this exact layout;
-            // elements are Copy, so no per-element drop is needed.
-            unsafe { dealloc(self.ptr.as_ptr().cast(), Self::layout(self.cap)) };
-        }
     }
 }
 
@@ -245,8 +284,13 @@ impl<T: Element> Default for Buffer<T> {
 }
 
 impl<T: Element> Clone for Buffer<T> {
+    /// O(1): shares the allocation. The first mutation on either handle
+    /// copies (see the module docs).
     fn clone(&self) -> Self {
-        Self::from_slice(self.as_slice())
+        Buffer {
+            raw: Arc::clone(&self.raw),
+            len: self.len,
+        }
     }
 }
 
@@ -419,6 +463,23 @@ mod tests {
     }
 
     #[test]
+    fn clone_shares_until_mutation() {
+        let mut a = Buffer::from_slice(&[1i64, 2, 3]);
+        let b = a.clone();
+        // Zero-copy: both handles read the same allocation.
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        // Mutating one triggers copy-on-write; the other keeps the
+        // original bytes at the original address.
+        let b_ptr = b.as_ptr();
+        a.push(4);
+        assert_ne!(a.as_ptr(), b.as_ptr());
+        assert_eq!(b.as_ptr(), b_ptr);
+        assert_eq!(b.as_slice(), &[1, 2, 3]);
+        assert_eq!(a.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(a.as_ptr() as usize % BUFFER_ALIGN, 0);
+    }
+
+    #[test]
     fn with_capacity_preallocates_aligned() {
         let buf = Buffer::<u32>::with_capacity(17);
         assert!(buf.is_empty());
@@ -457,6 +518,30 @@ mod tests {
                 prop_assert_eq!(buf.as_ptr() as usize % BUFFER_ALIGN, 0);
             }
             prop_assert_eq!(buf.as_slice(), model.as_slice());
+        }
+
+        /// Interleaved mutation of clone pairs stays independent — the
+        /// copy-on-write is never observable except through pointers.
+        #[test]
+        fn cow_clones_match_independent_vecs(
+            initial in prop::collection::vec(any::<i64>(), 0..20),
+            ops in prop::collection::vec((any::<bool>(), any::<i64>()), 0..20),
+        ) {
+            let mut a = Buffer::from_slice(&initial);
+            let mut b = a.clone();
+            let mut model_a = initial.clone();
+            let mut model_b = initial;
+            for (to_a, value) in ops {
+                if to_a {
+                    a.push(value);
+                    model_a.push(value);
+                } else {
+                    b.push(value);
+                    model_b.push(value);
+                }
+            }
+            prop_assert_eq!(a.as_slice(), model_a.as_slice());
+            prop_assert_eq!(b.as_slice(), model_b.as_slice());
         }
 
         /// null_count + count_set partition the rows.
