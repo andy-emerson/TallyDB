@@ -73,11 +73,11 @@
 //!   O(n·k) against an O(n·k²) solve. Revisit only with profiling evidence.
 
 pub mod bitmap;
+pub mod buffer;
 
 pub use bitmap::Bitmap;
+pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
 
-// TODO: numeric column buffers (f64, i64; 64-byte aligned; optional
-//       validity per schema nullability)
 // TODO: key column (u32 codes + interning table)
 // TODO: column enum wrapping numeric + key variants, nothing else
 // TODO: zero-copy views (offset + len) over columns
