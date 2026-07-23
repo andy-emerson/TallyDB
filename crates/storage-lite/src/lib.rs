@@ -60,21 +60,28 @@
 //! number that asks for it.
 //!
 //! ## Backend split (native today, WASM later)
-//! I/O should sit behind a trait from the start. The native implementation
-//! (mmap'd files) is the only one being built right now — but the trait
-//! boundary is what lets an OPFS-backed WASM implementation slot in later
-//! without touching anything above this crate. Don't let native-specific
-//! assumptions (real filesystem paths, blocking I/O) leak past the trait.
+//! I/O sits behind the [`io::StorageBackend`] trait — a flat namespace
+//! of named byte objects with atomic publish, nothing filesystem-shaped
+//! in its contract. The native implementation is a directory of files
+//! ([`io::FsBackend`]); an OPFS-backed WASM implementation slots in
+//! later without touching anything above the trait. mmap and ranged
+//! reads are recorded follow-ups for when query-time pruning or a
+//! profiling number asks for them (v1 opens decode into memory, so mmap
+//! would buy nothing today).
 //!
 //! ## Scope for this crate
-//! - Write buffer (append path)
-//! - Flush: write buffer -> immutable columnar segment
-//! - Compaction: merge segments, resolve tombstones
-//! - Zone maps: min/max per column per segment, used for query pruning
-//! - Compression: delta/delta-of-delta for ordered numeric columns
-//!   (timestamps in particular), a documented scheme for general f64
-//!   columns (e.g. Gorilla/XOR) — pick one, document the tradeoff, don't
-//!   gold-plate this before the rest of the crate works.
+//! Built: the write buffer and append path ([`mem`]), the multi-segment
+//! per-table [`store::Store`] with internal row ids, the deterministic
+//! golden-locked on-disk format with zone maps and per-column codec
+//! tags ([`mod@format`]), delta-of-delta for the ordered ordering key
+//! ([`codec`], measurement cited there), and persistence with
+//! reopen-and-verify behind the backend trait ([`io`]). Durability
+//! boundary: [`store::Store::flush`].
+//!
+//! Still ahead: tombstones and "newest version wins" resolution,
+//! compaction (both M2.3), zone-map pruning at query time (with WHERE,
+//! M2.4), and the general-`f64` codec (#30, deferred by ruling —
+//! uncompressed behind the tag is the shipped interim answer).
 //!
 //! ## Explicitly NOT in scope for this crate
 //! No SQL, no query planning — that's `query-lite`. No schema-level
@@ -93,8 +100,5 @@ pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
 pub use store::{Store, DEFAULT_SEGMENT_ROWS};
 
-// TODO: I/O backend trait (native mmap implementation first — designed
-//       together with the on-disk segment format, not before; see mem.rs)
-// TODO: on-disk segment format (header, per-column buffers, zone map)
 // TODO: tombstone record + "newest version wins" read resolution
 // TODO: compaction: merge segments, drop resolved tombstones
