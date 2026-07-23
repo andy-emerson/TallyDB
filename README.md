@@ -11,9 +11,12 @@
 > verified — run a SQL rolling least-squares regression solved by
 > LAPACK inside the engine, and read the results over an Arrow stream —
 > validated row-for-row against NumPy and DuckDB in CI, over data that
-> has round-tripped through storage. It is still one query shape, not a
-> database yet: general SQL, mutation and compaction, and the Lua/BLAS
-> surface are still ahead. The developer-facing design lives in
+> has round-tripped through storage — plus real `UPDATE`/`DELETE` via
+> tombstone + reinsert, resolved by crash-safe compaction, with
+> end-state semantics diffed against DuckDB in CI. It is still one
+> SELECT shape, not a database yet: the general query surface (WHERE,
+> GROUP BY, joins) and the Lua/BLAS surface are still ahead. The
+> developer-facing design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -168,13 +171,19 @@ are locked by a committed golden: per-column codec tags with
 delta-of-delta on the ordered ordering key (measured on the checked-in
 corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
 zone maps awaiting query-time pruning, and reopen that verifies schema,
-checksums, and row-id contiguity (no tombstones or compaction yet;
-durability boundary is the flush); `query-lite` parses
-exactly one SQL shape — window aggregates over `ROWS BETWEEN n
-PRECEDING AND CURRENT ROW`, optionally per key — via sqlparser-rs, and
-executes it across all segments of a snapshot, returning one Arrow
-batch per segment with per-segment key dictionaries remapped at query
-time where partitioning needs them; `compute-lapack` links system
+checksums, and row-id contiguity (durability boundary is the flush).
+Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
+row-id delete logs, reads resolve tombstones through live masks, and
+crash-safe generational compaction merges live rows back into sorted,
+contiguous segments — with end-state semantics validated against DuckDB
+in CI. `query-lite` parses one SELECT shape — window aggregates over
+`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, optionally per key — plus
+`UPDATE`/`DELETE` with a predicate fragment (numeric comparisons, key
+string equality and `IN` evaluated once per distinct dictionary value,
+`AND`/`OR`/`NOT`) via sqlparser-rs, and executes across all segments of
+a snapshot, returning one Arrow batch per segment with per-segment key
+dictionaries remapped at query time where partitioning needs them;
+`compute-lapack` links system
 LAPACK and solves least squares through `dgels` behind a
 capability-negotiating trait; and `engine` ties them together behind a
 multi-table `Database` handle, registering `regr_slope` /

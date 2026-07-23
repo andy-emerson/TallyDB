@@ -71,11 +71,11 @@ pub use plan::{
 };
 pub use predicate::{evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 
-// TODO: executor: filter (WHERE) / group-by / aggregate over
-//       storage-lite segments
+// TODO: executor: WHERE on SELECT (the predicate layer is built; wire
+//       it into the SELECT path with zone-map pruning) / group-by /
+//       aggregates
 // TODO: executor: equi-join (star-schema shape: one fact table, small
 //       dimension tables)
-// TODO: executor: window functions over ordered numeric columns
-// TODO: UPDATE / DELETE -> storage-lite tombstone + reinsert
-// TODO: differential test harness against DuckDB/DataFusion (dev-only
-//       dependency, never a runtime one)
+// TODO: generated differential harness against DuckDB/DataFusion over
+//       the corpus (the mutation oracle is its first, hand-written
+//       instance)

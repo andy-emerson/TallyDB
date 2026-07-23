@@ -14,18 +14,21 @@
 //! The store assigns every appended row an internal monotonic row id and
 //! stamps each segment with the id of its first row. Duplicates are
 //! first-class — nothing here inspects key values or collapses rows.
-//! These ids are what tombstones and "newest version wins" resolution
-//! will address when mutation arrives; today they only need to exist and
-//! be right.
+//! Tombstones address rows by these ids ([`Store::tombstone`]), and
+//! [`Store::compact`] resolves them: live rows merge into fresh
+//! segments sorted by (ordering key, ingest sequence) with contiguous
+//! new ids, crash-safely on a persistent store (see the generation
+//! protocol below).
 //!
 //! ## What a snapshot promises
 //!
-//! The segments come back in append order, each internally consistent,
-//! covering exactly the rows appended before the call. Global ordering is
-//! *not* promised — ingest is only expected roughly sorted — so each
-//! segment reports [`Segment::is_ordered`] and [`Segment::ordering_bounds`]
-//! and readers that require order (the window executor) check instead of
-//! assuming, exactly as they did for a single segment.
+//! One [`SegmentView`] per segment, in append order, covering exactly
+//! the rows appended before the call, each carrying the live mask its
+//! tombstones impose. Global ordering is *not* promised — ingest is
+//! only expected roughly sorted, and `UPDATE`'s reappends can disorder
+//! a table until compaction — so readers that require order (the window
+//! executor) check [`Segment::is_ordered`] and the live ordering bounds
+//! instead of assuming.
 
 use crate::format::{decode_segment, encode_segment};
 use crate::io::{IoError, StorageBackend};
