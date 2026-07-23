@@ -339,6 +339,100 @@ x86_64 CPU from 2011 onward — meaningfully faster than the more conservative
 off-the-shelf "non-FMA" package — it's a build-time `TARGET=` decision, not
 a switch, and a known low-effort one to make when it's actually needed.
 
+## How we test this repository
+
+This is the test plan's **skeleton**, per `AGENTS.md` (*Testing*). The
+schedule lives in the milestones; the executable detail lives in the test
+code and corpus; CI is the live status. Growing enumerations (case lists,
+corpus entries) belong at the executable leaf, not here.
+
+### What "correct" means here
+
+1. **Agrees with the oracle.** For the SQL semantics that overlap standard
+   behavior: same query, same data → same output as DuckDB (primary) /
+   DataFusion (secondary).
+2. **Round-trips with real Arrow.** Columns exported over the C Data
+   Interface import identically in arrow-rs and PyArrow, and vice versa —
+   dictionaries, nulls, and logical types intact.
+3. **Deterministic.** Same seeded input, same pinned compute backend →
+   bit-identical segment bytes and result buffers (goldens). `i64`-side
+   goldens and storage bytes are backend-independent; `f64` goldens are
+   pinned to the canonical non-FMA OpenBLAS build (see *Numerical
+   consistency*). A change that moves `f64` bits is by definition not a
+   refactor — it is a declared numeric-path change, and re-blessing the
+   goldens is part of its review.
+4. **Meets its own spec** where no reference exists — `storage-lite`'s
+   tests are the spec (see the reference map).
+
+### The reference map
+
+| Subsystem | Reference | Tier |
+|---|---|---|
+| `query-lite` SQL semantics | DuckDB / DataFusion | independent oracle |
+| `arrow-lite` layout + C Data Interface | arrow-rs / PyArrow | independent oracle |
+| compute seam (our calls into BLAS/LAPACK) | NumPy/SciPy on the same inputs | independent oracle |
+| storage format + determinism | committed goldens | prior self |
+| dictionary scope (#6), compression scheme, QR-vs-SVD | sibling candidate | A/B |
+| `storage-lite` behavior (append, compaction, tombstones) | its own spec-tests | none — tests are the spec |
+
+`storage-lite` occupies the weakest tier — no independent reference exists
+for its behavior. That is why the build order front-loads it and why its
+tests deserve the most scrutiny; the crate docs have said "these tests ARE
+the spec" from the start, and this framework is why that's true.
+
+### Peers (pairwise performance)
+
+- **DuckDB** — primary peer; also the correctness oracle and the control
+  group. One corpus, diffed for correctness and timed for performance —
+  which also guarantees we never benchmark a wrong answer.
+- **SQLite** — the floor: what "just use the simplest embeddable store"
+  costs on this workload.
+- **The exported-workflow pipeline** (DuckDB → pandas/NumPy) — the peer for
+  the headline benchmark: the same rolling analytics computed in-engine
+  versus exported-and-computed. The copy tax made visible; the
+  differentiator's claim lives or dies on this pair.
+- **kdb+** — excluded from *published* numbers pending a license review
+  (commercial database licenses commonly prohibit benchmark publication).
+
+Micro-level work (Bitmap ops, view arithmetic, segment flush) has no peer;
+it uses self-regression benches as engineering instruments from P2 onward.
+
+### The corpus
+
+Seeded synthetic generators — tick-shaped data: ordered `i64` timestamps,
+low-cardinality keys, `f64` values, with disorder fraction and null density
+as parameters — checked into the repository as the executable leaf of the
+plan. One corpus, three uses: correctness diffing, pairwise timing, golden
+inputs. It grows two ways: new capabilities add case families, and **every
+closed bug adds the case that would have caught it.**
+
+### Blast-radius ranking (where evidence lands earliest and heaviest)
+
+1. **Storage bytes** — silent corruption; entrenches at format freeze.
+   Golden-locked *before* the first real data exists in the format.
+2. **C Data Interface unsafe export** — silent corruption in *other
+   processes'* memory.
+3. **Oracle-visible SQL semantics** — wrong answers, but loud under
+   differential testing.
+4. Everything else.
+
+### A/B docket
+
+Decisions currently marked for possible evidence-resolution, each already
+behind a trait seam (the WASM-readiness discipline is what makes A/B
+cheap): dictionary scope (#6), the compression scheme for ordered `i64`
+columns, QR vs. SVD least-squares. The architect chooses argument vs. A/B
+when scheduling each.
+
+### CI tiers
+
+- **Per-PR (exists):** fmt, clippy, build, tests including doctests,
+  rustdoc — joined by golden checks and a fast corpus slice as those come
+  to exist.
+- **Scheduled (arrives around P1–P2):** the full oracle-corpus diff and the
+  pairwise benchmark run, nightly — ratios written to the job summary,
+  results kept as artifacts.
+
 ## Workspace layout
 
 TallyDB is a single Cargo workspace — each crate has a clean boundary and
@@ -424,7 +518,9 @@ Concretely:
   explanation, so the reader can verify the clever version against it.
 - **Performance wins every conflict with this constraint** — it is a
   nice-to-have, never a reason to ship slower code. But each win is
-  documented as a deliberate bend, which keeps the constraint honest.
+  documented as a deliberate bend, and a bend requires at least an
+  *Observed* measurement showing the clear version was actually the
+  bottleneck: **no bend without a number.**
 
 Where documentation can carry executable evidence, prefer it: Rust doctests
 compile and run in `cargo test`, so a documented claim with a doctest fails
