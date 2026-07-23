@@ -74,14 +74,14 @@
 
 pub mod bitmap;
 pub mod buffer;
+pub mod column;
 pub mod key;
 
 pub use bitmap::Bitmap;
 pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
+pub use column::{Column, ColumnType, KeyView, NumericData, NumericView};
 pub use key::{Dictionary, KeyColumn};
 
-// TODO: column enum wrapping numeric + key variants, nothing else
-// TODO: zero-copy views (offset + len) over columns
 // TODO: logical-type tags (Timestamp(ns), Decimal64(scale)) on i64 columns,
 //       consulted at export only
 // TODO: C Data Interface export/import, incl. ArrowArrayStream
