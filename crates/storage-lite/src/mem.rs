@@ -292,11 +292,13 @@ impl WriteBuffer {
         for (field, builder) in self.schema.fields().iter().zip(self.builders) {
             columns.push(builder.finish(field.name())?);
         }
+        let zone_maps = columns.iter().map(compute_zone_map).collect();
         Ok(Segment {
             batch: RecordBatch::new(self.schema, columns),
             ordering_key: self.ordering_key,
             ordered: self.ordered,
             base_row_id,
+            zone_maps,
         })
     }
 
@@ -392,6 +394,61 @@ impl ColumnBuilder {
     }
 }
 
+/// A column's value range within one segment: the min/max over valid
+/// (and, for `f64`, non-NaN) values. Absent when no such value exists —
+/// or for key columns, whose codes are identities, not quantities.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ZoneMap {
+    /// Bounds of an `f64` column.
+    F64 {
+        /// Smallest valid, non-NaN value.
+        min: f64,
+        /// Largest valid, non-NaN value.
+        max: f64,
+    },
+    /// Bounds of an `i64` column.
+    I64 {
+        /// Smallest valid value.
+        min: i64,
+        /// Largest valid value.
+        max: i64,
+    },
+}
+
+/// Computes a column's zone map (the format serializes exactly this, so
+/// in-memory and decoded segments agree byte-for-byte).
+pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
+    match column {
+        Column::Numeric(NumericData::F64(numeric)) => {
+            let mut range: Option<(f64, f64)> = None;
+            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
+                if !numeric.is_valid(index) || value.is_nan() {
+                    continue;
+                }
+                range = Some(match range {
+                    None => (value, value),
+                    Some((low, high)) => (low.min(value), high.max(value)),
+                });
+            }
+            range.map(|(min, max)| ZoneMap::F64 { min, max })
+        }
+        Column::Numeric(NumericData::I64(numeric)) => {
+            let mut range: Option<(i64, i64)> = None;
+            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
+                if !numeric.is_valid(index) {
+                    continue;
+                }
+                range = Some(match range {
+                    None => (value, value),
+                    Some((low, high)) => (low.min(value), high.max(value)),
+                });
+            }
+            range.map(|(min, max)| ZoneMap::I64 { min, max })
+        }
+        Column::Key(_) => None,
+    }
+}
+
 /// An immutable, in-memory segment: a record batch plus what storage knows
 /// about it.
 pub struct Segment {
@@ -399,6 +456,7 @@ pub struct Segment {
     ordering_key: usize,
     ordered: bool,
     base_row_id: u64,
+    zone_maps: Vec<Option<ZoneMap>>,
 }
 
 impl Segment {
@@ -409,13 +467,22 @@ impl Segment {
         ordering_key: usize,
         ordered: bool,
         base_row_id: u64,
+        zone_maps: Vec<Option<ZoneMap>>,
     ) -> Segment {
         Segment {
             batch,
             ordering_key,
             ordered,
             base_row_id,
+            zone_maps,
         }
+    }
+
+    /// The zone map for column `index`, if it has one (see [`ZoneMap`]).
+    /// Query planning prunes segments whose ranges cannot satisfy a
+    /// predicate; correctness never depends on these being present.
+    pub fn zone_map(&self, index: usize) -> Option<&ZoneMap> {
+        self.zone_maps.get(index).and_then(Option::as_ref)
     }
 
     /// The segment's data.
