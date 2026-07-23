@@ -92,7 +92,3 @@ pub use column::{Column, ColumnType, KeyView, NumericData, NumericView};
 pub use key::{Dictionary, KeyColumn};
 pub use logical::{LogicalType, DECIMAL64_PRECISION};
 pub use schema::{Field, RecordBatch, Schema};
-
-// TODO: round-trip tests against arrow-rs and PyArrow (dev-only oracles),
-//       covering both numeric subtypes, dictionaries, nulls, logical-type
-//       annotations, and batch streams
