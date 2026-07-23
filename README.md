@@ -2,12 +2,13 @@
 
 **A small, embeddable, SQL-native database for numeric data — with numeric compute living inside the engine, not bolted on beside it.**
 
-> **Status:** TallyDB is in its design phase. The architecture, invariants,
-> and crate boundaries are specified, settled decisions are recorded, and the
-> open ones are tracked — but no runnable engine exists yet. Everything below
-> describes what TallyDB is being built to be; the design is real, the
-> software is not yet. The developer-facing design lives in
-> [`DESIGN.md`](DESIGN.md); open work and decisions live in the repository's
+> **Status:** TallyDB is under construction. The columnar foundation —
+> `arrow-lite`, the Arrow-compatible layout and its C Data Interface — is
+> implemented and cross-checked against arrow-rs and PyArrow in CI, but no
+> runnable engine exists yet: storage, query, and compute are still ahead.
+> Everything below describes what TallyDB is being built to be. The
+> developer-facing design lives in [`DESIGN.md`](DESIGN.md); open work and
+> decisions live in the repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
 
 TallyDB is an HTAP-shaped store: fast, append-heavy ingest (the
@@ -144,7 +145,12 @@ q language, minus the license, minus the server.
 
 ## Where things stand
 
-The seven workspace crates are scaffolded: documented boundaries and settled
+`arrow-lite` is implemented: the shared bitmap, 64-byte-aligned `f64`/`i64`
+buffers, `u32`-dictionary key columns, the two-variant column enum with
+zero-copy views, logical-type export annotations, and the C Data Interface
+including `ArrowArrayStream` — every piece round-trip-tested against
+arrow-rs and PyArrow in CI, with the unsafe core also run under Miri. The
+other six crates are scaffolded: documented boundaries and settled
 contracts, not yet implementations. `blas.wasm` and `lua.wasm` (the WASM
 compute dependencies, for later) are real, working, MIT-licensed projects
 already in progress by the same author, with LAPACK-in-WASM as their next
