@@ -76,6 +76,8 @@ pub mod bitmap;
 pub mod buffer;
 pub mod cdata;
 pub mod column;
+#[cfg(feature = "oracle-harness")]
+pub mod harness;
 pub mod key;
 pub mod logical;
 pub mod schema;

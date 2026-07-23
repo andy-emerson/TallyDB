@@ -4,11 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+# cdylib exists solely for the PyArrow oracle script, which drives the
+# `oracle-harness` hooks through ctypes (see tests/pyarrow_roundtrip.py).
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
+oracle-harness = []
+
 [dependencies]
 # None at runtime, deliberately and permanently: the layout is hand-rolled
 # (issue #2, resolved — see src/lib.rs). Do not add arrow-rs here.
 
 [dev-dependencies]
+arrow = { version = "59.1.0", features = ["ffi"] }
 # arrow (arrow-rs) belongs here, dev-only, as the round-trip oracle for the
 # hand-rolled layout and C Data Interface export. PyArrow round-trips run as
 # test scripts/CI. Neither ever becomes a runtime dependency.
