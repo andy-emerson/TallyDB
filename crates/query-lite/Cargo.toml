@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-storage-lite = { path = "../storage-lite" }
+storage-lite = { version = "0.0.1", path = "../storage-lite" }
 sqlparser = "0.62.0"
 
 [dev-dependencies]
