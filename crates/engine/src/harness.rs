@@ -22,6 +22,12 @@ use storage_lite::RowValue;
 const ROWS: i64 = 240;
 /// The window: 19 preceding + current = 20 rows.
 const PRECEDING: usize = 19;
+/// Segment-row threshold: small enough that the fixture spans several
+/// frozen segments plus a live write-buffer tail (240 rows → 3 × 64
+/// frozen + 48 live), so the oracle exercises the multi-segment,
+/// multi-batch path — windows spanning segment boundaries, per-segment
+/// dictionaries — not just the M1 single-segment shape.
+const SEGMENT_ROWS: usize = 64;
 
 /// A fixed LCG (numerical recipes constants) so the fixture is identical
 /// everywhere.
@@ -47,7 +53,8 @@ fn fixture_table() -> Table {
         Field::new("x", ColumnType::F64, false),
         Field::new("y", ColumnType::F64, false),
     ]);
-    let mut table = Table::new("trades", schema, "ts").expect("fixture schema is valid");
+    let mut table = Table::with_segment_rows("trades", schema, "ts", SEGMENT_ROWS)
+        .expect("fixture schema is valid");
     let mut rng = Lcg(0x5EED_1234_5678_9ABC);
     let symbols = [
         ("AAPL", 2.0, 5.0),
@@ -72,12 +79,8 @@ fn fixture_table() -> Table {
 }
 
 fn export(sql: &str, out: *mut ArrowArrayStream) {
-    let mut table = fixture_table();
-    let stream = table.query(sql).map(|batch| {
-        let schema = batch.schema().clone();
-        arrow_lite::export_stream(schema, std::iter::once(batch))
-    });
-    match stream {
+    let table = fixture_table();
+    match table.query_stream(sql) {
         // SAFETY: the caller (the oracle script) provides a valid,
         // writable destination struct.
         Ok(stream) => unsafe { out.write(stream) },

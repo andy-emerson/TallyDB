@@ -49,15 +49,16 @@
 //! WASM path prematurely; do keep the trait boundaries clean so it isn't
 //! a rewrite later.
 
+pub mod database;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
 pub mod table;
 
+pub use database::Database;
+pub use query_lite::QueryOutput;
 pub use storage_lite::RowValue;
 pub use table::{EngineError, Table};
 
-// TODO: multi-table handle (connection type) once storage grows past the
-//       single write-then-read M1 table
 // TODO: expose compute-blas (multiplication-class) ops and the remaining
 //       compute-lapack ops as callable SQL functions, with
 //       backend-capability errors surfaced cleanly (not panics)
