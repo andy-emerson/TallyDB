@@ -44,8 +44,11 @@ impl Lcg {
     }
 }
 
-/// The M1 fixture: three symbols with different underlying lines plus
-/// deterministic noise, interleaved on an increasing ordering key.
+/// The fixture: three symbols with different underlying lines plus
+/// deterministic noise, interleaved on an increasing ordering key —
+/// ingested into a persistent table, flushed, closed, and **reopened
+/// from disk**, so the oracle's cross-check covers the full storage
+/// round trip (encode → backend → decode), not just the in-memory path.
 fn fixture_table() -> Table {
     let schema = Schema::new(vec![
         Field::new("ts", ColumnType::I64, false),
@@ -53,8 +56,11 @@ fn fixture_table() -> Table {
         Field::new("x", ColumnType::F64, false),
         Field::new("y", ColumnType::F64, false),
     ]);
-    let mut table = Table::with_segment_rows("trades", schema, "ts", SEGMENT_ROWS)
-        .expect("fixture schema is valid");
+    let dir = std::env::temp_dir().join(format!("tallydb-oracle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut table =
+        Table::persistent_with_segment_rows("trades", schema.clone(), "ts", &dir, SEGMENT_ROWS)
+            .expect("fixture schema is valid");
     let mut rng = Lcg(0x5EED_1234_5678_9ABC);
     let symbols = [
         ("AAPL", 2.0, 5.0),
@@ -75,7 +81,10 @@ fn fixture_table() -> Table {
             ])
             .expect("fixture rows are valid");
     }
-    table
+    table.flush().expect("fixture flush succeeds");
+    drop(table);
+    Table::persistent_with_segment_rows("trades", schema, "ts", &dir, SEGMENT_ROWS)
+        .expect("fixture reopens from disk")
 }
 
 fn export(sql: &str, out: *mut ArrowArrayStream) {
