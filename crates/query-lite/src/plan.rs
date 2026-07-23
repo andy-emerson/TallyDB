@@ -15,6 +15,7 @@
 //! rejection is scope honesty, not a parser limit: those features arrive
 //! at M2 through this same lowering.
 
+use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -82,7 +83,7 @@ pub enum PlanItem {
     },
 }
 
-/// The M1 logical plan: one table, a list of items.
+/// The SELECT plan: one table, a list of items.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     /// The FROM table's name (resolved to a segment by the embedder).
@@ -91,8 +92,60 @@ pub struct Plan {
     pub items: Vec<PlanItem>,
 }
 
-/// Parses and lowers one SQL statement into the M1 plan.
-pub fn plan(sql: &str) -> Result<Plan, QueryError> {
+/// A value the right side of `SET column = ...` may hold.
+#[derive(Clone, PartialEq, Debug)]
+pub enum SetValue {
+    /// A numeric literal (for `f64`/`i64` columns).
+    Number(Number),
+    /// A string literal (for key columns).
+    String(String),
+    /// `NULL` (for nullable columns).
+    Null,
+}
+
+/// One `SET column = literal` assignment.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Assignment {
+    /// The column being assigned.
+    pub column: String,
+    /// The literal assigned to it.
+    pub value: SetValue,
+}
+
+/// The `UPDATE` plan: tombstone the matched rows, reappend corrected
+/// copies (the one mutation mechanism, per the design).
+#[derive(Clone, PartialEq, Debug)]
+pub struct UpdatePlan {
+    /// The table being updated.
+    pub table: String,
+    /// The assignments, in statement order.
+    pub assignments: Vec<Assignment>,
+    /// The WHERE predicate; `None` means every row.
+    pub predicate: Option<Predicate>,
+}
+
+/// The `DELETE` plan: tombstone the matched rows.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DeletePlan {
+    /// The table being deleted from.
+    pub table: String,
+    /// The WHERE predicate; `None` means every row.
+    pub predicate: Option<Predicate>,
+}
+
+/// One supported SQL statement, lowered.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Statement {
+    /// A `SELECT`.
+    Select(Plan),
+    /// An `UPDATE ... SET ... [WHERE ...]`.
+    Update(UpdatePlan),
+    /// A `DELETE FROM ... [WHERE ...]`.
+    Delete(DeletePlan),
+}
+
+/// Parses and lowers one SQL statement.
+pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
     let statements =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| QueryError::Parse(e.to_string()))?;
     let [statement] = statements.as_slice() else {
@@ -101,12 +154,108 @@ pub fn plan(sql: &str) -> Result<Plan, QueryError> {
             statements.len()
         )));
     };
-    let ast::Statement::Query(query) = statement else {
+    match statement {
+        ast::Statement::Query(query) => Ok(Statement::Select(lower_query(query)?)),
+        ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
+        ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
+        _ => Err(QueryError::Unsupported(
+            "only SELECT, UPDATE, and DELETE statements are supported".to_owned(),
+        )),
+    }
+}
+
+/// Parses and lowers one SELECT statement (mutations go through
+/// [`parse_statement`]).
+pub fn plan(sql: &str) -> Result<Plan, QueryError> {
+    match parse_statement(sql)? {
+        Statement::Select(plan) => Ok(plan),
+        Statement::Update(_) | Statement::Delete(_) => Err(QueryError::Unsupported(
+            "mutations run through the mutation entry point, not query".to_owned(),
+        )),
+    }
+}
+
+fn lower_update(update: &ast::Update) -> Result<UpdatePlan, QueryError> {
+    if update.from.is_some() || !update.table.joins.is_empty() {
         return Err(QueryError::Unsupported(
-            "only SELECT statements are supported".to_owned(),
+            "UPDATE with FROM or JOIN".to_owned(),
+        ));
+    }
+    let ast::TableFactor::Table { name, .. } = &update.table.relation else {
+        return Err(QueryError::Unsupported(
+            "UPDATE target must be a plain table".to_owned(),
         ));
     };
-    lower_query(query)
+    let table = object_name(name)?;
+    let assignments = update
+        .assignments
+        .iter()
+        .map(lower_assignment)
+        .collect::<Result<Vec<Assignment>, QueryError>>()?;
+    if assignments.is_empty() {
+        return Err(QueryError::Unsupported("UPDATE without SET".to_owned()));
+    }
+    let predicate = update.selection.as_ref().map(lower_predicate).transpose()?;
+    Ok(UpdatePlan {
+        table,
+        assignments,
+        predicate,
+    })
+}
+
+fn lower_assignment(assignment: &ast::Assignment) -> Result<Assignment, QueryError> {
+    let ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+        return Err(QueryError::Unsupported(
+            "SET target must be a plain column".to_owned(),
+        ));
+    };
+    let column = object_name(name)?;
+    let ast::Expr::Value(value) = &assignment.value else {
+        return Err(QueryError::Unsupported(format!(
+            "SET {column} = '{}' — literals only for now",
+            assignment.value
+        )));
+    };
+    let value = match &value.value {
+        ast::Value::Number(text, _) => SetValue::Number(parse_number(text)?),
+        ast::Value::SingleQuotedString(text) => SetValue::String(text.clone()),
+        ast::Value::Null => SetValue::Null,
+        other => {
+            return Err(QueryError::Unsupported(format!(
+                "SET {column} = {other} — numbers, strings, and NULL only"
+            )))
+        }
+    };
+    Ok(Assignment { column, value })
+}
+
+fn lower_delete(delete: &ast::Delete) -> Result<DeletePlan, QueryError> {
+    if !delete.tables.is_empty() || delete.using.is_some() {
+        return Err(QueryError::Unsupported(
+            "multi-table DELETE / USING".to_owned(),
+        ));
+    }
+    let from = match &delete.from {
+        ast::FromTable::WithFromKeyword(from) | ast::FromTable::WithoutKeyword(from) => from,
+    };
+    let [table] = from.as_slice() else {
+        return Err(QueryError::Unsupported(
+            "DELETE FROM exactly one table".to_owned(),
+        ));
+    };
+    if !table.joins.is_empty() {
+        return Err(QueryError::Unsupported("DELETE with JOIN".to_owned()));
+    }
+    let ast::TableFactor::Table { name, .. } = &table.relation else {
+        return Err(QueryError::Unsupported(
+            "DELETE target must be a plain table".to_owned(),
+        ));
+    };
+    let predicate = delete.selection.as_ref().map(lower_predicate).transpose()?;
+    Ok(DeletePlan {
+        table: object_name(name)?,
+        predicate,
+    })
 }
 
 fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {

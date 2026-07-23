@@ -130,3 +130,35 @@ pub unsafe extern "C" fn tallydb_m1_regression_stream(out: *mut ArrowArrayStream
 pub extern "C" fn tallydb_m1_window_preceding() -> u64 {
     PRECEDING as u64
 }
+
+/// The mutation sequence the differential oracle replays in DuckDB.
+/// KEEP IN SYNC with `MUTATIONS` in `tests/m2_mutation_oracle.py` — a
+/// mismatch fails the oracle loudly, it cannot pass silently.
+const MUTATIONS: &[&str] = &[
+    "DELETE FROM trades WHERE sym = 'TSLA'",
+    "DELETE FROM trades WHERE ts >= 220",
+    "UPDATE trades SET y = 0 WHERE x < 2 AND sym IN ('AAPL', 'MSFT')",
+    "UPDATE trades SET x = 5.5 WHERE ts < 30 AND sym <> 'MSFT'",
+];
+
+/// Exports the fixture after the scripted `UPDATE`/`DELETE` sequence and
+/// a compaction — the end state the DuckDB differential diffs.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_m2_mutated_stream(out: *mut ArrowArrayStream) {
+    let mut table = fixture_table();
+    for statement in MUTATIONS {
+        table
+            .mutate(statement)
+            .unwrap_or_else(|error| panic!("fixture mutation '{statement}' failed: {error}"));
+    }
+    table.compact().expect("fixture compaction succeeds");
+    match table.query_stream("SELECT ts, sym, x, y FROM trades") {
+        // SAFETY: the caller (the oracle script) provides a valid,
+        // writable destination struct.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("mutated fixture query failed: {error}"),
+    }
+}
