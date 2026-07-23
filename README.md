@@ -13,10 +13,12 @@
 > validated row-for-row against NumPy and DuckDB in CI, over data that
 > has round-tripped through storage — plus real `UPDATE`/`DELETE` via
 > tombstone + reinsert, resolved by crash-safe compaction, with
-> end-state semantics diffed against DuckDB in CI. It is still one
-> SELECT shape, not a database yet: the general query surface (WHERE,
-> GROUP BY, joins) and the Lua/BLAS surface are still ahead. The
-> developer-facing design lives in
+> end-state semantics diffed against DuckDB in CI. SELECT now carries
+> WHERE (with zone-map pruning), GROUP BY with the standard aggregates,
+> ORDER BY, and LIMIT — every query family born cross-checked by a
+> generated DuckDB differential harness over the checked-in corpus.
+> Joins, the full window surface, and the Lua/BLAS surface are still
+> ahead. The developer-facing design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -176,13 +178,20 @@ Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
 row-id delete logs, reads resolve tombstones through live masks, and
 crash-safe generational compaction merges live rows back into sorted,
 contiguous segments — with end-state semantics validated against DuckDB
-in CI. `query-lite` parses one SELECT shape — window aggregates over
-`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, optionally per key — plus
-`UPDATE`/`DELETE` with a predicate fragment (numeric comparisons, key
-string equality and `IN` evaluated once per distinct dictionary value,
-`AND`/`OR`/`NOT`) via sqlparser-rs, and executes across all segments of
-a snapshot, returning one Arrow batch per segment with per-segment key
-dictionaries remapped at query time where partitioning needs them;
+in CI. `query-lite` speaks a real query subset via sqlparser-rs: SELECT with
+WHERE (the predicate fragment — numeric comparisons, key string
+equality and `IN` evaluated once per distinct dictionary value,
+`AND`/`OR`/`NOT` — with zone-map pruning skipping segments that cannot
+match), GROUP BY over key columns with
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
+`i64` stays exact and errors loudly on overflow rather than silently
+widening), top-level ORDER BY and LIMIT/OFFSET, window aggregates over
+`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, and `UPDATE`/`DELETE`. It
+executes across all segments of a snapshot, returning one Arrow batch
+per segment with per-segment key dictionaries remapped at query time
+where grouping or partitioning needs them, and a generated
+differential harness diffs query families against DuckDB over the
+corpus in CI;
 `compute-lapack` links system
 LAPACK and solves least squares through `dgels` behind a
 capability-negotiating trait; and `engine` ties them together behind a

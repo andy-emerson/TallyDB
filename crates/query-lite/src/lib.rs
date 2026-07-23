@@ -66,16 +66,13 @@ pub mod predicate;
 
 pub use exec::{execute, QueryOutput, Registry, WindowAggregate};
 pub use plan::{
-    parse_statement, plan, Assignment, DeletePlan, Plan, PlanItem, QueryError, SetValue, Statement,
-    UpdatePlan,
+    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, DeletePlan, OrderBy, Plan,
+    PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan,
 };
-pub use predicate::{evaluate as evaluate_predicate, CmpOp, Number, Predicate};
+pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 
-// TODO: executor: WHERE on SELECT (the predicate layer is built; wire
-//       it into the SELECT path with zone-map pruning) / group-by /
-//       aggregates
 // TODO: executor: equi-join (star-schema shape: one fact table, small
 //       dimension tables)
-// TODO: generated differential harness against DuckDB/DataFusion over
-//       the corpus (the mutation oracle is its first, hand-written
-//       instance)
+// TODO: full window surface (standard aggregates as windows, more
+//       frames, multiple windows per query)
+// TODO: DataFusion as a secondary differential oracle beside DuckDB
