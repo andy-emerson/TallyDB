@@ -151,9 +151,25 @@ already in progress by the same author, with LAPACK-in-WASM as their next
 planned milestone — tracked as future dependencies, not part of the current
 native-first build.
 
-- **[`DESIGN.md`](DESIGN.md)** — the forward-looking developer companion to
-  this document: positioning, invariants, crate boundaries, settled
-  decisions, build order.
-- **[`AGENTS.md`](AGENTS.md)** — how work happens in this repository.
-- **[Issues & milestones](https://github.com/andy-emerson/TallyDB/issues)**
-  — all open work: todos, decisions, and the roadmap.
+## How we work
+
+This repository follows the working agreement in [`AGENTS.md`](AGENTS.md)
+([source](https://github.com/andy-emerson/working-agreement)). The
+repo-specific half lives here:
+
+- **Durable documents:** this README (the user-facing current state) and
+  [`DESIGN.md`](DESIGN.md) — the design companion: philosophy, invariants,
+  crate boundaries, settled decisions, build order, and the test plan's
+  skeleton.
+- **Living status:** [GitHub Issues](https://github.com/andy-emerson/TallyDB/issues).
+  Open decisions carry the `decision` label; recorded alternatives with
+  reopen triggers carry `deferred`; everything else open is a todo or a bug.
+- **Roadmap:** [GitHub Milestones](https://github.com/andy-emerson/TallyDB/milestones)
+  — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
+  GA · M4 WASM parity.
+- **Checks:** GitHub Actions on every pull request — fmt, clippy, build,
+  tests including doctests, rustdoc with warnings as errors. Doctests are
+  this repository's preferred executable evidence.
+- **Audience:** documentation is written for a reader with a BS in applied
+  mathematics and a CS minor; code for the CS-minor side — see DESIGN.md,
+  *Who we write for*.
