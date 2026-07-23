@@ -1,6 +1,6 @@
 ---
 title: AGENTS.md working agreement
-version: 2.2.0
+version: 2.2.1
 source: https://github.com/andy-emerson/working-agreement
 copyright: © 2026 Andrew Emerson
 license: CC-BY-4.0
@@ -85,8 +85,8 @@ Two rules apply at every level:
   written at its level, and evidence that decays — a measurement, a
   hand check — cites its run.
 
-Strengthening is chosen the way the test plan is chosen: by the risk
-surface, not by accumulation.
+Strengthening is chosen, not accumulated: spend it where the risk is —
+where the bets are riskiest and failure is silent.
 
 ## Records
 
@@ -196,10 +196,14 @@ claim is never stronger than its latest run.
 
 # Review
 
-Every cycle ends in review, and the two reviews look opposite ways: the
-code review is goal-seeking, the documentation review is truth-seeking.
-The documentation review is the counterweight that keeps the code
-review's optimism from becoming documented overstatement.
+Every cycle ends in the review that matches its pass — a code pass ends
+in the code review, a doc pass in the documentation review — and the
+two look opposite ways: the code review is goal-seeking, the
+documentation review is truth-seeking. The documentation review is the
+counterweight that keeps the code review's optimism from becoming
+documented overstatement. A code review can fail by missing its target;
+a documentation review succeeds by telling the truth, even when the
+truth is that the target was missed.
 
 ## The code review
 
@@ -222,8 +226,8 @@ the project actually is, and it checks two things:
 weaken, earn, or remove them to living status — and descriptions the
 project has outgrown: renamed things, changed behavior, dead
 references. When open work completes, write its reality into the
-durable documents. Update what this cycle touched; do not revisit what
-it left alone.
+durable documents — a settled limitation as plainly as a success.
+Update what this cycle touched; do not revisit what it left alone.
 
 **Clarity.** Prefer industry-standard terms, used bare and undefined.
 Coin a term only for a genuinely new concept; define it where it first
