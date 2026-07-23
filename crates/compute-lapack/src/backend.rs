@@ -113,9 +113,13 @@ pub trait LapackBackend {
     /// Solves the least-squares problem `min ‖A x − b‖₂` for full-rank
     /// `A` (m ≥ n), returning the n coefficients.
     ///
-    /// The provisional inner routine is QR (`dgels`) per open decision
-    /// #20 — swappable behind this seam until the op's numerical behavior
-    /// is golden-locked at M2.
+    /// Decision #20 (2026-07-23): this op runs **both routines behind one
+    /// seam** — QR (`dgels`) as the fast path, SVD (`dgelsd`) on detected
+    /// trouble, because QR cannot be trusted to flag near-singular designs
+    /// (observed at M1: garbage coefficients with `info = 0` on a
+    /// constant-x window). QR is what is implemented today; the SVD
+    /// fallback and the documented switch criterion land with the M2 A/B
+    /// that golden-locks this op's numerical behavior.
     fn least_squares(&self, a: ColMajor<'_>, b: &[f64]) -> Result<Vec<f64>, ComputeError>;
 }
 
