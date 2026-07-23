@@ -156,6 +156,106 @@ grading what it advanced — the issues it touched and any it newly filed —
 then fixing the descriptive documents' staleness; it does not re-grade issues
 it left untouched.
 
+## Where things live: match the medium to its rate of change
+
+- **Files** hold *structure* — principles, invariants, organization. They
+  change slowly, through doc passes, and review is what keeps them true.
+- **Issues** hold *work* — anything with a lifecycle: it opens, it closes.
+  The tracker grooms itself; a file tracking the same state would rot.
+- **CI** holds *live status* — what builds, what passes, what the numbers
+  are right now. It is a status document that no one has to maintain.
+
+The rule: **no file may hand-track state that a lifecycle system already
+tracks.** A new file is justified when its content is structure; it is a
+mistake when its content is status wearing structure's clothes — beware
+growing enumerations, which are usually status.
+
+## Testing
+
+Testing runs as a pipeline: **design → test plan → claims.**
+
+- The **test plan derives from the design's risk surface**: what to probe,
+  and how hard, follows from where the design's bets are riskiest.
+- **Claims derive from the test plan**, never the reverse. Nothing enters
+  the documentation except through the plan; a claim is the distillate of
+  the tests that support it. This is "never grade a claim above its
+  evidence" applied at the planning level — many tests condense into few
+  claims, and exploration is allowed to run ahead of anything claimable.
+
+The plan lives at three altitudes, per the rate-of-change rule above: its
+**skeleton** (references, case families, corpus shape) in the design
+document; its **schedule** in the milestones — a milestone is not done
+until its slice of the plan has run; its **executable leaf** in the tests
+and corpus themselves, with CI as the plan's live status.
+
+### Every test compares against a reference — use the strongest available
+
+1. **An independent implementation** (an oracle or peer) — strongest,
+   because independence is exactly what "cross-checked" durability
+   measures.
+2. **Our own prior output** (golden tests). Bit-identity *defines* a
+   refactor: if committed goldens changed, the change was behavioral, and
+   re-blessing them is a declared, reviewed event — never silent.
+3. **A sibling candidate** (A/B). A performance-relevant decision may be
+   resolved by building both options behind the same interface and
+   measuring. This is an escalation path, not a default — reserve it for
+   decisions that are genuinely contested *and* expensive to reverse. The
+   losing implementation is deleted (the vestigial rule applies); its
+   numbers stay in the decision record.
+4. **No reference exists** — the tests *become* the reference, written from
+   intent with proportionate care. This is the weakest position; work that
+   must live here deserves the most scrutiny, and a harness that *creates*
+   a reference is worth more than any single test.
+
+### What enters the plan, and when
+
+Unlike passes, testing is conditional — the plan is chosen, not
+accumulated. Weigh:
+
+- **Silence of failure.** Silent corruption outranks loud crashes outranks
+  cosmetics. A panic half-tests itself; plausible garbage never does.
+- **Entrenchment.** Like decisions, tests are owed *before the freeze*: a
+  format wants its golden lock before real data exists in it; a public
+  interface wants its contract tests before anything depends on it.
+- **Where bugs hide.** Spend depth where bugs produce plausible output;
+  lean on integration coverage where bugs announce themselves.
+
+Timing: evidence lands in the **same integration** as the claim it earns —
+a doc pass cannot grade a claim whose test is "coming later." Once earned,
+CI keeps it earned. Exploratory probes (fuzzing, property tests) are plan
+line items with no claim attached — their product is *discovered* claims
+and bugs, and **every closed bug leaves a corpus case behind**: the
+regression test is the bug's tombstone.
+
+### What is deliberately not tested
+
+- **Unclaimed behavior.** No coverage quotas — line coverage is
+  supply-driven; the grid is the coverage metric (claims covered, not
+  lines). If a behavior matters, claim it; the claim then obligates the
+  test.
+- **Compiler-enforced properties.** Make invalid states unrepresentable,
+  then don't test for them.
+- **The internals of taken-as-is dependencies.** Take-whole implies
+  trust-whole; test the seam — that *we* call it correctly — not the
+  dependency.
+
+And test at **seams** — interfaces, formats, contracts — not internals:
+tests pinned to implementation details ossify code and rot under exactly
+the refactors that golden tests exist to permit.
+
+### Performance is measured pairwise
+
+Prefer **ratios against a named peer, measured in the same run on the same
+hardware**, over absolute numbers: hardware cancels out of a ratio, so the
+number stays meaningful across machines and time — and a stable peer
+doubles as a control, so a drifting ratio is regression detection for free.
+Absolute numbers, where used, cite their run (commit, environment,
+workload, methodology; medians, not best-of-N). Any CI performance gate
+names its proxy (instruction counts, allocations, trend tracking) —
+wall-clock in shared runners is noise, and pretending otherwise is a claim
+above evidence. Comparative claims document both sides' configurations and
+respect the peer's license terms for published benchmarks.
+
 ## Todos and decisions
 
 Issues hold three species of open work, separated by label and never mixed
@@ -205,5 +305,10 @@ instantiation.
 - **Executable documentation** here means Rust doctests (`cargo test` runs
   them); `cargo doc` output is the woven artifact the repo-wide doc pass
   reviews.
+- **The test plan:** skeleton in `DESIGN.md` (*How we test this
+  repository*); schedule in the milestones; executable leaf in the test
+  code and corpus; live status in CI.
+- **Issue forms** in `.github/ISSUE_TEMPLATE/` encode the three issue
+  species and their required fields.
 - **Audience:** documentation and code are written for the reader described in
   DESIGN.md's *Who we write for*.
