@@ -15,10 +15,13 @@
 > tombstone + reinsert, resolved by crash-safe compaction, with
 > end-state semantics diffed against DuckDB in CI. SELECT now carries
 > WHERE (with zone-map pruning), GROUP BY with the standard aggregates,
-> ORDER BY, and LIMIT — every query family born cross-checked by a
-> generated DuckDB differential harness over the checked-in corpus.
-> Joins, the full window surface, and the Lua/BLAS surface are still
-> ahead. The developer-facing design lives in
+> ORDER BY and LIMIT, star-schema joins against dimension tables, and
+> the standard aggregates as window functions over trailing and
+> unbounded frames — every query family born cross-checked by a
+> generated DuckDB differential harness over the checked-in corpus (38
+> query families and counting). The compute breadth (eigen/solve/
+> Cholesky, BLAS) and the Lua surface are still ahead. The
+> developer-facing design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -185,8 +188,11 @@ equality and `IN` evaluated once per distinct dictionary value,
 match), GROUP BY over key columns with
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
 `i64` stays exact and errors loudly on overflow rather than silently
-widening), top-level ORDER BY and LIMIT/OFFSET, window aggregates over
-`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, and `UPDATE`/`DELETE`. It
+widening), top-level ORDER BY and LIMIT/OFFSET, star-schema equi-joins (one fact
+table against small key-unique dimension tables, INNER or LEFT, run
+fact-driven through the same pipeline as everything else), the standard
+aggregates as window functions over `ROWS BETWEEN n | UNBOUNDED
+PRECEDING AND CURRENT ROW` frames, and `UPDATE`/`DELETE`. It
 executes across all segments of a snapshot, returning one Arrow batch
 per segment with per-segment key dictionaries remapped at query time
 where grouping or partitioning needs them, and a generated

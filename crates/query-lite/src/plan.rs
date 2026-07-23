@@ -5,7 +5,8 @@
 //!
 //! ```sql
 //! SELECT <columns | window calls | GROUP BY keys + aggregates>
-//! FROM table [WHERE predicate] [GROUP BY keys]
+//! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
+//! [WHERE predicate] [GROUP BY keys]
 //! [ORDER BY column [DESC]] [LIMIT n] [OFFSET n];
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];

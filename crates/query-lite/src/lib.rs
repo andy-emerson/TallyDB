@@ -71,8 +71,6 @@ pub use plan::{
 };
 pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 
-// TODO: executor: equi-join (star-schema shape: one fact table, small
-//       dimension tables)
-// TODO: full window surface (standard aggregates as windows, more
-//       frames, multiple windows per query)
 // TODO: DataFusion as a secondary differential oracle beside DuckDB
+// TODO: window ORDER BY beyond the ordering key; RANGE frames;
+//       DISTINCT aggregates — as the inclusion principle admits them
