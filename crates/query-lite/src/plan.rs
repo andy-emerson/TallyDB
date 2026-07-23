@@ -4,17 +4,19 @@
 //! here, in what this lowering accepts. Three statements lower today:
 //!
 //! ```sql
-//! SELECT <column | fn(args) OVER (
-//!            [PARTITION BY key] ORDER BY ordering_key
-//!            ROWS BETWEEN n PRECEDING AND CURRENT ROW)>, ...
-//! FROM table;
+//! SELECT <columns | window calls | GROUP BY keys + aggregates>
+//! FROM table [WHERE predicate] [GROUP BY keys]
+//! [ORDER BY column [DESC]] [LIMIT n] [OFFSET n];
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];
 //! ```
 //!
-//! (the predicate fragment is documented in [`crate::predicate`]).
-//! Everything else — WHERE on SELECT, GROUP BY, joins, subqueries,
-//! other frame shapes, SET expressions beyond literals — is rejected
+//! (the predicate fragment is documented in [`crate::predicate`];
+//! window calls are `fn(args) OVER ([PARTITION BY key] ORDER BY
+//! ordering_key ROWS BETWEEN n PRECEDING AND CURRENT ROW)`; aggregates
+//! are `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over plain columns). Everything
+//! else — joins, subqueries, HAVING, DISTINCT, other frame shapes, SET
+//! or projection expressions beyond literals and columns — is rejected
 //! with a message naming what was rejected. The rejection is scope
 //! honesty, not a parser limit: those features arrive through this same
 //! lowering as M2 proceeds.
