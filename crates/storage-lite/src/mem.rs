@@ -1,24 +1,22 @@
-//! The M1-thin storage path: an append buffer freezing into a single
-//! immutable in-memory segment.
+//! The in-memory building blocks: an append buffer that freezes into an
+//! immutable segment.
 //!
-//! This is deliberately the smallest storage that can carry the M1 slice
-//! (ingest → query → compute → export), and it dodges every open decision
-//! on purpose: **no tombstones or compaction** (row identity, #1), **no
-//! on-disk format, mmap, zone maps, or compression** (#19), and the
-//! dictionary living inside each key column is an implementation detail of
-//! this in-memory form, not a ruling on dictionary scope (#6). The I/O
-//! backend trait promised in the crate docs arrives with the on-disk
-//! format at M2 — designing it around a memory-only implementation now
-//! would freeze exactly the wrong assumptions.
+//! These are the pieces [`crate::store::Store`] composes into a table's
+//! storage — the buffer validates and accumulates arriving rows, the
+//! segment is the immutable unit readers see. Still ahead, in build
+//! order: the on-disk format and I/O backend trait (M2.2 — designed
+//! together, so the trait doesn't freeze memory-only assumptions), then
+//! tombstones and compaction (M2.3).
 //!
-//! What it does hold to already:
+//! What this layer holds to:
 //!
 //! - **Append-optimized:** one row at a time, O(1) amortized, into
 //!   per-column builders.
 //! - **Ordered:** the schema names its ordering key (`i64`, `NOT NULL`);
 //!   ingest is *expected* roughly sorted on it, and the frozen segment
-//!   reports [`Segment::is_ordered`] so readers that require strict order
-//!   (M1's window executor) can check instead of silently mis-computing.
+//!   reports [`Segment::is_ordered`] and [`Segment::ordering_bounds`] so
+//!   readers that require strict order (the window executor) can check
+//!   instead of silently mis-computing.
 //! - **Numeric-or-key:** rows are checked cell-by-cell against the schema
 //!   on append — wrong type, null into `NOT NULL`, wrong arity are all
 //!   errors at the door, not corruption later.
@@ -57,7 +55,7 @@ pub enum StorageError {
     /// The declared ordering key must be an `i64 NOT NULL` column.
     BadOrderingKey { reason: String },
     /// A nullable key column ended up all-null with an empty dictionary —
-    /// not representable as a `KeyColumn` (M1 limitation).
+    /// not representable as a `KeyColumn` (known limitation, kept).
     AllNullKeyColumn { column: String },
 }
 
