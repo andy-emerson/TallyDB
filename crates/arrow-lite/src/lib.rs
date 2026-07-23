@@ -74,17 +74,23 @@
 
 pub mod bitmap;
 pub mod buffer;
+pub mod cdata;
 pub mod column;
 pub mod key;
 pub mod logical;
+pub mod schema;
 
 pub use bitmap::Bitmap;
 pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
+pub use cdata::{
+    export_batch, export_schema, export_stream, import_batch, ArrowArray, ArrowArrayStream,
+    ArrowSchema, ImportError, StreamReader,
+};
 pub use column::{Column, ColumnType, KeyView, NumericData, NumericView};
 pub use key::{Dictionary, KeyColumn};
 pub use logical::{LogicalType, DECIMAL64_PRECISION};
+pub use schema::{Field, RecordBatch, Schema};
 
-// TODO: C Data Interface export/import, incl. ArrowArrayStream
 // TODO: round-trip tests against arrow-rs and PyArrow (dev-only oracles),
 //       covering both numeric subtypes, dictionaries, nulls, logical-type
 //       annotations, and batch streams

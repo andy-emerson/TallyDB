@@ -203,6 +203,29 @@ impl<T: Element> Buffer<T> {
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr()
     }
+
+    /// Appends `count` elements copied byte-wise from `src`.
+    ///
+    /// For the C Data Interface import path, where foreign buffers carry
+    /// no alignment promise — the byte-wise copy is legal for any `src`.
+    ///
+    /// # Safety
+    /// `src` must be valid for reading `count * size_of::<T>()` bytes that
+    /// represent initialized `T` values (any bit pattern is a valid f64/
+    /// i64/u32, so this reduces to the range being readable).
+    pub(crate) unsafe fn extend_from_raw(&mut self, src: *const T, count: usize) {
+        self.reserve(count);
+        // SAFETY: reserve guarantees room past len; caller guarantees src
+        // readable; regions cannot overlap (we own dst exclusively).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.cast::<u8>(),
+                self.ptr.as_ptr().add(self.len).cast::<u8>(),
+                count * size_of::<T>(),
+            );
+        }
+        self.len += count;
+    }
 }
 
 impl<T: Element> Drop for Buffer<T> {
