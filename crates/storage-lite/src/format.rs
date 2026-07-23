@@ -42,7 +42,7 @@
 //! today.
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
-use crate::mem::Segment;
+use crate::mem::{Segment, ZoneMap};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
     NumericData, RecordBatch, Schema,
@@ -147,7 +147,14 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
         .enumerate()
     {
         let is_ordering_key = index == segment.ordering_key();
-        encode_column(&mut out, segment, field, column, is_ordering_key);
+        encode_column(
+            &mut out,
+            segment,
+            field,
+            column,
+            is_ordering_key,
+            segment.zone_map(index),
+        );
     }
     let crc = crc32(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -173,6 +180,7 @@ fn encode_column(
     field: &Field,
     column: &Column,
     is_ordering_key: bool,
+    zone_map: Option<&ZoneMap>,
 ) {
     out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
     out.extend_from_slice(field.name().as_bytes());
@@ -190,7 +198,7 @@ fn encode_column(
     }
     let codec = writer_codec(segment, column, is_ordering_key);
     out.push(codec.tag());
-    encode_zone_map(out, column);
+    encode_zone_map(out, zone_map);
     let validity = match column {
         Column::Numeric(numeric) => numeric.validity(),
         Column::Key(keys) => keys.validity(),
@@ -239,39 +247,14 @@ fn push_values(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Zone map: min/max over valid values (skipping NaN for `f64`), absent
-/// when no such value exists. Key columns carry none — their codes are
-/// per-segment identities, not ordered quantities.
-fn encode_zone_map(out: &mut Vec<u8>, column: &Column) {
-    let bounds: Option<([u8; 8], [u8; 8])> = match column {
-        Column::Numeric(NumericData::F64(numeric)) => {
-            let mut range: Option<(f64, f64)> = None;
-            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
-                if !numeric.is_valid(index) || value.is_nan() {
-                    continue;
-                }
-                range = Some(match range {
-                    None => (value, value),
-                    Some((low, high)) => (low.min(value), high.max(value)),
-                });
-            }
-            range.map(|(low, high)| (low.to_le_bytes(), high.to_le_bytes()))
-        }
-        Column::Numeric(NumericData::I64(numeric)) => {
-            let mut range: Option<(i64, i64)> = None;
-            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
-                if !numeric.is_valid(index) {
-                    continue;
-                }
-                range = Some(match range {
-                    None => (value, value),
-                    Some((low, high)) => (low.min(value), high.max(value)),
-                });
-            }
-            range.map(|(low, high)| (low.to_le_bytes(), high.to_le_bytes()))
-        }
-        Column::Key(_) => None,
-    };
+/// Zone map: the segment's precomputed min/max (see
+/// [`crate::mem::ZoneMap`]), absent when no valid non-NaN value exists
+/// or the column is a key.
+fn encode_zone_map(out: &mut Vec<u8>, zone_map: Option<&ZoneMap>) {
+    let bounds: Option<([u8; 8], [u8; 8])> = zone_map.map(|zone_map| match zone_map {
+        ZoneMap::F64 { min, max } => (min.to_le_bytes(), max.to_le_bytes()),
+        ZoneMap::I64 { min, max } => (min.to_le_bytes(), max.to_le_bytes()),
+    });
     match bounds {
         None => out.push(0),
         Some((min, max)) => {
@@ -368,10 +351,12 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
     }
     let mut fields = Vec::with_capacity(column_count);
     let mut columns = Vec::with_capacity(column_count);
+    let mut zone_maps = Vec::with_capacity(column_count);
     for _ in 0..column_count {
-        let (field, column) = decode_column(&mut reader, row_count)?;
+        let (field, column, zone_map) = decode_column(&mut reader, row_count)?;
         fields.push(field);
         columns.push(column);
+        zone_maps.push(zone_map);
     }
     if reader.position != bytes.len() {
         return Err(FormatError::Corrupt(format!(
@@ -385,10 +370,14 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         ordering_key,
         ordered,
         base_row_id,
+        zone_maps,
     ))
 }
 
-fn decode_column(reader: &mut Reader<'_>, rows: usize) -> Result<(Field, Column), FormatError> {
+fn decode_column(
+    reader: &mut Reader<'_>,
+    rows: usize,
+) -> Result<(Field, Column, Option<ZoneMap>), FormatError> {
     let name_len = reader.u16()? as usize;
     let name = std::str::from_utf8(reader.take(name_len)?)
         .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
@@ -408,12 +397,27 @@ fn decode_column(reader: &mut Reader<'_>, rows: usize) -> Result<(Field, Column)
     };
     let codec = Codec::from_tag(reader.u8()?)
         .ok_or_else(|| FormatError::Corrupt(format!("unknown codec for '{name}'")))?;
-    // Zone maps are read and discarded here: v1 keeps them in the file
-    // for query-time pruning (M2.4), which reads headers without
-    // materializing columns.
-    if reader.u8()? != 0 {
-        reader.take(16)?;
-    }
+    let zone_map = if reader.u8()? != 0 {
+        let min = reader.take(8)?;
+        let max = reader.take(8)?;
+        Some(match column_type {
+            ColumnType::F64 => ZoneMap::F64 {
+                min: f64::from_le_bytes(min.try_into().unwrap()),
+                max: f64::from_le_bytes(max.try_into().unwrap()),
+            },
+            ColumnType::I64 => ZoneMap::I64 {
+                min: i64::from_le_bytes(min.try_into().unwrap()),
+                max: i64::from_le_bytes(max.try_into().unwrap()),
+            },
+            ColumnType::Key => {
+                return Err(FormatError::Corrupt(format!(
+                    "key column '{name}' carries a zone map"
+                )))
+            }
+        })
+    } else {
+        None
+    };
     let validity = if reader.u8()? != 0 {
         let byte_len = reader.u32()? as usize;
         let bytes = reader.take(byte_len)?;
@@ -491,7 +495,7 @@ fn decode_column(reader: &mut Reader<'_>, rows: usize) -> Result<(Field, Column)
     if let Some(logical) = logical {
         field = field.with_logical(logical);
     }
-    Ok((field, column))
+    Ok((field, column, zone_map))
 }
 
 fn decode_f64(bytes: &[u8], rows: usize, name: &str) -> Result<Buffer<f64>, FormatError> {

@@ -101,5 +101,5 @@ pub mod tombstone;
 pub use codec::{Codec, CodecError};
 pub use format::{decode_segment, encode_segment, FormatError};
 pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
-pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
+pub use mem::{RowValue, Segment, StorageError, WriteBuffer, ZoneMap};
 pub use store::{SegmentView, Store, DEFAULT_SEGMENT_ROWS};

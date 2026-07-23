@@ -13,7 +13,7 @@
 //! three-valued outcome for the fragment this tree can express.
 
 use crate::plan::QueryError;
-use arrow_lite::{Bitmap, Column, NumericData, Schema};
+use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
 use storage_lite::SegmentView;
 
@@ -289,6 +289,66 @@ pub fn evaluate(
     }
 }
 
+/// Whether any row of `view`'s segment could satisfy `predicate`, judged
+/// from zone maps alone — the segment-pruning test. This is a sound
+/// over-approximation: `true` means "maybe" (evaluate to find out),
+/// `false` means "provably no row matches" and the segment can be
+/// skipped without reading its columns. Only numeric comparisons prune
+/// (key predicates and NOT are always "maybe"); a numeric column with no
+/// zone map holds no valid, comparable values, so a comparison on it
+/// matches nothing.
+pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> bool {
+    match predicate {
+        Predicate::Compare { column, op, value } => {
+            let Some(index) = schema
+                .fields()
+                .iter()
+                .position(|field| field.name() == column)
+            else {
+                return true; // let evaluate report the unknown column
+            };
+            if schema.fields()[index].column_type() == ColumnType::Key {
+                return true; // let evaluate report the type error
+            }
+            let Some(zone_map) = view.segment.zone_map(index) else {
+                return false; // no valid values: a comparison matches nothing
+            };
+            fn interval_may_hold<T: PartialOrd>(op: CmpOp, min: T, max: T, target: T) -> bool {
+                match op {
+                    CmpOp::Eq => min <= target && target <= max,
+                    CmpOp::Ne => !(min == target && max == target),
+                    CmpOp::Lt => min < target,
+                    CmpOp::Le => min <= target,
+                    CmpOp::Gt => max > target,
+                    CmpOp::Ge => max >= target,
+                }
+            }
+            match (zone_map, value) {
+                (storage_lite::ZoneMap::F64 { min, max }, value) => {
+                    interval_may_hold(*op, *min, *max, value.as_f64())
+                }
+                (storage_lite::ZoneMap::I64 { min, max }, Number::Int(target)) => {
+                    interval_may_hold(*op, *min, *max, *target)
+                }
+                // i64 bounds vs a float literal: widening to f64 rounds,
+                // and a rounded bound could prune a matching segment —
+                // soundness beats the optimization, so don't prune.
+                (storage_lite::ZoneMap::I64 { .. }, Number::Float(_)) => true,
+            }
+        }
+        Predicate::And(left, right) => {
+            can_match(left, schema, view) && can_match(right, schema, view)
+        }
+        Predicate::Or(left, right) => {
+            can_match(left, schema, view) || can_match(right, schema, view)
+        }
+        // Key membership and NOT don't prune: dictionaries aren't ranges,
+        // and negating an interval fact soundly needs exact bounds
+        // semantics this test deliberately doesn't attempt.
+        Predicate::KeyEquals { .. } | Predicate::KeyIn { .. } | Predicate::Not(_) => true,
+    }
+}
+
 /// The string test run once per distinct dictionary value, applied to
 /// rows as integer set-membership.
 fn key_membership(
@@ -497,5 +557,109 @@ mod tests {
         let bitmap = evaluate(&predicate, &schema, &view).unwrap();
         assert!(bitmap.get(0));
         assert!(!bitmap.get(1)); // an f64 round trip would match both
+    }
+}
+
+#[cfg(test)]
+mod pruning_tests {
+    use super::*;
+    use arrow_lite::{ColumnType, Field};
+    use storage_lite::{RowValue, SegmentView, WriteBuffer};
+
+    fn view(ts: &[i64], x: &[f64]) -> (Schema, SegmentView) {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("sym", ColumnType::Key, false),
+        ]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        for (&ts, &x) in ts.iter().zip(x) {
+            buffer
+                .append(&[RowValue::I64(ts), RowValue::F64(x), RowValue::Key("A")])
+                .unwrap();
+        }
+        let segment = std::sync::Arc::new(buffer.freeze().unwrap());
+        (schema, SegmentView::all_live(segment))
+    }
+
+    fn compare(column: &str, op: CmpOp, value: Number) -> Predicate {
+        Predicate::Compare {
+            column: column.into(),
+            op,
+            value,
+        }
+    }
+
+    #[test]
+    fn interval_logic_prunes_exactly_the_impossible() {
+        // ts ∈ [10, 20], x ∈ [1.5, 3.5].
+        let (schema, view) = view(&[10, 15, 20], &[1.5, 3.5, 2.0]);
+        let cases = [
+            (compare("ts", CmpOp::Eq, Number::Int(15)), true),
+            (compare("ts", CmpOp::Eq, Number::Int(21)), false),
+            (compare("ts", CmpOp::Eq, Number::Int(9)), false),
+            (compare("ts", CmpOp::Lt, Number::Int(10)), false),
+            (compare("ts", CmpOp::Lt, Number::Int(11)), true),
+            (compare("ts", CmpOp::Le, Number::Int(10)), true),
+            (compare("ts", CmpOp::Gt, Number::Int(20)), false),
+            (compare("ts", CmpOp::Ge, Number::Int(20)), true),
+            (compare("ts", CmpOp::Ne, Number::Int(15)), true),
+            (compare("x", CmpOp::Gt, Number::Float(3.5)), false),
+            (compare("x", CmpOp::Ge, Number::Float(3.5)), true),
+            (compare("x", CmpOp::Lt, Number::Float(1.5)), false),
+        ];
+        for (predicate, expected) in cases {
+            assert_eq!(
+                can_match(&predicate, &schema, &view),
+                expected,
+                "{predicate:?}"
+            );
+        }
+        // Boolean structure: AND prunes if either side prunes; OR only
+        // if both do; NOT and key predicates never prune.
+        let hit = compare("ts", CmpOp::Eq, Number::Int(15));
+        let miss = compare("ts", CmpOp::Eq, Number::Int(99));
+        let and = Predicate::And(Box::new(hit.clone()), Box::new(miss.clone()));
+        assert!(!can_match(&and, &schema, &view));
+        let or = Predicate::Or(Box::new(hit.clone()), Box::new(miss.clone()));
+        assert!(can_match(&or, &schema, &view));
+        let both_miss = Predicate::Or(Box::new(miss.clone()), Box::new(miss.clone()));
+        assert!(!can_match(&both_miss, &schema, &view));
+        assert!(can_match(&Predicate::Not(Box::new(miss)), &schema, &view));
+        assert!(can_match(
+            &Predicate::KeyEquals {
+                column: "sym".into(),
+                value: "ZZZ".into(),
+                negated: false
+            },
+            &schema,
+            &view
+        ));
+        // i64 bounds vs a float literal never prune (soundness first).
+        assert!(can_match(
+            &compare("ts", CmpOp::Eq, Number::Float(9.5)),
+            &schema,
+            &view
+        ));
+    }
+
+    #[test]
+    fn a_column_with_no_comparable_values_prunes_comparisons() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        buffer.append(&[RowValue::I64(1), RowValue::Null]).unwrap();
+        buffer
+            .append(&[RowValue::I64(2), RowValue::F64(f64::NAN)])
+            .unwrap();
+        let view = SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()));
+        // y holds only NULL and NaN: no comparison can match any row.
+        assert!(!can_match(
+            &compare("y", CmpOp::Ge, Number::Float(0.0)),
+            &schema,
+            &view
+        ));
     }
 }

@@ -36,10 +36,11 @@
 //! remapped into a query-lifetime key space (the query-time remap
 //! decision #6 accepted).
 
-use crate::plan::{Plan, PlanItem, QueryError};
+use crate::plan::{AggCall, AggFunction, AggItem, OrderBy, Plan, PlanItem, Projection, QueryError};
+use crate::predicate::{can_match, evaluate as evaluate_predicate};
 use arrow_lite::{
-    Bitmap, Buffer, Column, ColumnType, Field, KeyColumn, NumericColumn, NumericData, RecordBatch,
-    Schema,
+    Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
+    RecordBatch, Schema,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,16 +109,68 @@ pub fn execute(
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
+    // WHERE first, standard SQL order of operations: the predicate folds
+    // into each view's live mask, so everything downstream — windows
+    // included — sees only the surviving rows.
+    let filtered: Vec<SegmentView>;
+    let views: &[SegmentView] = match &plan.predicate {
+        None => views,
+        Some(predicate) => {
+            filtered = views
+                .iter()
+                .map(|view| {
+                    // Zone-map pruning: skip evaluating segments whose
+                    // value ranges provably cannot match. Correctness
+                    // never depends on this — the pruned outcome is
+                    // exactly an all-false match.
+                    let rows = view.segment.batch().num_rows();
+                    let live = if !can_match(predicate, schema, view) {
+                        Bitmap::new_unset(rows)
+                    } else {
+                        let matched = evaluate_predicate(predicate, schema, view)?;
+                        match &view.live {
+                            None => matched,
+                            Some(live) => live.and(&matched),
+                        }
+                    };
+                    Ok(SegmentView {
+                        segment: view.segment.clone(),
+                        live: Some(live),
+                    })
+                })
+                .collect::<Result<Vec<SegmentView>, QueryError>>()?;
+            &filtered
+        }
+    };
     // Views with no live rows contribute nothing; dropping them up front
     // means "one batch per segment" below never emits an empty batch.
     let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
-    let mut fields = Vec::with_capacity(plan.items.len());
+    let mut output = match &plan.projection {
+        Projection::Items(items) => project_items(schema, &views, items, registry)?,
+        Projection::Aggregate { keys, items } => project_aggregate(schema, &views, keys, items)?,
+    };
+    if let Some(order_by) = &plan.order_by {
+        output = sort_output(output, order_by)?;
+    }
+    if plan.limit.is_some() || plan.offset.is_some() {
+        output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
+    }
+    Ok(output)
+}
+
+/// The row-per-row projection: plain columns and window calls, one
+/// output batch per view.
+fn project_items(
+    schema: &Schema,
+    views: &[&SegmentView],
+    items: &[PlanItem],
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    let mut fields = Vec::with_capacity(items.len());
     let mut columns_per_view: Vec<Vec<Column>> = views.iter().map(|_| Vec::new()).collect();
-    for item in &plan.items {
+    for item in items {
         let (field, columns) = match item {
-            PlanItem::Column { name, alias } => {
-                passthrough(schema, &views, name, alias.as_deref())?
-            }
+            PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
             PlanItem::WindowAgg {
                 function,
                 args,
@@ -127,7 +180,7 @@ pub fn execute(
                 alias,
             } => window_aggregate(
                 schema,
-                &views,
+                views,
                 registry,
                 function,
                 args,
@@ -500,6 +553,560 @@ fn partitioned(
     Ok(())
 }
 
+/// A group key's per-row code: a unified dictionary code, or the null
+/// group.
+type GroupCode = Option<usize>;
+
+/// One aggregate accumulator. The variant is chosen from the call and
+/// its argument column's type; every variant tracks whether it has seen
+/// a (non-null) value, because SQL aggregates over nothing are NULL —
+/// except COUNT, which is 0.
+#[derive(Clone)]
+enum Accumulator {
+    CountStar(i64),
+    CountColumn(i64),
+    SumF64 { sum: f64, seen: bool },
+    SumI64 { sum: i64, seen: bool },
+    Avg { sum: f64, count: i64 },
+    MinMaxF64 { value: f64, seen: bool, max: bool },
+    MinMaxI64 { value: i64, seen: bool, max: bool },
+}
+
+impl Accumulator {
+    /// The starting accumulator for `call` over a column of
+    /// `argument_type` (`None` for `COUNT(*)`).
+    fn new(call: &AggCall, argument_type: Option<ColumnType>) -> Result<Accumulator, QueryError> {
+        let type_error = |what: &str| {
+            QueryError::TypeError(format!(
+                "{what} needs a numeric argument, got {:?}",
+                argument_type
+            ))
+        };
+        Ok(match (call.function, argument_type) {
+            (AggFunction::Count, None) => Accumulator::CountStar(0),
+            (AggFunction::Count, Some(_)) => Accumulator::CountColumn(0),
+            (AggFunction::Sum, Some(ColumnType::F64)) => Accumulator::SumF64 {
+                sum: 0.0,
+                seen: false,
+            },
+            (AggFunction::Sum, Some(ColumnType::I64)) => Accumulator::SumI64 {
+                sum: 0,
+                seen: false,
+            },
+            (AggFunction::Avg, Some(ColumnType::F64 | ColumnType::I64)) => {
+                Accumulator::Avg { sum: 0.0, count: 0 }
+            }
+            (AggFunction::Min | AggFunction::Max, Some(ColumnType::F64)) => {
+                Accumulator::MinMaxF64 {
+                    value: 0.0,
+                    seen: false,
+                    max: call.function == AggFunction::Max,
+                }
+            }
+            (AggFunction::Min | AggFunction::Max, Some(ColumnType::I64)) => {
+                Accumulator::MinMaxI64 {
+                    value: 0,
+                    seen: false,
+                    max: call.function == AggFunction::Max,
+                }
+            }
+            (AggFunction::Sum, _) => return Err(type_error("SUM")),
+            (AggFunction::Avg, _) => return Err(type_error("AVG")),
+            (AggFunction::Min, _) => return Err(type_error("MIN")),
+            (AggFunction::Max, _) => return Err(type_error("MAX")),
+        })
+    }
+
+    /// Folds in one row's cell (`None` = the cell is null, or the call
+    /// is `COUNT(*)` and there is no cell).
+    fn update(&mut self, cell: Option<CellNumber>) -> Result<(), QueryError> {
+        match (self, cell) {
+            (Accumulator::CountStar(count), _) => *count += 1,
+            (Accumulator::CountColumn(_), None) => {}
+            (Accumulator::CountColumn(count), Some(_)) => *count += 1,
+            (_, None) => {}
+            (Accumulator::SumF64 { sum, seen }, Some(cell)) => {
+                *sum += cell.as_f64();
+                *seen = true;
+            }
+            (Accumulator::SumI64 { sum, seen }, Some(CellNumber::I64(value))) => {
+                *sum = sum.checked_add(value).ok_or_else(|| {
+                    QueryError::Compute("SUM overflows i64 — refusing a wrong answer".to_owned())
+                })?;
+                *seen = true;
+            }
+            (Accumulator::Avg { sum, count }, Some(cell)) => {
+                *sum += cell.as_f64();
+                *count += 1;
+            }
+            (Accumulator::MinMaxF64 { value, seen, max }, Some(cell)) => {
+                let candidate = cell.as_f64();
+                // total_cmp keeps NaN ordered (greater than everything),
+                // matching how it will sort and compare downstream.
+                let replace = !*seen
+                    || (*max && candidate.total_cmp(value).is_gt())
+                    || (!*max && candidate.total_cmp(value).is_lt());
+                if replace {
+                    *value = candidate;
+                }
+                *seen = true;
+            }
+            (Accumulator::MinMaxI64 { value, seen, max }, Some(CellNumber::I64(candidate))) => {
+                let replace =
+                    !*seen || (*max && candidate > *value) || (!*max && candidate < *value);
+                if replace {
+                    *value = candidate;
+                }
+                *seen = true;
+            }
+            _ => unreachable!("accumulator variant chosen from the argument type"),
+        }
+        Ok(())
+    }
+}
+
+/// One numeric cell, typed.
+#[derive(Clone, Copy)]
+enum CellNumber {
+    F64(f64),
+    I64(i64),
+}
+
+impl CellNumber {
+    fn as_f64(self) -> f64 {
+        match self {
+            CellNumber::F64(value) => value,
+            CellNumber::I64(value) => value as f64,
+        }
+    }
+}
+
+/// The aggregate projection: group live rows by key columns in the
+/// query-lifetime unified key space (decision #6 — codes remap per
+/// segment), fold the accumulators, and emit one batch with one row per
+/// group, groups in first-seen order (deterministic; callers wanting a
+/// specific order say ORDER BY). No GROUP BY keys means one global
+/// group — emitted even over zero rows, per SQL.
+fn project_aggregate(
+    schema: &Schema,
+    views: &[&SegmentView],
+    keys: &[String],
+    items: &[AggItem],
+) -> Result<QueryOutput, QueryError> {
+    // Resolve keys (must be key columns) and calls (typed accumulators).
+    let key_indices: Vec<usize> = keys
+        .iter()
+        .map(|key| {
+            let (index, field) = resolve(schema, key)?;
+            if field.column_type() != ColumnType::Key {
+                return Err(QueryError::TypeError(format!(
+                    "GROUP BY '{key}' must be a key column — grouping is what keys are for"
+                )));
+            }
+            Ok(index)
+        })
+        .collect::<Result<Vec<usize>, QueryError>>()?;
+    let calls: Vec<(&AggCall, Option<usize>, Option<ColumnType>)> = items
+        .iter()
+        .filter_map(|item| match item {
+            AggItem::Call(call) => Some(call),
+            AggItem::Key { .. } => None,
+        })
+        .map(|call| {
+            let argument = call
+                .argument
+                .as_ref()
+                .map(|name| resolve(schema, name))
+                .transpose()?;
+            let index = argument.map(|(index, _)| index);
+            let column_type = argument.map(|(_, field)| field.column_type());
+            Ok((call, index, column_type))
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    let template: Vec<Accumulator> = calls
+        .iter()
+        .map(|(call, _, column_type)| Accumulator::new(call, *column_type))
+        .collect::<Result<Vec<Accumulator>, QueryError>>()?;
+    // The unified key space, one per key column.
+    let mut unified: Vec<HashMap<String, usize>> = vec![HashMap::new(); keys.len()];
+    let mut unified_values: Vec<Vec<String>> = vec![Vec::new(); keys.len()];
+    // Groups in first-seen order.
+    let mut groups: HashMap<Vec<GroupCode>, usize> = HashMap::new();
+    let mut group_keys: Vec<Vec<GroupCode>> = Vec::new();
+    let mut accumulators: Vec<Vec<Accumulator>> = Vec::new();
+    if keys.is_empty() {
+        groups.insert(Vec::new(), 0);
+        group_keys.push(Vec::new());
+        accumulators.push(template.clone());
+    }
+    for view in views {
+        let batch = view.segment.batch();
+        // This view's key columns, with per-segment codes remapped into
+        // the unified space (decision #6's query-time remap).
+        let mut remaps: Vec<(&KeyColumn, Vec<usize>)> = Vec::with_capacity(key_indices.len());
+        for (position, &index) in key_indices.iter().enumerate() {
+            let Column::Key(column) = &batch.columns()[index] else {
+                unreachable!("validated as a key column above")
+            };
+            let dictionary = column.dictionary();
+            let remap: Vec<usize> = (0..dictionary.len() as u32)
+                .map(|code| {
+                    let value = dictionary.value(code);
+                    if let Some(&unified_code) = unified[position].get(value) {
+                        unified_code
+                    } else {
+                        let unified_code = unified_values[position].len();
+                        unified[position].insert(value.to_owned(), unified_code);
+                        unified_values[position].push(value.to_owned());
+                        unified_code
+                    }
+                })
+                .collect();
+            remaps.push((column, remap));
+        }
+        for row in live_rows(view) {
+            let group_key: Vec<GroupCode> = remaps
+                .iter()
+                .map(|(column, remap)| {
+                    column
+                        .is_valid(row)
+                        .then(|| remap[column.codes().as_slice()[row] as usize])
+                })
+                .collect();
+            let group = *groups.entry(group_key.clone()).or_insert_with(|| {
+                group_keys.push(group_key.clone());
+                accumulators.push(template.clone());
+                group_keys.len() - 1
+            });
+            for ((_, argument_index, _), accumulator) in
+                calls.iter().zip(accumulators[group].iter_mut())
+            {
+                let cell = match argument_index {
+                    None => None,
+                    Some(index) => match &batch.columns()[*index] {
+                        Column::Numeric(NumericData::F64(numeric)) => numeric
+                            .is_valid(row)
+                            .then(|| CellNumber::F64(numeric.values().as_slice()[row])),
+                        Column::Numeric(NumericData::I64(numeric)) => numeric
+                            .is_valid(row)
+                            .then(|| CellNumber::I64(numeric.values().as_slice()[row])),
+                        Column::Key(_) => {
+                            return Err(QueryError::TypeError(
+                                "aggregates take numeric arguments; keys are labels".to_owned(),
+                            ))
+                        }
+                    },
+                };
+                accumulator.update(cell)?;
+            }
+        }
+    }
+    // Assemble the single output batch, SELECT-list order.
+    let group_count = group_keys.len();
+    let mut fields = Vec::with_capacity(items.len());
+    let mut columns = Vec::with_capacity(items.len());
+    let mut next_call = 0usize;
+    for item in items {
+        match item {
+            AggItem::Key { name, alias } => {
+                let position = keys.iter().position(|key| key == name).expect("validated");
+                let mut dictionary = Dictionary::new();
+                let mut codes: Buffer<u32> = Buffer::with_capacity(group_count);
+                let mut validity: Vec<bool> = Vec::with_capacity(group_count);
+                for group_key in &group_keys {
+                    match group_key[position] {
+                        Some(code) => {
+                            codes.push(dictionary.intern(&unified_values[position][code]));
+                            validity.push(true);
+                        }
+                        None => {
+                            codes.push(0);
+                            validity.push(false);
+                        }
+                    }
+                }
+                let nullable = validity.iter().any(|&valid| !valid);
+                let column = if nullable {
+                    KeyColumn::new_nullable(
+                        codes,
+                        Bitmap::from_bools(validity.iter().copied()),
+                        dictionary,
+                    )
+                } else {
+                    KeyColumn::new_non_null(codes, dictionary)
+                };
+                fields.push(Field::new(
+                    alias.as_deref().unwrap_or(name),
+                    ColumnType::Key,
+                    nullable,
+                ));
+                columns.push(Column::Key(column));
+            }
+            AggItem::Call(call) => {
+                let default_name = match call.function {
+                    AggFunction::Count => "count",
+                    AggFunction::Sum => "sum",
+                    AggFunction::Avg => "avg",
+                    AggFunction::Min => "min",
+                    AggFunction::Max => "max",
+                };
+                let name = call.alias.as_deref().unwrap_or(default_name);
+                let (field, column) = assemble_aggregate(
+                    name,
+                    accumulators.iter().map(|group| &group[next_call]),
+                    group_count,
+                );
+                fields.push(field);
+                columns.push(column);
+                next_call += 1;
+            }
+        }
+    }
+    let schema = Schema::new(fields);
+    let batches = if group_count == 0 {
+        Vec::new()
+    } else {
+        vec![RecordBatch::new(schema.clone(), columns)]
+    };
+    Ok(QueryOutput { schema, batches })
+}
+
+/// One aggregate output column from its per-group accumulators.
+fn assemble_aggregate<'a>(
+    name: &str,
+    accumulators: impl Iterator<Item = &'a Accumulator>,
+    groups: usize,
+) -> (Field, Column) {
+    let mut f64_values: Vec<Option<f64>> = Vec::with_capacity(groups);
+    let mut i64_values: Vec<Option<i64>> = Vec::with_capacity(groups);
+    let mut is_i64 = false;
+    for accumulator in accumulators {
+        match accumulator {
+            Accumulator::CountStar(count) | Accumulator::CountColumn(count) => {
+                is_i64 = true;
+                i64_values.push(Some(*count));
+            }
+            Accumulator::SumF64 { sum, seen } => f64_values.push(seen.then_some(*sum)),
+            Accumulator::SumI64 { sum, seen } => {
+                is_i64 = true;
+                i64_values.push(seen.then_some(*sum));
+            }
+            Accumulator::Avg { sum, count } => {
+                f64_values.push((*count > 0).then(|| sum / *count as f64))
+            }
+            Accumulator::MinMaxF64 { value, seen, .. } => f64_values.push(seen.then_some(*value)),
+            Accumulator::MinMaxI64 { value, seen, .. } => {
+                is_i64 = true;
+                i64_values.push(seen.then_some(*value));
+            }
+        }
+    }
+    if is_i64 {
+        let nullable = i64_values.iter().any(Option::is_none);
+        let values: Buffer<i64> = i64_values.iter().map(|value| value.unwrap_or(0)).collect();
+        let column = if nullable {
+            NumericColumn::new_nullable(
+                values,
+                Bitmap::from_bools(i64_values.iter().map(Option::is_some)),
+            )
+        } else {
+            NumericColumn::new_non_null(values)
+        };
+        (
+            Field::new(name, ColumnType::I64, nullable),
+            Column::Numeric(NumericData::I64(column)),
+        )
+    } else {
+        let nullable = f64_values.iter().any(Option::is_none);
+        let values: Buffer<f64> = f64_values
+            .iter()
+            .map(|value| value.unwrap_or(0.0))
+            .collect();
+        let column = if nullable {
+            NumericColumn::new_nullable(
+                values,
+                Bitmap::from_bools(f64_values.iter().map(Option::is_some)),
+            )
+        } else {
+            NumericColumn::new_non_null(values)
+        };
+        (
+            Field::new(name, ColumnType::F64, nullable),
+            Column::Numeric(NumericData::F64(column)),
+        )
+    }
+}
+
+/// A sortable view of one output cell.
+#[derive(Clone, PartialEq, PartialOrd)]
+enum SortCell {
+    I64(i64),
+    F64(f64),
+    Text(String),
+}
+
+/// Sorts the whole output by one column into a single batch — the
+/// materialization ORDER BY inherently asks for. Nulls follow the
+/// PostgreSQL (and DuckDB) default: last under ASC, first under DESC;
+/// `f64` uses total order, so NaN sorts above every number.
+fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, QueryError> {
+    let (column_index, _) = resolve(&output.schema, &order_by.column)?;
+    let mut picks: Vec<(usize, usize)> = Vec::with_capacity(output.num_rows());
+    let mut cells: Vec<Option<SortCell>> = Vec::with_capacity(output.num_rows());
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        let column = &batch.columns()[column_index];
+        for row in 0..batch.num_rows() {
+            picks.push((batch_index, row));
+            cells.push(match column {
+                Column::Numeric(NumericData::F64(numeric)) => numeric
+                    .is_valid(row)
+                    .then(|| SortCell::F64(numeric.values().as_slice()[row])),
+                Column::Numeric(NumericData::I64(numeric)) => numeric
+                    .is_valid(row)
+                    .then(|| SortCell::I64(numeric.values().as_slice()[row])),
+                Column::Key(keys) => keys
+                    .value_at(row)
+                    .map(|value| SortCell::Text(value.to_owned())),
+            });
+        }
+    }
+    let mut order: Vec<usize> = (0..picks.len()).collect();
+    let compare = |left: &Option<SortCell>, right: &Option<SortCell>| match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        // Nulls sort as the largest value (ASC last); DESC reversal
+        // below then puts them first — the PostgreSQL default.
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(SortCell::F64(left)), Some(SortCell::F64(right))) => left.total_cmp(right),
+        (Some(left), Some(right)) => left.partial_cmp(right).expect("same variant per column"),
+    };
+    order.sort_by(|&left, &right| {
+        let ordering = compare(&cells[left], &cells[right]);
+        if order_by.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    let picks: Vec<(usize, usize)> = order.into_iter().map(|index| picks[index]).collect();
+    let batch = take_rows(&output.schema, &output.batches, &picks);
+    Ok(QueryOutput {
+        schema: output.schema,
+        batches: vec![batch],
+    })
+}
+
+/// Applies OFFSET/LIMIT across the output's rows (in the output's
+/// current order), materializing the kept rows into one batch.
+fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> QueryOutput {
+    let keep = limit.unwrap_or(usize::MAX);
+    let picks: Vec<(usize, usize)> = output
+        .batches
+        .iter()
+        .enumerate()
+        .flat_map(|(batch_index, batch)| (0..batch.num_rows()).map(move |row| (batch_index, row)))
+        .skip(offset)
+        .take(keep)
+        .collect();
+    if picks.is_empty() {
+        return QueryOutput {
+            schema: output.schema,
+            batches: Vec::new(),
+        };
+    }
+    let batch = take_rows(&output.schema, &output.batches, &picks);
+    QueryOutput {
+        schema: output.schema,
+        batches: vec![batch],
+    }
+}
+
+/// Gathers `picks` (batch, row) into one batch. Key columns re-encode
+/// into a fresh dictionary — the sources' per-segment dictionaries don't
+/// share codes.
+fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)]) -> RecordBatch {
+    let columns = (0..schema.fields().len())
+        .map(|column_index| {
+            let cell_column = |batch: usize| &batches[batch].columns()[column_index];
+            match cell_column(picks.first().map(|&(batch, _)| batch).unwrap_or(0)) {
+                Column::Numeric(NumericData::F64(_)) => {
+                    let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
+                    let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+                    for &(batch, row) in picks {
+                        let Column::Numeric(NumericData::F64(numeric)) = cell_column(batch) else {
+                            unreachable!("batches share a schema")
+                        };
+                        values.push(numeric.values().as_slice()[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    assemble_numeric_f64(values, validity)
+                }
+                Column::Numeric(NumericData::I64(_)) => {
+                    let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
+                    let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+                    for &(batch, row) in picks {
+                        let Column::Numeric(NumericData::I64(numeric)) = cell_column(batch) else {
+                            unreachable!("batches share a schema")
+                        };
+                        values.push(numeric.values().as_slice()[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    assemble_numeric_i64(values, validity)
+                }
+                Column::Key(_) => {
+                    let mut dictionary = Dictionary::new();
+                    let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
+                    let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
+                    for &(batch, row) in picks {
+                        let Column::Key(keys) = cell_column(batch) else {
+                            unreachable!("batches share a schema")
+                        };
+                        match keys.value_at(row) {
+                            Some(value) => {
+                                codes.push(dictionary.intern(value));
+                                validity.push(true);
+                            }
+                            None => {
+                                codes.push(0);
+                                validity.push(false);
+                            }
+                        }
+                    }
+                    let column = if validity.iter().any(|&valid| !valid) {
+                        KeyColumn::new_nullable(
+                            codes,
+                            Bitmap::from_bools(validity.iter().copied()),
+                            dictionary,
+                        )
+                    } else {
+                        KeyColumn::new_non_null(codes, dictionary)
+                    };
+                    Column::Key(column)
+                }
+            }
+        })
+        .collect();
+    RecordBatch::new(schema.clone(), columns)
+}
+
+fn assemble_numeric_f64(values: Buffer<f64>, validity: Vec<bool>) -> Column {
+    let column = if validity.iter().any(|&valid| !valid) {
+        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
+    } else {
+        NumericColumn::new_non_null(values)
+    };
+    Column::Numeric(NumericData::F64(column))
+}
+
+fn assemble_numeric_i64(values: Buffer<i64>, validity: Vec<bool>) -> Column {
+    let column = if validity.iter().any(|&valid| !valid) {
+        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
+    } else {
+        NumericColumn::new_non_null(values)
+    };
+    Column::Numeric(NumericData::I64(column))
+}
+
 /// One view's output column: nullable f64, bitmap only if a window
 /// actually came back undefined.
 fn assemble_f64(results: Vec<Option<f64>>) -> Column {
@@ -538,13 +1145,13 @@ mod tests {
         }
     }
 
-    fn registry() -> Registry {
+    pub(super) fn registry() -> Registry {
         let mut registry = Registry::new();
         registry.register("mean", Arc::new(Mean));
         registry
     }
 
-    fn schema() -> Schema {
+    pub(super) fn schema() -> Schema {
         Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
             Field::new("sym", ColumnType::Key, false),
@@ -553,7 +1160,7 @@ mod tests {
     }
 
     /// One mask-free view holding `rows`, as the M1 tests built.
-    fn segment(rows: &[(i64, &str, f64)]) -> Vec<SegmentView> {
+    pub(super) fn segment(rows: &[(i64, &str, f64)]) -> Vec<SegmentView> {
         let mut buffer = WriteBuffer::new(schema(), 0).unwrap();
         for &(ts, sym, x) in rows {
             buffer
@@ -565,7 +1172,7 @@ mod tests {
 
     /// The same rows split into segments of `segment_rows` via a Store —
     /// the multi-segment shape queries actually run over.
-    fn store(rows: &[(i64, &str, f64)], segment_rows: usize) -> Store {
+    pub(super) fn store(rows: &[(i64, &str, f64)], segment_rows: usize) -> Store {
         let mut store = Store::with_segment_rows(schema(), 0, segment_rows).unwrap();
         for &(ts, sym, x) in rows {
             store
@@ -575,11 +1182,11 @@ mod tests {
         store
     }
 
-    fn segmented(rows: &[(i64, &str, f64)], segment_rows: usize) -> Vec<SegmentView> {
+    pub(super) fn segmented(rows: &[(i64, &str, f64)], segment_rows: usize) -> Vec<SegmentView> {
         store(rows, segment_rows).snapshot().unwrap()
     }
 
-    fn f64_column(batch: &RecordBatch, index: usize) -> &NumericColumn<f64> {
+    pub(super) fn f64_column(batch: &RecordBatch, index: usize) -> &NumericColumn<f64> {
         let Column::Numeric(NumericData::F64(column)) = &batch.columns()[index] else {
             panic!("expected f64 column")
         };
@@ -588,7 +1195,7 @@ mod tests {
 
     /// Flattens one output column of a multi-batch result into
     /// `Option<f64>` per row, for comparison against a reference.
-    fn flatten(output: &QueryOutput, index: usize) -> Vec<Option<f64>> {
+    pub(super) fn flatten(output: &QueryOutput, index: usize) -> Vec<Option<f64>> {
         output
             .batches
             .iter()
@@ -601,7 +1208,7 @@ mod tests {
             .collect()
     }
 
-    fn run(views: &[SegmentView], sql: &str) -> Result<QueryOutput, QueryError> {
+    pub(super) fn run(views: &[SegmentView], sql: &str) -> Result<QueryOutput, QueryError> {
         execute(&schema(), views, &plan(sql).unwrap(), &registry())
     }
 
@@ -852,7 +1459,7 @@ mod tests {
             ("SELECT nope FROM t", "unknown column"),
             (
                 "SELECT nope(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-                "unknown window function",
+                "unknown function",
             ),
             (
                 "SELECT mean(sym) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
@@ -906,5 +1513,290 @@ mod tests {
         );
         disordered.tombstone(&[1]).unwrap();
         run(&disordered.snapshot().unwrap(), sql).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod query1_tests {
+    use super::tests::{f64_column, flatten, run, schema, segment, segmented, store};
+    use super::*;
+
+    #[test]
+    fn where_filters_before_everything() {
+        let rows: &[(i64, &str, f64)] = &[
+            (1, "A", 1.0),
+            (2, "B", 2.0),
+            (3, "A", 3.0),
+            (4, "B", 4.0),
+            (5, "A", 5.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(&views, "SELECT x FROM t WHERE sym = 'A' AND ts > 1").unwrap();
+            assert_eq!(flatten(&output, 0), [Some(3.0), Some(5.0)]);
+            // WHERE applies before windows (standard SQL): the window
+            // sees only surviving rows, exactly as if the others were
+            // never ingested.
+            let filtered = run(
+                &views,
+                "SELECT mean(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM t WHERE sym = 'A'",
+            )
+            .unwrap();
+            let reference = run(
+                &segment(&[(1, "A", 1.0), (3, "A", 3.0), (5, "A", 5.0)]),
+                "SELECT mean(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&filtered, 0), flatten(&reference, 0));
+        }
+    }
+
+    #[test]
+    fn aggregates_match_hand_computation() {
+        let rows: &[(i64, &str, f64)] = &[
+            (1, "A", 1.0),
+            (2, "B", 10.0),
+            (3, "A", 2.0),
+            (4, "B", 20.0),
+            (5, "A", 6.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(
+                &views,
+                "SELECT sym, count(*) AS n, sum(x) AS total, avg(x) AS mean_x, \
+                 min(x) AS low, max(x) AS high FROM t GROUP BY sym ORDER BY sym",
+            )
+            .unwrap();
+            assert_eq!(output.batches.len(), 1);
+            let batch = &output.batches[0];
+            let Column::Key(sym) = &batch.columns()[0] else {
+                panic!("sym type")
+            };
+            assert_eq!(sym.value_at(0), Some("A"));
+            assert_eq!(sym.value_at(1), Some("B"));
+            let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
+                panic!("count type")
+            };
+            assert_eq!(n.values().as_slice(), &[3, 2]);
+            assert_eq!(f64_column(batch, 2).values().as_slice(), &[9.0, 30.0]);
+            assert_eq!(f64_column(batch, 3).values().as_slice(), &[3.0, 15.0]);
+            assert_eq!(f64_column(batch, 4).values().as_slice(), &[1.0, 10.0]);
+            assert_eq!(f64_column(batch, 5).values().as_slice(), &[6.0, 20.0]);
+        }
+    }
+
+    #[test]
+    fn global_aggregates_emit_one_row_even_over_nothing() {
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0)]);
+        let output = run(&views, "SELECT count(*) AS n, sum(x) AS s FROM t").unwrap();
+        let batch = &output.batches[0];
+        let Column::Numeric(NumericData::I64(n)) = &batch.columns()[0] else {
+            panic!("count type")
+        };
+        assert_eq!(n.values().as_slice(), &[1 + 1]);
+        // Over a fully filtered table: COUNT is 0, SUM is NULL — SQL.
+        let output = run(
+            &views,
+            "SELECT count(*) AS n, sum(x) AS s FROM t WHERE ts > 99",
+        )
+        .unwrap();
+        let batch = &output.batches[0];
+        let Column::Numeric(NumericData::I64(n)) = &batch.columns()[0] else {
+            panic!("count type")
+        };
+        assert_eq!(n.values().as_slice(), &[0]);
+        let s = f64_column(batch, 1);
+        assert!(!s.is_valid(0));
+        // With GROUP BY and nothing surviving: zero groups, zero batches.
+        let output = run(
+            &views,
+            "SELECT sym, count(*) FROM t WHERE ts > 99 GROUP BY sym",
+        )
+        .unwrap();
+        assert_eq!(output.batches.len(), 0);
+    }
+
+    #[test]
+    fn sum_of_i64_is_exact_and_overflow_is_loud() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("n", ColumnType::I64, false),
+        ]);
+        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        for (ts, n) in [(1, i64::MAX - 1), (2, 1)] {
+            buffer
+                .append(&[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::I64(n),
+                ])
+                .unwrap();
+        }
+        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let output = execute(
+            &schema,
+            &views,
+            &crate::plan::plan("SELECT sum(n) AS s FROM t").unwrap(),
+            &Registry::new(),
+        )
+        .unwrap();
+        let Column::Numeric(NumericData::I64(s)) = &output.batches[0].columns()[0] else {
+            panic!("sum type")
+        };
+        assert_eq!(s.values().as_slice(), &[i64::MAX]);
+        // One more row overflows: a loud error, never a wrong answer.
+        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        for (ts, n) in [(1, i64::MAX), (2, 1)] {
+            buffer
+                .append(&[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::I64(n),
+                ])
+                .unwrap();
+        }
+        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        assert!(matches!(
+            execute(
+                &schema,
+                &views,
+                &crate::plan::plan("SELECT sum(n) FROM t").unwrap(),
+                &Registry::new(),
+            ),
+            Err(QueryError::Compute(_))
+        ));
+    }
+
+    #[test]
+    fn order_by_sorts_and_limit_trims() {
+        let rows: &[(i64, &str, f64)] = &[
+            (1, "B", 3.0),
+            (2, "A", 1.0),
+            (3, "C", 2.0),
+            (4, "A", 5.0),
+            (5, "B", 4.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(&views, "SELECT ts, x FROM t ORDER BY x").unwrap();
+            assert_eq!(output.batches.len(), 1); // materialized
+            assert_eq!(
+                flatten(&output, 1),
+                [Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0)]
+            );
+            let output = run(&views, "SELECT ts, x FROM t ORDER BY x DESC LIMIT 2").unwrap();
+            assert_eq!(flatten(&output, 1), [Some(5.0), Some(4.0)]);
+            let output = run(&views, "SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1").unwrap();
+            assert_eq!(flatten(&output, 0), [Some(2.0), Some(3.0)]);
+            // Keys sort by rendered value, not by dictionary code.
+            let output = run(&views, "SELECT sym, x FROM t ORDER BY sym").unwrap();
+            let Column::Key(sym) = &output.batches[0].columns()[0] else {
+                panic!("sym type")
+            };
+            let values: Vec<&str> = (0..5).map(|row| sym.value_at(row).unwrap()).collect();
+            assert_eq!(values, ["A", "A", "B", "B", "C"]);
+            // LIMIT without ORDER BY keeps ingest order.
+            let output = run(&views, "SELECT ts FROM t LIMIT 3").unwrap();
+            let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {
+                panic!("ts type")
+            };
+            assert_eq!(ts.values().as_slice(), &[1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn order_by_nulls_follow_postgres_defaults() {
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "C", 3.0)]);
+        // A window column with a NULL first row provides the nulls.
+        let sql_asc = "SELECT needs2(x) OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING AND \
+                       CURRENT ROW) AS w FROM t ORDER BY w";
+        let sql_desc = "SELECT needs2(x) OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING AND \
+                        CURRENT ROW) AS w FROM t ORDER BY w DESC";
+        struct NeedsTwo;
+        impl WindowAggregate for NeedsTwo {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok((args[0].len() >= 2).then(|| args[0][args[0].len() - 1]))
+            }
+        }
+        let mut registry = Registry::new();
+        registry.register("needs2", Arc::new(NeedsTwo));
+        let ascending = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql_asc).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&ascending, 0), [Some(2.0), Some(3.0), None]); // nulls last
+        let descending = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql_desc).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&descending, 0), [None, Some(3.0), Some(2.0)]); // nulls first
+    }
+
+    #[test]
+    fn where_composes_with_mutation_masks() {
+        // WHERE ANDs into tombstone masks rather than replacing them.
+        let mut store = store(
+            &[(1, "A", 1.0), (2, "A", 2.0), (3, "A", 3.0), (4, "A", 4.0)],
+            100,
+        );
+        store.tombstone(&[1]).unwrap(); // ts=2 dies
+        let output = run(&store.snapshot().unwrap(), "SELECT ts FROM t WHERE ts <= 3").unwrap();
+        let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {
+            panic!("ts type")
+        };
+        assert_eq!(ts.values().as_slice(), &[1, 3]);
+    }
+
+    #[test]
+    fn group_by_multiple_keys_uses_composite_groups() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("a", ColumnType::Key, false),
+            Field::new("b", ColumnType::Key, false),
+        ]);
+        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        for (ts, a, b) in [(1, "x", "p"), (2, "x", "q"), (3, "x", "p"), (4, "y", "q")] {
+            buffer
+                .append(&[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::Key(a),
+                    storage_lite::RowValue::Key(b),
+                ])
+                .unwrap();
+        }
+        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let output = execute(
+            &schema,
+            &views,
+            &crate::plan::plan("SELECT a, b, count(*) AS n FROM t GROUP BY a, b ORDER BY n DESC")
+                .unwrap(),
+            &Registry::new(),
+        )
+        .unwrap();
+        let batch = &output.batches[0];
+        assert_eq!(batch.num_rows(), 3); // (x,p)=2, (x,q)=1, (y,q)=1
+        let Column::Numeric(NumericData::I64(n)) = &batch.columns()[2] else {
+            panic!("count type")
+        };
+        assert_eq!(n.values().as_slice()[0], 2);
+    }
+
+    #[test]
+    fn grouping_by_numeric_is_refused_by_design() {
+        let views = segment(&[(1, "A", 1.0)]);
+        let error = run(&views, "SELECT x, count(*) FROM t GROUP BY x")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("keys"), "{error}");
     }
 }

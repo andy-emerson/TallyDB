@@ -34,7 +34,8 @@ pub enum QueryError {
     Unsupported(String),
     /// A referenced column does not exist.
     UnknownColumn(String),
-    /// A window function nobody registered.
+    /// A function that is neither a standard aggregate nor a registered
+    /// window function.
     UnknownFunction(String),
     /// A column has the wrong type for its role.
     TypeError(String),
@@ -50,7 +51,7 @@ impl fmt::Display for QueryError {
             QueryError::Parse(message) => write!(f, "parse error: {message}"),
             QueryError::Unsupported(what) => write!(f, "unsupported SQL: {what}"),
             QueryError::UnknownColumn(name) => write!(f, "unknown column '{name}'"),
-            QueryError::UnknownFunction(name) => write!(f, "unknown window function '{name}'"),
+            QueryError::UnknownFunction(name) => write!(f, "unknown function '{name}'"),
             QueryError::TypeError(message) => write!(f, "type error: {message}"),
             QueryError::Unordered(message) => write!(f, "data not ordered: {message}"),
             QueryError::Compute(message) => write!(f, "compute error: {message}"),
@@ -87,13 +88,98 @@ pub enum PlanItem {
     },
 }
 
-/// The SELECT plan: one table, a list of items.
+/// A standard SQL aggregate function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AggFunction {
+    /// `COUNT(*)` / `COUNT(col)`.
+    Count,
+    /// `SUM(col)`.
+    Sum,
+    /// `AVG(col)`.
+    Avg,
+    /// `MIN(col)`.
+    Min,
+    /// `MAX(col)`.
+    Max,
+}
+
+impl AggFunction {
+    fn from_name(name: &str) -> Option<AggFunction> {
+        match name {
+            "count" => Some(AggFunction::Count),
+            "sum" => Some(AggFunction::Sum),
+            "avg" => Some(AggFunction::Avg),
+            "min" => Some(AggFunction::Min),
+            "max" => Some(AggFunction::Max),
+            _ => None,
+        }
+    }
+}
+
+/// One plain (non-window) aggregate call in an aggregate projection.
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AggCall {
+    /// The function.
+    pub function: AggFunction,
+    /// The argument column; `None` is `COUNT(*)`.
+    pub argument: Option<String>,
+    /// Output name, if aliased.
+    pub alias: Option<String>,
+}
+
+/// One output column of an aggregate projection, in SELECT-list order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AggItem {
+    /// A GROUP BY key, passed through (must appear in the GROUP BY
+    /// list).
+    Key {
+        /// The key column.
+        name: String,
+        /// Output name, if aliased.
+        alias: Option<String>,
+    },
+    /// An aggregate call.
+    Call(AggCall),
+}
+
+/// What the SELECT list computes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Projection {
+    /// Plain columns and window calls, one output row per input row.
+    Items(Vec<PlanItem>),
+    /// `GROUP BY` keys and aggregate calls, one output row per group.
+    Aggregate {
+        /// The GROUP BY key columns (empty = one global group).
+        keys: Vec<String>,
+        /// The SELECT list.
+        items: Vec<AggItem>,
+    },
+}
+
+/// Top-level `ORDER BY`: one output column, a direction.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OrderBy {
+    /// The output column name (after aliasing).
+    pub column: String,
+    /// `true` for `DESC`.
+    pub descending: bool,
+}
+
+/// The SELECT plan.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Plan {
-    /// The FROM table's name (resolved to a segment by the embedder).
+    /// The FROM table's name (resolved to a snapshot by the embedder).
     pub table: String,
-    /// The SELECT list.
-    pub items: Vec<PlanItem>,
+    /// What the SELECT list computes.
+    pub projection: Projection,
+    /// The WHERE predicate, applied before everything else.
+    pub predicate: Option<Predicate>,
+    /// Top-level ORDER BY, applied to the projected output.
+    pub order_by: Option<OrderBy>,
+    /// `LIMIT`, applied last (with `offset`).
+    pub limit: Option<usize>,
+    /// `OFFSET`.
+    pub offset: Option<usize>,
 }
 
 /// A value the right side of `SET column = ...` may hold.
@@ -266,36 +352,87 @@ fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {
     if query.with.is_some() {
         return Err(QueryError::Unsupported("WITH / CTEs".to_owned()));
     }
-    if !query.order_by.as_ref().is_none_or(order_by_is_empty) {
-        return Err(QueryError::Unsupported(
-            "top-level ORDER BY (results keep ingest order in M1)".to_owned(),
-        ));
-    }
-    if query.limit_clause.is_some() {
-        return Err(QueryError::Unsupported("LIMIT / OFFSET".to_owned()));
-    }
+    let order_by = lower_order_by(query.order_by.as_ref())?;
+    let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err(QueryError::Unsupported(
             "set operations / VALUES".to_owned(),
         ));
     };
-    lower_select(select)
+    let mut plan = lower_select(select)?;
+    plan.order_by = order_by;
+    plan.limit = limit;
+    plan.offset = offset;
+    Ok(plan)
 }
 
-fn order_by_is_empty(order_by: &ast::OrderBy) -> bool {
-    matches!(&order_by.kind, ast::OrderByKind::Expressions(exprs) if exprs.is_empty())
+fn lower_order_by(order_by: Option<&ast::OrderBy>) -> Result<Option<OrderBy>, QueryError> {
+    let Some(order_by) = order_by else {
+        return Ok(None);
+    };
+    let ast::OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return Err(QueryError::Unsupported("ORDER BY ALL".to_owned()));
+    };
+    match exprs.as_slice() {
+        [] => Ok(None),
+        [order] => {
+            let ast::Expr::Identifier(column) = &order.expr else {
+                return Err(QueryError::Unsupported(
+                    "ORDER BY must name an output column".to_owned(),
+                ));
+            };
+            Ok(Some(OrderBy {
+                column: ident(column),
+                descending: order.options.asc == Some(false),
+            }))
+        }
+        _ => Err(QueryError::Unsupported(
+            "ORDER BY one column (multi-column ordering not yet lowered)".to_owned(),
+        )),
+    }
+}
+
+fn lower_limit(
+    limit_clause: Option<&ast::LimitClause>,
+) -> Result<(Option<usize>, Option<usize>), QueryError> {
+    let Some(clause) = limit_clause else {
+        return Ok((None, None));
+    };
+    let ast::LimitClause::LimitOffset {
+        limit,
+        offset,
+        limit_by,
+    } = clause
+    else {
+        return Err(QueryError::Unsupported("OFFSET ... FETCH".to_owned()));
+    };
+    if !limit_by.is_empty() {
+        return Err(QueryError::Unsupported("LIMIT ... BY".to_owned()));
+    }
+    let number = |expr: &ast::Expr, what: &str| -> Result<usize, QueryError> {
+        if let ast::Expr::Value(value) = expr {
+            if let ast::Value::Number(text, _) = &value.value {
+                if let Ok(value) = text.parse::<usize>() {
+                    return Ok(value);
+                }
+            }
+        }
+        Err(QueryError::Unsupported(format!(
+            "{what} must be a non-negative integer literal"
+        )))
+    };
+    let limit = limit
+        .as_ref()
+        .map(|expr| number(expr, "LIMIT"))
+        .transpose()?;
+    let offset = offset
+        .as_ref()
+        .map(|offset| number(&offset.value, "OFFSET"))
+        .transpose()?;
+    Ok((limit, offset))
 }
 
 fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
-    if select.selection.is_some() {
-        return Err(QueryError::Unsupported("WHERE (arrives at M2)".to_owned()));
-    }
-    if !matches!(&select.group_by, ast::GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty())
-    {
-        return Err(QueryError::Unsupported(
-            "GROUP BY (arrives at M2)".to_owned(),
-        ));
-    }
     if select.having.is_some() || select.distinct.is_some() {
         return Err(QueryError::Unsupported("HAVING / DISTINCT".to_owned()));
     }
@@ -314,11 +451,126 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
         ));
     };
     let table = object_name(name)?;
-    let mut items = Vec::with_capacity(select.projection.len());
-    for projection in &select.projection {
-        items.push(lower_item(projection)?);
+    let predicate = select.selection.as_ref().map(lower_predicate).transpose()?;
+    let keys = lower_group_by(&select.group_by)?;
+    // An aggregate projection is signaled by GROUP BY or by any plain
+    // (no OVER) call to a standard aggregate in the SELECT list.
+    let aggregate_shaped = !keys.is_empty()
+        || select.projection.iter().any(|item| {
+            let expr = match item {
+                ast::SelectItem::UnnamedExpr(expr) => expr,
+                ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => return false,
+            };
+            matches!(expr, ast::Expr::Function(function) if function.over.is_none())
+        });
+    let projection = if aggregate_shaped {
+        let mut items = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            items.push(lower_agg_item(item, &keys)?);
+        }
+        Projection::Aggregate { keys, items }
+    } else {
+        let mut items = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            items.push(lower_item(item)?);
+        }
+        Projection::Items(items)
+    };
+    Ok(Plan {
+        table,
+        projection,
+        predicate,
+        order_by: None,
+        limit: None,
+        offset: None,
+    })
+}
+
+fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError> {
+    let ast::GroupByExpr::Expressions(exprs, modifiers) = group_by else {
+        return Err(QueryError::Unsupported("GROUP BY ALL".to_owned()));
+    };
+    if !modifiers.is_empty() {
+        return Err(QueryError::Unsupported(
+            "GROUP BY ROLLUP / CUBE / GROUPING SETS".to_owned(),
+        ));
     }
-    Ok(Plan { table, items })
+    exprs
+        .iter()
+        .map(|expr| match expr {
+            ast::Expr::Identifier(column) => Ok(ident(column)),
+            other => Err(QueryError::Unsupported(format!(
+                "GROUP BY '{other}' (plain key columns only)"
+            ))),
+        })
+        .collect()
+}
+
+fn lower_agg_item(item: &ast::SelectItem, keys: &[String]) -> Result<AggItem, QueryError> {
+    let (expr, alias) = match item {
+        ast::SelectItem::UnnamedExpr(expr) => (expr, None),
+        ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident(alias))),
+        _ => {
+            return Err(QueryError::Unsupported(
+                "wildcard projection (name the columns)".to_owned(),
+            ))
+        }
+    };
+    match expr {
+        ast::Expr::Identifier(name) => {
+            let name = ident(name);
+            if !keys.contains(&name) {
+                return Err(QueryError::Unsupported(format!(
+                    "column '{name}' must appear in GROUP BY or an aggregate"
+                )));
+            }
+            Ok(AggItem::Key { name, alias })
+        }
+        ast::Expr::Function(function) if function.over.is_none() => {
+            let name = object_name(&function.name)?.to_lowercase();
+            let Some(agg) = AggFunction::from_name(&name) else {
+                return Err(QueryError::UnknownFunction(name));
+            };
+            let argument = lower_agg_argument(&function.args, agg)?;
+            Ok(AggItem::Call(AggCall {
+                function: agg,
+                argument,
+                alias,
+            }))
+        }
+        other => Err(QueryError::Unsupported(format!(
+            "expression '{other}' in an aggregate SELECT list"
+        ))),
+    }
+}
+
+/// `COUNT(*)` has no argument column; everything else takes exactly one
+/// plain column.
+fn lower_agg_argument(
+    args: &ast::FunctionArguments,
+    function: AggFunction,
+) -> Result<Option<String>, QueryError> {
+    let ast::FunctionArguments::List(list) = args else {
+        return Err(QueryError::Unsupported(
+            "aggregate call without an argument list".to_owned(),
+        ));
+    };
+    match list.args.as_slice() {
+        [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] => {
+            if function == AggFunction::Count {
+                Ok(None)
+            } else {
+                Err(QueryError::Unsupported("only COUNT takes '*'".to_owned()))
+            }
+        }
+        [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Identifier(column)))] => {
+            Ok(Some(ident(column)))
+        }
+        other => Err(QueryError::Unsupported(format!(
+            "aggregate arguments {other:?} (one plain column, or * for COUNT)"
+        ))),
+    }
 }
 
 fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
@@ -350,7 +602,7 @@ fn lower_window_call(
     let name = object_name(&function.name)?.to_lowercase();
     let Some(over) = &function.over else {
         return Err(QueryError::Unsupported(format!(
-            "plain aggregate '{name}' (only window calls with OVER in M1)"
+            "plain call '{name}' outside an aggregate projection"
         )));
     };
     let ast::WindowType::WindowSpec(spec) = over else {
@@ -477,8 +729,8 @@ mod tests {
         .expect("plans");
         assert_eq!(plan.table, "trades");
         assert_eq!(
-            plan.items,
-            vec![
+            plan.projection,
+            Projection::Items(vec![
                 PlanItem::Column {
                     name: "ts".into(),
                     alias: None
@@ -495,7 +747,7 @@ mod tests {
                     preceding: 19,
                     alias: Some("beta".into()),
                 },
-            ]
+            ])
         );
     }
 
@@ -506,28 +758,30 @@ mod tests {
         )
         .expect("plans");
         assert_eq!(
-            plan.items,
-            vec![PlanItem::WindowAgg {
+            plan.projection,
+            Projection::Items(vec![PlanItem::WindowAgg {
                 function: "mean".into(),
                 args: vec!["x".into()],
                 partition_by: None,
                 order_by: "ts".into(),
                 preceding: 2,
                 alias: None,
-            }]
+            }])
         );
     }
 
     #[test]
     fn rejections_name_the_construct() {
         for (sql, needle) in [
-            ("SELECT x FROM t WHERE x > 1", "WHERE"),
-            ("SELECT x FROM t GROUP BY x", "GROUP BY"),
             ("SELECT * FROM t", "wildcard"),
             ("SELECT x FROM t JOIN u ON t.a = u.a", "JOIN"),
-            ("SELECT x FROM t LIMIT 5", "LIMIT"),
-            ("SELECT x FROM t ORDER BY x", "top-level ORDER BY"),
-            ("SELECT sum(x) FROM t", "OVER"),
+            ("SELECT x FROM t ORDER BY x, y", "one column"),
+            ("SELECT x FROM t WHERE x > 1 HAVING x > 2", "HAVING"),
+            ("SELECT DISTINCT x FROM t", "DISTINCT"),
+            ("SELECT x, sum(y) FROM t GROUP BY x, x + 1", "plain key columns"),
+            ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
+            ("SELECT nope_agg(x) FROM t", "nope_agg"),
+            ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
             (
                 "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
                 "ROWS only",
