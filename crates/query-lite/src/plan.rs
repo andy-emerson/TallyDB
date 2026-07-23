@@ -1,19 +1,23 @@
-//! Parsing and lowering: SQL text → the M1 logical plan.
+//! Parsing and lowering: SQL text → logical plans.
 //!
 //! sqlparser-rs parses (taken as-is, pinned); the subsetting happens
-//! here, in what this lowering accepts. The M1 shape is exactly:
+//! here, in what this lowering accepts. Three statements lower today:
 //!
 //! ```sql
 //! SELECT <column | fn(args) OVER (
 //!            [PARTITION BY key] ORDER BY ordering_key
 //!            ROWS BETWEEN n PRECEDING AND CURRENT ROW)>, ...
-//! FROM table
+//! FROM table;
+//! UPDATE table SET column = literal, ... [WHERE predicate];
+//! DELETE FROM table [WHERE predicate];
 //! ```
 //!
-//! Everything else — WHERE, GROUP BY, joins, subqueries, other frame
-//! shapes — is rejected with a message naming what was rejected. The
-//! rejection is scope honesty, not a parser limit: those features arrive
-//! at M2 through this same lowering.
+//! (the predicate fragment is documented in [`crate::predicate`]).
+//! Everything else — WHERE on SELECT, GROUP BY, joins, subqueries,
+//! other frame shapes, SET expressions beyond literals — is rejected
+//! with a message naming what was rejected. The rejection is scope
+//! honesty, not a parser limit: those features arrive through this same
+//! lowering as M2 proceeds.
 
 use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;

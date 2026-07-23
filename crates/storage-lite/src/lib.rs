@@ -74,14 +74,17 @@
 //! per-table [`store::Store`] with internal row ids, the deterministic
 //! golden-locked on-disk format with zone maps and per-column codec
 //! tags ([`mod@format`]), delta-of-delta for the ordered ordering key
-//! ([`codec`], measurement cited there), and persistence with
-//! reopen-and-verify behind the backend trait ([`io`]). Durability
-//! boundary: [`store::Store::flush`].
+//! ([`codec`], measurement cited there), persistence with
+//! reopen-and-verify behind the backend trait ([`io`]), row-id
+//! tombstones with append-only delete logs ([`tombstone`]), live-masked
+//! snapshots, and crash-safe generational compaction that resolves
+//! tombstones, restores order, and reassigns contiguous row ids
+//! ([`store::Store::compact`]). Durability boundary:
+//! [`store::Store::flush`].
 //!
-//! Still ahead: tombstones and "newest version wins" resolution,
-//! compaction (both M2.3), zone-map pruning at query time (with WHERE,
-//! M2.4), and the general-`f64` codec (#30, deferred by ruling —
-//! uncompressed behind the tag is the shipped interim answer).
+//! Still ahead: zone-map pruning at query time (with WHERE, M2.4) and
+//! the general-`f64` codec (#30, deferred by ruling — uncompressed
+//! behind the tag is the shipped interim answer).
 //!
 //! ## Explicitly NOT in scope for this crate
 //! No SQL, no query planning — that's `query-lite`. No schema-level
@@ -100,6 +103,3 @@ pub use format::{decode_segment, encode_segment, FormatError};
 pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
 pub use store::{SegmentView, Store, DEFAULT_SEGMENT_ROWS};
-
-// TODO: tombstone record + "newest version wins" read resolution
-// TODO: compaction: merge segments, drop resolved tombstones
