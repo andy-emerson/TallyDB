@@ -131,6 +131,87 @@ pub extern "C" fn tallydb_m1_window_preceding() -> u64 {
     PRECEDING as u64
 }
 
+/// The corpus fixture: 5,000 rows of the telemetry family (seed 24) —
+/// jittered 1s cadence, 8 sensors, ~1% late arrivals, ~2% nulls in
+/// `y` — ingested through the real append path and **compacted**, so
+/// the ~1% disorder is resolved the way the design resolves it and
+/// every query shape (windows included) runs. `ts` values are unique by
+/// construction (cadence far exceeds jitter), which is what lets the
+/// differential compare under `ORDER BY ts` as a total order.
+fn corpus_table() -> Table {
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("x", ColumnType::F64, false),
+        Field::new("y", ColumnType::F64, true),
+    ]);
+    let mut table =
+        Table::with_segment_rows("corpus", schema, "ts", 512).expect("corpus schema is valid");
+    for row in corpus::Spec::telemetry(5_000, 24).generate() {
+        let label = corpus::key_label(row.key);
+        table
+            .append(&[
+                RowValue::I64(row.ts),
+                RowValue::Key(&label),
+                RowValue::F64(row.value),
+                row.aux.map_or(RowValue::Null, RowValue::F64),
+            ])
+            .expect("corpus rows are valid");
+    }
+    table.compact().expect("corpus compaction succeeds");
+    table
+}
+
+/// Exports the corpus fixture's raw rows (`ts, sym, x, y`), for the
+/// differential script to replicate into DuckDB.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_corpus_inputs_stream(out: *mut ArrowArrayStream) {
+    let table = corpus_table();
+    match table.query_stream("SELECT ts, sym, x, y FROM corpus") {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("corpus export failed: {error}"),
+    }
+}
+
+/// Runs one SQL statement (NUL-terminated UTF-8) against the corpus
+/// fixture and exports the result. Returns 0 on success; on failure
+/// prints the error to stderr and returns 1 with `out` untouched — the
+/// differential script treats that as a failed query, loudly.
+///
+/// # Safety
+/// `sql` must be a valid NUL-terminated string and `out` a valid,
+/// writable destination not holding a live export.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_corpus_query_stream(
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_corpus_query_stream: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    let table = corpus_table();
+    match table.query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_corpus_query_stream: {sql}: {error}");
+            1
+        }
+    }
+}
+
 /// The mutation sequence the differential oracle replays in DuckDB.
 /// KEEP IN SYNC with `MUTATIONS` in `tests/m2_mutation_oracle.py` — a
 /// mismatch fails the oracle loudly, it cannot pass silently.
