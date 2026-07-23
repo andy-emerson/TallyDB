@@ -19,9 +19,14 @@
 > the standard aggregates as window functions over trailing and
 > unbounded frames — every query family born cross-checked by a
 > generated DuckDB differential harness over the checked-in corpus (38
-> query families and counting). The compute breadth (eigen/solve/
-> Cholesky, BLAS) and the Lua surface are still ahead. The
-> developer-facing design lives in
+> query families and counting). Compute has its breadth: symmetric
+> eigenvalues, linear solve, and Cholesky behind the capability trait,
+> least squares running QR with an SVD fallback (#20, criterion
+> measured and documented), native BLAS primitives, and `covar_pop` /
+> `corr` / `eigen_max` as SQL window functions — cross-checked against
+> DuckDB and NumPy in CI. Of M2's plan, only the deferred pair remains:
+> the Lua layer (#5) and the f64 codec A/B (#30). The developer-facing
+> design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -201,11 +206,11 @@ corpus in CI;
 `compute-lapack` links system
 LAPACK and solves least squares through `dgels` behind a
 capability-negotiating trait; and `engine` ties them together behind a
-multi-table `Database` handle, registering `regr_slope` /
-`regr_intercept` as SQL window functions whose every window is
-re-derived independently by `np.linalg.lstsq` and DuckDB in CI — over
-a fixture that spans several segments, so cross-segment windows are in
-the cross-check. Passthrough results share the stored buffers
+multi-table `Database` handle, registering `regr_slope` / `regr_intercept`, `covar_pop` / `corr`,
+and `eigen_max` (the window's first principal-component variance, via
+`dsyev`) as SQL window functions — every window re-derived
+independently by NumPy and DuckDB in CI, over a fixture that spans
+several segments and a storage round trip. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
 are the bounded copies, as recorded in the crate docs. `compute-blas` and
 `compute-lua` remain scaffolds: documented boundaries and settled
