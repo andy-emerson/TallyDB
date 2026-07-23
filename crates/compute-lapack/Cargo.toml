@@ -20,3 +20,4 @@ arrow-lite = { path = "../arrow-lite" }
 # WASM milestone actually starts.
 
 [dev-dependencies]
+proptest = "1"

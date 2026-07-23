@@ -58,9 +58,10 @@
 //! No autodiff. No general tensor operations. No "as much of LAPACK as we can
 //! wrap" — see the curated list above.
 
-// TODO: LAPACK-class backend trait (native-LAPACK-via-FFI implementation
-//       first), with capability negotiation baked in from the start
-// TODO: least-squares solve (regression)
+pub mod backend;
+
+pub use backend::{ColMajor, ComputeError, LapackBackend, NativeLapack, Op};
+
 // TODO: symmetric eigendecomposition (covariance / PCA)
 // TODO: general linear solve (portfolio weights / factor models)
 // TODO: Cholesky (fast path for positive-definite covariance)
