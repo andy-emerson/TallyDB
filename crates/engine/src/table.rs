@@ -27,7 +27,7 @@ use compute_lapack::{ColMajor, ComputeError, LapackBackend, NativeLapack, Op};
 use query_lite::{execute, plan, Plan, QueryError, QueryOutput, Registry, WindowAggregate};
 use std::fmt;
 use std::sync::Arc;
-use storage_lite::{RowValue, StorageError, Store};
+use storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store};
 
 /// Why a table or database operation failed.
 #[derive(Debug)]
@@ -156,21 +156,56 @@ impl Table {
         Table::build(name, schema, ordering_key, Some(segment_rows))
     }
 
+    /// A table stored durably in `dir` (created if absent): opens the
+    /// existing table there — verifying the stored schema and every
+    /// segment — or creates a fresh one. Durability follows storage's
+    /// contract: flushed segments survive a crash, the write buffer does
+    /// not; [`Table::flush`] is the boundary.
+    pub fn persistent(
+        name: impl Into<String>,
+        schema: Schema,
+        ordering_key: &str,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Table, EngineError> {
+        let index = ordering_index(&schema, ordering_key)?;
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::persistent(backend, schema, index)?,
+        ))
+    }
+
+    /// As [`Table::persistent`], with an explicit segment-row threshold.
+    pub fn persistent_with_segment_rows(
+        name: impl Into<String>,
+        schema: Schema,
+        ordering_key: &str,
+        dir: impl AsRef<std::path::Path>,
+        segment_rows: usize,
+    ) -> Result<Table, EngineError> {
+        let index = ordering_index(&schema, ordering_key)?;
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::persistent_with_segment_rows(backend, schema, index, segment_rows)?,
+        ))
+    }
+
     fn build(
         name: impl Into<String>,
         schema: Schema,
         ordering_key: &str,
         segment_rows: Option<usize>,
     ) -> Result<Table, EngineError> {
-        let ordering_index = schema
-            .fields()
-            .iter()
-            .position(|field| field.name() == ordering_key)
-            .ok_or_else(|| EngineError::UnknownOrderingKey(ordering_key.to_owned()))?;
+        let ordering_index = ordering_index(&schema, ordering_key)?;
         let store = match segment_rows {
             None => Store::new(schema, ordering_index)?,
             Some(rows) => Store::with_segment_rows(schema, ordering_index, rows)?,
         };
+        Ok(Table::from_store(name, store))
+    }
+
+    fn from_store(name: impl Into<String>, store: Store) -> Table {
         let mut registry = Registry::new();
         let backend = NativeLapack;
         registry.register(
@@ -187,11 +222,11 @@ impl Table {
                 output: RegressionOutput::Intercept,
             }),
         );
-        Ok(Table {
+        Table {
             name: name.into(),
             store,
             registry,
-        })
+        }
     }
 
     /// The table's name.
@@ -250,6 +285,21 @@ impl Table {
         let QueryOutput { schema, batches } = self.query(sql)?;
         Ok(arrow_lite::export_stream(schema, batches.into_iter()))
     }
+}
+
+/// Resolves the declared ordering key to its column index.
+fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
+    schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == ordering_key)
+        .ok_or_else(|| EngineError::UnknownOrderingKey(ordering_key.to_owned()))
+}
+
+/// The native storage backend: a directory of files.
+fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend>, EngineError> {
+    let backend = FsBackend::new(dir.as_ref()).map_err(StorageError::from)?;
+    Ok(Arc::new(backend))
 }
 
 /// Which coefficient of the per-window fit `y ≈ intercept + slope · x`
@@ -505,6 +555,46 @@ mod tests {
         assert_eq!(output.num_rows(), 0);
         assert_eq!(output.batches.len(), 0);
         assert_eq!(output.schema.fields()[1].name(), "x");
+    }
+
+    #[test]
+    fn persistent_table_reopens_with_identical_results() {
+        let dir =
+            std::env::temp_dir().join(format!("tallydb-engine-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reference;
+        {
+            let mut table =
+                Table::persistent_with_segment_rows("trades", m1_schema(), "ts", &dir, 8).unwrap();
+            for i in 0..30i64 {
+                table.append(&linear_row(i)).unwrap();
+            }
+            table.flush().unwrap();
+            reference = flatten(&table.query(REGRESSION_SQL).unwrap(), 1);
+        }
+        // A fresh process-equivalent: open the same directory, ask the
+        // same question, get bit-identical regression output.
+        let reopened =
+            Table::persistent_with_segment_rows("trades", m1_schema(), "ts", &dir, 8).unwrap();
+        assert_eq!(
+            flatten(&reopened.query(REGRESSION_SQL).unwrap(), 1),
+            reference
+        );
+        // And the reopened table keeps ingesting where it left off.
+        let mut reopened = reopened;
+        assert_eq!(reopened.append(&linear_row(30)).unwrap(), 30);
+        // Schema disagreement at open is refused loudly.
+        let wrong = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("z", ColumnType::F64, false),
+        ]);
+        assert!(matches!(
+            Table::persistent("trades", wrong, "ts", &dir),
+            Err(EngineError::Storage(StorageError::SchemaMismatch { .. }))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
