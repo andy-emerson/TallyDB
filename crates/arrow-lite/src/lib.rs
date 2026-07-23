@@ -72,7 +72,10 @@
 //!   considered and deferred (issue #4): the design-matrix gather is
 //!   O(n·k) against an O(n·k²) solve. Revisit only with profiling evidence.
 
-// TODO: Bitmap (LSB-ordered; and/or/not, popcount, set-bit iteration)
+pub mod bitmap;
+
+pub use bitmap::Bitmap;
+
 // TODO: numeric column buffers (f64, i64; 64-byte aligned; optional
 //       validity per schema nullability)
 // TODO: key column (u32 codes + interning table)
