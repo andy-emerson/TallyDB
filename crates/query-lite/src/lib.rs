@@ -63,7 +63,7 @@
 pub mod exec;
 pub mod plan;
 
-pub use exec::{execute, Registry, WindowAggregate};
+pub use exec::{execute, QueryOutput, Registry, WindowAggregate};
 pub use plan::{plan, Plan, PlanItem, QueryError};
 
 // TODO: executor: filter (WHERE) / group-by / aggregate over
