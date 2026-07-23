@@ -74,11 +74,12 @@
 
 pub mod bitmap;
 pub mod buffer;
+pub mod key;
 
 pub use bitmap::Bitmap;
 pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
+pub use key::{Dictionary, KeyColumn};
 
-// TODO: key column (u32 codes + interning table)
 // TODO: column enum wrapping numeric + key variants, nothing else
 // TODO: zero-copy views (offset + len) over columns
 // TODO: logical-type tags (Timestamp(ns), Decimal64(scale)) on i64 columns,
