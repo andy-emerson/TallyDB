@@ -39,3 +39,8 @@ jobs:
           cargo build -p arrow-lite --features oracle-harness
           pip install pyarrow cffi
           python3 crates/arrow-lite/tests/pyarrow_roundtrip.py target/debug/libarrow_lite.so
+      - name: M1 slice oracle — NumPy + DuckDB (issue #27)
+        run: |
+          cargo build -p engine --features oracle-harness
+          pip install numpy duckdb
+          python3 crates/engine/tests/m1_slice_oracle.py target/debug/libengine.so
