@@ -31,7 +31,7 @@ use crate::format::{decode_segment, encode_segment};
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
-use arrow_lite::{Bitmap, Schema};
+use arrow_lite::{Bitmap, Column, NumericData, Schema};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -43,18 +43,55 @@ pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
 /// The backend object holding the table manifest — an encoded empty
 /// segment, which carries exactly what a manifest needs (schema and
 /// ordering key) with the segment format's own magic, CRC, and
-/// versioning.
+/// versioning. The manifest's otherwise-unused `base_row_id` field
+/// stores the table's current **generation** (see below).
 const MANIFEST: &str = "table.tlym";
 
-/// The backend object name for the segment based at `base_row_id`
-/// (zero-padded so lexicographic order is row-id order).
-fn segment_name(base_row_id: u64) -> String {
-    format!("seg-{base_row_id:020}.tlyseg")
+/// Segment and delete-log names carry a generation number, and the
+/// manifest names the current one. This is what makes compaction
+/// crash-safe: a compaction writes the whole next generation first,
+/// then commits it with one atomic manifest write, then cleans up the
+/// old objects — a crash at any point leaves a backend whose manifest
+/// still names exactly one complete, self-consistent generation, and
+/// reopen ignores every object from any other.
+fn segment_name(generation: u64, base_row_id: u64) -> String {
+    format!("seg-g{generation:010}-{base_row_id:020}.tlyseg")
 }
 
-/// The backend object name for the `sequence`-th delete log.
-fn delete_log_name(sequence: u64) -> String {
-    format!("del-{sequence:020}.tlyd")
+fn delete_log_name(generation: u64, sequence: u64) -> String {
+    format!("del-g{generation:010}-{sequence:020}.tlyd")
+}
+
+/// The `name`s of a generation's objects start with these.
+fn segment_prefix(generation: u64) -> String {
+    format!("seg-g{generation:010}-")
+}
+
+/// The cell at (`column`, `row`) as the row value that would recreate
+/// it — how compaction replays live rows through the ordinary append
+/// path.
+fn cell_value(column: &Column, row: usize) -> RowValue<'_> {
+    match column {
+        Column::Numeric(NumericData::F64(numeric)) => {
+            if numeric.is_valid(row) {
+                RowValue::F64(numeric.values().as_slice()[row])
+            } else {
+                RowValue::Null
+            }
+        }
+        Column::Numeric(NumericData::I64(numeric)) => {
+            if numeric.is_valid(row) {
+                RowValue::I64(numeric.values().as_slice()[row])
+            } else {
+                RowValue::Null
+            }
+        }
+        Column::Key(keys) => keys.value_at(row).map_or(RowValue::Null, RowValue::Key),
+    }
+}
+
+fn delete_log_prefix(generation: u64) -> String {
+    format!("del-g{generation:010}-")
 }
 
 /// One segment as a reader sees it: the immutable segment plus the live
@@ -126,6 +163,8 @@ pub struct Store {
     tombstones: BTreeSet<u64>,
     /// Sequence number for the next delete log.
     delete_log_sequence: u64,
+    /// The current storage generation (bumped by each compaction).
+    generation: u64,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
 }
@@ -156,6 +195,7 @@ impl Store {
             rows: 0,
             tombstones: BTreeSet::new(),
             delete_log_sequence: 0,
+            generation: 0,
             backend: None,
         })
     }
@@ -186,7 +226,7 @@ impl Store {
         segment_rows: usize,
     ) -> Result<Store, StorageError> {
         let mut store = Store::with_segment_rows(schema, ordering_key, segment_rows)?;
-        match backend.read(MANIFEST) {
+        let generation = match backend.read(MANIFEST) {
             Ok(bytes) => {
                 let manifest = decode_segment(&bytes)?;
                 if manifest.batch().schema() != &store.schema {
@@ -202,19 +242,23 @@ impl Store {
                         ),
                     });
                 }
+                manifest.base_row_id() // the current generation
             }
             Err(IoError::NotFound(_)) => {
                 let empty = WriteBuffer::new(store.schema.clone(), ordering_key)?.freeze()?;
                 backend.write(MANIFEST, &encode_segment(&empty))?;
+                0
             }
             Err(error) => return Err(error.into()),
-        }
+        };
         let mut segments = Vec::new();
         let mut tombstones = BTreeSet::new();
         let mut next_sequence = 0u64;
         for name in backend.list()? {
+            // Objects from other generations are a crashed compaction's
+            // leftovers — invisible here, removed by the next compaction.
             if let Some(sequence) = name
-                .strip_prefix("del-")
+                .strip_prefix(&delete_log_prefix(generation))
                 .and_then(|rest| rest.strip_suffix(".tlyd"))
             {
                 let sequence: u64 = sequence.parse().map_err(|_| StorageError::SchemaMismatch {
@@ -224,7 +268,7 @@ impl Store {
                 next_sequence = next_sequence.max(sequence + 1);
                 continue;
             }
-            if !(name.starts_with("seg-") && name.ends_with(".tlyseg")) {
+            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
                 continue;
             }
             let segment = decode_segment(&backend.read(&name)?)?;
@@ -253,6 +297,7 @@ impl Store {
         store.buffer_base = expected_base;
         store.tombstones = tombstones;
         store.delete_log_sequence = next_sequence;
+        store.generation = generation;
         store.backend = Some(backend);
         Ok(store)
     }
@@ -311,7 +356,10 @@ impl Store {
         }
         let segment = self.buffer.snapshot_at(self.buffer_base)?;
         if let Some(backend) = &self.backend {
-            backend.write(&segment_name(self.buffer_base), &encode_segment(&segment))?;
+            backend.write(
+                &segment_name(self.generation, self.buffer_base),
+                &encode_segment(&segment),
+            )?;
         }
         self.segments.push(Arc::new(segment));
         self.buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
@@ -339,7 +387,7 @@ impl Store {
         }
         if let Some(backend) = &self.backend {
             backend.write(
-                &delete_log_name(self.delete_log_sequence),
+                &delete_log_name(self.generation, self.delete_log_sequence),
                 &encode_tombstones(&newly),
             )?;
             self.delete_log_sequence += 1;
@@ -347,6 +395,112 @@ impl Store {
         let count = newly.len() as u64;
         self.tombstones.extend(newly);
         Ok(count)
+    }
+
+    /// Compacts the table: merges every live row — buffer included —
+    /// into fresh segments **sorted by (ordering key, ingest sequence)**,
+    /// resolves all tombstones, and reassigns contiguous internal row
+    /// ids in the new order. This is where "resolved at the next
+    /// compaction" happens: deleted rows physically disappear, and the
+    /// disorder left by late arrivals or `UPDATE`'s reappends is sorted
+    /// away, so a store is always globally ordered right after
+    /// compaction. Ties on the ordering key keep ingest order (stable
+    /// sort by row id), so duplicates stay first-class and "newest
+    /// version wins" stays meaningful.
+    ///
+    /// On a persistent store the rewrite is crash-safe: the entire next
+    /// generation is written first, one atomic manifest write commits
+    /// it, and only then are the old generation's objects removed — a
+    /// crash anywhere leaves one complete generation to reopen.
+    pub fn compact(&mut self) -> Result<(), StorageError> {
+        // Collect every live row's (ordering value, row id, location),
+        // buffer included via an ephemeral snapshot.
+        let views = self.snapshot()?;
+        let mut order: Vec<(i64, u64, usize, usize)> = Vec::with_capacity(self.live_len() as usize);
+        for (view_index, view) in views.iter().enumerate() {
+            let Column::Numeric(NumericData::I64(ordering)) =
+                &view.segment.batch().columns()[self.ordering_key]
+            else {
+                unreachable!("the ordering key is validated as i64 at construction")
+            };
+            let base = view.segment.base_row_id();
+            for (row, &value) in ordering.values().as_slice().iter().enumerate() {
+                if view.is_live(row) {
+                    order.push((value, base + row as u64, view_index, row));
+                }
+            }
+        }
+        order.sort_by_key(|&(value, id, _, _)| (value, id));
+        // Rebuild into fresh segments of the configured size.
+        let mut new_segments: Vec<Segment> = Vec::new();
+        let mut buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        let mut base = 0u64;
+        for &(_, _, view_index, row) in &order {
+            let batch = views[view_index].segment.batch();
+            let cells: Vec<RowValue<'_>> = batch
+                .columns()
+                .iter()
+                .map(|column| cell_value(column, row))
+                .collect();
+            buffer.append(&cells)?;
+            if buffer.len() >= self.segment_rows {
+                let rows = buffer.len() as u64;
+                let full = std::mem::replace(
+                    &mut buffer,
+                    WriteBuffer::new(self.schema.clone(), self.ordering_key)?,
+                );
+                new_segments.push(full.freeze_at(base)?);
+                base += rows;
+            }
+        }
+        if !buffer.is_empty() {
+            let rows = buffer.len() as u64;
+            new_segments.push(buffer.freeze_at(base)?);
+            base += rows;
+        }
+        // Persist the next generation, commit it, then clean up.
+        if let Some(backend) = &self.backend {
+            let next = self.generation + 1;
+            // Pre-clean: a compaction that crashed after writing some
+            // next-generation objects left strays under exactly this
+            // generation. They must go before we write, or a stray whose
+            // base the new layout doesn't overwrite would be loaded as
+            // real data after the commit.
+            for name in backend.list()? {
+                if name.starts_with(&segment_prefix(next))
+                    || name.starts_with(&delete_log_prefix(next))
+                {
+                    backend.remove(&name)?;
+                }
+            }
+            for segment in &new_segments {
+                backend.write(
+                    &segment_name(next, segment.base_row_id()),
+                    &encode_segment(segment),
+                )?;
+            }
+            let manifest =
+                WriteBuffer::new(self.schema.clone(), self.ordering_key)?.freeze_at(next)?;
+            backend.write(MANIFEST, &encode_segment(&manifest))?;
+            // Committed. Old objects are now garbage; reopen would
+            // ignore them regardless, but a clean run leaves nothing.
+            for name in backend.list()? {
+                let current = name.starts_with(&segment_prefix(next))
+                    || name.starts_with(&delete_log_prefix(next));
+                let stale = (name.starts_with("seg-") || name.starts_with("del-")) && !current;
+                if stale {
+                    backend.remove(&name)?;
+                }
+            }
+            self.generation = next;
+        }
+        self.segments = new_segments.into_iter().map(Arc::new).collect();
+        self.rows = base;
+        self.buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        self.buffer_base = base;
+        self.tombstones.clear();
+        self.delete_log_sequence = 0;
+        Ok(())
     }
 
     /// A point-in-time view: every frozen segment plus (if the buffer
