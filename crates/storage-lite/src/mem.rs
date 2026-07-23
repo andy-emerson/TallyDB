@@ -85,6 +85,13 @@ impl fmt::Display for StorageError {
 impl std::error::Error for StorageError {}
 
 /// Per-column accumulation state while rows arrive.
+///
+/// Cloning is cheap by design: numeric and code buffers are copy-on-write
+/// handles (O(1)), and the null flags and dictionary are bounded by the
+/// write buffer's row count and distinct-key count. [`WriteBuffer::snapshot`]
+/// leans on this to freeze a point-in-time segment without consuming the
+/// buffer.
+#[derive(Clone)]
 enum ColumnBuilder {
     F64 {
         values: Buffer<f64>,
@@ -121,6 +128,7 @@ enum ColumnBuilder {
 /// assert_eq!(segment.batch().num_rows(), 1);
 /// assert!(segment.is_ordered());
 /// ```
+#[derive(Clone)]
 pub struct WriteBuffer {
     schema: Schema,
     ordering_key: usize,
@@ -239,8 +247,14 @@ impl WriteBuffer {
         self.rows == 0
     }
 
-    /// Freezes into an immutable segment.
+    /// Freezes into an immutable segment whose rows begin at row id 0.
     pub fn freeze(self) -> Result<Segment, StorageError> {
+        self.freeze_at(0)
+    }
+
+    /// Freezes into an immutable segment whose first row carries the
+    /// internal row id `base_row_id` (see [`Segment::base_row_id`]).
+    pub fn freeze_at(self, base_row_id: u64) -> Result<Segment, StorageError> {
         let mut columns = Vec::with_capacity(self.builders.len());
         for (field, builder) in self.schema.fields().iter().zip(self.builders) {
             columns.push(builder.finish(field.name())?);
@@ -249,7 +263,16 @@ impl WriteBuffer {
             batch: RecordBatch::new(self.schema, columns),
             ordering_key: self.ordering_key,
             ordered: self.ordered,
+            base_row_id,
         })
+    }
+
+    /// Freezes a point-in-time copy without consuming the buffer: the
+    /// segment holds exactly the rows appended so far, and later appends
+    /// leave it untouched (the copy-on-write buffers make this cheap —
+    /// no row data is copied at snapshot time).
+    pub fn snapshot_at(&self, base_row_id: u64) -> Result<Segment, StorageError> {
+        self.clone().freeze_at(base_row_id)
     }
 }
 
@@ -342,6 +365,7 @@ pub struct Segment {
     batch: RecordBatch,
     ordering_key: usize,
     ordered: bool,
+    base_row_id: u64,
 }
 
 impl Segment {
@@ -360,6 +384,27 @@ impl Segment {
     /// than assume.
     pub fn is_ordered(&self) -> bool {
         self.ordered
+    }
+
+    /// The internal row id of this segment's first row (decision #1: every
+    /// row carries a monotonic id assigned at ingest — row `i` of this
+    /// segment has id `base_row_id + i`). Tombstones and "newest version
+    /// wins" resolution address rows by these ids, never by key tuples.
+    pub fn base_row_id(&self) -> u64 {
+        self.base_row_id
+    }
+
+    /// First and last values of the ordering key, or `None` if the
+    /// segment is empty. Readers use this to check that a *sequence* of
+    /// segments is globally ordered: each segment internally ordered, and
+    /// each boundary non-decreasing.
+    pub fn ordering_bounds(&self) -> Option<(i64, i64)> {
+        let Column::Numeric(NumericData::I64(column)) = &self.batch.columns()[self.ordering_key]
+        else {
+            unreachable!("the ordering key is validated as i64 at construction")
+        };
+        let values = column.values().as_slice();
+        Some((*values.first()?, *values.last()?))
     }
 }
 

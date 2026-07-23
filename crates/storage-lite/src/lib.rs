@@ -82,13 +82,13 @@
 //! crates.
 
 pub mod mem;
+pub mod store;
 
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
+pub use store::{Store, DEFAULT_SEGMENT_ROWS};
 
 // TODO: I/O backend trait (native mmap implementation first — designed
 //       together with the on-disk segment format, not before; see mem.rs)
 // TODO: on-disk segment format (header, per-column buffers, zone map)
 // TODO: tombstone record + "newest version wins" read resolution
 // TODO: compaction: merge segments, drop resolved tombstones
-// TODO: correctness test suite (this crate has no external oracle —
-//       these tests ARE the spec, treat them accordingly)
