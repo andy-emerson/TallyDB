@@ -49,12 +49,17 @@
 //! WASM path prematurely; do keep the trait boundaries clean so it isn't
 //! a rewrite later.
 
-// TODO: schema definition API (numeric f64/i64 vs. key column declaration,
-//       plus the declared ordering key; reject anything else at definition
-//       time, across results/intermediates, not just stored columns)
-// TODO: wire storage-lite + query-lite into a single connection/handle type
-// TODO: expose compute-blas (multiplication-class) and compute-lapack
-//       (curated solves/decompositions) ops as callable SQL functions, with
+#[cfg(feature = "oracle-harness")]
+pub mod harness;
+pub mod table;
+
+pub use storage_lite::RowValue;
+pub use table::{EngineError, Table};
+
+// TODO: multi-table handle (connection type) once storage grows past the
+//       single write-then-read M1 table
+// TODO: expose compute-blas (multiplication-class) ops and the remaining
+//       compute-lapack ops as callable SQL functions, with
 //       backend-capability errors surfaced cleanly (not panics)
 // TODO: expose compute-lua as a callable-from-SQL scripting layer
 //       (batch calling convention — whole column/window per call, not

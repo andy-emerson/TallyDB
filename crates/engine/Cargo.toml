@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+# cdylib exists solely for the M1 end-to-end oracle script, which drives
+# the `oracle-harness` hooks through ctypes (tests/m1_slice_oracle.py).
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
+oracle-harness = []
+
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
 storage-lite = { path = "../storage-lite" }

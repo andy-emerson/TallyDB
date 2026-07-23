@@ -72,15 +72,23 @@
 //!   considered and deferred (issue #4): the design-matrix gather is
 //!   O(n·k) against an O(n·k²) solve. Revisit only with profiling evidence.
 
-// TODO: Bitmap (LSB-ordered; and/or/not, popcount, set-bit iteration)
-// TODO: numeric column buffers (f64, i64; 64-byte aligned; optional
-//       validity per schema nullability)
-// TODO: key column (u32 codes + interning table)
-// TODO: column enum wrapping numeric + key variants, nothing else
-// TODO: zero-copy views (offset + len) over columns
-// TODO: logical-type tags (Timestamp(ns), Decimal64(scale)) on i64 columns,
-//       consulted at export only
-// TODO: C Data Interface export/import, incl. ArrowArrayStream
-// TODO: round-trip tests against arrow-rs and PyArrow (dev-only oracles),
-//       covering both numeric subtypes, dictionaries, nulls, logical-type
-//       annotations, and batch streams
+pub mod bitmap;
+pub mod buffer;
+pub mod cdata;
+pub mod column;
+#[cfg(feature = "oracle-harness")]
+pub mod harness;
+pub mod key;
+pub mod logical;
+pub mod schema;
+
+pub use bitmap::Bitmap;
+pub use buffer::{Buffer, Element, NumericColumn, BUFFER_ALIGN};
+pub use cdata::{
+    export_batch, export_schema, export_stream, import_batch, ArrowArray, ArrowArrayStream,
+    ArrowSchema, ImportError, StreamReader,
+};
+pub use column::{Column, ColumnType, KeyView, NumericData, NumericView};
+pub use key::{Dictionary, KeyColumn};
+pub use logical::{LogicalType, DECIMAL64_PRECISION};
+pub use schema::{Field, RecordBatch, Schema};

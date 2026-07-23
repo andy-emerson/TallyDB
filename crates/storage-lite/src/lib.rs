@@ -78,10 +78,13 @@
 //! type decisions — that's `engine`. No BLAS/Lua — that's the compute
 //! crates.
 
-// TODO: I/O backend trait (native mmap implementation first)
-// TODO: write buffer / append path
-// TODO: segment format (header, per-column buffers, zone map)
-// TODO: flush: write buffer -> segment
+pub mod mem;
+
+pub use mem::{RowValue, Segment, StorageError, WriteBuffer};
+
+// TODO: I/O backend trait (native mmap implementation first — designed
+//       together with the on-disk segment format, not before; see mem.rs)
+// TODO: on-disk segment format (header, per-column buffers, zone map)
 // TODO: tombstone record + "newest version wins" read resolution
 // TODO: compaction: merge segments, drop resolved tombstones
 // TODO: correctness test suite (this crate has no external oracle —

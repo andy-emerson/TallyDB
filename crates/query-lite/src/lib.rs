@@ -60,9 +60,13 @@
 //! built to accelerate; keep that seam in mind rather than reimplementing
 //! matrix-shaped math by hand.
 
-// TODO: sqlparser-rs integration, pin a version
-// TODO: AST -> logical plan for the supported subset
-// TODO: executor: filter / project / group-by / aggregate over
+pub mod exec;
+pub mod plan;
+
+pub use exec::{execute, Registry, WindowAggregate};
+pub use plan::{plan, Plan, PlanItem, QueryError};
+
+// TODO: executor: filter (WHERE) / group-by / aggregate over
 //       storage-lite segments
 // TODO: executor: equi-join (star-schema shape: one fact table, small
 //       dimension tables)

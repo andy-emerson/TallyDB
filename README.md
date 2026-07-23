@@ -2,12 +2,17 @@
 
 **A small, embeddable, SQL-native database for numeric data — with numeric compute living inside the engine, not bolted on beside it.**
 
-> **Status:** TallyDB is in its design phase. The architecture, invariants,
-> and crate boundaries are specified, settled decisions are recorded, and the
-> open ones are tracked — but no runnable engine exists yet. Everything below
-> describes what TallyDB is being built to be; the design is real, the
-> software is not yet. The developer-facing design lives in
-> [`DESIGN.md`](DESIGN.md); open work and decisions live in the repository's
+> **Status:** TallyDB is under construction, and a first thin engine runs.
+> The columnar foundation (`arrow-lite`) is implemented and cross-checked
+> against arrow-rs and PyArrow in CI, and a minimal vertical slice now
+> works end to end: append rows one at a time, run a SQL rolling
+> least-squares regression solved by LAPACK inside the engine, and read
+> the results over an Arrow stream — validated row-for-row against NumPy
+> and DuckDB in CI. It is one query shape over one in-memory table, not a
+> database yet: general SQL, persistent storage, and the Lua/BLAS surface
+> are still ahead. The developer-facing design lives in
+> [`DESIGN.md`](DESIGN.md); open work and decisions live in the
+> repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
 
 TallyDB is an HTAP-shaped store: fast, append-heavy ingest (the
@@ -144,7 +149,25 @@ q language, minus the license, minus the server.
 
 ## Where things stand
 
-The seven workspace crates are scaffolded: documented boundaries and settled
+`arrow-lite` is implemented: the shared bitmap, 64-byte-aligned `f64`/`i64`
+buffers, `u32`-dictionary key columns, the two-variant column enum with
+zero-copy views, logical-type export annotations, and the C Data Interface
+including `ArrowArrayStream` — every piece round-trip-tested against
+arrow-rs and PyArrow in CI, with the unsafe core also run under Miri.
+
+On top of it runs the first vertical slice, deliberately thin in each
+crate: `storage-lite` appends validated rows into a single immutable
+in-memory segment (no persistence, tombstones, or compaction yet);
+`query-lite` parses exactly one SQL shape — window aggregates over
+`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, optionally per key — via
+sqlparser-rs; `compute-lapack` links system LAPACK and solves least
+squares through `dgels` behind a capability-negotiating trait; and
+`engine` ties them together, registering `regr_slope`/`regr_intercept`
+as SQL window functions whose every window is re-derived independently
+by `np.linalg.lstsq` and DuckDB in CI. Passthrough results share the
+stored buffers (pointer-verified); the design-matrix gather is the one
+bounded copy, as recorded in the tracker. `compute-blas` and
+`compute-lua` remain scaffolds: documented boundaries and settled
 contracts, not yet implementations. `blas.wasm` and `lua.wasm` (the WASM
 compute dependencies, for later) are real, working, MIT-licensed projects
 already in progress by the same author, with LAPACK-in-WASM as their next

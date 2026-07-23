@@ -1,6 +1,7 @@
-# CI — the "CI-enforced" durability tier of AGENTS.md, made real.
+# CI — the executable evidence of AGENTS.md, run on every change.
 # Every push to main and every pull request re-earns the claims below:
-# formatting, lints, build, tests (including doctests), and rustdoc.
+# formatting, lints, build, tests (including doctests), rustdoc, and the
+# PyArrow round-trip oracle for the C Data Interface.
 name: CI
 
 on:
@@ -21,13 +22,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rust toolchain versions
         run: rustc --version && cargo --version
+      - name: System LAPACK (compute-lapack links it as-is)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblapack-dev
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --workspace
-      - name: Test (includes doctests)
+      - name: Test (includes doctests and the arrow-rs oracle)
         run: cargo test --workspace
       - name: Docs
         run: cargo doc --workspace --no-deps
+      - name: PyArrow oracle (issue #15)
+        run: |
+          cargo build -p arrow-lite --features oracle-harness
+          pip install pyarrow cffi
+          python3 crates/arrow-lite/tests/pyarrow_roundtrip.py target/debug/libarrow_lite.so
+      - name: M1 slice oracle — NumPy + DuckDB (issue #27)
+        run: |
+          cargo build -p engine --features oracle-harness
+          pip install numpy duckdb
+          python3 crates/engine/tests/m1_slice_oracle.py target/debug/libengine.so
