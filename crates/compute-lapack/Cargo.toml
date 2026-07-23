@@ -21,3 +21,4 @@ arrow-lite = { path = "../arrow-lite" }
 
 [dev-dependencies]
 proptest = "1"
+corpus = { path = "../corpus" }

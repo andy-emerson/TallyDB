@@ -225,6 +225,27 @@ impl Table {
                 output: RegressionOutput::Intercept,
             }),
         );
+        registry.register(
+            "covar_pop",
+            Arc::new(PairStatistic {
+                backend,
+                kind: PairKind::CovarPop,
+            }),
+        );
+        registry.register(
+            "corr",
+            Arc::new(PairStatistic {
+                backend,
+                kind: PairKind::Corr,
+            }),
+        );
+        registry.register(
+            "eigen_max",
+            Arc::new(PairStatistic {
+                backend,
+                kind: PairKind::EigenMax,
+            }),
+        );
         Table {
             name: name.into(),
             store,
@@ -569,6 +590,76 @@ impl WindowAggregate for RollingRegression {
             // undefined there — SQL NULL, matching regr_slope semantics.
             Err(ComputeError::Lapack { .. }) => Ok(None),
             Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// Which pair statistic an instance computes.
+enum PairKind {
+    /// Population covariance of `(y, x)` — 0 for a single point,
+    /// matching `covar_pop`.
+    CovarPop,
+    /// Pearson correlation; `NULL` when either variance is zero.
+    Corr,
+    /// The largest eigenvalue of the window's 2 × 2 population
+    /// covariance matrix — the first principal component's variance,
+    /// solved by `dsyev` through `compute-lapack`. `NULL` under two
+    /// rows.
+    EigenMax,
+}
+
+/// Two-column window statistics over `(y, x)`, sharing one accumulation
+/// of the population moments.
+struct PairStatistic {
+    backend: NativeLapack,
+    kind: PairKind,
+}
+
+impl WindowAggregate for PairStatistic {
+    fn arity(&self) -> usize {
+        2 // (y, x), same convention as regr_slope
+    }
+
+    fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        let (y, x) = (args[0], args[1]);
+        let n = y.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let count = n as f64;
+        let (mean_y, mean_x) = (y.iter().sum::<f64>() / count, x.iter().sum::<f64>() / count);
+        let (mut var_y, mut var_x, mut covar) = (0.0f64, 0.0f64, 0.0f64);
+        for (&yi, &xi) in y.iter().zip(x) {
+            let (dy, dx) = (yi - mean_y, xi - mean_x);
+            var_y += dy * dy;
+            var_x += dx * dx;
+            covar += dy * dx;
+        }
+        var_y /= count;
+        var_x /= count;
+        covar /= count;
+        match self.kind {
+            PairKind::CovarPop => Ok(Some(covar)),
+            PairKind::Corr => {
+                if var_y <= 0.0 || var_x <= 0.0 {
+                    return Ok(None); // undefined, per corr's definition
+                }
+                Ok(Some(covar / (var_y * var_x).sqrt()))
+            }
+            PairKind::EigenMax => {
+                if n < 2 {
+                    return Ok(None);
+                }
+                if !self.backend.supports(Op::SymmetricEigen) {
+                    return Err("symmetric eigen is unavailable on this compute backend".to_owned());
+                }
+                let covariance = [var_y, covar, covar, var_x];
+                let (eigenvalues, _) = self
+                    .backend
+                    .symmetric_eigen(ColMajor::new(&covariance, 2, 2))
+                    .map_err(|error| error.to_string())?;
+                Ok(Some(eigenvalues[1])) // ascending: the last is largest
+            }
         }
     }
 }

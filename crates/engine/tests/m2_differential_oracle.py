@@ -165,7 +165,73 @@ WINDOW_QUERIES = [
     "SELECT ts, regr_intercept(y, x) OVER (ORDER BY ts "
     "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "WHERE y > -100000 ORDER BY ts",
+    # M2.6: the pair statistics DuckDB also implements.
+    "SELECT ts, covar_pop(y, x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, corr(y, x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, covar_pop(y, x) OVER (ORDER BY ts "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
 ]
+
+EIGEN_PRECEDING = 19
+
+
+def numpy_eigen_check(lib, inputs) -> None:
+    """eigen_max has no DuckDB counterpart: recompute every window's
+    largest 2x2 population-covariance eigenvalue with NumPy instead."""
+    import numpy as np
+
+    sql = (
+        "SELECT ts, eigen_max(y, x) OVER (PARTITION BY sym ORDER BY ts "
+        f"ROWS BETWEEN {EIGEN_PRECEDING} PRECEDING AND CURRENT ROW) AS w "
+        "FROM corpus WHERE y > -100000 ORDER BY ts"
+    )
+    engine = tallydb_query(lib, sql)
+    rows = sorted(
+        (
+            (ts, sym, x, y)
+            for ts, sym, x, y in zip(
+                inputs["ts"].to_pylist(),
+                inputs["sym"].to_pylist(),
+                inputs["x"].to_pylist(),
+                inputs["y"].to_pylist(),
+            )
+            if y is not None
+        ),
+        key=lambda row: row[0],
+    )
+    per_sym: dict[str, list[tuple]] = {}
+    expected_by_ts: dict[int, float | None] = {}
+    for ts, sym, x, y in rows:
+        history = per_sym.setdefault(sym, [])
+        history.append((x, y))
+        window = history[-(EIGEN_PRECEDING + 1) :]
+        if len(window) < 2:
+            expected_by_ts[ts] = None
+            continue
+        wx = np.array([w[0] for w in window])
+        wy = np.array([w[1] for w in window])
+        covariance = np.array(
+            [
+                [np.mean((wy - wy.mean()) ** 2), np.mean((wy - wy.mean()) * (wx - wx.mean()))],
+                [np.mean((wy - wy.mean()) * (wx - wx.mean())), np.mean((wx - wx.mean()) ** 2)],
+            ]
+        )
+        expected_by_ts[ts] = float(np.linalg.eigvalsh(covariance)[-1])
+    engine_ts = engine["ts"].to_pylist()
+    engine_w = engine["w"].to_pylist()
+    for row, (ts, value) in enumerate(zip(engine_ts, engine_w)):
+        expected = expected_by_ts[ts]
+        if not close(value, expected):
+            sys.exit(
+                f"FAIL eigen_max vs numpy: row {row} engine {value!r} "
+                f"vs numpy {expected!r}"
+            )
+    print(f"PASS eigen_max vs numpy ({len(engine_ts)} rows)")
 
 
 def compare_tables(sql: str, engine: pa.Table, oracle: pa.Table, window: bool) -> None:
@@ -242,6 +308,7 @@ def main() -> None:
         oracle = connection.execute(sql).to_arrow_table()
         compare_tables(sql, engine, oracle, window=True)
         passed += 1
+    numpy_eigen_check(lib, inputs)
     print(
         f"Differential: {passed} generated queries agree with DuckDB "
         f"{duckdb.__version__} over {inputs.num_rows} corpus rows"
