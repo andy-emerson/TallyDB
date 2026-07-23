@@ -1,24 +1,22 @@
-//! The M1-thin storage path: an append buffer freezing into a single
-//! immutable in-memory segment.
+//! The in-memory building blocks: an append buffer that freezes into an
+//! immutable segment.
 //!
-//! This is deliberately the smallest storage that can carry the M1 slice
-//! (ingest → query → compute → export), and it dodges every open decision
-//! on purpose: **no tombstones or compaction** (row identity, #1), **no
-//! on-disk format, mmap, zone maps, or compression** (#19), and the
-//! dictionary living inside each key column is an implementation detail of
-//! this in-memory form, not a ruling on dictionary scope (#6). The I/O
-//! backend trait promised in the crate docs arrives with the on-disk
-//! format at M2 — designing it around a memory-only implementation now
-//! would freeze exactly the wrong assumptions.
+//! These are the pieces [`crate::store::Store`] composes into a table's
+//! storage — the buffer validates and accumulates arriving rows, the
+//! segment is the immutable unit readers see. Still ahead, in build
+//! order: the on-disk format and I/O backend trait (M2.2 — designed
+//! together, so the trait doesn't freeze memory-only assumptions), then
+//! tombstones and compaction (M2.3).
 //!
-//! What it does hold to already:
+//! What this layer holds to:
 //!
 //! - **Append-optimized:** one row at a time, O(1) amortized, into
 //!   per-column builders.
 //! - **Ordered:** the schema names its ordering key (`i64`, `NOT NULL`);
 //!   ingest is *expected* roughly sorted on it, and the frozen segment
-//!   reports [`Segment::is_ordered`] so readers that require strict order
-//!   (M1's window executor) can check instead of silently mis-computing.
+//!   reports [`Segment::is_ordered`] and [`Segment::ordering_bounds`] so
+//!   readers that require strict order (the window executor) can check
+//!   instead of silently mis-computing.
 //! - **Numeric-or-key:** rows are checked cell-by-cell against the schema
 //!   on append — wrong type, null into `NOT NULL`, wrong arity are all
 //!   errors at the door, not corruption later.
@@ -57,8 +55,19 @@ pub enum StorageError {
     /// The declared ordering key must be an `i64 NOT NULL` column.
     BadOrderingKey { reason: String },
     /// A nullable key column ended up all-null with an empty dictionary —
-    /// not representable as a `KeyColumn` (M1 limitation).
+    /// not representable as a `KeyColumn` (known limitation, kept).
     AllNullKeyColumn { column: String },
+    /// The storage backend failed.
+    Io(crate::io::IoError),
+    /// Stored segment bytes failed to decode.
+    Format(crate::format::FormatError),
+    /// Stored data disagrees with the schema this store was opened with.
+    SchemaMismatch { reason: String },
+    /// The stored segments do not cover a contiguous row-id range — a
+    /// segment file is missing or duplicated.
+    MissingRows { expected_base: u64 },
+    /// A tombstone names a row id that was never assigned.
+    TombstoneOutOfRange { id: u64 },
 }
 
 impl fmt::Display for StorageError {
@@ -78,13 +87,44 @@ impl fmt::Display for StorageError {
                 f,
                 "key column '{column}' is entirely null; an all-null key column is unsupported"
             ),
+            StorageError::Io(error) => write!(f, "{error}"),
+            StorageError::Format(error) => write!(f, "{error}"),
+            StorageError::SchemaMismatch { reason } => {
+                write!(f, "stored data does not match the schema: {reason}")
+            }
+            StorageError::MissingRows { expected_base } => write!(
+                f,
+                "stored segments are not contiguous: no segment starts at row id {expected_base}"
+            ),
+            StorageError::TombstoneOutOfRange { id } => {
+                write!(f, "tombstone names row id {id}, which was never assigned")
+            }
         }
+    }
+}
+
+impl From<crate::io::IoError> for StorageError {
+    fn from(error: crate::io::IoError) -> Self {
+        StorageError::Io(error)
+    }
+}
+
+impl From<crate::format::FormatError> for StorageError {
+    fn from(error: crate::format::FormatError) -> Self {
+        StorageError::Format(error)
     }
 }
 
 impl std::error::Error for StorageError {}
 
 /// Per-column accumulation state while rows arrive.
+///
+/// Cloning is cheap by design: numeric and code buffers are copy-on-write
+/// handles (O(1)), and the null flags and dictionary are bounded by the
+/// write buffer's row count and distinct-key count. [`WriteBuffer::snapshot`]
+/// leans on this to freeze a point-in-time segment without consuming the
+/// buffer.
+#[derive(Clone)]
 enum ColumnBuilder {
     F64 {
         values: Buffer<f64>,
@@ -121,6 +161,7 @@ enum ColumnBuilder {
 /// assert_eq!(segment.batch().num_rows(), 1);
 /// assert!(segment.is_ordered());
 /// ```
+#[derive(Clone)]
 pub struct WriteBuffer {
     schema: Schema,
     ordering_key: usize,
@@ -239,17 +280,34 @@ impl WriteBuffer {
         self.rows == 0
     }
 
-    /// Freezes into an immutable segment.
+    /// Freezes into an immutable segment whose rows begin at row id 0.
     pub fn freeze(self) -> Result<Segment, StorageError> {
+        self.freeze_at(0)
+    }
+
+    /// Freezes into an immutable segment whose first row carries the
+    /// internal row id `base_row_id` (see [`Segment::base_row_id`]).
+    pub fn freeze_at(self, base_row_id: u64) -> Result<Segment, StorageError> {
         let mut columns = Vec::with_capacity(self.builders.len());
         for (field, builder) in self.schema.fields().iter().zip(self.builders) {
             columns.push(builder.finish(field.name())?);
         }
+        let zone_maps = columns.iter().map(compute_zone_map).collect();
         Ok(Segment {
             batch: RecordBatch::new(self.schema, columns),
             ordering_key: self.ordering_key,
             ordered: self.ordered,
+            base_row_id,
+            zone_maps,
         })
+    }
+
+    /// Freezes a point-in-time copy without consuming the buffer: the
+    /// segment holds exactly the rows appended so far, and later appends
+    /// leave it untouched (the copy-on-write buffers make this cheap —
+    /// no row data is copied at snapshot time).
+    pub fn snapshot_at(&self, base_row_id: u64) -> Result<Segment, StorageError> {
+        self.clone().freeze_at(base_row_id)
     }
 }
 
@@ -336,15 +394,112 @@ impl ColumnBuilder {
     }
 }
 
+/// A column's value range within one segment: the min/max over valid
+/// (and, for `f64`, non-NaN) values. Absent when no such value exists —
+/// or for key columns, whose codes are identities, not quantities.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ZoneMap {
+    /// Bounds of an `f64` column.
+    F64 {
+        /// Smallest valid, non-NaN value.
+        min: f64,
+        /// Largest valid, non-NaN value.
+        max: f64,
+    },
+    /// Bounds of an `i64` column.
+    I64 {
+        /// Smallest valid value.
+        min: i64,
+        /// Largest valid value.
+        max: i64,
+    },
+}
+
+/// Computes a column's zone map (the format serializes exactly this, so
+/// in-memory and decoded segments agree byte-for-byte).
+pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
+    match column {
+        Column::Numeric(NumericData::F64(numeric)) => {
+            let mut range: Option<(f64, f64)> = None;
+            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
+                if !numeric.is_valid(index) || value.is_nan() {
+                    continue;
+                }
+                range = Some(match range {
+                    None => (value, value),
+                    Some((low, high)) => (low.min(value), high.max(value)),
+                });
+            }
+            range.map(|(min, max)| ZoneMap::F64 { min, max })
+        }
+        Column::Numeric(NumericData::I64(numeric)) => {
+            let mut range: Option<(i64, i64)> = None;
+            for (index, &value) in numeric.values().as_slice().iter().enumerate() {
+                if !numeric.is_valid(index) {
+                    continue;
+                }
+                range = Some(match range {
+                    None => (value, value),
+                    Some((low, high)) => (low.min(value), high.max(value)),
+                });
+            }
+            range.map(|(min, max)| ZoneMap::I64 { min, max })
+        }
+        Column::Key(_) => None,
+    }
+}
+
 /// An immutable, in-memory segment: a record batch plus what storage knows
 /// about it.
 pub struct Segment {
     batch: RecordBatch,
     ordering_key: usize,
     ordered: bool,
+    base_row_id: u64,
+    zone_maps: Vec<Option<ZoneMap>>,
 }
 
 impl Segment {
+    /// Reassembles a segment from decoded parts (the format module's
+    /// doorway; nothing else constructs segments directly).
+    pub(crate) fn from_parts(
+        batch: RecordBatch,
+        ordering_key: usize,
+        ordered: bool,
+        base_row_id: u64,
+        zone_maps: Vec<Option<ZoneMap>>,
+    ) -> Segment {
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id,
+            zone_maps,
+        }
+    }
+
+    /// The zone map for column `index`, if it has one (see [`ZoneMap`]).
+    /// Query planning prunes segments whose ranges cannot satisfy a
+    /// predicate; correctness never depends on these being present.
+    pub fn zone_map(&self, index: usize) -> Option<&ZoneMap> {
+        self.zone_maps.get(index).and_then(Option::as_ref)
+    }
+
+    /// Wraps an already-built batch as a free-standing segment — the
+    /// doorway `query-lite`'s join uses to run the single-table pipeline
+    /// over a joined intermediate. Zone maps are computed; the row-id
+    /// base is 0 (these rows are query-lifetime, not stored).
+    pub fn from_batch(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {
+        let zone_maps = batch.columns().iter().map(compute_zone_map).collect();
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id: 0,
+            zone_maps,
+        }
+    }
+
     /// The segment's data.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
@@ -360,6 +515,27 @@ impl Segment {
     /// than assume.
     pub fn is_ordered(&self) -> bool {
         self.ordered
+    }
+
+    /// The internal row id of this segment's first row (decision #1: every
+    /// row carries a monotonic id assigned at ingest — row `i` of this
+    /// segment has id `base_row_id + i`). Tombstones and "newest version
+    /// wins" resolution address rows by these ids, never by key tuples.
+    pub fn base_row_id(&self) -> u64 {
+        self.base_row_id
+    }
+
+    /// First and last values of the ordering key, or `None` if the
+    /// segment is empty. Readers use this to check that a *sequence* of
+    /// segments is globally ordered: each segment internally ordered, and
+    /// each boundary non-decreasing.
+    pub fn ordering_bounds(&self) -> Option<(i64, i64)> {
+        let Column::Numeric(NumericData::I64(column)) = &self.batch.columns()[self.ordering_key]
+        else {
+            unreachable!("the ordering key is validated as i64 at construction")
+        };
+        let values = column.values().as_slice();
+        Some((*values.first()?, *values.last()?))
     }
 }
 

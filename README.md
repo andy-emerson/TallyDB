@@ -5,12 +5,28 @@
 > **Status:** TallyDB is under construction, and a first thin engine runs.
 > The columnar foundation (`arrow-lite`) is implemented and cross-checked
 > against arrow-rs and PyArrow in CI, and a minimal vertical slice now
-> works end to end: append rows one at a time, run a SQL rolling
-> least-squares regression solved by LAPACK inside the engine, and read
-> the results over an Arrow stream — validated row-for-row against NumPy
-> and DuckDB in CI. It is one query shape over one in-memory table, not a
-> database yet: general SQL, persistent storage, and the Lua/BLAS surface
-> are still ahead. The developer-facing design lives in
+> works end to end: append rows one at a time — freely interleaved with
+> queries, into multi-segment storage with internal row ids that
+> persists to disk in a golden-locked columnar format and reopens
+> verified — run a SQL rolling least-squares regression solved by
+> LAPACK inside the engine, and read the results over an Arrow stream —
+> validated row-for-row against NumPy and DuckDB in CI, over data that
+> has round-tripped through storage — plus real `UPDATE`/`DELETE` via
+> tombstone + reinsert, resolved by crash-safe compaction, with
+> end-state semantics diffed against DuckDB in CI. SELECT now carries
+> WHERE (with zone-map pruning), GROUP BY with the standard aggregates,
+> ORDER BY and LIMIT, star-schema joins against dimension tables, and
+> the standard aggregates as window functions over trailing and
+> unbounded frames — every query family born cross-checked by a
+> generated DuckDB differential harness over the checked-in corpus (38
+> query families and counting). Compute has its breadth: symmetric
+> eigenvalues, linear solve, and Cholesky behind the capability trait,
+> least squares running QR with an SVD fallback (#20, criterion
+> measured and documented), native BLAS primitives, and `covar_pop` /
+> `corr` / `eigen_max` as SQL window functions — cross-checked against
+> DuckDB and NumPy in CI. Of M2's plan, only the deferred pair remains:
+> the Lua layer (#5) and the f64 codec A/B (#30). The developer-facing
+> design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -105,7 +121,9 @@ boundary, not our own foresight.
 ## How you'll use it
 
 - Link it into your application like SQLite or DuckDB — no server process,
-  no separate database to administer.
+  no separate database to administer. (A standalone single-file CLI
+  binary per release — the `sqlite3`-shell shape, still no server — is
+  planned for native GA; see `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded
@@ -155,18 +173,48 @@ zero-copy views, logical-type export annotations, and the C Data Interface
 including `ArrowArrayStream` — every piece round-trip-tested against
 arrow-rs and PyArrow in CI, with the unsafe core also run under Miri.
 
-On top of it runs the first vertical slice, deliberately thin in each
-crate: `storage-lite` appends validated rows into a single immutable
-in-memory segment (no persistence, tombstones, or compaction yet);
-`query-lite` parses exactly one SQL shape — window aggregates over
-`ROWS BETWEEN n PRECEDING AND CURRENT ROW`, optionally per key — via
-sqlparser-rs; `compute-lapack` links system LAPACK and solves least
-squares through `dgels` behind a capability-negotiating trait; and
-`engine` ties them together, registering `regr_slope`/`regr_intercept`
-as SQL window functions whose every window is re-derived independently
-by `np.linalg.lstsq` and DuckDB in CI. Passthrough results share the
-stored buffers (pointer-verified); the design-matrix gather is the one
-bounded copy, as recorded in the tracker. `compute-blas` and
+On top of it runs the vertical slice, now past its M1 write-then-read
+shape: `storage-lite` appends validated rows into a per-table store —
+a write buffer freezing into immutable segments at a row threshold,
+each row carrying an internal monotonic row id — and persists them
+behind a storage-backend trait (natively, a directory of files) in a
+self-describing, CRC-checked, deterministic on-disk format whose bytes
+are locked by a committed golden: per-column codec tags with
+delta-of-delta on the ordered ordering key (measured on the checked-in
+corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
+zone maps awaiting query-time pruning, and reopen that verifies schema,
+checksums, and row-id contiguity (durability boundary is the flush).
+Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
+row-id delete logs, reads resolve tombstones through live masks, and
+crash-safe generational compaction merges live rows back into sorted,
+contiguous segments — with end-state semantics validated against DuckDB
+in CI. `query-lite` speaks a real query subset via sqlparser-rs: SELECT with
+WHERE (the predicate fragment — numeric comparisons, key string
+equality and `IN` evaluated once per distinct dictionary value,
+`AND`/`OR`/`NOT` — with zone-map pruning skipping segments that cannot
+match), GROUP BY over key columns with
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
+`i64` stays exact and errors loudly on overflow rather than silently
+widening), top-level ORDER BY and LIMIT/OFFSET, star-schema equi-joins (one fact
+table against small key-unique dimension tables, INNER or LEFT, run
+fact-driven through the same pipeline as everything else), the standard
+aggregates as window functions over `ROWS BETWEEN n | UNBOUNDED
+PRECEDING AND CURRENT ROW` frames, and `UPDATE`/`DELETE`. It
+executes across all segments of a snapshot, returning one Arrow batch
+per segment with per-segment key dictionaries remapped at query time
+where grouping or partitioning needs them, and a generated
+differential harness diffs query families against DuckDB over the
+corpus in CI;
+`compute-lapack` links system
+LAPACK and solves least squares through `dgels` behind a
+capability-negotiating trait; and `engine` ties them together behind a
+multi-table `Database` handle, registering `regr_slope` / `regr_intercept`, `covar_pop` / `corr`,
+and `eigen_max` (the window's first principal-component variance, via
+`dsyev`) as SQL window functions — every window re-derived
+independently by NumPy and DuckDB in CI, over a fixture that spans
+several segments and a storage round trip. Passthrough results share the stored buffers
+(pointer-verified); the design-matrix and cross-segment window gathers
+are the bounded copies, as recorded in the crate docs. `compute-blas` and
 `compute-lua` remain scaffolds: documented boundaries and settled
 contracts, not yet implementations. `blas.wasm` and `lua.wasm` (the WASM
 compute dependencies, for later) are real, working, MIT-licensed projects

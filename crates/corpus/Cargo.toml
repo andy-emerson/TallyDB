@@ -1,0 +1,10 @@
+[package]
+name = "corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Dev-only infrastructure: measurement and differential-test data for the
+# other crates. Never a runtime dependency of the engine.
+publish = false
+
+[dependencies]

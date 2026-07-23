@@ -44,3 +44,7 @@ jobs:
           cargo build -p engine --features oracle-harness
           pip install numpy duckdb
           python3 crates/engine/tests/m1_slice_oracle.py target/debug/libengine.so
+      - name: M2.3 mutation oracle — DuckDB differential (issue #35)
+        run: python3 crates/engine/tests/m2_mutation_oracle.py target/debug/libengine.so
+      - name: M2.4 differential harness — generated queries vs DuckDB (issue #36)
+        run: python3 crates/engine/tests/m2_differential_oracle.py target/debug/libengine.so
