@@ -196,8 +196,26 @@ compaction resolves tombstones and merges segments. This means:
 > standard for clock-like keys, with a confirm-against-plain-delta
 > measurement on the corpus at implementation. **`f64` columns ship
 > uncompressed behind the tag** — a legitimate answer for hot data, not
-> a placeholder — while the Gorilla-vs-zstd fork stays open (issue #30),
-> resolved by A/B when the corpus exists.
+> a placeholder. **The general-`f64` codec is decided: ALP** (issue
+> #30, closed 2026-07-24 by argument over the published evidence
+> rather than an in-house A/B — sound precisely because the codec
+> registry makes the choice an additive tag, cheap to reverse). ALP
+> converts decimals-in-doubles to integers per vector
+> (frame-of-reference + bit-packing, verbatim exceptions, ALP-RD
+> fallback for true doubles), with losslessness enforced per value at
+> encode time; it leads the field on both of our weighted criteria —
+> decode throughput on the read path first, ratio second (encode runs
+> at freeze/compaction, off the hot path). Rejected: Gorilla and Chimp
+> (the XOR family's bit-serial decode cannot vectorize; Chimp remains
+> the named low-effort fallback if ALP's implementation cost vetoes
+> it), Elf (near-parity ratio bought with ~215× slower decode and a
+> global erase-and-restore correctness obligation), and zstd±byte-split
+> (float-blind, and a dependency where a hand-roll fits the registry).
+> Implementation is #42, scheduled by footprint need rather than
+> milestone; until it lands, uncompressed remains the shipped answer.
+> Measurement caveat: before ALP is measured, the corpus ticks family
+> must round to a realistic tick size — real prices are decimals, and
+> an unrounded random walk misrepresents the target workload.
 
 ## Deployment shapes
 
