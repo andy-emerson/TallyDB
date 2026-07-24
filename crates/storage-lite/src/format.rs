@@ -33,8 +33,10 @@
 //!   nullable    u8
 //!   logical     u8 tag + u8 payload — frozen registry (0,0 = none)
 //!   codec       u8   — frozen registry (decision #28)
-//!   zone map    u8 present; if 1: min 8B, max 8B (f64 bits or i64,
-//!                  per column type; computed over valid, non-NaN values)
+//!   zone map    u8 bitfield (bit 0 present, bit 1 has-NaN, f64 only);
+//!                  if present: min 8B, max 8B (f64 bits or i64, per
+//!                  column type; min/max over valid non-NaN values,
+//!                  canonical NaN when every valid value is NaN)
 //!   validity    u8 present; if 1: u32 byte length + LSB bitmap bytes
 //!   values      u64 byte length + encoded bytes (per the codec; key
 //!                  columns store their u32 codes here)
@@ -280,17 +282,24 @@ fn push_values(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Zone map: the segment's precomputed min/max (see
-/// [`crate::mem::ZoneMap`]), absent when no valid non-NaN value exists
-/// or the column is a key.
+/// [`crate::mem::ZoneMap`]), absent when no valid value exists or the
+/// column is a key. The presence byte is a small bitfield: bit 0 =
+/// present, bit 1 = the column holds at least one valid NaN (`f64`
+/// only — pruning soundness under the NaN-is-greatest comparison
+/// relation, D2 ruling 2026-07-24).
 fn encode_zone_map(out: &mut Vec<u8>, zone_map: Option<&ZoneMap>) {
-    let bounds: Option<([u8; 8], [u8; 8])> = zone_map.map(|zone_map| match zone_map {
-        ZoneMap::F64 { min, max } => (min.to_le_bytes(), max.to_le_bytes()),
-        ZoneMap::I64 { min, max } => (min.to_le_bytes(), max.to_le_bytes()),
+    let encoded: Option<(u8, [u8; 8], [u8; 8])> = zone_map.map(|zone_map| match zone_map {
+        ZoneMap::F64 { min, max, has_nan } => (
+            1 | (u8::from(*has_nan) << 1),
+            min.to_le_bytes(),
+            max.to_le_bytes(),
+        ),
+        ZoneMap::I64 { min, max } => (1, min.to_le_bytes(), max.to_le_bytes()),
     });
-    match bounds {
+    match encoded {
         None => out.push(0),
-        Some((min, max)) => {
-            out.push(1);
+        Some((presence, min, max)) => {
+            out.push(presence);
             out.extend_from_slice(&min);
             out.extend_from_slice(&max);
         }
@@ -539,14 +548,27 @@ fn decode_column(
     };
     let codec = Codec::from_tag(reader.u8()?)
         .ok_or_else(|| FormatError::Corrupt(format!("unknown codec for '{name}'")))?;
-    let zone_map = if reader.u8()? != 0 {
+    let presence = reader.u8()?;
+    if presence & !0b11 != 0 || (presence & 0b10 != 0 && (presence & 1 == 0)) {
+        return Err(FormatError::Corrupt(format!(
+            "invalid zone-map presence byte {presence:#04x} for '{name}'"
+        )));
+    }
+    let zone_map = if presence & 1 != 0 {
+        let has_nan = presence & 0b10 != 0;
         let min = reader.take(8)?;
         let max = reader.take(8)?;
         Some(match column_type {
             ColumnType::F64 => ZoneMap::F64 {
                 min: f64::from_le_bytes(min.try_into().unwrap()),
                 max: f64::from_le_bytes(max.try_into().unwrap()),
+                has_nan,
             },
+            ColumnType::I64 if has_nan => {
+                return Err(FormatError::Corrupt(format!(
+                    "i64 column '{name}' carries the NaN zone-map bit"
+                )))
+            }
             ColumnType::I64 => ZoneMap::I64 {
                 min: i64::from_le_bytes(min.try_into().unwrap()),
                 max: i64::from_le_bytes(max.try_into().unwrap()),
