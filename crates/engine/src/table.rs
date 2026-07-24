@@ -573,18 +573,25 @@ impl WindowAggregate for RollingRegression {
         if x.iter().all(|&value| value == x[0]) {
             return Ok(None);
         }
-        // The one bounded copy (issue #4): gather the [1 | x] design
-        // matrix in the column-major layout LAPACK requires.
+        // The one bounded copy (issue #4): gather the [1 | x - x̄] design
+        // matrix in the column-major layout LAPACK requires. x is centered
+        // because the raw pair (1, x) is catastrophically ill-conditioned
+        // when x carries a large offset relative to its in-window spread —
+        // a timestamp-scale regressor (unix seconds ≈ 1e9) loses the slope
+        // entirely, while centering holds ~1e-11 relative error across
+        // offsets up to 1e15 (bug #45, measured 2026-07-24). The slope is
+        // shift-invariant; the intercept is un-centered on the way out.
+        let mean_x = x.iter().sum::<f64>() / rows as f64;
         let mut design = Vec::with_capacity(rows * 2);
         design.resize(rows, 1.0);
-        design.extend_from_slice(x);
+        design.extend(x.iter().map(|&value| value - mean_x));
         match self
             .backend
             .least_squares(ColMajor::new(&design, rows, 2), y)
         {
             Ok(coefficients) => Ok(Some(match self.output {
                 RegressionOutput::Slope => coefficients[1],
-                RegressionOutput::Intercept => coefficients[0],
+                RegressionOutput::Intercept => coefficients[0] - coefficients[1] * mean_x,
             })),
             // Rank-deficient window (constant x): the regression is
             // undefined there — SQL NULL, matching regr_slope semantics.
@@ -731,6 +738,76 @@ mod tests {
          ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS beta, \
          regr_intercept(y, x) OVER (PARTITION BY sym ORDER BY ts \
          ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS alpha FROM trades";
+
+    /// Bug #45: a regressor with a large offset relative to its in-window
+    /// spread (a timestamp-scale x) made the raw [1 | x] design matrix
+    /// catastrophically ill-conditioned — the fitted slope was garbage at
+    /// offsets ≥ 1e9 while the CI oracle, solving the same raw matrix,
+    /// agreed with the garbage. The reference here is the centered
+    /// closed form, deliberately a different computational path from the
+    /// engine's centered QR solve.
+    #[test]
+    fn rolling_regression_survives_timestamp_scale_x() {
+        let mut table = Table::new("trades", m1_schema(), "ts").unwrap();
+        let n = 20usize;
+        let offset = 1e9f64;
+        let slope = 2e-6f64;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = offset + i as f64;
+            // Deterministic perturbation so the fit is not exact — the
+            // regime where the uncentered solve loses the slope entirely.
+            let y = 3.0 + slope * i as f64 + f64::from((i as u32 * 37) % 17) * 1e-5;
+            xs.push(x);
+            ys.push(y);
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(x),
+                    RowValue::F64(y),
+                ])
+                .unwrap();
+        }
+        // Centered closed-form reference over the full window.
+        let count = n as f64;
+        let (mean_x, mean_y) = (
+            xs.iter().sum::<f64>() / count,
+            ys.iter().sum::<f64>() / count,
+        );
+        let mut ss_xx = 0.0f64;
+        let mut ss_xy = 0.0f64;
+        for (&x, &y) in xs.iter().zip(&ys) {
+            ss_xx += (x - mean_x) * (x - mean_x);
+            ss_xy += (x - mean_x) * (y - mean_y);
+        }
+        let slope_ref = ss_xy / ss_xx;
+        let intercept_ref = mean_y - slope_ref * mean_x;
+
+        let output = table
+            .query(
+                "SELECT regr_slope(y, x) OVER (ORDER BY ts \
+                 ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS beta, \
+                 regr_intercept(y, x) OVER (ORDER BY ts \
+                 ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS alpha FROM trades",
+            )
+            .unwrap();
+        let batch = output.batches.last().unwrap();
+        let last = batch.num_rows() - 1;
+        let beta = f64_column(batch, 0).values().as_slice()[last];
+        let alpha = f64_column(batch, 1).values().as_slice()[last];
+        let beta_err = ((beta - slope_ref) / slope_ref).abs();
+        assert!(
+            beta_err < 1e-6,
+            "slope {beta} vs reference {slope_ref} (relative error {beta_err:e})"
+        );
+        let alpha_err = ((alpha - intercept_ref) / intercept_ref).abs();
+        assert!(
+            alpha_err < 1e-6,
+            "intercept {alpha} vs reference {intercept_ref} (relative error {alpha_err:e})"
+        );
+    }
 
     #[test]
     fn rolling_regression_recovers_exact_lines_per_symbol() {
