@@ -96,6 +96,13 @@ available, because withholding a SQL verb the storage engine already
 supports under a different name would just push the same work into
 application code.
 
+**Null and NaN, precisely.** NULL is absence, not a value: it matches no
+comparison (three-valued logic), aggregates skip it, and `ORDER BY`
+places it after all values in *both* directions. NaN is a value —
+computed, greater than every number, equal to itself — under one
+comparison relation shared by sorting, `WHERE`, `MIN`/`MAX`, and
+zone-map pruning (see `DESIGN.md`, *Null, NaN, and ordering semantics*).
+
 **Strings, precisely.** The numeric-or-key rule holds across the *entire
 pipeline* — stored columns, intermediate results, and query outputs are
 always numeric or key; a bare string never exists in the engine. That is
