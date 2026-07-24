@@ -15,6 +15,7 @@
 use crate::plan::QueryError;
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
+use std::cmp::Ordering;
 use storage_lite::SegmentView;
 
 /// A numeric literal, kept as written: integers stay exact `i64`, so an
@@ -63,6 +64,34 @@ impl CmpOp {
             CmpOp::Gt => left > right,
             CmpOp::Ge => left >= right,
         }
+    }
+
+    fn holds_f64(self, left: f64, right: f64) -> bool {
+        let ordering = cmp_f64(left, right);
+        match self {
+            CmpOp::Eq => ordering == Ordering::Equal,
+            CmpOp::Ne => ordering != Ordering::Equal,
+            CmpOp::Lt => ordering == Ordering::Less,
+            CmpOp::Le => ordering != Ordering::Greater,
+            CmpOp::Gt => ordering == Ordering::Greater,
+            CmpOp::Ge => ordering != Ordering::Less,
+        }
+    }
+}
+
+/// The engine's `f64` comparison relation (D2 ruling, 2026-07-24): NaN
+/// is a *value*, greater than every number and equal to itself, so a
+/// NaN row matches `x > 5` and sorts, filters, and prunes under one
+/// consistent order. Ordinary values keep IEEE comparison, so
+/// `-0.0 = 0.0` stays true — this is "NaN lifted to the top", not
+/// bitwise total order. NULL is not handled here: null is not a value
+/// and never reaches a comparison (three-valued logic masks it out).
+fn cmp_f64(left: f64, right: f64) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => left.partial_cmp(&right).expect("both are non-NaN"),
     }
 }
 
@@ -257,7 +286,7 @@ pub fn evaluate(
                     let values = numeric.values().as_slice();
                     let target = value.as_f64();
                     Ok(Bitmap::from_bools((0..rows).map(|row| {
-                        numeric.is_valid(row) && op.holds(values[row], target)
+                        numeric.is_valid(row) && op.holds_f64(values[row], target)
                     })))
                 }
                 Column::Numeric(NumericData::I64(numeric)) => {
@@ -269,7 +298,7 @@ pub fn evaluate(
                                 .map(|row| numeric.is_valid(row) && op.holds(values[row], *target)),
                         ),
                         Number::Float(target) => Bitmap::from_bools((0..rows).map(|row| {
-                            numeric.is_valid(row) && op.holds(values[row] as f64, *target)
+                            numeric.is_valid(row) && op.holds_f64(values[row] as f64, *target)
                         })),
                     })
                 }
@@ -338,8 +367,34 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
                 }
             }
             match (zone_map, value) {
-                (storage_lite::ZoneMap::F64 { min, max }, value) => {
-                    interval_may_hold(*op, *min, *max, value.as_f64())
+                // f64 zones exclude NaN from min/max, but under the
+                // engine's comparison relation NaN is greater than every
+                // number — so `>`-side pruning (and `<>`) must also ask
+                // whether the segment holds a NaN row. An all-NaN zone
+                // stores NaN bounds, and cmp_f64 makes every bound test
+                // below answer soundly for it.
+                (storage_lite::ZoneMap::F64 { min, max, has_nan }, value) => {
+                    let target = value.as_f64();
+                    if target.is_nan() {
+                        // No SQL literal produces NaN today; if one ever
+                        // arrives, never prune on it.
+                        return true;
+                    }
+                    match op {
+                        CmpOp::Eq => {
+                            cmp_f64(*min, target) != Ordering::Greater
+                                && cmp_f64(target, *max) != Ordering::Greater
+                        }
+                        CmpOp::Ne => {
+                            *has_nan
+                                || !(cmp_f64(*min, target) == Ordering::Equal
+                                    && cmp_f64(*max, target) == Ordering::Equal)
+                        }
+                        CmpOp::Lt => cmp_f64(*min, target) == Ordering::Less,
+                        CmpOp::Le => cmp_f64(*min, target) != Ordering::Greater,
+                        CmpOp::Gt => *has_nan || cmp_f64(*max, target) == Ordering::Greater,
+                        CmpOp::Ge => *has_nan || cmp_f64(*max, target) != Ordering::Less,
+                    }
                 }
                 (storage_lite::ZoneMap::I64 { min, max }, Number::Int(target)) => {
                     interval_may_hold(*op, *min, *max, *target)
@@ -441,6 +496,91 @@ mod tests {
     use super::*;
     use arrow_lite::{ColumnType, Field};
     use storage_lite::{RowValue, WriteBuffer};
+
+    /// A segment mixing NaN with finite values, plus one all-NaN
+    /// segment — the D2 ruling's edge cases: NaN is a value, greater
+    /// than every number, equal to itself, in predicates and pruning.
+    fn nan_view(values: &[f64]) -> (Schema, SegmentView) {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        for (ts, &x) in values.iter().enumerate() {
+            buffer
+                .append(&[RowValue::I64(ts as i64), RowValue::F64(x)])
+                .unwrap();
+        }
+        let segment = std::sync::Arc::new(buffer.freeze().unwrap());
+        (schema, SegmentView::all_live(segment))
+    }
+
+    #[test]
+    fn nan_is_a_value_greater_than_every_number() {
+        let (schema, view) = nan_view(&[1.0, f64::NAN, 5.0]);
+        let cases: &[(CmpOp, f64, [bool; 3])] = &[
+            (CmpOp::Gt, 2.0, [false, true, true]),   // NaN > 2
+            (CmpOp::Ge, 5.0, [false, true, true]),   // NaN >= 5
+            (CmpOp::Lt, 2.0, [true, false, false]),  // NaN is not < 2
+            (CmpOp::Le, 1e308, [true, false, true]), // NaN above every number
+            (CmpOp::Ne, 5.0, [true, true, false]),   // NaN <> 5
+            (CmpOp::Eq, 1.0, [true, false, false]),  // NaN != finite
+        ];
+        for &(op, target, expected) in cases {
+            let predicate = Predicate::Compare {
+                column: "x".to_owned(),
+                op,
+                value: Number::Float(target),
+            };
+            let bitmap = evaluate(&predicate, &schema, &view).unwrap();
+            for (row, &want) in expected.iter().enumerate() {
+                assert_eq!(bitmap.get(row), want, "{op:?} {target} row {row}");
+            }
+            // Pruning stays sound: any op that matches a row must also
+            // report the segment as maybe-matching.
+            if expected.iter().any(|&matched| matched) {
+                assert!(can_match(&predicate, &schema, &view), "{op:?} {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn nan_rows_defeat_upper_bound_pruning_only() {
+        // Finite max is 5.0; the NaN row must keep > / >= / <> alive.
+        let (schema, view) = nan_view(&[1.0, f64::NAN, 5.0]);
+        let compare = |op, target| Predicate::Compare {
+            column: "x".to_owned(),
+            op,
+            value: Number::Float(target),
+        };
+        assert!(can_match(&compare(CmpOp::Gt, 100.0), &schema, &view));
+        assert!(can_match(&compare(CmpOp::Ge, 100.0), &schema, &view));
+        assert!(can_match(&compare(CmpOp::Ne, 100.0), &schema, &view));
+        // NaN is not below anything: < / <= / = still prune by bounds.
+        assert!(!can_match(&compare(CmpOp::Lt, 0.5), &schema, &view));
+        assert!(!can_match(&compare(CmpOp::Le, 0.5), &schema, &view));
+        assert!(!can_match(&compare(CmpOp::Eq, 100.0), &schema, &view));
+        // Without NaN, the upper bound prunes as before.
+        let (schema, clean) = nan_view(&[1.0, 5.0]);
+        assert!(!can_match(&compare(CmpOp::Gt, 100.0), &schema, &clean));
+    }
+
+    #[test]
+    fn all_nan_segment_prunes_soundly() {
+        let (schema, view) = nan_view(&[f64::NAN, f64::NAN]);
+        let compare = |op, target| Predicate::Compare {
+            column: "x".to_owned(),
+            op,
+            value: Number::Float(target),
+        };
+        // NaN matches only the >-side and <>.
+        assert!(can_match(&compare(CmpOp::Gt, 100.0), &schema, &view));
+        assert!(can_match(&compare(CmpOp::Ne, 3.0), &schema, &view));
+        assert!(!can_match(&compare(CmpOp::Lt, 100.0), &schema, &view));
+        assert!(!can_match(&compare(CmpOp::Eq, 3.0), &schema, &view));
+        let matched = evaluate(&compare(CmpOp::Gt, 100.0), &schema, &view).unwrap();
+        assert!(matched.get(0) && matched.get(1));
+    }
 
     fn view() -> (Schema, SegmentView) {
         let schema = Schema::new(vec![
@@ -663,20 +803,35 @@ mod pruning_tests {
     }
 
     #[test]
-    fn a_column_with_no_comparable_values_prunes_comparisons() {
+    fn null_only_columns_prune_and_nan_rows_do_not() {
         let schema = Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
             Field::new("y", ColumnType::F64, true),
         ]);
+        // Only NULLs: null is not a value, so no comparison can match.
+        let mut nulls = WriteBuffer::new(schema.clone(), 0).unwrap();
+        nulls.append(&[RowValue::I64(1), RowValue::Null]).unwrap();
+        let null_view = SegmentView::all_live(std::sync::Arc::new(nulls.freeze().unwrap()));
+        assert!(!can_match(
+            &compare("y", CmpOp::Ge, Number::Float(0.0)),
+            &schema,
+            &null_view
+        ));
+        // NULL plus NaN: NaN *is* a value (greater than every number,
+        // D2 ruling), so `>=` may match — and does, on the NaN row.
         let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
         buffer.append(&[RowValue::I64(1), RowValue::Null]).unwrap();
         buffer
             .append(&[RowValue::I64(2), RowValue::F64(f64::NAN)])
             .unwrap();
         let view = SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()));
-        // y holds only NULL and NaN: no comparison can match any row.
+        let ge = compare("y", CmpOp::Ge, Number::Float(0.0));
+        assert!(can_match(&ge, &schema, &view));
+        let matched = evaluate(&ge, &schema, &view).unwrap();
+        assert!(!matched.get(0) && matched.get(1));
+        // The <-side still prunes: NaN is never below a number.
         assert!(!can_match(
-            &compare("y", CmpOp::Ge, Number::Float(0.0)),
+            &compare("y", CmpOp::Lt, Number::Float(0.0)),
             &schema,
             &view
         ));
