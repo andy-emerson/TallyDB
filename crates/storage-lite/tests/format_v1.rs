@@ -8,7 +8,10 @@
 //! re-blessing `tests/golden/segment_v1.bin`, never a refactor.
 
 use arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
-use storage_lite::{decode_segment, encode_segment, FormatError, RowValue, Segment, WriteBuffer};
+use storage_lite::{
+    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, RowValue,
+    Segment, WriteBuffer,
+};
 
 /// A fixture exercising every format feature: all three column types, a
 /// logical annotation, nulls (and a nullable column without nulls), an
@@ -124,6 +127,95 @@ fn every_single_byte_corruption_is_caught() {
             "flipped byte {position} decoded"
         );
     }
+}
+
+/// The manifest fixture: every schema feature the manifest serializes
+/// (all three column types, nullability, a logical annotation), a
+/// non-zero ordering key, and a non-zero generation.
+fn fixture_manifest() -> (Schema, usize, u64) {
+    let schema = Schema::new(vec![
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("ts", ColumnType::I64, false).with_logical(LogicalType::TimestampNs),
+        Field::new("x", ColumnType::F64, true),
+    ]);
+    (schema, 1, 42)
+}
+
+#[test]
+fn manifest_round_trips_exactly() {
+    let (schema, ordering_key, generation) = fixture_manifest();
+    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let manifest = decode_manifest(&bytes).unwrap();
+    assert_eq!(manifest.schema, schema);
+    assert_eq!(manifest.ordering_key, ordering_key);
+    assert_eq!(manifest.generation, generation);
+}
+
+#[test]
+fn every_manifest_truncation_is_an_error_never_a_panic() {
+    let (schema, ordering_key, generation) = fixture_manifest();
+    let bytes = encode_manifest(&schema, ordering_key, generation);
+    for len in 0..bytes.len() {
+        assert!(
+            decode_manifest(&bytes[..len]).is_err(),
+            "prefix of {len} bytes decoded"
+        );
+    }
+}
+
+#[test]
+fn every_manifest_single_byte_corruption_is_caught() {
+    let (schema, ordering_key, generation) = fixture_manifest();
+    let bytes = encode_manifest(&schema, ordering_key, generation);
+    for position in 0..bytes.len() {
+        let mut corrupt = bytes.clone();
+        corrupt[position] ^= 0x40;
+        assert!(
+            decode_manifest(&corrupt).is_err(),
+            "flipped byte {position} decoded"
+        );
+    }
+}
+
+#[test]
+fn manifest_rejects_segment_bytes_and_vice_versa() {
+    let (schema, ordering_key, generation) = fixture_manifest();
+    assert!(matches!(
+        decode_manifest(&encode_segment(&fixture_segment())),
+        Err(FormatError::BadMagic)
+    ));
+    assert!(matches!(
+        decode_segment(&encode_manifest(&schema, ordering_key, generation)),
+        Err(FormatError::BadMagic)
+    ));
+}
+
+/// The manifest golden lock — same contract as the segment's below.
+#[test]
+fn manifest_golden_bytes_are_locked() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("manifest_v1.bin");
+    let (schema, ordering_key, generation) = fixture_manifest();
+    let bytes = encode_manifest(&schema, ordering_key, generation);
+    if !path.exists() && std::env::var_os("TALLYDB_BLESS_GOLDEN").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        panic!("golden blessed at {path:?}; rerun without TALLYDB_BLESS_GOLDEN");
+    }
+    let golden = std::fs::read(&path).unwrap_or_else(|_| {
+        panic!("missing {path:?} — bless it with TALLYDB_BLESS_GOLDEN=1 if intentional")
+    });
+    assert_eq!(
+        bytes, golden,
+        "manifest bytes moved off the committed golden — a behavioral \
+         change; re-bless deliberately, in review"
+    );
+    let decoded = decode_manifest(&golden).unwrap();
+    assert_eq!(decoded.schema, schema);
+    assert_eq!(decoded.ordering_key, ordering_key);
+    assert_eq!(decoded.generation, generation);
 }
 
 #[test]

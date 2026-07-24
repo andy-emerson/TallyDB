@@ -14,7 +14,14 @@
 //! magic        8B  "TALLYSEG"
 //! version      u16 (this module writes 1)
 //! reserved     u16 (zero)
-//! crc32        u32 — IEEE CRC-32 of every byte after this field
+//! crc32c       u32 — CRC-32C (Castagnoli) of every byte after this
+//!                  field; chosen over IEEE CRC-32 because it is the
+//!                  polynomial with hardware instructions on both
+//!                  x86_64 (SSE4.2) and ARMv8, and identical software
+//!                  cost everywhere else including WASM (ruled
+//!                  2026-07-24; the accelerated implementation is a
+//!                  future additive optimization — this module's
+//!                  table-driven form defines the function)
 //! base_row_id  u64 (decision #1: id of the segment's first row)
 //! row_count    u64
 //! ordering_key u32 (column index)
@@ -40,6 +47,28 @@
 //! open for uncompressed columns would be a new version — cheap under
 //! the append-only registry discipline, and not worth speculative bytes
 //! today.
+//!
+//! ## The manifest format, version 1
+//!
+//! The table manifest is its own small record (it used to be an encoded
+//! empty segment whose `base_row_id` field smuggled the generation — a
+//! pun retired 2026-07-24). It carries exactly what reopen needs: the
+//! schema to verify against, the ordering key, and the committed
+//! generation. Same conventions as the segment: little-endian,
+//! deterministic, golden-locked.
+//!
+//! ```text
+//! magic        8B  "TALLYMFT"
+//! version      u16 (this module writes 1)
+//! reserved     u16 (zero)
+//! crc32c       u32 — CRC-32C of every byte after this field
+//! generation   u64 — the committed compaction generation
+//! ordering_key u32 (column index)
+//! column_count u32
+//! then per column (the segment format's schema prefix, same registries):
+//!   name_len u16, name bytes (UTF-8)
+//!   column_type u8, nullable u8, logical u8 tag + u8 payload
+//! ```
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
 use crate::mem::{Segment, ZoneMap};
@@ -61,7 +90,7 @@ pub enum FormatError {
     BadMagic,
     /// A version this build does not read.
     UnsupportedVersion(u16),
-    /// The CRC-32 over the payload disagrees with the header.
+    /// The CRC-32C over the payload disagrees with the header.
     ChecksumMismatch { stored: u32, computed: u32 },
     /// Structurally invalid bytes; names what was wrong.
     Corrupt(String),
@@ -72,16 +101,16 @@ pub enum FormatError {
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FormatError::BadMagic => write!(f, "not a TallyDB segment (bad magic)"),
+            FormatError::BadMagic => write!(f, "not a TallyDB segment or manifest (bad magic)"),
             FormatError::UnsupportedVersion(version) => {
-                write!(f, "segment format version {version} is not supported")
+                write!(f, "format version {version} is not supported")
             }
             FormatError::ChecksumMismatch { stored, computed } => write!(
                 f,
-                "segment checksum mismatch (stored {stored:#010x}, computed {computed:#010x})"
+                "checksum mismatch (stored {stored:#010x}, computed {computed:#010x})"
             ),
-            FormatError::Corrupt(what) => write!(f, "corrupt segment: {what}"),
-            FormatError::Codec(error) => write!(f, "corrupt segment: {error}"),
+            FormatError::Corrupt(what) => write!(f, "corrupt file: {what}"),
+            FormatError::Codec(error) => write!(f, "corrupt file: {error}"),
         }
     }
 }
@@ -94,8 +123,11 @@ impl From<CodecError> for FormatError {
     }
 }
 
-/// IEEE CRC-32 (the zlib/PNG polynomial), table-driven.
-fn crc32(bytes: &[u8]) -> u32 {
+/// CRC-32C (the Castagnoli polynomial), table-driven. This software
+/// form defines the function; a hardware implementation (SSE4.2 /
+/// ARMv8 CRC instructions compute exactly this polynomial) is a future
+/// additive optimization, never a format change.
+fn crc32c(bytes: &[u8]) -> u32 {
     const TABLE: [u32; 256] = {
         let mut table = [0u32; 256];
         let mut i = 0;
@@ -104,7 +136,7 @@ fn crc32(bytes: &[u8]) -> u32 {
             let mut bit = 0;
             while bit < 8 {
                 crc = if crc & 1 != 0 {
-                    (crc >> 1) ^ 0xEDB8_8320
+                    (crc >> 1) ^ 0x82F6_3B78
                 } else {
                     crc >> 1
                 };
@@ -156,7 +188,7 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
             segment.zone_map(index),
         );
     }
-    let crc = crc32(&out[PAYLOAD_OFFSET..]);
+    let crc = crc32c(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out
 }
@@ -333,7 +365,7 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         ));
     }
     let stored = reader.u32()?;
-    let computed = crc32(&bytes[PAYLOAD_OFFSET..]);
+    let computed = crc32c(&bytes[PAYLOAD_OFFSET..]);
     if stored != computed {
         return Err(FormatError::ChecksumMismatch { stored, computed });
     }
@@ -372,6 +404,116 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         base_row_id,
         zone_maps,
     ))
+}
+
+/// First bytes of every manifest file.
+pub const MANIFEST_MAGIC: [u8; 8] = *b"TALLYMFT";
+/// The manifest format version this module writes.
+pub const MANIFEST_VERSION: u16 = 1;
+
+/// A decoded table manifest: what reopen verifies against and the
+/// generation the backend is committed to.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Manifest {
+    /// The table's schema.
+    pub schema: Schema,
+    /// Index of the ordering-key column.
+    pub ordering_key: usize,
+    /// The committed compaction generation.
+    pub generation: u64,
+}
+
+/// Encodes a manifest into its v1 bytes.
+pub fn encode_manifest(schema: &Schema, ordering_key: usize, generation: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MANIFEST_MAGIC);
+    out.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+    out.extend_from_slice(&generation.to_le_bytes());
+    out.extend_from_slice(&(ordering_key as u32).to_le_bytes());
+    out.extend_from_slice(&(schema.fields().len() as u32).to_le_bytes());
+    for field in schema.fields() {
+        out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
+        out.extend_from_slice(field.name().as_bytes());
+        out.push(field.column_type() as u8);
+        out.push(u8::from(field.nullable()));
+        match field.logical() {
+            None => out.extend_from_slice(&[0, 0]),
+            Some(logical) => {
+                let payload = match logical {
+                    LogicalType::Decimal64 { scale } => scale,
+                    LogicalType::TimestampNs => 0,
+                };
+                out.extend_from_slice(&[logical.tag(), payload]);
+            }
+        }
+    }
+    let crc = crc32c(&out[PAYLOAD_OFFSET..]);
+    out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Decodes v1 manifest bytes, verifying magic, version, and checksum.
+pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
+    let mut reader = Reader { bytes, position: 0 };
+    if reader.take(8)? != MANIFEST_MAGIC {
+        return Err(FormatError::BadMagic);
+    }
+    let version = reader.u16()?;
+    if version != MANIFEST_VERSION {
+        return Err(FormatError::UnsupportedVersion(version));
+    }
+    if reader.u16()? != 0 {
+        return Err(FormatError::Corrupt(
+            "reserved header bytes are not zero".to_owned(),
+        ));
+    }
+    let stored = reader.u32()?;
+    let computed = crc32c(&bytes[PAYLOAD_OFFSET..]);
+    if stored != computed {
+        return Err(FormatError::ChecksumMismatch { stored, computed });
+    }
+    let generation = reader.u64()?;
+    let ordering_key = reader.u32()? as usize;
+    let column_count = reader.u32()? as usize;
+    if ordering_key >= column_count {
+        return Err(FormatError::Corrupt(format!(
+            "ordering key index {ordering_key} out of range for {column_count} columns"
+        )));
+    }
+    let mut fields = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let name_len = reader.u16()? as usize;
+        let name = std::str::from_utf8(reader.take(name_len)?)
+            .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
+            .to_owned();
+        let column_type = ColumnType::from_tag(reader.u8()?)
+            .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
+        let nullable = reader.u8()? != 0;
+        let logical_tag = reader.u8()?;
+        let logical_payload = reader.u8()?;
+        let mut field = Field::new(name.clone(), column_type, nullable);
+        if logical_tag != 0 {
+            field = field.with_logical(
+                LogicalType::from_parts(logical_tag, logical_payload).ok_or_else(|| {
+                    FormatError::Corrupt(format!("unknown logical type {logical_tag} for '{name}'"))
+                })?,
+            );
+        }
+        fields.push(field);
+    }
+    if reader.position != bytes.len() {
+        return Err(FormatError::Corrupt(format!(
+            "{} bytes remain after the last column",
+            bytes.len() - reader.position
+        )));
+    }
+    Ok(Manifest {
+        schema: Schema::new(fields),
+        ordering_key,
+        generation,
+    })
 }
 
 fn decode_column(
