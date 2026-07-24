@@ -99,7 +99,9 @@ pub mod store;
 pub mod tombstone;
 
 pub use codec::{Codec, CodecError};
-pub use format::{decode_segment, encode_segment, FormatError};
+pub use format::{
+    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, Manifest,
+};
 pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer, ZoneMap};
 pub use store::{SegmentView, Store, DEFAULT_SEGMENT_ROWS};
