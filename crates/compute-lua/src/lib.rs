@@ -59,6 +59,9 @@
 //! DESIGN.md for the reasoning.
 
 mod ffi;
+mod state;
+
+pub use state::{LuaState, ViewArg};
 
 // TODO: Lua backend trait (native vendored-5.4 implementation first;
 //       first act is the zero-copy userdata-view spike, pointer-verified)
