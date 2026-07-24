@@ -149,6 +149,37 @@ explicitly NOT a valid reason to exclude something otherwise in scope** —
 real usage regularly surprises the people who built the tool. The
 invariants are the boundary, not our own imagination.
 
+## Null, NaN, and ordering semantics
+
+> **Decided (2026-07-24): NULL is placed, not ordered; NaN is a value,
+> greater than every number, everywhere.** The engine's three-valued
+> predicate logic already put NULL outside the number line — a null
+> matches neither `x > 5` nor `x <= 5`, aggregates skip it, arithmetic
+> propagates it — and ordering says the same thing: nulls are not
+> compared but *placed*, after all values, in both sort directions.
+> Consequently `ORDER BY x DESC` is not the sequence-reversal of `ASC`:
+> within the values it is an exact mirror (total order guarantees it);
+> only the non-values stay put. That asymmetry is sound here because of
+> two premises, which are its reopen tripwire: the executor never
+> serves `DESC` by reversing an `ASC` result (each query sorts by its
+> own comparator, and there is no optimizer to introduce the shortcut),
+> and the one physically-ordered column — the ordering key — is `NOT
+> NULL` by schema rule. NaN, by contrast, *is* a value: computed, and
+> comparable under one relation used by sort, predicates, MIN/MAX, and
+> zone-map pruning alike — NaN is greater than every number and equal
+> to itself, while `-0.0 = 0.0` stays true (NaN lifted to the top, not
+> bitwise total order). The ascending ladder is *numbers… +∞, NaN,
+> then NULL off the end*. Pruning stays sound via a has-NaN bit in the
+> `f64` zone map (see `format.rs`). Rejected: nulls-as-largest/smallest
+> (they put absence *on* the number line for sorting while predicates
+> keep it off — one seam, two answers), and IEEE-strict predicates
+> (NaN invisible to every operator but `<>` while sorting as a value —
+> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is an
+> additive todo. The choice was made from the numeric-or-key thesis,
+> not oracle convenience: where the SQL standard leaves semantics
+> implementation-defined, the choice is ours and the differential
+> harness normalizes.
+
 ## Storage, ordering, corrections, and UPDATE/DELETE
 
 Storage is columnar, partitioned on the declared ordering key, and immutable
@@ -325,6 +356,32 @@ Test these thoroughly and deliberately. There is no reference implementation
 to diff against for this part of the project — the tests written here
 effectively *are* the specification.
 
+## How decisions are made here (hygiene, 2026-07-24)
+
+Three rules, adopted after a sweep of this project's own decision
+history found the same defect twice (a codec fork framed from a 2015
+paper and decided in 2026; an interpreter treated as settled because
+early drafts named it):
+
+1. **Option spaces carry provenance.** A decision record states how and
+   when its options were assembled; a fork bounded by a moving field
+   cites a check of current practice at decision time, not framing time.
+2. **A tripwire for what must be surfaced.** A choice is a decision —
+   not routing — when it freezes an external contract (bytes, API),
+   sets user-visible semantics, or sets a product guarantee. These are
+   surfaced to the architect even when discovered mid-pass, even when
+   one option seems obvious.
+3. **Settled requires a record.** A choice inherited from early drafts
+   is not settled; settled means a record exists naming the
+   alternatives that lost. Absence of a record means open.
+
+Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
+exact and errors loudly on overflow; query output is one Arrow batch
+per segment; window frames are `ROWS`-only for now. Interim states with
+their decisions still open: durability boundary is the flush (issue
+#43, must close before M3 ships a binary) and segments freeze at a
+fixed row count (issue #44) — the two sibling cadence questions.
+
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
 - **Compiled Lua C extensions** (`package.loadlib`). Pure-Lua libraries are
@@ -404,6 +461,21 @@ set aside because it couples `arrow-lite`'s allocator to `storage-lite`'s
 segment layout and constrains compaction. Reopen trigger: profiling on
 target workloads shows design-matrix assembly is a material fraction of
 query time.
+
+**Decision record — rolling regression solves a centered factorization
+(2026-07-24).** The design matrix is `[1 | x − x̄]`, never raw `[1 | x]`:
+a regressor with a large offset relative to its in-window spread (a
+timestamp-scale x) makes the raw pair catastrophically ill-conditioned —
+measured on a 20-row window (run 2026-07-24, pinned as
+`rolling_regression_survives_timestamp_scale_x`): the raw solve loses
+the slope entirely from offset 1e9 while the centered solve holds
+~3e-11 relative error through 1e15 (bug #45). The rejected default was
+streaming sufficient statistics — O(1) per window slide and how DuckDB
+computes `regr_slope` — because the running-sums formula squares the
+condition number and degrades a thousand-fold earlier (five digits gone
+at offset 1e6). It may return later as an explicit opt-in fast path
+with its accuracy caveat documented; reopen trigger: profiling shows
+per-window factorization dominating a real workload.
 
 ## Batch, not per-row, for Lua and BLAS/LAPACK calls
 
@@ -524,7 +596,14 @@ lists, corpus entries — belong with the tests, not in this file.
 
 1. **Agrees with the oracle.** For the SQL semantics that overlap standard
    behavior: same query, same data → same output as DuckDB (primary) /
-   DataFusion (secondary).
+   DataFusion (secondary). **Every oracle has a declared scope of
+   authority** (convention, 2026-07-24): an oracle checks that we compute
+   *our chosen* semantics correctly — where the standard leaves a choice
+   (null placement, integer overflow), the choice is ours, recorded in
+   this document, and the harness normalizes the documented divergence.
+   An oracle never chooses semantics, and a diff must never share the
+   implementation's computational path (the #45 lesson: an oracle solving
+   the same ill-conditioned matrix agreed with the wrong answer).
 2. **Round-trips with real Arrow.** Columns exported over the C Data
    Interface import identically in arrow-rs and PyArrow, and vice versa —
    dictionaries, nulls, and logical types intact.
