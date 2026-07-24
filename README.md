@@ -24,8 +24,10 @@
 > least squares running QR with an SVD fallback (#20, criterion
 > measured and documented), native BLAS primitives, and `covar_pop` /
 > `corr` / `eigen_max` as SQL window functions — cross-checked against
-> DuckDB and NumPy in CI. Of M2's plan, only the deferred pair remains:
-> the Lua layer (#5) and the f64 codec A/B (#30). The developer-facing
+> DuckDB and NumPy in CI. Of M2's plan, only M2.7 remains — implementing
+> the Lua layer (#41); its two design decisions are closed (canonical
+> PUC Lua 5.4, vendored, with hand-rolled bindings; ALP as the decided
+> f64 codec, built later as #42). The developer-facing
 > design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
