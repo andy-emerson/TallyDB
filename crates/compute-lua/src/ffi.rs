@@ -91,6 +91,7 @@ unsafe extern "C" {
     pub(crate) fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char);
     pub(crate) fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) -> c_int;
     pub(crate) fn lua_setglobal(L: *mut lua_State, name: *const c_char);
+    pub(crate) fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int;
 
     // Curated standard libraries (opened individually — there is no
     // luaL_openlibs call anywhere in this crate, by policy).
