@@ -3,6 +3,16 @@ name = "compute-lua"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
+
+[features]
+# Compiles the vendored interpreter with LUA_USE_APICHECK: the Lua
+# authors' own C-API-misuse assertions, this binding's discipline
+# oracle. Test builds and CI enable it; release builds do not.
+apicheck = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
