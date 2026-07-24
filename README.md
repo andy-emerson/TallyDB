@@ -143,7 +143,7 @@ storage, dictionary-encoded keys, in-database compute — each exists
 somewhere. The differentiator is the *combination and packaging*: numeric
 compute (regression, covariance, factor math) running inside an
 **embeddable, SQL-native** engine, over **off-the-shelf** numeric libraries
-(LuaJIT, BLAS/LAPACK) on **zero-copy shared buffers** — rather than a
+(canonical Lua, BLAS/LAPACK) on **zero-copy shared buffers** — rather than a
 bespoke array language (kdb+'s q) or a serialization hop (DuckDB ↔ Python).
 The honest one-line framing is *"an open, SQL-native, embeddable kdb+ for
 teams below kdb+ scale"*: the workload kdb+ proved over 25 years, minus the

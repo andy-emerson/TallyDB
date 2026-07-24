@@ -32,8 +32,8 @@
 //! ## Compute backend selection
 //! `compute-lua`, `compute-blas`, and `compute-lapack` are consumed here
 //! through their trait interfaces (see those crates), not through concrete
-//! types. Right now that means the native implementations (LuaJIT, native
-//! BLAS, native LAPACK) are the only ones that exist — but this crate should
+//! types. Right now that means the native implementations (vendored Lua 5.4,
+//! native BLAS, native LAPACK) are the only ones that exist — but this crate should
 //! never hardcode that assumption. Select the concrete implementation with
 //! `cfg(target_arch = "wasm32")` / a Cargo feature at the point where a
 //! concrete type is actually needed, not throughout this crate's logic. Route

@@ -261,7 +261,10 @@ actually novel.**
 ### Taken as-is (do not fork, vendor, or reimplement)
 
 - **`sqlparser-rs`** — SQL parsing.
-- **LuaJIT** — native scripting, via FFI.
+- **PUC Lua 5.4** — embedded scripting; the canonical upstream sources
+  compiled into the engine unmodified, which is the embedding model Lua
+  is designed and distributed for. (Not LuaJIT, and not via `mlua` — see
+  *The Lua layer* below for the decision record.)
 - **Native BLAS/LAPACK** (OpenBLAS/MKL/Accelerate) — via FFI.
 
 These are mature, narrow, embedding-oriented dependencies — linking them
@@ -346,9 +349,9 @@ library boundary (LAPACK is built on BLAS and calls into it), the consumer
 boundary, and the WASM-availability boundary:
 
 - **`compute-blas`** — multiplication-class primitives (dot, gemv, gemm).
-  Direct consumers: the executor's window/numeric inner loops and
-  Lua-over-FFI. Native: OpenBLAS BLAS. WASM (future): `blas.wasm`, which
-  exists.
+  Direct consumers: the executor's window/numeric inner loops and Lua
+  scripts through `compute-lua`'s registered functions. Native: OpenBLAS
+  BLAS. WASM (future): `blas.wasm`, which exists.
 - **`compute-lapack`** — the curated analytical solves/decompositions, each
   justified by a named workflow: least-squares solve (rolling regression),
   symmetric eigendecomposition (covariance/PCA), general linear solve
@@ -395,15 +398,77 @@ shape.
 
 ## The Lua layer
 
-LuaJIT and native BLAS/LAPACK aren't just linked side by side — they're
-called directly from Lua via LuaJIT's FFI, which lets Lua declare a C
-function's signature and call straight into a linked library with near-zero
-overhead, no hand-written binding layer, numeric arrays passed as raw
-pointers into the same memory the query engine already holds. This is how
-the original Torch (pre-PyTorch) worked: LuaJIT + BLAS-backed tensors over
-FFI. TallyDB's `compute-lua`/`compute-blas`/`compute-lapack` crates use the
-same mechanism, scoped to a curated set of operations rather than a general
-tensor/autodiff library.
+The embedded interpreter is **canonical PUC Lua 5.4**, compiled into the
+engine from the unmodified upstream sources — the embedding model Lua is
+designed around. Scripts reach the engine's buffers through zero-copy
+userdata views: the userdata wraps the live `arrow-lite` buffer pointer
+and its accessors are implemented on the Rust side, so no bytes are
+copied. Stated precisely, in the same spirit as the compute-split's
+zero-copy record above: *access* is zero-copy, but each element read is
+a metamethod dispatch rather than a compiled raw load. The curated
+`compute-blas`/`compute-lapack` ops are exposed to scripts as registered
+functions operating over those same views — sharing buffers, not
+copying between them. Lua 5.4's numeric model — one number type with a
+64-bit integer subtype and a 64-bit float subtype — is exactly TallyDB's
+`i64`/`f64` column pair, so numeric values cross the script boundary
+without losing exactness; that alignment is a load-bearing reason for
+the 5.4 choice, not a convenience.
+
+The performance story for scripts is a **promotion ladder**, not a JIT:
+write the custom kernel in Lua to get it *correct* — immediately,
+cross-checkably — and if it proves hot, promote it to a curated native
+op to make it *fast*. That is the pattern `regr_slope`, `covar_pop`,
+`corr`, and `eigen_max` already followed. Interpreter speed is a
+comfort, not a foundation: the engine's speed lives in columnar storage
+and pruning, BLAS/LAPACK, and the batch calling convention above, none
+of which pass through the interpreter's inner loop.
+
+**Decision record — interpreter and binding (2026-07-24).** Two
+alternatives rejected, each with a reopen condition:
+
+- **LuaJIT** (the original plan) — rejected. It is a fork frozen at Lua
+  5.1: no native 64-bit integers (only `int64_t` cdata boxes, with
+  different equality, hashing, and mixing semantics — a permanent seam
+  through the scripting surface of a database that is careful about
+  `i64` exactness everywhere else), and a permanent version skew
+  against the WASM build's `lua.wasm`, which is Lua 5.4 (a fork of
+  lua-aot, whose runtime is stock 5.4). Canonical 5.4 on both targets
+  deletes the skew instead of managing it, and canonical-over-fork is
+  this project's own thesis applied to a dependency. What LuaJIT
+  offered — trace-compiled script loops and `ffi` raw-pointer access —
+  is covered by the promotion ladder. Reopen condition: a real workload
+  shows ad-hoc kernel performance is unacceptable *and* promotion to a
+  native op cannot cover it.
+- **`mlua`** (the safe binding wrapper) — rejected, including as a
+  dev-only witness. It is neither canonical nor small (five Lua
+  versions, serde, async, macro machinery — we would use a sliver), and
+  the witness role does not survive inspection: diffing two bindings
+  over the same vendored interpreter mostly tests the interpreter
+  against itself, while a binding's real failure modes — stack
+  imbalance, GC anchoring mistakes, a `longjmp` over Rust frames — are
+  memory-safety violations that output diffing cannot see. Reopen
+  condition: the C API surface we actually need balloons well past the
+  ~two dozen functions the batch convention implies.
+
+What ships instead: **hand-rolled thin bindings** to the 5.4 C API,
+with the error discipline built in by construction — every entry into
+Lua goes through `lua_pcall`; Rust functions called from Lua never
+raise a Lua error across frames with pending destructors; and
+`catch_unwind` at the boundary so a Rust panic never unwinds into C.
+Verified with no binding dependency at all, using Lua's own enforcement
+plus standard tooling: test builds compile the vendored interpreter
+with `LUA_USE_APICHECK`, so the interpreter itself asserts on C API
+misuse (the real oracle for binding discipline); seam tests run under
+the official test suite's GC/allocation-torture infrastructure
+(`ltests.c` — full collection on every allocation, injectable
+allocation failure); the official Lua test suite runs against the
+vendored build in CI; and ASan/UBSan cover the combined artifact. This
+is the arrow-lite configuration — a frozen canonical spec *and* an
+external oracle — the same pair that decided the hand-roll there (#2).
+The AOT compilation path (lua-aot natively) is *not* adopted: our
+ad-hoc scripts are unknown at build time, so AOT lands on the one part
+of the design that cannot use it; it remains available later, at zero
+semantic cost, for any precompiled script library we might ship.
 
 Embedded Lua supports pure-Lua libraries (plain `.lua` source) out of the
 box — they run as ordinary Lua code with no extra integration work.
@@ -521,7 +586,8 @@ tallydb/
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
                     #   numeric-or-key as a hard schema rule
-    compute-lua/    # Lua scripting behind a trait; LuaJIT via FFI for now
+    compute-lua/    # Lua scripting behind a trait; vendored PUC Lua 5.4,
+                    #   hand-rolled bindings (lua.wasm, also 5.4, later)
     compute-blas/   # multiplication-class BLAS behind a trait; OpenBLAS via
                     #   FFI for now (blas.wasm later)
     compute-lapack/ # curated LAPACK solves/decompositions behind a trait;
@@ -556,7 +622,7 @@ after that the rest is a wide front, and the ordering below is a
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
 4. `compute-lua` / `compute-blas` / `compute-lapack` — native backends
-   (LuaJIT, OpenBLAS, LAPACK) via FFI; can be developed in parallel with
+   (vendored Lua 5.4, OpenBLAS, LAPACK); can be developed in parallel with
    `query-lite` once `arrow-lite`'s buffer format is stable, since they
    consume it directly.
 5. `engine` — last, since it's the integration point for everything above.
