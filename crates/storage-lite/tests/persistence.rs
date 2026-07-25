@@ -278,10 +278,52 @@ fn tombstone_bounds_are_checked() {
         store.tombstone(&[3]),
         Err(StorageError::TombstoneOutOfRange { id: 3 })
     );
-    // Rows still in the write buffer can be tombstoned.
+    // Rows still in the write buffer can be tombstoned (in-memory store:
+    // no delete log, no durability concern).
     assert_eq!(store.tombstone(&[2]).unwrap(), 1);
     assert_eq!(store.live_len(), 2);
     let views = store.snapshot().unwrap();
     assert!(!views[0].is_live(2));
     assert!(views[0].is_live(0));
+}
+
+// Regression: tombstoning rows that are still in the write buffer on a
+// PERSISTENT store must flush them durable before writing the delete
+// log — otherwise a crash after the (synced) log leaves a delete
+// naming a row that never reached disk, and reopen underflows/shadow-
+// kills. This reproduces the storage half of the mutation data-loss
+// cluster found by the 2026-07-25 axis re-review.
+#[test]
+fn tombstoning_buffered_rows_persists_them_first() {
+    each_backend(|backend| {
+        // Threshold high enough that nothing auto-flushes: all five rows
+        // sit in the write buffer when the tombstone lands.
+        let mut store =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..5);
+        assert_eq!(store.tombstone(&[1, 3]).unwrap(), 2);
+        drop(store); // the crash boundary: only durable state survives
+
+        // Reopen from the backend alone. The tombstone flushed the rows,
+        // so every physical row is present and the live set is exactly
+        // {0, 2, 4} — no TombstoneOutOfRange, no live_len underflow.
+        let reopened = Store::persistent(backend, schema(), 0).unwrap();
+        assert_eq!(reopened.live_len(), 3);
+        assert_eq!(ts_values(&reopened), vec![0, 1, 2, 3, 4]);
+        let views = reopened.snapshot().unwrap();
+        let live: Vec<i64> = views
+            .iter()
+            .flat_map(|view| {
+                let Column::Numeric(NumericData::I64(ts)) = &view.segment.batch().columns()[0]
+                else {
+                    panic!("ts type")
+                };
+                (0..ts.values().as_slice().len())
+                    .filter(|&row| view.is_live(row))
+                    .map(|row| ts.values().as_slice()[row])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(live, vec![0, 2, 4]);
+    });
 }

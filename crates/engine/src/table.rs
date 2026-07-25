@@ -464,12 +464,19 @@ impl Table {
                 corrected.push(cells);
             }
         }
-        // Tombstone, then reappend — the one mutation mechanism.
-        let affected = self.store.tombstone(&matched_ids)?;
+        // Reappend the replacements first, then tombstone the originals
+        // — the one mutation mechanism, ordered for crash safety. The
+        // tombstone durably flushes the buffer before writing its delete
+        // log, so on a persistent store the replacements are on disk
+        // before the delete that supersedes the originals. A crash
+        // between the two leaves originals and replacements both live
+        // (recoverable duplicates under the row-id identity rule), never
+        // the replacements lost.
         for cells in &corrected {
             let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
             self.store.append(&row)?;
         }
+        let affected = self.store.tombstone(&matched_ids)?;
         Ok(affected)
     }
 }
