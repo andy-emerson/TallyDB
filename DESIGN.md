@@ -149,6 +149,30 @@ explicitly NOT a valid reason to exclude something otherwise in scope** —
 real usage regularly surprises the people who built the tool. The
 invariants are the boundary, not our own imagination.
 
+**The oracle-set rule for built-in functions (decided 2026-07-25).**
+The inclusion principle bounds which *verbs* are in scope; this rule
+bounds which *built-in functions we ship* on the SQL surface: **a
+built-in joins the SQL surface only if the differential-oracle set
+implements it** — DuckDB today, DataFusion when wired as the secondary
+(which, since DataFusion is InfluxDB v3's SQL engine, also covers the
+modern surface of our closest use-case neighbor). The rule does two
+jobs at once: every admitted built-in is *born diffable* (it rides the
+differential harness like everything else, rather than needing a
+hand-built check), and every admitted built-in is *guessable* (users
+find functions by knowing standard analytical SQL, which the oracle
+set curates). Everything else TallyDB can compute — decompositions,
+solves, anything BLAS/LAPACK-shaped — is reached through the Lua
+surface, where results need not fit SQL's scalar-per-cell type system.
+The rule governs what *we* ship built-in; a user's own registered
+functions are their code, named as they please. Applied at adoption:
+`regr_slope` / `regr_intercept` / `covar_pop` / `corr` stay (all in
+the oracle set); `eigen_max` leaves the SQL surface when the Role-2
+scripting API lands (#41) — it was an eigendecomposition amputated to
+a scalar so SQL could return it, and it migrates to a Role-2 example
+whose NumPy check becomes that example's differential test. Reopen
+condition per function: a function that later becomes standard in the
+oracle set becomes eligible here.
+
 ## Null, NaN, and ordering semantics
 
 > **Decided (2026-07-24): NULL is placed, not ordered; NaN is a value,
