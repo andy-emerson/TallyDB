@@ -5,9 +5,12 @@
 //! backend is a flat namespace of named byte objects with atomic
 //! publish. [`FsBackend`] (a directory of files) is the native
 //! implementation; [`MemBackend`] backs tests and demonstrates the shape
-//! an OPFS/WASM backend must fit. Ranged reads and mmap are recorded
-//! follow-ups for when query-time pruning (M2.4) or a profiling number
-//! asks for them — the trait grows additively then.
+//! an OPFS/WASM backend must fit. Whole-object reads are the contract
+//! by decision, not omission: the working-set cut is owned (DESIGN.md,
+//! *The axes* — a table fits in memory; v1 opens decode-into-memory),
+//! so ranged reads and mmap are retired as follow-ups. The recorded
+//! escape, if the reopen trigger ever fires, is a zero-copy-open
+//! format version, at which point this trait grows additively.
 
 use std::collections::BTreeMap;
 use std::fmt;

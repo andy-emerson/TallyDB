@@ -356,6 +356,102 @@ Test these thoroughly and deliberately. There is no reference implementation
 to diff against for this part of the project — the tests written here
 effectively *are* the specification.
 
+## The axes: cuts, refusals, and reversal classes (adopted 2026-07-25)
+
+This section adopts the review vocabulary of *A Taxonomy of Principled
+Database Simplifications* (2026): a specialized engine's deletions are
+**forced by positive workload assumptions**, never selected from a
+menu; each cut's **reversal class** (additive / invasive /
+foundational) sets how much scrutiny its licensing assumption
+deserves, because the assumption is what fails, not the cut. The
+external axis assessment of 2026-07-24 audited this project against
+that method; this section records the outcome so every absence has a
+name and every refusal is visibly deliberate.
+
+| Axis | Our position | Licensing assumption | Reversal class |
+|---|---|---|---|
+| Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
+| Working set | **Cut, now owned**: v1 opens decode-into-memory | A table fits in memory (see below) | Foundational |
+| Query (planner) | Cut: a **fixed-strategy planner** — `plan()` exists; search, costing, and choice do not | One access path ⇒ nothing to choose between | Additive |
+| Query (surface) | **Refused**: broad standard SQL, bounded by the inclusion principle | — | Additive |
+| Access path | Cut totally: no secondary indexes; ordering-key clustering + scan is the one path (zone maps are pruning metadata, not a path) | Ordered ingest on the declared key (assumption 2) | Invasive |
+| Write | **Refused**: cheap online single-row append is the design center | — | n/a |
+| Transaction | Cut: submitted units only — no `BEGIN`/`COMMIT`/`ROLLBACK`, no session state (contract below) | Work arrives as single statements | Invasive |
+| Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
+| Concurrency | Single writer, concurrent snapshot readers (facade currently overcuts to single-accessor — corrective work tracked, pre-M3) | One writer at a time is enough | Additive to correct |
+| Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
+| Deployment | Cut: library, never a server (see *Deployment shapes*) | One application owns the data | Additive |
+| Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
+| Durability | Not cut: publish is atomic **and synced** (power-loss durable at the flush); cadence policy open as #43 | — | — |
+
+Refusals are design decisions too: the write axis and the query
+surface are kept deliberately, and a reader should be able to tell
+refusal from oversight.
+
+**The access-path cut licenses the planner cut.** A planner exists to
+choose among access paths; with exactly one path there is nothing for
+a cost model to decide, so the absence of an optimizer is structural,
+not a bet about workload simplicity. Corollary, to prevent an
+over-broad reading of the settled "no optimizer": **predicate
+reordering is not forbidden** — evaluating the cheapest, most
+selective predicate first is a heuristic needing no statistics beyond
+existing zone maps, and remains available. Likewise, if within-segment
+scan acceleration is ever wanted, the sanctioned shape is block-level
+min/max summaries at the codec's block granularity (small materialized
+aggregates — decades old, patent-safe); per-value order-preserving
+lossy codes should be patent-checked before any implementation, and
+their value lies in unclustered data, which assumption 2 removes.
+
+**Working set — decided (2026-07-25): the cut is owned.** Version 1
+opens a table by decoding it into memory, and this is now a stated
+commitment, not drift: the licensing assumption is that *a table fits
+in memory* at the scale this engine targets. The banked simplification
+is real (no buffer pool, no page cache, no partial-read machinery; the
+mmap/ranged-read follow-up notes are retired). Reopen trigger, stated
+because this cut is foundational-class: the M3 benchmark suite's
+startup-time and footprint results embarrassing open-time on
+realistic tables. The recorded escape is a zero-copy-open format
+version — additive under the append-only version and codec registries.
+
+**Transaction contract.** Work reaches the engine only as submitted
+units — one `append`, one `query`, one `mutate`. There is no
+interactive transaction, no session state, and no verb for either;
+adding a session object would be a *reversal on the transaction axis*
+and must be treated as one.
+
+**Isolation contract.** A read sees a snapshot taken at statement
+start: `Store::snapshot` returns owned segment views, and appends or
+mutations after the call are invisible to it (test:
+`snapshot_is_isolated_from_later_appends`). One guarantee — snapshot
+isolation at statement granularity — no isolation-level menu.
+
+**Truth values — decided (2026-07-25).** There is no boolean type and
+none is coming. A flag column is `i64` in {0, 1} — which is the right
+answer, not a workaround: `SUM(flag)` is a count and `AVG(flag)` is a
+duty cycle. When computed expressions land in projection, a projected
+comparison yields `i64` in {0, 1}. `bool_and`/`bool_or` are not
+offered (`MIN`/`MAX`/`SUM` over the flag serve). Recorded now so a
+third type cannot arrive as an implementation detail of the
+arithmetic-projection commit.
+
+**The join constraint is a size invariant, not a modelling shape
+(restated 2026-07-25).** What execution requires is that the build
+side be small enough to materialize; "star schema" was the use case
+wearing the invariant's clothes — the same correction as
+time-vs-ordered. The rule is: **one large table joined against tables
+small enough to materialize.** This preserves every current behavior,
+and it *licenses* (as ordinary future todos, not scope fights) shapes
+the modelling name wrongly excluded — join chains against several
+small tables, snowflakes, self-joins against small aggregates — while
+naming the real hazard: a nominal "dimension" grown too large to
+materialize. A stated threshold belongs in the contract when the
+executor generalizes.
+
+**Load-bearing note on dictionaries:** the low-cardinality assumption
+carries query performance, not just storage size — cross-segment
+grouping and joins pay segments × distinct-values remapping, and the
+recorded remap-cache mitigation bounds but does not remove it.
+
 ## How decisions are made here (hygiene, 2026-07-24)
 
 Three rules, adopted after a sweep of this project's own decision
