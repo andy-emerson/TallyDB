@@ -24,10 +24,16 @@
 > least squares running QR with an SVD fallback (#20, criterion
 > measured and documented), native BLAS primitives, and `covar_pop` /
 > `corr` / `eigen_max` as SQL window functions — cross-checked against
-> DuckDB and NumPy in CI. Of M2's plan, only M2.7 remains — implementing
-> the Lua layer (#41); its two design decisions are closed (canonical
-> PUC Lua 5.4, vendored, with hand-rolled bindings; ALP as the decided
-> f64 codec, built later as #42). The developer-facing
+> DuckDB and NumPy in CI. Of M2's plan, only M2.7 remains, and it is
+> underway: the canonical PUC Lua 5.4 interpreter is vendored and
+> compiled into the engine, and zero-copy compute on the engine's own
+> buffers is proven (pointer-verified) and measured. Its two prior
+> design decisions are closed (hand-rolled bindings over the vendored
+> interpreter, #5; ALP as the decided `f64` codec, built later as #42);
+> its implementation has since surfaced the scripting-surface decisions
+> — which SQL/Lua interaction roles, the sandboxed standard-library
+> set, and script semantics — now under active design with the forks
+> tracked as open issues. The developer-facing
 > design lives in
 > [`DESIGN.md`](DESIGN.md); open work and decisions live in the
 > repository's
