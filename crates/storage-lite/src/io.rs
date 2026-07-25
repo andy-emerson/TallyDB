@@ -42,6 +42,14 @@ impl std::error::Error for IoError {}
 /// name, in unspecified order.
 pub trait StorageBackend: Send + Sync {
     /// Publishes `bytes` under `name`, replacing any previous object.
+    /// **Durability contract:** when `write` returns, the object is
+    /// durable against power loss, not merely against process crash —
+    /// on the native backend that means the bytes and the publishing
+    /// rename are synced to the device before return. Atomic publish
+    /// alone (rename without sync) is a page-cache promise, and the
+    /// documented "durability boundary is the flush" depends on this
+    /// stronger one (finding recorded 2026-07-25; baseline noted in
+    /// decision #43).
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError>;
 
     /// Reads the object named `name`.
@@ -55,9 +63,11 @@ pub trait StorageBackend: Send + Sync {
 }
 
 /// The native backend: one directory, one file per object. Writes go to
-/// a dot-prefixed temporary file in the same directory, then rename —
-/// atomic publish on POSIX filesystems; leftover temporaries from a
-/// crash are invisible to `list` and overwritten by the next write.
+/// a dot-prefixed temporary file in the same directory (contents
+/// synced), then rename, then the directory itself is synced — atomic
+/// *and durable* publish on POSIX filesystems; leftover temporaries
+/// from a crash are invisible to `list` and overwritten by the next
+/// write.
 pub struct FsBackend {
     dir: PathBuf,
 }
@@ -76,10 +86,27 @@ impl StorageBackend for FsBackend {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
         let temp = self.dir.join(format!(".tmp-{name}"));
         let path = self.dir.join(name);
-        std::fs::write(&temp, bytes)
-            .map_err(|error| IoError::Backend(format!("writing {}: {error}", temp.display())))?;
+        // Write and sync the contents before the rename: a rename can
+        // be durable while the data it points at is still only in the
+        // page cache, which loses or truncates a "published" file on
+        // power loss.
+        {
+            let mut file = std::fs::File::create(&temp).map_err(|error| {
+                IoError::Backend(format!("creating {}: {error}", temp.display()))
+            })?;
+            std::io::Write::write_all(&mut file, bytes).map_err(|error| {
+                IoError::Backend(format!("writing {}: {error}", temp.display()))
+            })?;
+            file.sync_all().map_err(|error| {
+                IoError::Backend(format!("syncing {}: {error}", temp.display()))
+            })?;
+        }
         std::fs::rename(&temp, &path)
-            .map_err(|error| IoError::Backend(format!("publishing {}: {error}", path.display())))
+            .map_err(|error| IoError::Backend(format!("publishing {}: {error}", path.display())))?;
+        // Sync the directory so the rename itself survives power loss.
+        std::fs::File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| IoError::Backend(format!("syncing {}: {error}", self.dir.display())))
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, IoError> {
