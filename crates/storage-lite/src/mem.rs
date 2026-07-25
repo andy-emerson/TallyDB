@@ -401,10 +401,18 @@ impl ColumnBuilder {
 pub enum ZoneMap {
     /// Bounds of an `f64` column.
     F64 {
-        /// Smallest valid, non-NaN value.
+        /// Smallest valid, non-NaN value (NaN when every valid value
+        /// is NaN — `has_nan` is true in that case).
         min: f64,
-        /// Largest valid, non-NaN value.
+        /// Largest valid, non-NaN value (NaN when every valid value
+        /// is NaN).
         max: f64,
+        /// Whether any valid value is NaN. Load-bearing for pruning
+        /// soundness: under the engine's comparison relation NaN is a
+        /// value greater than every number (D2 ruling, 2026-07-24), so
+        /// a segment whose finite `max` sits below a `>` target may
+        /// still match through a NaN row.
+        has_nan: bool,
     },
     /// Bounds of an `i64` column.
     I64 {
@@ -421,8 +429,13 @@ pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
     match column {
         Column::Numeric(NumericData::F64(numeric)) => {
             let mut range: Option<(f64, f64)> = None;
+            let mut has_nan = false;
             for (index, &value) in numeric.values().as_slice().iter().enumerate() {
-                if !numeric.is_valid(index) || value.is_nan() {
+                if !numeric.is_valid(index) {
+                    continue;
+                }
+                if value.is_nan() {
+                    has_nan = true;
                     continue;
                 }
                 range = Some(match range {
@@ -430,7 +443,18 @@ pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
                     Some((low, high)) => (low.min(value), high.max(value)),
                 });
             }
-            range.map(|(min, max)| ZoneMap::F64 { min, max })
+            match (range, has_nan) {
+                (Some((min, max)), _) => Some(ZoneMap::F64 { min, max, has_nan }),
+                // Every valid value is NaN: the zone still exists (the
+                // segment matches `>`-style predicates through NaN) with
+                // a canonical-NaN range so encoding stays deterministic.
+                (None, true) => Some(ZoneMap::F64 {
+                    min: f64::NAN,
+                    max: f64::NAN,
+                    has_nan: true,
+                }),
+                (None, false) => None,
+            }
         }
         Column::Numeric(NumericData::I64(numeric)) => {
             let mut range: Option<(i64, i64)> = None;

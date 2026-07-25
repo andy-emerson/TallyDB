@@ -30,7 +30,7 @@
 //! executor) check [`Segment::is_ordered`] and the live ordering bounds
 //! instead of assuming.
 
-use crate::format::{decode_segment, encode_segment};
+use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_segment};
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
@@ -43,11 +43,10 @@ use std::sync::Arc;
 /// of compaction and I/O.
 pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
 
-/// The backend object holding the table manifest — an encoded empty
-/// segment, which carries exactly what a manifest needs (schema and
-/// ordering key) with the segment format's own magic, CRC, and
-/// versioning. The manifest's otherwise-unused `base_row_id` field
-/// stores the table's current **generation** (see below).
+/// The backend object holding the table manifest — a dedicated small
+/// record (schema, ordering key, and the table's current **generation**,
+/// see below) with its own magic, CRC, and versioning; the format lives
+/// in `format.rs` beside the segment's.
 const MANIFEST: &str = "table.tlym";
 
 /// Segment and delete-log names carry a generation number, and the
@@ -231,25 +230,24 @@ impl Store {
         let mut store = Store::with_segment_rows(schema, ordering_key, segment_rows)?;
         let generation = match backend.read(MANIFEST) {
             Ok(bytes) => {
-                let manifest = decode_segment(&bytes)?;
-                if manifest.batch().schema() != &store.schema {
+                let manifest = decode_manifest(&bytes)?;
+                if manifest.schema != store.schema {
                     return Err(StorageError::SchemaMismatch {
                         reason: "manifest schema differs from the schema given".to_owned(),
                     });
                 }
-                if manifest.ordering_key() != ordering_key {
+                if manifest.ordering_key != ordering_key {
                     return Err(StorageError::SchemaMismatch {
                         reason: format!(
                             "manifest orders on column {}, caller asked for {ordering_key}",
-                            manifest.ordering_key()
+                            manifest.ordering_key
                         ),
                     });
                 }
-                manifest.base_row_id() // the current generation
+                manifest.generation
             }
             Err(IoError::NotFound(_)) => {
-                let empty = WriteBuffer::new(store.schema.clone(), ordering_key)?.freeze()?;
-                backend.write(MANIFEST, &encode_segment(&empty))?;
+                backend.write(MANIFEST, &encode_manifest(&store.schema, ordering_key, 0))?;
                 0
             }
             Err(error) => return Err(error.into()),
@@ -482,9 +480,10 @@ impl Store {
                     &encode_segment(segment),
                 )?;
             }
-            let manifest =
-                WriteBuffer::new(self.schema.clone(), self.ordering_key)?.freeze_at(next)?;
-            backend.write(MANIFEST, &encode_segment(&manifest))?;
+            backend.write(
+                MANIFEST,
+                &encode_manifest(&self.schema, self.ordering_key, next),
+            )?;
             // Committed. Old objects are now garbage; reopen would
             // ignore them regardless, but a clean run leaves nothing.
             for name in backend.list()? {

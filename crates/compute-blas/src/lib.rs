@@ -11,7 +11,8 @@
 //!
 //! The split follows a real boundary — different libraries (LAPACK is built
 //! on BLAS), different consumers (the primitives here are called directly by
-//! the executor's window/numeric inner loops and by Lua-over-FFI, whereas the
+//! the executor's window/numeric inner loops and by Lua scripts through
+//! `compute-lua`'s registered functions, whereas the
 //! LAPACK curated set is the higher-level analytics surface), and different
 //! WASM-availability timelines (`blas.wasm` exists today; a LAPACK-in-WASM
 //! layer does not).

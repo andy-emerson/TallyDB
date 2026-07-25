@@ -149,6 +149,37 @@ explicitly NOT a valid reason to exclude something otherwise in scope** —
 real usage regularly surprises the people who built the tool. The
 invariants are the boundary, not our own imagination.
 
+## Null, NaN, and ordering semantics
+
+> **Decided (2026-07-24): NULL is placed, not ordered; NaN is a value,
+> greater than every number, everywhere.** The engine's three-valued
+> predicate logic already put NULL outside the number line — a null
+> matches neither `x > 5` nor `x <= 5`, aggregates skip it, arithmetic
+> propagates it — and ordering says the same thing: nulls are not
+> compared but *placed*, after all values, in both sort directions.
+> Consequently `ORDER BY x DESC` is not the sequence-reversal of `ASC`:
+> within the values it is an exact mirror (total order guarantees it);
+> only the non-values stay put. That asymmetry is sound here because of
+> two premises, which are its reopen tripwire: the executor never
+> serves `DESC` by reversing an `ASC` result (each query sorts by its
+> own comparator, and there is no optimizer to introduce the shortcut),
+> and the one physically-ordered column — the ordering key — is `NOT
+> NULL` by schema rule. NaN, by contrast, *is* a value: computed, and
+> comparable under one relation used by sort, predicates, MIN/MAX, and
+> zone-map pruning alike — NaN is greater than every number and equal
+> to itself, while `-0.0 = 0.0` stays true (NaN lifted to the top, not
+> bitwise total order). The ascending ladder is *numbers… +∞, NaN,
+> then NULL off the end*. Pruning stays sound via a has-NaN bit in the
+> `f64` zone map (see `format.rs`). Rejected: nulls-as-largest/smallest
+> (they put absence *on* the number line for sorting while predicates
+> keep it off — one seam, two answers), and IEEE-strict predicates
+> (NaN invisible to every operator but `<>` while sorting as a value —
+> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is an
+> additive todo. The choice was made from the numeric-or-key thesis,
+> not oracle convenience: where the SQL standard leaves semantics
+> implementation-defined, the choice is ours and the differential
+> harness normalizes.
+
 ## Storage, ordering, corrections, and UPDATE/DELETE
 
 Storage is columnar, partitioned on the declared ordering key, and immutable
@@ -196,8 +227,26 @@ compaction resolves tombstones and merges segments. This means:
 > standard for clock-like keys, with a confirm-against-plain-delta
 > measurement on the corpus at implementation. **`f64` columns ship
 > uncompressed behind the tag** — a legitimate answer for hot data, not
-> a placeholder — while the Gorilla-vs-zstd fork stays open (issue #30),
-> resolved by A/B when the corpus exists.
+> a placeholder. **The general-`f64` codec is decided: ALP** (issue
+> #30, closed 2026-07-24 by argument over the published evidence
+> rather than an in-house A/B — sound precisely because the codec
+> registry makes the choice an additive tag, cheap to reverse). ALP
+> converts decimals-in-doubles to integers per vector
+> (frame-of-reference + bit-packing, verbatim exceptions, ALP-RD
+> fallback for true doubles), with losslessness enforced per value at
+> encode time; it leads the field on both of our weighted criteria —
+> decode throughput on the read path first, ratio second (encode runs
+> at freeze/compaction, off the hot path). Rejected: Gorilla and Chimp
+> (the XOR family's bit-serial decode cannot vectorize; Chimp remains
+> the named low-effort fallback if ALP's implementation cost vetoes
+> it), Elf (near-parity ratio bought with ~215× slower decode and a
+> global erase-and-restore correctness obligation), and zstd±byte-split
+> (float-blind, and a dependency where a hand-roll fits the registry).
+> Implementation is #42, scheduled by footprint need rather than
+> milestone; until it lands, uncompressed remains the shipped answer.
+> Measurement caveat: before ALP is measured, the corpus ticks family
+> must round to a realistic tick size — real prices are decimals, and
+> an unrounded random walk misrepresents the target workload.
 
 ## Deployment shapes
 
@@ -261,7 +310,10 @@ actually novel.**
 ### Taken as-is (do not fork, vendor, or reimplement)
 
 - **`sqlparser-rs`** — SQL parsing.
-- **LuaJIT** — native scripting, via FFI.
+- **PUC Lua 5.4** — embedded scripting; the canonical upstream sources
+  compiled into the engine unmodified, which is the embedding model Lua
+  is designed and distributed for. (Not LuaJIT, and not via `mlua` — see
+  *The Lua layer* below for the decision record.)
 - **Native BLAS/LAPACK** (OpenBLAS/MKL/Accelerate) — via FFI.
 
 These are mature, narrow, embedding-oriented dependencies — linking them
@@ -303,6 +355,32 @@ library from scratch — that work already exists and is already correct.
 Test these thoroughly and deliberately. There is no reference implementation
 to diff against for this part of the project — the tests written here
 effectively *are* the specification.
+
+## How decisions are made here (hygiene, 2026-07-24)
+
+Three rules, adopted after a sweep of this project's own decision
+history found the same defect twice (a codec fork framed from a 2015
+paper and decided in 2026; an interpreter treated as settled because
+early drafts named it):
+
+1. **Option spaces carry provenance.** A decision record states how and
+   when its options were assembled; a fork bounded by a moving field
+   cites a check of current practice at decision time, not framing time.
+2. **A tripwire for what must be surfaced.** A choice is a decision —
+   not routing — when it freezes an external contract (bytes, API),
+   sets user-visible semantics, or sets a product guarantee. These are
+   surfaced to the architect even when discovered mid-pass, even when
+   one option seems obvious.
+3. **Settled requires a record.** A choice inherited from early drafts
+   is not settled; settled means a record exists naming the
+   alternatives that lost. Absence of a record means open.
+
+Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
+exact and errors loudly on overflow; query output is one Arrow batch
+per segment; window frames are `ROWS`-only for now. Interim states with
+their decisions still open: durability boundary is the flush (issue
+#43, must close before M3 ships a binary) and segments freeze at a
+fixed row count (issue #44) — the two sibling cadence questions.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
@@ -346,9 +424,9 @@ library boundary (LAPACK is built on BLAS and calls into it), the consumer
 boundary, and the WASM-availability boundary:
 
 - **`compute-blas`** — multiplication-class primitives (dot, gemv, gemm).
-  Direct consumers: the executor's window/numeric inner loops and
-  Lua-over-FFI. Native: OpenBLAS BLAS. WASM (future): `blas.wasm`, which
-  exists.
+  Direct consumers: the executor's window/numeric inner loops and Lua
+  scripts through `compute-lua`'s registered functions. Native: OpenBLAS
+  BLAS. WASM (future): `blas.wasm`, which exists.
 - **`compute-lapack`** — the curated analytical solves/decompositions, each
   justified by a named workflow: least-squares solve (rolling regression),
   symmetric eigendecomposition (covariance/PCA), general linear solve
@@ -384,6 +462,21 @@ segment layout and constrains compaction. Reopen trigger: profiling on
 target workloads shows design-matrix assembly is a material fraction of
 query time.
 
+**Decision record — rolling regression solves a centered factorization
+(2026-07-24).** The design matrix is `[1 | x − x̄]`, never raw `[1 | x]`:
+a regressor with a large offset relative to its in-window spread (a
+timestamp-scale x) makes the raw pair catastrophically ill-conditioned —
+measured on a 20-row window (run 2026-07-24, pinned as
+`rolling_regression_survives_timestamp_scale_x`): the raw solve loses
+the slope entirely from offset 1e9 while the centered solve holds
+~3e-11 relative error through 1e15 (bug #45). The rejected default was
+streaming sufficient statistics — O(1) per window slide and how DuckDB
+computes `regr_slope` — because the running-sums formula squares the
+condition number and degrades a thousand-fold earlier (five digits gone
+at offset 1e6). It may return later as an explicit opt-in fast path
+with its accuracy caveat documented; reopen trigger: profiling shows
+per-window factorization dominating a real workload.
+
 ## Batch, not per-row, for Lua and BLAS/LAPACK calls
 
 Every call from the query executor into `compute-lua`, `compute-blas`, or
@@ -395,15 +488,77 @@ shape.
 
 ## The Lua layer
 
-LuaJIT and native BLAS/LAPACK aren't just linked side by side — they're
-called directly from Lua via LuaJIT's FFI, which lets Lua declare a C
-function's signature and call straight into a linked library with near-zero
-overhead, no hand-written binding layer, numeric arrays passed as raw
-pointers into the same memory the query engine already holds. This is how
-the original Torch (pre-PyTorch) worked: LuaJIT + BLAS-backed tensors over
-FFI. TallyDB's `compute-lua`/`compute-blas`/`compute-lapack` crates use the
-same mechanism, scoped to a curated set of operations rather than a general
-tensor/autodiff library.
+The embedded interpreter is **canonical PUC Lua 5.4**, compiled into the
+engine from the unmodified upstream sources — the embedding model Lua is
+designed around. Scripts reach the engine's buffers through zero-copy
+userdata views: the userdata wraps the live `arrow-lite` buffer pointer
+and its accessors are implemented on the Rust side, so no bytes are
+copied. Stated precisely, in the same spirit as the compute-split's
+zero-copy record above: *access* is zero-copy, but each element read is
+a metamethod dispatch rather than a compiled raw load. The curated
+`compute-blas`/`compute-lapack` ops are exposed to scripts as registered
+functions operating over those same views — sharing buffers, not
+copying between them. Lua 5.4's numeric model — one number type with a
+64-bit integer subtype and a 64-bit float subtype — is exactly TallyDB's
+`i64`/`f64` column pair, so numeric values cross the script boundary
+without losing exactness; that alignment is a load-bearing reason for
+the 5.4 choice, not a convenience.
+
+The performance story for scripts is a **promotion ladder**, not a JIT:
+write the custom kernel in Lua to get it *correct* — immediately,
+cross-checkably — and if it proves hot, promote it to a curated native
+op to make it *fast*. That is the pattern `regr_slope`, `covar_pop`,
+`corr`, and `eigen_max` already followed. Interpreter speed is a
+comfort, not a foundation: the engine's speed lives in columnar storage
+and pruning, BLAS/LAPACK, and the batch calling convention above, none
+of which pass through the interpreter's inner loop.
+
+**Decision record — interpreter and binding (2026-07-24).** Two
+alternatives rejected, each with a reopen condition:
+
+- **LuaJIT** (the original plan) — rejected. It is a fork frozen at Lua
+  5.1: no native 64-bit integers (only `int64_t` cdata boxes, with
+  different equality, hashing, and mixing semantics — a permanent seam
+  through the scripting surface of a database that is careful about
+  `i64` exactness everywhere else), and a permanent version skew
+  against the WASM build's `lua.wasm`, which is Lua 5.4 (a fork of
+  lua-aot, whose runtime is stock 5.4). Canonical 5.4 on both targets
+  deletes the skew instead of managing it, and canonical-over-fork is
+  this project's own thesis applied to a dependency. What LuaJIT
+  offered — trace-compiled script loops and `ffi` raw-pointer access —
+  is covered by the promotion ladder. Reopen condition: a real workload
+  shows ad-hoc kernel performance is unacceptable *and* promotion to a
+  native op cannot cover it.
+- **`mlua`** (the safe binding wrapper) — rejected, including as a
+  dev-only witness. It is neither canonical nor small (five Lua
+  versions, serde, async, macro machinery — we would use a sliver), and
+  the witness role does not survive inspection: diffing two bindings
+  over the same vendored interpreter mostly tests the interpreter
+  against itself, while a binding's real failure modes — stack
+  imbalance, GC anchoring mistakes, a `longjmp` over Rust frames — are
+  memory-safety violations that output diffing cannot see. Reopen
+  condition: the C API surface we actually need balloons well past the
+  ~two dozen functions the batch convention implies.
+
+What ships instead: **hand-rolled thin bindings** to the 5.4 C API,
+with the error discipline built in by construction — every entry into
+Lua goes through `lua_pcall`; Rust functions called from Lua never
+raise a Lua error across frames with pending destructors; and
+`catch_unwind` at the boundary so a Rust panic never unwinds into C.
+Verified with no binding dependency at all, using Lua's own enforcement
+plus standard tooling: test builds compile the vendored interpreter
+with `LUA_USE_APICHECK`, so the interpreter itself asserts on C API
+misuse (the real oracle for binding discipline); seam tests run under
+the official test suite's GC/allocation-torture infrastructure
+(`ltests.c` — full collection on every allocation, injectable
+allocation failure); the official Lua test suite runs against the
+vendored build in CI; and ASan/UBSan cover the combined artifact. This
+is the arrow-lite configuration — a frozen canonical spec *and* an
+external oracle — the same pair that decided the hand-roll there (#2).
+The AOT compilation path (lua-aot natively) is *not* adopted: our
+ad-hoc scripts are unknown at build time, so AOT lands on the one part
+of the design that cannot use it; it remains available later, at zero
+semantic cost, for any precompiled script library we might ship.
 
 Embedded Lua supports pure-Lua libraries (plain `.lua` source) out of the
 box — they run as ordinary Lua code with no extra integration work.
@@ -441,7 +596,14 @@ lists, corpus entries — belong with the tests, not in this file.
 
 1. **Agrees with the oracle.** For the SQL semantics that overlap standard
    behavior: same query, same data → same output as DuckDB (primary) /
-   DataFusion (secondary).
+   DataFusion (secondary). **Every oracle has a declared scope of
+   authority** (convention, 2026-07-24): an oracle checks that we compute
+   *our chosen* semantics correctly — where the standard leaves a choice
+   (null placement, integer overflow), the choice is ours, recorded in
+   this document, and the harness normalizes the documented divergence.
+   An oracle never chooses semantics, and a diff must never share the
+   implementation's computational path (the #45 lesson: an oracle solving
+   the same ill-conditioned matrix agreed with the wrong answer).
 2. **Round-trips with real Arrow.** Columns exported over the C Data
    Interface import identically in arrow-rs and PyArrow, and vice versa —
    dictionaries, nulls, and logical types intact.
@@ -521,7 +683,8 @@ tallydb/
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
                     #   numeric-or-key as a hard schema rule
-    compute-lua/    # Lua scripting behind a trait; LuaJIT via FFI for now
+    compute-lua/    # Lua scripting behind a trait; vendored PUC Lua 5.4,
+                    #   hand-rolled bindings (lua.wasm, also 5.4, later)
     compute-blas/   # multiplication-class BLAS behind a trait; OpenBLAS via
                     #   FFI for now (blas.wasm later)
     compute-lapack/ # curated LAPACK solves/decompositions behind a trait;
@@ -556,7 +719,7 @@ after that the rest is a wide front, and the ordering below is a
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
 4. `compute-lua` / `compute-blas` / `compute-lapack` — native backends
-   (LuaJIT, OpenBLAS, LAPACK) via FFI; can be developed in parallel with
+   (vendored Lua 5.4, OpenBLAS, LAPACK); can be developed in parallel with
    `query-lite` once `arrow-lite`'s buffer format is stable, since they
    consume it directly.
 5. `engine` — last, since it's the integration point for everything above.
