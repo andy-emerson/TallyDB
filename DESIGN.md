@@ -830,6 +830,31 @@ contract for the Lua boundary. The ergonomics layered on top — batch
 reductions, `v:mask()`, `v:get(i, default)` — are additive and do not
 change it.
 
+**Decision record — the calling convention (Option A, 2026-07-26;
+Observed).** A Lua-backed function is a **vectorized UDF**: the engine
+calls it **once per segment**, handing whole columns as zero-copy input
+views and — for the scalar/elementwise slot — a preallocated zero-copy
+output view; the script loops the column *inside Lua* and writes the
+output column. The window slot is the same shape one level in: the engine
+drives the framing and the script reduces one frame to one scalar, exactly
+the `regr_slope` / `eigen_max` pattern already shipped. Arguments are
+**positional, with each argument's kind (column vs scalar constant)
+declared at registration** alongside the return type (the value map
+above), so the engine binds columns as views and constants as plain Lua
+numbers. This is the batch-not-per-row rule made concrete — one boundary
+crossing per *(function, segment)*, never per row. *Rejected:* **inline
+Lua in the SQL text** (code in query strings has no registration to
+declare a return type on, fights app-registered kernels, and recompiles
+per call) and **a single uniform batch object** (it hands frame control to
+the script — the one thing the measurement says to keep engine-side — and
+buys only the table-valued / multi-output slots #47 already defers).
+Evidence (`values_map_spike`, release, 4,096 rows): the vectorized call
+produces its output column in ~518µs against ~12.7ms for per-row
+invocation of the same kernel — a **25× penalty avoided**, the same
+crossing tax the feed-reactive ruling excludes. The ~120× over a native
+Rust loop is the interpreter / metamethod cost the promotion ladder
+closes, not a property of the convention.
+
 **Decision record — feed-reactive compute (settled direction, 2026-07-26;
 implementation M3+).** Reacting to new ordered data with compute is *in
 scope* — it is a TSDB-native pattern, not a general-DB frill, and kdb+
