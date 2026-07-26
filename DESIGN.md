@@ -1,10 +1,13 @@
 # TallyDB — Design
 
-This is the **forward-looking developer companion** to `README.md`: what we
-are building, why, and which parts are settled. The README describes where
-the project is now from the user's point of view; this document describes
-where it is going from the developer's. How we work — passes, reviews,
-issues, integration — is `AGENTS.md`.
+This is the **developer companion** to `README.md`: what we are building,
+why, and which parts are settled. The README describes where the project is
+now from the user's point of view; this document describes where it is going
+from the developer's — and, as decisions settle, **why it is the way it is**.
+It is forward-looking today, but written to endure: when the project is
+complete this becomes the durable record of its design decisions and the
+principles behind them — a power-user-level inventory of *why*, not just
+*what*. How we work — passes, reviews, issues, integration — is `AGENTS.md`.
 
 ## What this is (positioning, so scope calls stay anchored)
 
@@ -142,14 +145,28 @@ role in a star schema, numeric columns are the *measures*; the
 Kimball vocabulary was considered and set aside because "dimension" and
 "measure" collide with this document's mathematical audience.
 
-## The inclusion principle for the SQL surface
+## The inclusion principle (SQL and Lua)
 
-Include a standard SQL function or verb if it (a) doesn't require a
-non-numeric, non-key column type, and (b) doesn't require a general-purpose
-cost-based optimizer. **"We can't think of a quant use case for it" is
-explicitly NOT a valid reason to exclude something otherwise in scope** —
-real usage regularly surprises the people who built the tool. The
-invariants are the boundary, not our own imagination.
+One principle governs both surfaces: **a capability — a SQL verb or
+function, or a Lua stdlib facility — is in scope by default, and excluded
+only where it would violate a named invariant.** We do not hand-pick a
+feature list, and we do not require a use case to admit something:
+**"we can't think of a quant use case for it" is explicitly NOT a valid
+reason to exclude something otherwise in scope** — real usage regularly
+surprises the people who built the tool. The invariants are the boundary,
+not our imagination. The two surfaces share this *method* and differ only
+in *which* invariants apply.
+
+**SQL is bounded by** (a) numeric-or-key — no non-numeric, non-key column
+type — and (b) no general-purpose cost-based optimizer.
+
+| SQL capability | In / Out | Bounding invariant |
+|---|---|---|
+| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, star-schema equi-joins, window functions, `UPDATE`/`DELETE` | **in** (built) | — |
+| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames | **in** (not yet built) | — |
+| `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
+| general N-way / non-star joins | **out** | (b): needs a cost-based optimizer |
+| a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
 
 **The oracle-set rule for built-in functions (decided 2026-07-25).**
 The inclusion principle bounds which *verbs* are in scope; this rule
@@ -168,12 +185,52 @@ surface, where results need not fit SQL's scalar-per-cell type system.
 The rule governs what *we* ship built-in; a user's own registered
 functions are their code, named as they please. Applied at adoption:
 `regr_slope` / `regr_intercept` / `covar_pop` / `corr` stay (all in
-the oracle set); `eigen_max` leaves the SQL surface when the Role-2
+the oracle set); `eigen_max` leaves the SQL surface when the SQL-in-Lua
 scripting API lands (#41) — it was an eigendecomposition amputated to
-a scalar so SQL could return it, and it migrates to a Role-2 example
+a scalar so SQL could return it, and it migrates to a SQL-in-Lua example
 whose NumPy check becomes that example's differential test. Reopen
 condition per function: a function that later becomes standard in the
 oracle set becomes eligible here.
+
+**Lua is bounded by** (a) the sandbox — no filesystem, process, network,
+native code, memory-safety, or escape hazard — (b) determinism unless the
+author opts out, and (c) the same numeric-or-key rule on what may *cross
+into the engine*.
+
+| Lua stdlib | In / Out | Bounding invariant |
+|---|---|---|
+| `math`, `table`, `string`, `utf8`, curated `base` | **in** | — |
+| `math.random` / `randomseed` | **in**, documented | (b) with opt-out — forfeits reproducibility |
+| `io`, `os` | **out** | (a): filesystem / process |
+| `debug`, raw metatable & `raw*` functions | **out** | (a): sandbox escape (shared metatables) |
+| `load` / `loadstring` / `loadfile` / `dofile` | **out** | (a): code injection / memory safety |
+| `package.loadlib`, native `require` | **out** | (a): native code (`package` curated to a pure-Lua searcher) |
+| `coroutine` | **out** (deferred) | *not an invariant* — see exceptions |
+
+### Apparent exceptions (named, so they don't read as drift)
+
+- **`string` is cut in SQL but open in Lua** — not a contradiction. The
+  numeric-or-key invariant governs *what crosses a boundary* (a stored,
+  intermediate, or output value), not *local scratch*. SQL has no scratch:
+  every value is a column, so a string function *is* a text column, and it
+  is out. Lua has scratch (locals), so string manipulation is transient,
+  and the invariant is enforced at the Lua→engine boundary — a returned
+  string interns into a **key**; a bare string column cannot cross. Same
+  invariant, opposite-looking result. (The one real guard is on the
+  *output*: a script synthesizing a unique label per row would blow the
+  low-cardinality key assumption — capped at the boundary, not by
+  crippling `string`.)
+- **`math.random` is admitted despite nondeterminism.** The determinism
+  invariant carries an explicit opt-out: a script may be nondeterministic
+  if the author chooses, at the documented cost of query reproducibility.
+  We can afford this because we are not replicated — unlike Redis before
+  7.0, whose *script* replication forced determinism (Redis 7 relaxed it
+  once it replicated *effects* instead).
+- **`coroutine` is a genuine exception** — excluded for an *implementation*
+  reason, not a principled one. It breaks no invariant; it fights the
+  `pcall`/`longjmp` discipline at the Rust↔C boundary. It is a *deferral*
+  pending a binding that can host it safely, not an invariant-based cut —
+  when the binding can, the principle admits it.
 
 ## Null, NaN, and ordering semantics
 
@@ -429,13 +486,36 @@ rebuild, being wrong about the additive one costs a later layer.
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
 | Concurrency | Single writer, concurrent snapshot readers (facade currently overcuts to single-accessor — corrective work tracked, pre-M3) | One writer at a time is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
-| Deployment | Cut: library, never a server (see *Deployment shapes*) | One application owns the data | Additive |
+| Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
 | Durability | Not cut: publish is atomic **and synced** (power-loss durable at the flush); cadence policy open as #43 | — | — |
 
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
 refusal from oversight.
+
+**Live data, precisely.** The Distribution and Deployment cuts draw the
+line through the middle of the phrase "live feed," so a reader comparing
+TallyDB to a tickerplant must read them together. *Freshness is not
+sacrificed:* a query snapshot includes the live write buffer, not only the
+frozen segments (`Store::snapshot` appends the buffer's rows to the
+segment sequence; the contract is that a snapshot covers exactly the rows
+appended before the call), so a row appended microseconds ago is visible
+to the very next query. Freeze/flush is the *durability and layout*
+boundary — a fresh row is queryable but not power-loss durable until flush
+(cadence is #43) — never a visibility gate. So an application that ingests
+a live feed and recomputes over it in the same process — real-time risk,
+live P&L, a moving regression on the newest window — is squarely in scope,
+and is the compute-without-copying sweet spot: socket → storage → SQL →
+BLAS with no serialization hop. What is *out* is being the tick **server**:
+one process streaming ticks over the network to a farm of subscriber
+processes, which the never-a-server (Deployment) and no-network-boundary
+(Distribution) cuts forbid outright. Stated as a single rule: "live feed"
+as *in-process analytics over freshly-landed data* is in; "live feed" as
+*server-side publish/subscribe fan-out* is out. The reactive-compute shape
+over that fresh data — batch ingest hooks and continuous queries, per-row
+invocation excluded — is the *feed-reactive compute* decision record
+below.
 
 **The access-path cut licenses the planner cut.** A planner exists to
 choose among access paths; with exactly one path there is nothing for
@@ -660,6 +740,121 @@ copying between them. Lua 5.4's numeric model — one number type with a
 `i64`/`f64` column pair, so numeric values cross the script boundary
 without losing exactness; that alignment is a load-bearing reason for
 the 5.4 choice, not a convenience.
+
+**The two directions (and only two).** Lua and the engine meet in exactly
+two directions, named for which language encloses the other:
+**Lua-in-SQL** — the engine calls a Lua kernel mid-query
+(`my_kernel(x) OVER (…)`) — and **SQL-in-Lua** — a Lua program drives the
+engine and runs SQL. A third, the **data-only baseline** (staged
+`SQL → columns → Lua → columns → SQL`, neither side calling the other),
+falls out for free from being an embeddable library. These *exhaust* the
+in-process embed: direction — who calls whom — is the only axis, so there
+is no third role to invent. SQL-only queries and Lua-only computation are
+the degenerate cases (no crossing), not prohibitions. M2.7 builds
+**SQL-in-Lua first**, then the **Lua-in-SQL window slot** (#47, #53); the
+remaining Lua-in-SQL slots — scalar, table-valued, predicate — are
+deferred sub-scopes of that direction, not new roles. (These replace the
+earlier "Role 1 / Role 2" labels: Lua-in-SQL was Role 1, SQL-in-Lua was
+Role 2.)
+
+**Decision record — NULL across the script boundary (2026-07-26).** NULL
+crosses to Lua as a distinct **sentinel value** — a `pd.NA`-style
+singleton — not as Lua `nil` and not as NaN. *The principle that decided
+it:* a non-editing round trip across any of the three boundaries
+(DB↔SQL, DB↔Lua, Lua↔SQL) must preserve everything, which requires each
+value mapping to be a total, invertible function. `nil` is not total —
+inside a Lua table a `nil` *deletes* the slot, destroying both the value
+and the row's structure, and that failure cannot be prevented inside
+arbitrary user scripts. A distinct sentinel is a real value that survives
+in a table, so the mapping stays total and faithful; it is kept distinct
+from NaN (a computed value — see *Null, NaN, and ordering*) and
+propagates over both numeric subtypes, so `i64` exactness holds. This was
+chosen by a bake-off spike against the `nil` alternative, not by
+argument.
+
+*The cost we do not pay:* the prior art that reached the same conclusion
+(Tarantool `box.NULL`, OpenResty `ngx.null`, pandas `pd.NA`) pays a real
+price — the sentinel is truthy (`if x` is true for a null) and `x == nil`
+silently misses it. Those systems carry data *as language values*, so
+every field access meets the sentinel and its footguns. TallyDB does not:
+columns cross as zero-copy views over engine buffers, and compute is
+batch, not per-row. Null-aware batch ops (`v:sum()`), an out-of-band
+validity view (`v:mask()`), and the curated BLAS ops consume
+`(buffer, validity)` engine-side and never materialize the sentinel. The
+footguns are real but confined to the discouraged manual per-element
+path; the common path never meets them. A sentinel is the faithful
+representation you rarely have to handle — an advantage that follows
+directly from being a zero-copy, compute-in-engine store rather than a
+value-shaped one. (One honest limit: relational `<`/`<=` against the
+sentinel is a loud error, because Lua forces those operators to a
+boolean and three-valued logic cannot propagate through them; arithmetic
+propagates to the sentinel.)
+
+**Decision record — the value map: return types, coercion, keys
+(2026-07-26).** Three conventions govern how a script's results cross the
+typed boundary, each chosen from TallyDB's own invariants (numeric-or-key,
+exact-or-loud, zero-copy, the fixed-strategy planner), not from any one
+precedent — the outside systems that solve the same problem validate the
+*workload*, they do not get a vote on the *how*.
+
+- **Return type is declared at registration and resolved at plan time** —
+  never inferred from the value a call happens to return. A Lua-backed
+  function names its result type (`f64` / `i64` / `key`) when registered;
+  the planner fixes the output column's type from that, so a query yields
+  the same Arrow schema on every run. Inferring per call would make the
+  output type *data-dependent* (Lua silently floats integers) — the
+  dynamic-typing property the fixed-strategy planner exists to exclude,
+  and the root of bugs B4/B5 (#54). Every statically-typed peer declares
+  it; the choice follows from our own static schema, not from theirs.
+- **Coercion is exact-or-loud.** A Lua `integer` fills an `i64` and a
+  `float` fills an `f64`; a `float` may fill an `i64` *only if it is
+  losslessly integral*, otherwise it is a loud error — never a silent
+  truncation. A Lua `boolean` maps to `i64 {0, 1}`: Booleans are a
+  transient value, never a third column type (the numeric-or-key
+  invariant holds). `nil` is NULL (the sentinel above). A `string` is
+  interned into the output key dictionary — the only way a script
+  produces a key. This closes B6 (#54).
+- **Keys read as codes, with lazy text.** A key element reads as its
+  integer dictionary code, so equality, grouping, and membership stay
+  integer-cheap — which is *why* keys are dictionary-encoded, and what
+  keeps the read zero-copy (the code is in the buffer; a string is not).
+  `v:text(i)` decodes on demand; `v:code_of(literal)` resolves a literal
+  once (the once-per-distinct-value pattern `WHERE` already uses), so
+  `key == literal` is an integer compare. Codes are per-segment (#6); the
+  engine guarantees a script sees one consistent code space per call
+  (per-call or query-lifetime-remapped), so a raw code is never compared
+  across segments.
+
+Together with the NULL sentinel above, this is the frozen value-map
+contract for the Lua boundary. The ergonomics layered on top — batch
+reductions, `v:mask()`, `v:get(i, default)` — are additive and do not
+change it.
+
+**Decision record — feed-reactive compute (settled direction, 2026-07-26;
+implementation M3+).** Reacting to new ordered data with compute is *in
+scope* — it is a TSDB-native pattern, not a general-DB frill, and kdb+
+(the reference workload) is built on it. The admitted shapes are **ingest
+hooks** — a kernel invoked at a *batch* boundary inside `append()`
+(segment freeze / batch land), compute-only, app-registered — and
+**continuous queries** — derived data kept fresh on ordered append,
+reduction via a kernel, with a restricted append-friendly incremental
+scheme (details at implementation). Per-row *semantics* are available by
+looping a batch inside one kernel call; **per-row hook *invocation* is
+out** — measured at ~27× the batched loop (near-pure `pcall` crossing
+tax, `values_map_spike`), and against the batch-not-per-row rule, the
+append fast path, and columnar execution. Also out: **catalog-persisted
+stored procedures** (never-a-server; code in the catalog is not
+numeric-or-key — app-registered named kernels, which *are* the Lua-in-SQL
+model, stay in) and **network delivery / push** (the app delivers; the
+engine detects). Recompute-on-demand is not a reactive feature — it folds
+into plain invocation. This is the standing **kdb+-as-floor** principle in
+action: kdb+ sets a soft feature/perf floor at the *user* POV
+(meet-or-exceed unless it conflicts with an invariant), and its own model
+is exactly the batch ingest hook (`upd`), app-registered, no per-row
+triggers, no catalog stored-procs — the same shape, delivered in-process
+rather than via a multi-process server. Interacts with #44 (segment
+freeze = the hook point), #49 (continuous-query SQL surface), and the
+#41 / #47 kernel contract.
 
 The performance story for scripts is a **promotion ladder**, not a JIT:
 write the custom kernel in Lua to get it *correct* — immediately,

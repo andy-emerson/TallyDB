@@ -61,6 +61,11 @@
 mod ffi;
 mod state;
 
+// Throwaway spike for the F1 values-map decision (2026-07-26); not part
+// of the crate's API. Earns Observed evidence before the contract freezes.
+#[cfg(test)]
+mod values_map_spike;
+
 pub use state::{LuaState, ViewArg};
 
 // TODO: Lua backend trait (native vendored-5.4 implementation first;
