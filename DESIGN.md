@@ -185,9 +185,9 @@ surface, where results need not fit SQL's scalar-per-cell type system.
 The rule governs what *we* ship built-in; a user's own registered
 functions are their code, named as they please. Applied at adoption:
 `regr_slope` / `regr_intercept` / `covar_pop` / `corr` stay (all in
-the oracle set); `eigen_max` leaves the SQL surface when the Role-2
+the oracle set); `eigen_max` leaves the SQL surface when the SQL-in-Lua
 scripting API lands (#41) — it was an eigendecomposition amputated to
-a scalar so SQL could return it, and it migrates to a Role-2 example
+a scalar so SQL could return it, and it migrates to a SQL-in-Lua example
 whose NumPy check becomes that example's differential test. Reopen
 condition per function: a function that later becomes standard in the
 oracle set becomes eligible here.
@@ -717,6 +717,22 @@ copying between them. Lua 5.4's numeric model — one number type with a
 `i64`/`f64` column pair, so numeric values cross the script boundary
 without losing exactness; that alignment is a load-bearing reason for
 the 5.4 choice, not a convenience.
+
+**The two directions (and only two).** Lua and the engine meet in exactly
+two directions, named for which language encloses the other:
+**Lua-in-SQL** — the engine calls a Lua kernel mid-query
+(`my_kernel(x) OVER (…)`) — and **SQL-in-Lua** — a Lua program drives the
+engine and runs SQL. A third, the **data-only baseline** (staged
+`SQL → columns → Lua → columns → SQL`, neither side calling the other),
+falls out for free from being an embeddable library. These *exhaust* the
+in-process embed: direction — who calls whom — is the only axis, so there
+is no third role to invent. SQL-only queries and Lua-only computation are
+the degenerate cases (no crossing), not prohibitions. M2.7 builds
+**SQL-in-Lua first**, then the **Lua-in-SQL window slot** (#47, #53); the
+remaining Lua-in-SQL slots — scalar, table-valued, predicate — are
+deferred sub-scopes of that direction, not new roles. (These replace the
+earlier "Role 1 / Role 2" labels: Lua-in-SQL was Role 1, SQL-in-Lua was
+Role 2.)
 
 **Decision record — NULL across the script boundary (2026-07-26).** NULL
 crosses to Lua as a distinct **sentinel value** — a `pd.NA`-style
