@@ -6,7 +6,7 @@
 > foundation (`arrow-lite`) is implemented and cross-checked against arrow-rs
 > and PyArrow; on top of it, a working vertical slice appends rows one at a
 > time into persistent, crash-safe, multi-segment storage and serves a real
-> SQL subset — `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, star-schema
+> SQL subset — `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, small-table
 > joins, window functions, and `UPDATE`/`DELETE` — with BLAS/LAPACK compute
 > (regression, covariance, PCA) exposed as SQL. Every query family is born
 > cross-checked against DuckDB and NumPy in CI, over data that has
@@ -59,8 +59,13 @@ Quantitative research, sensor and telemetry pipelines, event/metric streams,
 financial ledgers: anything whose shape matches the three assumptions above.
 
 **Not for:** general-purpose relational work. There will be no arbitrary
-text columns or blobs, no third column type, and no general multi-table
-joins outside a star-schema shape. If your data doesn't fit the three
+text columns or blobs, no third column type, and no joins beyond the two
+shapes the engine can execute without a cost-based optimizer: equi-joins
+where one side is small enough to materialize (the star-schema family —
+lookups, dimensions, reference tables), and ordered-merge joins (`ASOF`
+and relatives, planned) where both sides are ordered on the join key.
+Two large tables joined on an arbitrary key is refused loudly, not
+served slowly. If your data doesn't fit the three
 assumptions, use Postgres, DuckDB, or SQLite — they're better at being
 general. TallyDB is a **specialized component** you reach for alongside a
 general store, the way SQLite often is — not the one database that runs your
@@ -165,7 +170,8 @@ q language, minus the license, minus the server.
 buffers, `u32`-dictionary key columns, the two-variant column enum with
 zero-copy views, logical-type export annotations, and the C Data Interface
 including `ArrowArrayStream` — every piece round-trip-tested against
-arrow-rs and PyArrow in CI, with the unsafe core also run under Miri.
+arrow-rs and PyArrow in CI, with the unsafe core additionally checked
+under Miri by hand (not yet wired into CI — issue #63).
 
 On top of it runs the vertical slice, now past its M1 write-then-read
 shape: `storage-lite` appends validated rows into a per-table store —
@@ -189,9 +195,10 @@ equality and `IN` evaluated once per distinct dictionary value,
 match), GROUP BY over key columns with
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
 `i64` stays exact and errors loudly on overflow rather than silently
-widening), top-level ORDER BY and LIMIT/OFFSET, star-schema equi-joins (one fact
-table against small key-unique dimension tables, INNER or LEFT, run
-fact-driven through the same pipeline as everything else), the standard
+widening), top-level ORDER BY and LIMIT/OFFSET, equi-joins (one large table
+against small key-unique dimension tables — the star-schema family —
+INNER or LEFT, run fact-driven through the same pipeline as everything
+else), the standard
 aggregates as window functions over `ROWS BETWEEN n | UNBOUNDED
 PRECEDING AND CURRENT ROW` frames, and `UPDATE`/`DELETE`. It
 executes across all segments of a snapshot, returning one Arrow batch

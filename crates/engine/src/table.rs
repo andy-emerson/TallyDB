@@ -18,9 +18,11 @@
 //! (copy-on-write handles), and the C Data export hands those same
 //! buffers out — asserted by pointer identity in this crate's tests.
 //! Windows over a single segment feed the regression as plain sub-slices;
-//! windows that span segments and partitioned windows run over a bounded
-//! O(rows) gather, the same class of copy as the regression's `[1 | x]`
-//! design-matrix gather (the trade recorded in deferred issue #4).
+//! windows that span segments and partitioned windows run over an O(rows)
+//! gather — table-proportional, not bounded by a constant (~56 B/row for
+//! a two-argument regression) — the same class of copy as the
+//! regression's `[1 | x]` design-matrix gather (the trade recorded in
+//! deferred issue #4; peak-memory accounting in #56).
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
 use compute_lapack::{ColMajor, ComputeError, LapackBackend, NativeLapack, Op};
@@ -336,7 +338,10 @@ impl Table {
     /// of the ingest sequence — so an update whose rows carry old
     /// ordering-key values leaves the table unordered until
     /// [`Table::compact`], and window queries in between refuse loudly
-    /// rather than mis-compute. Not the fast path, by design.
+    /// rather than mis-compute. Not the fast path, by design — nor the
+    /// lean one: a full-table `UPDATE` peaks at several times the columnar
+    /// footprint (a row-major copy, a string per key cell, then reappend;
+    /// accounted in #56).
     pub fn mutate(&mut self, sql: &str) -> Result<u64, EngineError> {
         match parse_statement(sql)? {
             Statement::Select(_) => Err(EngineError::Query(QueryError::Unsupported(

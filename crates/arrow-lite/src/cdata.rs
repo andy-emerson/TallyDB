@@ -492,7 +492,10 @@ struct StreamPrivate {
 /// Exports a stream of batches sharing `schema`.
 ///
 /// Each `get_next` pulls one batch from `batches` and hands it over with
-/// full ownership transfer — no batch is ever concatenated or copied. A
+/// full ownership transfer — no batch is ever concatenated or copied at
+/// this seam. (This bounds only the ABI hand-off: a caller that builds
+/// the batch iterator by materializing a whole query result first still
+/// holds that result in memory before the stream is pulled.) A
 /// batch whose schema disagrees with `schema` fails that `get_next` with
 /// `EINVAL` (visible via `get_last_error`).
 pub fn export_stream(

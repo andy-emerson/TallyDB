@@ -975,4 +975,104 @@ mod tests {
             per_row.as_secs_f64() / batch.as_secs_f64()
         );
     }
+
+    // ===== F2 calling-convention probe (2026-07-26) =====
+    // Option A — the vectorized scalar UDF: one pcall per segment, Lua
+    // loops the input view and writes an output column through the
+    // zero-copy `out` view. `eval_into_output` (nullable column in,
+    // writable column out) *is* that shape, so this reuses the F1 harness.
+    // Null representation is orthogonal to the crossing cost, so the
+    // measurement runs all-valid (F1's sentinel is established above);
+    // multi-column args are a mechanical extension of the same binding
+    // and are not separately timed.
+
+    /// Checked-in correctness for the Option A path: a vectorized UDF that
+    /// writes an output column agrees bit-for-bit with the native loop.
+    #[test]
+    fn vectorized_udf_column_matches_native() {
+        let n = 256usize;
+        let values: Vec<f64> = (0..n).map(|i| i as f64 - 128.0).collect();
+        let valid = vec![true; n];
+        let mut state = SpikeState::new();
+        let (out, out_valid) = state
+            .eval_into_output(
+                "for i = 1, #v do local x = v[i]; out[i] = x*x*0.5 + x end",
+                &values,
+                &valid,
+                n,
+            )
+            .expect("runs");
+        for (i, &x) in values.iter().enumerate() {
+            let native = x * x * 0.5 + x;
+            assert_eq!(out[i].to_bits(), native.to_bits(), "row {i}");
+            assert!(out_valid[i]);
+        }
+    }
+
+    /// The F2 decision's perf evidence: a vectorized scalar UDF producing
+    /// a full output column in ONE call, against the per-row anti-pattern
+    /// producing the same column in N calls, with a native-Rust floor for
+    /// context. Run:
+    ///   cargo test -p compute-lua --release -- --ignored measure_vectorized
+    #[test]
+    #[ignore = "measurement, not a check: run explicitly in release"]
+    fn measure_vectorized_udf_vs_per_row() {
+        use std::hint::black_box;
+        let n = 4096usize;
+        let values: Vec<f64> = (0..n).map(|i| i as f64 * 0.5 - 1000.0).collect();
+        let valid = vec![true; n];
+        let mut state = SpikeState::new();
+
+        // Native floor: the same elementwise kernel in Rust.
+        let native_rounds = 1000;
+        let mut native_out = vec![0.0f64; n];
+        let start = std::time::Instant::now();
+        for _ in 0..native_rounds {
+            for i in 0..n {
+                let x = black_box(values[i]);
+                native_out[i] = black_box(x * x * 0.5 + x);
+            }
+        }
+        let native = start.elapsed() / native_rounds;
+
+        // Option A: one call; Lua loops the view and writes the column.
+        let vec_rounds = 100;
+        let vec_chunk = "for i = 1, #v do local x = v[i]; out[i] = x*x*0.5 + x end";
+        let mut vec_out = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..vec_rounds {
+            vec_out = state
+                .eval_into_output(vec_chunk, &values, &valid, n)
+                .unwrap()
+                .0;
+        }
+        let vectorized = start.elapsed() / vec_rounds;
+
+        // Per-row anti-pattern: N calls, one element each, stitched back.
+        let per_row_rounds = 20;
+        let row_chunk = "out[1] = v[1]*v[1]*0.5 + v[1]";
+        let mut row_out = vec![0.0f64; n];
+        let start = std::time::Instant::now();
+        for _ in 0..per_row_rounds {
+            for i in 0..n {
+                row_out[i] = state
+                    .eval_into_output(row_chunk, &values[i..i + 1], &valid[i..i + 1], 1)
+                    .unwrap()
+                    .0[0];
+            }
+        }
+        let per_row = start.elapsed() / per_row_rounds;
+
+        // All three agree bit-for-bit: no dead-code elimination, honest run.
+        for i in 0..n {
+            assert_eq!(vec_out[i].to_bits(), native_out[i].to_bits());
+            assert_eq!(row_out[i].to_bits(), native_out[i].to_bits());
+        }
+        println!(
+            "measure_vectorized: {n} rows/pass — native {native:?}, vectorized {vectorized:?}, \
+             per-row {per_row:?} | per-row/vectorized {:.0}x, vectorized/native {:.0}x",
+            per_row.as_secs_f64() / vectorized.as_secs_f64(),
+            vectorized.as_secs_f64() / native.as_secs_f64(),
+        );
+    }
 }

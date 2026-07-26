@@ -28,9 +28,9 @@
 //! simply do not exist here — not in passthrough, not in windows, not in
 //! partitions. The zero-copy path survives untombstoned: a mask-free
 //! view over a single segment slices the stored buffers directly, while
-//! a masked view is filter-materialized once per query — a bounded
-//! O(rows) gather, the price of mutation on the read side, paid only
-//! where mutation actually happened. Windows that *span segments* and
+//! a masked view is filter-materialized once per query — an O(rows)
+//! gather (proportional to the segment, not bounded by a constant), the
+//! price a masked read pays. Windows that *span segments* and
 //! `PARTITION BY` gather the same way they did before; for `PARTITION
 //! BY` across segments, each segment's dictionary codes are first
 //! remapped into a query-lifetime key space (the query-time remap
@@ -126,7 +126,10 @@ pub fn execute(
 /// each fact segment's join-key codes are remapped **once per distinct
 /// dictionary value** into dimension row lookups (decision #6's
 /// pattern), and the dimension's columns are gathered per fact row —
-/// the bounded copy a join is. `INNER` drops unmatched fact rows
+/// the copy a join is: sized by the *fact* table, not the dimension, and
+/// **every** dimension attribute is gathered regardless of the `SELECT`
+/// (there is no projection pushdown yet — #56). `INNER` drops unmatched
+/// fact rows
 /// through the live mask (the same mechanism as tombstones and WHERE);
 /// `LEFT` keeps them with null dimension cells. Null join keys match
 /// nothing, per SQL. Dimension columns join as nullable. The dimension
@@ -238,6 +241,7 @@ pub fn execute_join(
             columns.push(gather_dimension_column(
                 dimension_views,
                 dimension_column,
+                dimension_schema.fields()[dimension_column].column_type(),
                 &picks,
             ));
         }
@@ -255,19 +259,20 @@ pub fn execute_join(
     execute_single(&joined_schema, &joined_views, plan, registry)
 }
 
-/// One dimension column, gathered per fact row (`None` = no match:
-/// a null cell).
+/// One dimension column, gathered per fact row (`None` pick = no match:
+/// a null cell). The output type comes from the dimension *schema*, not
+/// from the views — so a join against an **empty** dimension (no views to
+/// sniff a type from) still builds a column of the declared type rather
+/// than defaulting to `f64` and mismatching the joined schema.
 fn gather_dimension_column(
     dimension_views: &[SegmentView],
     column_index: usize,
+    column_type: ColumnType,
     picks: &[Option<(usize, usize)>],
 ) -> Column {
     let cell = |view: usize| &dimension_views[view].segment.batch().columns()[column_index];
-    let first_kind = dimension_views
-        .first()
-        .map(|view| view.segment.batch().columns()[column_index].column_type());
-    match first_kind {
-        Some(ColumnType::F64) | None => {
+    match column_type {
+        ColumnType::F64 => {
             let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
             for pick in picks {
@@ -287,7 +292,7 @@ fn gather_dimension_column(
             }
             assemble_numeric_f64(values, validity)
         }
-        Some(ColumnType::I64) => {
+        ColumnType::I64 => {
             let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
             for pick in picks {
@@ -307,7 +312,7 @@ fn gather_dimension_column(
             }
             assemble_numeric_i64(values, validity)
         }
-        Some(ColumnType::Key) => {
+        ColumnType::Key => {
             let mut dictionary = Dictionary::new();
             let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
@@ -468,8 +473,10 @@ fn live_rows<'a>(view: &'a SegmentView) -> impl Iterator<Item = usize> + 'a {
     (0..view.segment.batch().num_rows()).filter(move |&row| view.is_live(row))
 }
 
-/// Rebuilds `column` with only the mask's live rows — the bounded copy a
-/// tombstoned segment costs its readers.
+/// Rebuilds `column` with only the mask's live rows — the O(rows) copy a
+/// masked segment costs its readers, whether the mask came from
+/// tombstones or a `WHERE` predicate (paid even when the predicate keeps
+/// every row — there is no "matches everything, skip the copy" fast path).
 fn filter_column(column: &Column, view: &SegmentView) -> Column {
     let keep: Vec<usize> = live_rows(view).collect();
     let validity = |bitmap: Option<&Bitmap>| {
@@ -1257,7 +1264,10 @@ enum SortCell {
 }
 
 /// Sorts the whole output by one column into a single batch — the
-/// materialization ORDER BY inherently asks for. Nulls sort **last in
+/// materialization ORDER BY inherently asks for, plus (today) a `String`
+/// per row for key columns and a doubled `picks` index, and **no top-k**:
+/// `ORDER BY ... LIMIT k` still sorts and materializes the entire result
+/// before the limit applies (#56). Nulls sort **last in
 /// both directions**, DuckDB's default (PostgreSQL flips them under
 /// DESC; when the two disagree we follow our oracle); `f64` uses total
 /// order, so NaN sorts above every number.

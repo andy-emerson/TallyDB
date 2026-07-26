@@ -304,8 +304,10 @@ impl WriteBuffer {
 
     /// Freezes a point-in-time copy without consuming the buffer: the
     /// segment holds exactly the rows appended so far, and later appends
-    /// leave it untouched (the copy-on-write buffers make this cheap —
-    /// no row data is copied at snapshot time).
+    /// leave it untouched. Cheap, but not zero-copy: the value and code
+    /// buffers are copy-on-write handles (no bulk data copied), while the
+    /// null flags and dictionary index are duplicated (bounded by row and
+    /// distinct-key count).
     pub fn snapshot_at(&self, base_row_id: u64) -> Result<Segment, StorageError> {
         self.clone().freeze_at(base_row_id)
     }
