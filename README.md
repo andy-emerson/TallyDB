@@ -234,7 +234,7 @@ repo-specific half lives here:
 - **Roadmap:** [GitHub Milestones](https://github.com/andy-emerson/TallyDB/milestones)
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
   GA · M4 WASM parity.
-- **Checks:** GitHub Actions on every pull request — fmt, clippy, build,
+- **Checks:** GitHub Actions on every push to `main` — fmt, clippy, build,
   tests including doctests, rustdoc with warnings as errors. Doctests are
   this repository's preferred executable evidence.
 - **Audience:** documentation is written for a reader with a BS in applied
