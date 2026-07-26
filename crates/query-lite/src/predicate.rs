@@ -68,7 +68,12 @@ impl CmpOp {
     }
 
     fn holds_f64(self, left: f64, right: f64) -> bool {
-        let ordering = cmp_f64(left, right);
+        self.holds_ordering(cmp_f64(left, right))
+    }
+
+    /// Whether the operator holds given a precomputed ordering — shared by
+    /// the f64 relation and the exact i64-vs-float relation.
+    fn holds_ordering(self, ordering: Ordering) -> bool {
         match self {
             CmpOp::Eq => ordering == Ordering::Equal,
             CmpOp::Ne => ordering != Ordering::Equal,
@@ -87,12 +92,38 @@ impl CmpOp {
 /// `-0.0 = 0.0` stays true — this is "NaN lifted to the top", not
 /// bitwise total order. NULL is not handled here: null is not a value
 /// and never reaches a comparison (three-valued logic masks it out).
-fn cmp_f64(left: f64, right: f64) -> Ordering {
+pub(crate) fn cmp_f64(left: f64, right: f64) -> Ordering {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
         (false, false) => left.partial_cmp(&right).expect("both are non-NaN"),
+    }
+}
+
+/// Exact ordering of an `i64` against an `f64` literal under the same
+/// relation as [`cmp_f64`] — but **without** the lossy `as f64` cast, so
+/// an `i64` beyond 2^53 compares correctly (B6). `t` is a finite SQL
+/// float literal in practice; a NaN target is treated as greatest, for
+/// consistency with `cmp_f64`.
+pub(crate) fn cmp_i64_f64(v: i64, t: f64) -> Ordering {
+    if t.is_nan() {
+        return Ordering::Less; // every number is below NaN
+    }
+    // Out of i64 range: the sign of `t` alone decides.
+    if t >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less; // v <= i64::MAX < 2^63 <= t
+    }
+    if t < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater; // v >= i64::MIN = -2^63 > t
+    }
+    // `t` is in [-2^63, 2^63): its floor is integral and fits i64 exactly.
+    let floor = t.floor();
+    let floor_i = floor as i64;
+    match v.cmp(&floor_i) {
+        // v == floor(t); a fractional part makes t strictly greater.
+        Ordering::Equal if t > floor => Ordering::Less,
+        other => other,
     }
 }
 
@@ -347,7 +378,11 @@ fn evaluate_3vl(
                         let holds = match value {
                             // Exact integer comparison — no f64 round trip.
                             Number::Int(target) => op.holds(values[row], *target),
-                            Number::Float(target) => op.holds_f64(values[row] as f64, *target),
+                            // Also exact against a float literal (B6): no
+                            // lossy `as f64` cast, so i64 past 2^53 is right.
+                            Number::Float(target) => {
+                                op.holds_ordering(cmp_i64_f64(values[row], *target))
+                            }
                         };
                         (numeric.is_valid(row), holds)
                     }))
@@ -758,6 +793,28 @@ mod tests {
         let bitmap = evaluate(&predicate, &schema, &view).unwrap();
         assert!(bitmap.get(0));
         assert!(!bitmap.get(1)); // an f64 round trip would match both
+    }
+
+    #[test]
+    fn i64_vs_float_literal_is_exact_beyond_f64_precision() {
+        // B6: comparing an i64 column to a *float* literal must not cast
+        // through f64. 2^53 + 1 and 2^53 - 1 both collapse to 2^53 under
+        // `as f64`; the exact relation keeps them on opposite sides of a
+        // 2^53 float literal.
+        let schema = Schema::new(vec![Field::new("ts", ColumnType::I64, false)]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        let two_pow_53 = 1i64 << 53;
+        buffer.append(&[RowValue::I64(two_pow_53 + 1)]).unwrap();
+        buffer.append(&[RowValue::I64(two_pow_53 - 1)]).unwrap();
+        let view = SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()));
+        let gt = Predicate::Compare {
+            column: "ts".into(),
+            op: CmpOp::Gt,
+            value: Number::Float(9_007_199_254_740_992.0), // exactly 2^53
+        };
+        let bitmap = evaluate(&gt, &schema, &view).unwrap();
+        assert!(bitmap.get(0)); // 2^53 + 1 > 2^53
+        assert!(!bitmap.get(1)); // 2^53 - 1 is not > 2^53 (a cast says it is)
     }
 }
 

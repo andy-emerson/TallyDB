@@ -37,7 +37,7 @@
 //! decision #6 accepted).
 
 use crate::plan::{AggCall, AggFunction, AggItem, OrderBy, Plan, PlanItem, Projection, QueryError};
-use crate::predicate::{can_match, evaluate as evaluate_predicate};
+use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
@@ -56,6 +56,16 @@ pub trait WindowAggregate: Send + Sync {
     /// the aggregate is undefined for this window and becomes SQL `NULL`;
     /// `Err` aborts the query.
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String>;
+
+    /// The Arrow type of this window's output column. Computed in `f64`
+    /// internally, but a function whose result is logically integral (e.g.
+    /// `COUNT`) declares `I64` so its output column matches SQL — the
+    /// integer values are cast back exactly at materialization. Defaults
+    /// to `F64`; this is also where a script-backed window will declare
+    /// its return type (F2, M2.7).
+    fn output_type(&self) -> ColumnType {
+        ColumnType::F64
+    }
 }
 
 /// The window-aggregate registry: SQL name → implementation.
@@ -705,8 +715,17 @@ fn window_aggregate(
         )?,
     }
     let name = alias.unwrap_or(function);
-    let columns = results.into_iter().map(assemble_f64).collect();
-    Ok((Field::new(name, ColumnType::F64, true), columns))
+    let output_type = aggregate.output_type();
+    let columns = results
+        .into_iter()
+        .map(|result| match output_type {
+            // An I64-typed window (COUNT) produces integral f64 values;
+            // cast them back exactly (B5). Others stay f64.
+            ColumnType::I64 => assemble_i64_from_f64(result),
+            _ => assemble_f64(result),
+        })
+        .collect();
+    Ok((Field::new(name, output_type, true), columns))
 }
 
 /// Unpartitioned windows run over the snapshot's live rows in append
@@ -836,6 +855,16 @@ impl WindowAggregate for BuiltinWindow {
         1
     }
 
+    fn output_type(&self) -> ColumnType {
+        // COUNT is an integer count (SQL/DuckDB return BIGINT); the rest
+        // are f64 over f64 arguments. (i64 SUM/MIN/MAX windows are refused
+        // upstream — that's the separate #40.)
+        match self.0 {
+            AggFunction::Count => ColumnType::I64,
+            _ => ColumnType::F64,
+        }
+    }
+
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
         let window = args[0];
         if window.is_empty() {
@@ -848,12 +877,12 @@ impl WindowAggregate for BuiltinWindow {
             AggFunction::Min => window
                 .iter()
                 .copied()
-                .min_by(|left, right| left.total_cmp(right))
+                .min_by(|left, right| cmp_f64(*left, *right))
                 .expect("window is non-empty"),
             AggFunction::Max => window
                 .iter()
                 .copied()
-                .max_by(|left, right| left.total_cmp(right))
+                .max_by(|left, right| cmp_f64(*left, *right))
                 .expect("window is non-empty"),
         }))
     }
@@ -935,6 +964,44 @@ impl Accumulator {
         })
     }
 
+    /// The Arrow type this accumulator's output column takes — the single
+    /// source of truth for the aggregate's result type, read from a
+    /// template accumulator so the type comes from the *plan*, never from
+    /// how many groups happened to match (B4).
+    fn column_type(&self) -> ColumnType {
+        match self {
+            Accumulator::CountStar(_)
+            | Accumulator::CountColumn(_)
+            | Accumulator::SumI64 { .. }
+            | Accumulator::MinMaxI64 { .. } => ColumnType::I64,
+            Accumulator::SumF64 { .. }
+            | Accumulator::Avg { .. }
+            | Accumulator::MinMaxF64 { .. } => ColumnType::F64,
+        }
+    }
+
+    /// This accumulator's result as an `i64` (for an `I64`-typed column);
+    /// `None` = SQL NULL (no rows seen). Only called on i64 variants.
+    fn i64_value(&self) -> Option<i64> {
+        match self {
+            Accumulator::CountStar(count) | Accumulator::CountColumn(count) => Some(*count),
+            Accumulator::SumI64 { sum, seen } => seen.then_some(*sum),
+            Accumulator::MinMaxI64 { value, seen, .. } => seen.then_some(*value),
+            _ => None,
+        }
+    }
+
+    /// This accumulator's result as an `f64` (for an `F64`-typed column);
+    /// `None` = SQL NULL. Only called on f64 variants.
+    fn f64_value(&self) -> Option<f64> {
+        match self {
+            Accumulator::SumF64 { sum, seen } => seen.then_some(*sum),
+            Accumulator::Avg { sum, count } => (*count > 0).then(|| sum / *count as f64),
+            Accumulator::MinMaxF64 { value, seen, .. } => seen.then_some(*value),
+            _ => None,
+        }
+    }
+
     /// Folds in one row's cell (`None` = the cell is null, or the call
     /// is `COUNT(*)` and there is no cell).
     fn update(&mut self, cell: Option<CellNumber>) -> Result<(), QueryError> {
@@ -959,11 +1026,11 @@ impl Accumulator {
             }
             (Accumulator::MinMaxF64 { value, seen, max }, Some(cell)) => {
                 let candidate = cell.as_f64();
-                // total_cmp keeps NaN ordered (greater than everything),
-                // matching how it will sort and compare downstream.
+                // The one f64 relation (cmp_f64): NaN is greatest, matching
+                // WHERE and pruning — not total_cmp's bitwise order (B3).
                 let replace = !*seen
-                    || (*max && candidate.total_cmp(value).is_gt())
-                    || (!*max && candidate.total_cmp(value).is_lt());
+                    || (*max && cmp_f64(candidate, *value).is_gt())
+                    || (!*max && cmp_f64(candidate, *value).is_lt());
                 if replace {
                     *value = candidate;
                 }
@@ -1169,8 +1236,12 @@ fn project_aggregate(
                     AggFunction::Max => "max",
                 };
                 let name = call.alias.as_deref().unwrap_or(default_name);
+                // Output type from the plan (the template accumulator), so
+                // it is the same whether or not any group matched (B4).
+                let output_type = template[next_call].column_type();
                 let (field, column) = assemble_aggregate(
                     name,
+                    output_type,
                     accumulators.iter().map(|group| &group[next_call]),
                     group_count,
                 );
@@ -1189,69 +1260,58 @@ fn project_aggregate(
     Ok(QueryOutput { schema, batches })
 }
 
-/// One aggregate output column from its per-group accumulators.
+/// One aggregate output column from its per-group accumulators. The
+/// column's `output_type` comes from the plan (a template accumulator),
+/// not from the accumulator instances here — so zero groups still yields
+/// the right Arrow type (B4).
 fn assemble_aggregate<'a>(
     name: &str,
+    output_type: ColumnType,
     accumulators: impl Iterator<Item = &'a Accumulator>,
     groups: usize,
 ) -> (Field, Column) {
-    let mut f64_values: Vec<Option<f64>> = Vec::with_capacity(groups);
-    let mut i64_values: Vec<Option<i64>> = Vec::with_capacity(groups);
-    let mut is_i64 = false;
-    for accumulator in accumulators {
-        match accumulator {
-            Accumulator::CountStar(count) | Accumulator::CountColumn(count) => {
-                is_i64 = true;
-                i64_values.push(Some(*count));
+    match output_type {
+        ColumnType::I64 => {
+            let mut cells: Vec<Option<i64>> = Vec::with_capacity(groups);
+            for accumulator in accumulators {
+                cells.push(accumulator.i64_value());
             }
-            Accumulator::SumF64 { sum, seen } => f64_values.push(seen.then_some(*sum)),
-            Accumulator::SumI64 { sum, seen } => {
-                is_i64 = true;
-                i64_values.push(seen.then_some(*sum));
-            }
-            Accumulator::Avg { sum, count } => {
-                f64_values.push((*count > 0).then(|| sum / *count as f64))
-            }
-            Accumulator::MinMaxF64 { value, seen, .. } => f64_values.push(seen.then_some(*value)),
-            Accumulator::MinMaxI64 { value, seen, .. } => {
-                is_i64 = true;
-                i64_values.push(seen.then_some(*value));
-            }
+            let nullable = cells.iter().any(Option::is_none);
+            let values: Buffer<i64> = cells.iter().map(|value| value.unwrap_or(0)).collect();
+            let column = if nullable {
+                NumericColumn::new_nullable(
+                    values,
+                    Bitmap::from_bools(cells.iter().map(Option::is_some)),
+                )
+            } else {
+                NumericColumn::new_non_null(values)
+            };
+            (
+                Field::new(name, ColumnType::I64, nullable),
+                Column::Numeric(NumericData::I64(column)),
+            )
         }
-    }
-    if is_i64 {
-        let nullable = i64_values.iter().any(Option::is_none);
-        let values: Buffer<i64> = i64_values.iter().map(|value| value.unwrap_or(0)).collect();
-        let column = if nullable {
-            NumericColumn::new_nullable(
-                values,
-                Bitmap::from_bools(i64_values.iter().map(Option::is_some)),
+        // Aggregates are numeric; a Key output can't arise.
+        _ => {
+            let mut cells: Vec<Option<f64>> = Vec::with_capacity(groups);
+            for accumulator in accumulators {
+                cells.push(accumulator.f64_value());
+            }
+            let nullable = cells.iter().any(Option::is_none);
+            let values: Buffer<f64> = cells.iter().map(|value| value.unwrap_or(0.0)).collect();
+            let column = if nullable {
+                NumericColumn::new_nullable(
+                    values,
+                    Bitmap::from_bools(cells.iter().map(Option::is_some)),
+                )
+            } else {
+                NumericColumn::new_non_null(values)
+            };
+            (
+                Field::new(name, ColumnType::F64, nullable),
+                Column::Numeric(NumericData::F64(column)),
             )
-        } else {
-            NumericColumn::new_non_null(values)
-        };
-        (
-            Field::new(name, ColumnType::I64, nullable),
-            Column::Numeric(NumericData::I64(column)),
-        )
-    } else {
-        let nullable = f64_values.iter().any(Option::is_none);
-        let values: Buffer<f64> = f64_values
-            .iter()
-            .map(|value| value.unwrap_or(0.0))
-            .collect();
-        let column = if nullable {
-            NumericColumn::new_nullable(
-                values,
-                Bitmap::from_bools(f64_values.iter().map(Option::is_some)),
-            )
-        } else {
-            NumericColumn::new_non_null(values)
-        };
-        (
-            Field::new(name, ColumnType::F64, nullable),
-            Column::Numeric(NumericData::F64(column)),
-        )
+        }
     }
 }
 
@@ -1294,7 +1354,7 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
     }
     let mut order: Vec<usize> = (0..picks.len()).collect();
     let compare_values = |left: &SortCell, right: &SortCell| match (left, right) {
-        (SortCell::F64(left), SortCell::F64(right)) => left.total_cmp(right),
+        (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
         (left, right) => left.partial_cmp(right).expect("same variant per column"),
     };
     order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
@@ -1434,6 +1494,22 @@ fn assemble_f64(results: Vec<Option<f64>>) -> Column {
         NumericColumn::new_non_null(values)
     };
     Column::Numeric(NumericData::F64(column))
+}
+
+/// Materializes an `i64` output column from integral `f64` results — the
+/// `COUNT`-window path (B5). Each present value is an exact integer count,
+/// so the cast is lossless.
+fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
+    let values = results.iter().map(|v| v.map_or(0, |x| x as i64)).collect();
+    let column = if results.iter().any(Option::is_none) {
+        NumericColumn::new_nullable(
+            values,
+            Bitmap::from_bools(results.iter().map(Option::is_some)),
+        )
+    } else {
+        NumericColumn::new_non_null(values)
+    };
+    Column::Numeric(NumericData::I64(column))
 }
 
 #[cfg(test)]
@@ -1739,6 +1815,53 @@ mod tests {
         .unwrap();
         assert_eq!(output.batches.len(), 0);
         assert_eq!(output.schema.fields()[0].column_type(), ColumnType::F64);
+    }
+
+    #[test]
+    fn aggregates_and_order_by_use_the_where_relation_for_nan() {
+        // B3: MIN/MAX and ORDER BY use the one f64 relation (cmp_f64, NaN
+        // greatest) that WHERE and pruning use — not total_cmp, which ranks
+        // -NaN below -inf. With a -NaN row: MAX is NaN, MIN is the finite
+        // minimum, and ORDER BY DESC puts NaN first.
+        let views = segment(&[(1, "A", 1.0), (2, "A", -f64::NAN), (3, "A", 5.0)]);
+        let hi = run(&views, "SELECT max(x) FROM t GROUP BY sym").unwrap();
+        assert!(
+            flatten(&hi, 0)[0].unwrap().is_nan(),
+            "MAX must be NaN (greatest), not the finite max"
+        );
+        let lo = run(&views, "SELECT min(x) FROM t GROUP BY sym").unwrap();
+        assert_eq!(flatten(&lo, 0), [Some(1.0)]);
+        let sorted = run(&views, "SELECT x FROM t ORDER BY x DESC").unwrap();
+        let xs = flatten(&sorted, 0);
+        assert!(xs[0].unwrap().is_nan(), "NaN sorts first under DESC");
+        assert_eq!((xs[1], xs[2]), (Some(5.0), Some(1.0)));
+    }
+
+    #[test]
+    fn empty_group_aggregate_types_from_the_plan() {
+        // B4: zero groups must still export COUNT as i64 — the type comes
+        // from the plan (a template accumulator), not from instances that
+        // never got created.
+        let out = run(&[], "SELECT sym, count(*) FROM t GROUP BY sym").unwrap();
+        assert_eq!(out.batches.len(), 0);
+        assert_eq!(out.schema.fields()[1].column_type(), ColumnType::I64);
+    }
+
+    #[test]
+    fn window_count_output_is_i64() {
+        // B5: a COUNT window returns an integer column, like SQL/DuckDB.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 2.0)]);
+        let out = run(
+            &views,
+            "SELECT count(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t",
+        )
+        .unwrap();
+        assert_eq!(out.schema.fields()[0].column_type(), ColumnType::I64);
+        let Column::Numeric(NumericData::I64(n)) = &out.batches[0].columns()[0] else {
+            panic!("count window must be i64")
+        };
+        assert_eq!(n.values().as_slice(), [1, 2]);
     }
 
     #[test]
@@ -2134,10 +2257,11 @@ mod query1_tests {
             flatten(&output, 3),
             [Some(1.0), Some(2.0), Some(3.0), Some(4.0)]
         );
-        assert_eq!(
-            flatten(&output, 4),
-            [Some(1.0), Some(2.0), Some(2.0), Some(2.0)]
-        );
+        // count is an integer window (B5): SQL COUNT returns i64, not f64.
+        let Column::Numeric(NumericData::I64(n)) = &output.batches[0].columns()[4] else {
+            panic!("count window must be i64")
+        };
+        assert_eq!(n.values().as_slice(), [1, 2, 2, 2]);
         // An embedder registration of the same name wins over the
         // builtin.
         struct AlwaysNine;
