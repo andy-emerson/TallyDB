@@ -170,7 +170,8 @@ q language, minus the license, minus the server.
 buffers, `u32`-dictionary key columns, the two-variant column enum with
 zero-copy views, logical-type export annotations, and the C Data Interface
 including `ArrowArrayStream` — every piece round-trip-tested against
-arrow-rs and PyArrow in CI, with the unsafe core also run under Miri.
+arrow-rs and PyArrow in CI, with the unsafe core additionally checked
+under Miri by hand (not yet wired into CI — issue #63).
 
 On top of it runs the vertical slice, now past its M1 write-then-read
 shape: `storage-lite` appends validated rows into a per-table store —

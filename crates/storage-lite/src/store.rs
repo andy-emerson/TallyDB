@@ -5,7 +5,9 @@
 //! reaches the store's segment-row threshold it is flushed automatically,
 //! so a long-lived store is a growing sequence of bounded segments.
 //! Readers never see the buffer directly — [`Store::snapshot`] freezes a
-//! point-in-time copy of it (cheap, copy-on-write) and returns the full
+//! point-in-time copy of it (cheap — value and code buffers are
+//! copy-on-write; the per-snapshot cost is the null flags and dictionary
+//! index, which are copied) and returns the full
 //! segment sequence, so appends and queries interleave freely without
 //! either blocking the other.
 //!
@@ -433,8 +435,16 @@ impl Store {
     ///
     /// On a persistent store the rewrite is crash-safe: the entire next
     /// generation is written first, one atomic manifest write commits
-    /// it, and only then are the old generation's objects removed — a
-    /// crash anywhere leaves one complete generation to reopen.
+    /// it, and only then are the old generation's objects removed
+    /// (best-effort — a removal failure leaves ignorable garbage, never a
+    /// stranded generation) — a crash anywhere leaves one complete
+    /// generation to reopen.
+    ///
+    /// Memory: compaction holds the old generation and the fully rebuilt
+    /// new one at once, plus a sort index (~32 bytes/row), so it peaks at
+    /// roughly twice the table's footprint — and it is the only way to
+    /// release `UPDATE`/`DELETE` debt, so it runs precisely when the table
+    /// is already inflated (interacts with #43/#44, #56).
     pub fn compact(&mut self) -> Result<(), StorageError> {
         // Collect every live row's (ordering value, row id, location),
         // buffer included via an ephemeral snapshot.
