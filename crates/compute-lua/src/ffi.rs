@@ -112,10 +112,10 @@ unsafe extern "C" {
 /// # Safety
 /// Same contract as `lua_pcallk` with no continuation.
 pub(crate) unsafe fn lua_pcall(
-    L: *mut lua_State,
+    state: *mut lua_State,
     nargs: c_int,
     nresults: c_int,
     errfunc: c_int,
 ) -> c_int {
-    unsafe { lua_pcallk(L, nargs, nresults, errfunc, 0, std::ptr::null()) }
+    unsafe { lua_pcallk(state, nargs, nresults, errfunc, 0, std::ptr::null()) }
 }

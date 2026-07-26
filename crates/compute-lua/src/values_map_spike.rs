@@ -601,8 +601,8 @@ unsafe extern "C" fn nullable_c_mask(state: *mut ffi::lua_State) -> c_int {
             return raise(state, c"mask on a non-view");
         }
         let view = *payload;
-        let slot = ffi::lua_newuserdatauv(state, std::mem::size_of::<MaskView>(), 0)
-            .cast::<MaskView>();
+        let slot =
+            ffi::lua_newuserdatauv(state, std::mem::size_of::<MaskView>(), 0).cast::<MaskView>();
         slot.write(MaskView {
             valid: view.valid,
             len: view.len,
@@ -628,7 +628,11 @@ unsafe extern "C" fn mask_index(state: *mut ffi::lua_State) -> c_int {
             return raise(state, c"mask index out of range");
         }
         let offset = (index - 1) as usize;
-        let bit = if *view.valid.add(offset) != 0 { 1.0 } else { 0.0 };
+        let bit = if *view.valid.add(offset) != 0 {
+            1.0
+        } else {
+            0.0
+        };
         ffi::lua_pushnumber(state, bit);
         1
     }
@@ -863,7 +867,11 @@ mod tests {
         let r = state
             .eval_scalar_c("if v[1] then return 1 else return 0 end", &values, &valid)
             .expect("runs");
-        assert_eq!(r, CScalar::Num(1.0), "NULL is truthy — the sentinel footgun");
+        assert_eq!(
+            r,
+            CScalar::Num(1.0),
+            "NULL is truthy — the sentinel footgun"
+        );
     }
 
     // C-WART 2 — 3VL cannot propagate through relational operators: Lua
@@ -940,7 +948,9 @@ mod tests {
         let start = std::time::Instant::now();
         let mut batch_result = 0.0;
         for _ in 0..rounds {
-            batch_result = state.eval_scalar_nullable(batch_chunk, &values, &valid).unwrap();
+            batch_result = state
+                .eval_scalar_nullable(batch_chunk, &values, &valid)
+                .unwrap();
         }
         let batch = start.elapsed() / rounds;
 
