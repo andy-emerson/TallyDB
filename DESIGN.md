@@ -162,10 +162,10 @@ type — and (b) no general-purpose cost-based optimizer.
 
 | SQL capability | In / Out | Bounding invariant |
 |---|---|---|
-| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, star-schema equi-joins, window functions, `UPDATE`/`DELETE` | **in** (built) | — |
-| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames | **in** (not yet built) | — |
+| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE` | **in** (built) | — |
+| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
 | `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
-| general N-way / non-star joins | **out** | (b): needs a cost-based optimizer |
+| joins no structural fact licenses — neither side small enough to materialize, inputs not co-ordered on the join key, join-*order* search | **out** | (b): would need a cost-based optimizer (see *the join constraint, completed*) |
 | a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
 
 **The oracle-set rule for built-in functions (decided 2026-07-25).**
@@ -588,6 +588,48 @@ naming the real hazard: a nominal "dimension" grown too large to
 materialize. A stated threshold belongs in the contract when the
 executor generalizes.
 
+**Decision record — the join constraint, completed: strategy fixed by
+structure (Human-ruled 2026-07-26).** The size invariant above is one
+clause of a two-clause principle: **a join is supported when a structural
+property of its inputs fixes the execution strategy — never by cost.**
+Each admitted strategy is guarded by the structural fact that makes it
+safe at any scale without estimation:
+
+| Strategy | Guarding structural fact | What it protects against |
+|---|---|---|
+| Broadcast/hash lookup | one side small enough to materialize, key-unique | unbounded memory |
+| Ordered merge (`ASOF JOIN` and relatives, #65) | both sides ordered on the join key — their declared ordering key | unbounded memory *and* sorting |
+
+Clause 1 is the size invariant, unchanged, guarding the strategy that
+materializes a build side. Clause 2 needs no size bound as a *property,
+not an exemption*: a merge over inputs already clustered on the join key
+is a streaming co-walk — a cursor per side plus the current match window
+— so its memory does not scale with input size; that is exactly why it
+may admit large ⋈ large, and why only on the ordering key, where the
+storage layout guarantees the clustering (assumption 2 plays for clause
+2 the role the size invariant plays for clause 1). Its runtime guard is
+`Segment::is_ordered` — the check the window executor already relies on;
+a transiently disordered table (UPDATE reappends before compaction)
+refuses the merge loudly rather than serving a wrong answer. Dispatch
+never estimates: an embedded single-machine snapshot knows every table's
+**exact** row count and every dictionary's exact cardinality, so "small
+enough" is a measurement against a stated threshold, not a cost model —
+the fixed-strategy planner stays fixed. A join with *neither* guarding
+fact — two large tables on a non-ordering key, or join-*order* search —
+is **refused loudly, naming the missing structure**: serving it needs
+spilling, partitioning, or an optimizer, i.e. a different product.
+*Precedent (validates the workload, no vote on the how):* kdb+ dispatches
+by user-named join verbs trusting declared structure (`lj` keyed lookup,
+`aj` sorted as-of) with no optimizer anywhere; QuestDB keys `ASOF`/`LT`/
+`SPLICE` off the schema-declared designated timestamp — the closest
+living relative of this rule; ClickHouse ran years of the world's largest
+analytics on exactly clause 1 (hash join, right side fits memory, join
+order = syntax order) before generalizing into CBO — the reopen path,
+visible; DuckDB implements `ASOF JOIN` as first-class syntax over a CBO,
+which we refuse, but it standardizes the surface and serves as the
+differential oracle, so the ordered-merge family is born cross-checked
+(the oracle-set rule holds).
+
 **Load-bearing note on dictionaries:** the low-cardinality assumption
 carries query performance, not just storage size — cross-segment
 grouping and joins pay segments × distinct-values remapping, and the
@@ -640,9 +682,10 @@ fixed row count (issue #44) — the two sibling cadence questions.
   DifferentialEquations.jl-style breadth) to compensate for Lua's thinner
   ecosystem. Not this project's job — the embedded Lua scripting layer is
   the intended escape hatch for gaps, not something we pre-fill.
-- **A general query optimizer / cost-based planner.** Query shapes are
-  assumed simple (one fact table + small dimension tables, star-schema
-  equi-joins).
+- **A general query optimizer / cost-based planner.** Join strategy is
+  fixed by input structure — a small materializable side, or co-ordering
+  on the join key — never chosen by cost (see *the join constraint,
+  completed*).
 - **Arrow IPC / Flight / Parquet in `arrow-lite`.** The interop surface is
   the C Data Interface (including the stream variant), nothing else — IPC
   drags in FlatBuffers and a much larger spec. Parquet in/out is the
