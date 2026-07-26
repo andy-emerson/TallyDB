@@ -451,6 +451,18 @@ mutations after the call are invisible to it (test:
 `snapshot_is_isolated_from_later_appends`). One guarantee — snapshot
 isolation at statement granularity — no isolation-level menu.
 
+*One consistency obligation for the concurrent-reader work (#51):* a
+statement that reads more than one table — today only a join, which
+snapshots the fact table and each dimension separately
+(`table.rs:311-312`) — takes multiple `snapshot()` calls at distinct
+instants. This is sound under the current single-writer model because
+no writer can interleave between them, but the moment concurrent
+writers exist (#51) those inputs could come from different instants —
+a cross-table torn read. The snapshot-handle design must give a
+multi-input statement one consistent snapshot epoch across all inputs;
+the single-`snapshot()`-per-input mechanism does not survive #51
+unchanged.
+
 **Truth values — decided (2026-07-25).** There is no boolean type and
 none is coming. A flag column is `i64` in {0, 1} — which is the right
 answer, not a workaround: `SUM(flag)` is a count and `AVG(flag)` is a
