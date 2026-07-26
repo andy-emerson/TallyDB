@@ -337,6 +337,19 @@ struct NullableViewC {
     len: usize,
 }
 
+/// Out-of-band validity, exposed by `v:mask()` — a zero-copy view over
+/// the same validity buffer, so a script can read validity separately
+/// while the value stream stays purely numeric (BLAS-ready). Elements
+/// read as 1.0 (valid) / 0.0 (null); the real API would use booleans.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MaskView {
+    valid: *const u8,
+    len: usize,
+}
+
+const META_MASK: &CStr = c"tallydb.spike.mask";
+
 struct SpikeStateC {
     raw: *mut ffi::lua_State,
 }
@@ -398,6 +411,16 @@ impl SpikeStateC {
             ffi::lua_pushcclosure(raw, nullable_c_index, 0);
             ffi::lua_setfield(raw, -2, c"__index".as_ptr());
             ffi::lua_pushcclosure(raw, nullable_c_len, 0);
+            ffi::lua_setfield(raw, -2, c"__len".as_ptr());
+            ffi::lua_pushcclosure(raw, readonly_newindex, 0);
+            ffi::lua_setfield(raw, -2, c"__newindex".as_ptr());
+            ffi::lua_settop(raw, 0);
+
+            // The out-of-band mask view metatable.
+            ffi::luaL_newmetatable(raw, META_MASK.as_ptr());
+            ffi::lua_pushcclosure(raw, mask_index, 0);
+            ffi::lua_setfield(raw, -2, c"__index".as_ptr());
+            ffi::lua_pushcclosure(raw, mask_len, 0);
             ffi::lua_setfield(raw, -2, c"__len".as_ptr());
             ffi::lua_pushcclosure(raw, readonly_newindex, 0);
             ffi::lua_setfield(raw, -2, c"__newindex".as_ptr());
@@ -492,7 +515,10 @@ unsafe extern "C" fn null_tostring(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
-/// Config-C nullable view: null slots read as the NULL singleton.
+/// Config-C nullable view: a numeric key is an element read (null slots
+/// read as the NULL singleton); a string key dispatches to a batch method
+/// (`v:sum()`, `v:mask()`) whose implementation never materializes the
+/// sentinel — the point of the cost-reducers.
 unsafe extern "C" fn nullable_c_index(state: *mut ffi::lua_State) -> c_int {
     unsafe {
         let payload =
@@ -501,6 +527,26 @@ unsafe extern "C" fn nullable_c_index(state: *mut ffi::lua_State) -> c_int {
             return raise(state, c"view accessor on a non-view");
         }
         let view = *payload;
+        // String key → batch method; number key → element access.
+        if ffi::lua_type(state, 2) != ffi::LUA_TNUMBER {
+            let mut klen = 0usize;
+            let kptr = ffi::lua_tolstring(state, 2, &mut klen);
+            if kptr.is_null() {
+                return raise(state, c"view index must be an integer or method name");
+            }
+            let key = std::slice::from_raw_parts(kptr.cast::<u8>(), klen);
+            return match key {
+                b"sum" => {
+                    ffi::lua_pushcclosure(state, nullable_c_sum, 0);
+                    1
+                }
+                b"mask" => {
+                    ffi::lua_pushcclosure(state, nullable_c_mask, 0);
+                    1
+                }
+                _ => raise(state, c"no such view method"),
+            };
+        }
         let mut is_integer = 0;
         let index = ffi::lua_tointegerx(state, 2, &mut is_integer);
         if is_integer == 0 {
@@ -515,6 +561,86 @@ unsafe extern "C" fn nullable_c_index(state: *mut ffi::lua_State) -> c_int {
         } else {
             ffi::lua_pushnumber(state, *view.ptr.add(offset));
         }
+        1
+    }
+}
+
+/// `v:sum()` — a null-aware batch reduction computed engine-side over the
+/// raw buffer + validity. The sentinel is NEVER pushed; no per-element
+/// Lua loop, no truthiness/`== nil` footgun can arise. This is the common
+/// path our zero-copy/columnar shape makes cheap and Tarantool cannot.
+unsafe extern "C" fn nullable_c_sum(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let payload =
+            ffi::luaL_testudata(state, 1, META_NULLABLE_C.as_ptr()).cast::<NullableViewC>();
+        if payload.is_null() {
+            return raise(state, c"sum on a non-view");
+        }
+        let view = *payload;
+        let mut sum = 0.0f64;
+        let mut i = 0usize;
+        while i < view.len {
+            if *view.valid.add(i) != 0 {
+                sum += *view.ptr.add(i);
+            }
+            i += 1;
+        }
+        ffi::lua_pushnumber(state, sum);
+        1
+    }
+}
+
+/// `v:mask()` — a zero-copy view over the same validity buffer, so a
+/// script can read validity out-of-band while the value stream stays
+/// purely numeric (the BLAS-ready path).
+unsafe extern "C" fn nullable_c_mask(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let payload =
+            ffi::luaL_testudata(state, 1, META_NULLABLE_C.as_ptr()).cast::<NullableViewC>();
+        if payload.is_null() {
+            return raise(state, c"mask on a non-view");
+        }
+        let view = *payload;
+        let slot = ffi::lua_newuserdatauv(state, std::mem::size_of::<MaskView>(), 0)
+            .cast::<MaskView>();
+        slot.write(MaskView {
+            valid: view.valid,
+            len: view.len,
+        });
+        ffi::luaL_setmetatable(state, META_MASK.as_ptr());
+        1
+    }
+}
+
+unsafe extern "C" fn mask_index(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let payload = ffi::luaL_testudata(state, 1, META_MASK.as_ptr()).cast::<MaskView>();
+        if payload.is_null() {
+            return raise(state, c"mask accessor on a non-mask");
+        }
+        let view = *payload;
+        let mut is_integer = 0;
+        let index = ffi::lua_tointegerx(state, 2, &mut is_integer);
+        if is_integer == 0 {
+            return raise(state, c"mask index must be an integer");
+        }
+        if index < 1 || index as usize > view.len {
+            return raise(state, c"mask index out of range");
+        }
+        let offset = (index - 1) as usize;
+        let bit = if *view.valid.add(offset) != 0 { 1.0 } else { 0.0 };
+        ffi::lua_pushnumber(state, bit);
+        1
+    }
+}
+
+unsafe extern "C" fn mask_len(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let payload = ffi::luaL_testudata(state, 1, META_MASK.as_ptr()).cast::<MaskView>();
+        if payload.is_null() {
+            return raise(state, c"mask accessor on a non-mask");
+        }
+        ffi::lua_pushinteger(state, (*payload).len as i64);
         1
     }
 }
@@ -755,5 +881,43 @@ mod tests {
             err.contains("compare") || err.contains("attempt"),
             "expected a loud compare error, got: {err}"
         );
+    }
+
+    // ---- Cost-reducers on top of C (the "cheaper for us" variations) ----
+
+    // VAR-1 — the common path: a null-aware batch reduction computed
+    // engine-side. `v:sum()` skips nulls and the sentinel is NEVER
+    // materialized — no per-element loop, so none of C's footguns
+    // (truthiness, `== nil`, comparison) can even arise here. This is the
+    // path Tarantool cannot offer, because its data *is* Lua values.
+    #[test]
+    fn var1_batch_sum_never_touches_the_sentinel() {
+        let values = [10.0, 20.0, 30.0, 40.0];
+        let valid = [true, false, true, false]; // two nulls
+        let mut state = SpikeStateC::new();
+        let s = state
+            .eval_scalar_c("return v:sum()", &values, &valid)
+            .expect("runs");
+        assert_eq!(s, CScalar::Num(40.0)); // 10 + 30, nulls skipped
+    }
+
+    // VAR-2 — out-of-band validity: `v:mask()` is a zero-copy view over
+    // the SAME validity buffer, so a script reads validity separately
+    // while the value stream stays purely numeric (BLAS-ready). Proves
+    // the values and the nulls can be handled on independent views.
+    #[test]
+    fn var2_mask_is_out_of_band_and_zero_copy() {
+        let values = [1.0, 2.0, 3.0];
+        let valid = [true, false, true];
+        let mut state = SpikeStateC::new();
+        // Read the mask as its own view; encode the three bits as a number.
+        let code = state
+            .eval_scalar_c(
+                "local m = v:mask()\nreturn m[1] * 100 + m[2] * 10 + m[3]",
+                &values,
+                &valid,
+            )
+            .expect("runs");
+        assert_eq!(code, CScalar::Num(101.0)); // valid, null, valid
     }
 }
