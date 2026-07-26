@@ -41,8 +41,9 @@
 //! including distinct events sharing keys and ordering-key value — are
 //! first-class. `UPDATE`/`DELETE` address rows by predicate; a correction
 //! supersedes by ingest sequence, which is what "newest version wins"
-//! means. Tombstones therefore reference row ids (or carry predicates),
-//! never key tuples. The rejected InfluxDB-style `(key-set, ordering-key)`
+//! means. Tombstones therefore reference row ids, never key tuples
+//! (predicates are resolved to ids before the delete log is written —
+//! the log carries only ids). The rejected InfluxDB-style `(key-set, ordering-key)`
 //! primary key silently collapses same-tuple events; if user-visible
 //! overwrite semantics are ever needed, the path is an opt-in declared
 //! uniqueness constraint layered on top — additive, not a reversal.
@@ -64,10 +65,13 @@
 //! of named byte objects with atomic publish, nothing filesystem-shaped
 //! in its contract. The native implementation is a directory of files
 //! ([`io::FsBackend`]); an OPFS-backed WASM implementation slots in
-//! later without touching anything above the trait. mmap and ranged
-//! reads are recorded follow-ups for when query-time pruning or a
-//! profiling number asks for them (v1 opens decode into memory, so mmap
-//! would buy nothing today).
+//! later without touching anything above the trait. Whole-object reads
+//! are the contract by decision: the working-set cut is owned (a table
+//! fits in memory; v1 opens decode-into-memory — DESIGN.md, "The
+//! axes"), so mmap and ranged reads are **retired**, not deferred. The
+//! recorded escape, if the reopen trigger fires, is a zero-copy-open
+//! format version — an additive new format, not a partial-read path
+//! bolted onto this one.
 //!
 //! ## Scope for this crate
 //! Built: the write buffer and append path ([`mem`]), the multi-segment

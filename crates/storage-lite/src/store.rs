@@ -293,6 +293,13 @@ impl Store {
             }
             expected_base += segment.batch().num_rows() as u64;
         }
+        // A tombstone naming a row id that was never made durable is the
+        // fingerprint of a torn mutation written by a pre-fix build (or a
+        // corrupt log). Reject it loudly rather than carrying it: left in
+        // place it underflows live_len and shadow-kills reissued ids.
+        if let Some(&bad) = tombstones.iter().find(|&&id| id >= expected_base) {
+            return Err(StorageError::TombstoneOutOfRange { id: bad });
+        }
         store.segments = segments;
         store.rows = expected_base;
         store.buffer_base = expected_base;
@@ -319,9 +326,12 @@ impl Store {
         self.rows
     }
 
-    /// Rows a reader sees: appended minus tombstoned.
+    /// Rows a reader sees: appended minus tombstoned. Saturating as
+    /// defense in depth — a healthy store never tombstones more than it
+    /// appended, and the reopen check rejects any log that would, but an
+    /// underflow must degrade to zero rather than wrap.
     pub fn live_len(&self) -> u64 {
-        self.rows - self.tombstones.len() as u64
+        self.rows.saturating_sub(self.tombstones.len() as u64)
     }
 
     /// Whether no rows have ever been appended.
@@ -385,6 +395,18 @@ impl Store {
             .collect();
         if newly.is_empty() {
             return Ok(0);
+        }
+        // A delete log must never name a row that is not yet durable. Any
+        // id in the current write buffer (>= buffer_base) is in-memory
+        // only, so flush before writing the log: this makes every
+        // tombstoned row — and any replacement rows a mutation appended
+        // ahead of the tombstone — durable first. Without it, a crash
+        // after the (synced) delete log but before a flush would apply a
+        // delete against a row that never reached disk, and reopen would
+        // carry a tombstone for a row id it then reissues (silent
+        // shadow-kill of future rows).
+        if self.backend.is_some() && newly.iter().any(|&id| id >= self.buffer_base) {
+            self.flush()?;
         }
         if let Some(backend) = &self.backend {
             backend.write(

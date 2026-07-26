@@ -7,8 +7,15 @@
 //! `u32` code (u32 only — no u64 variant, per issue #2). The dictionary is
 //! the one variable-width structure in the system, and it is *reference
 //! data, not row data*: sized by distinct values, touched at intern time
-//! and once-per-distinct-value predicate evaluation, never on the per-row
-//! scan/compute path.
+//! and once-per-distinct-value in predicate, GROUP BY, and PARTITION BY
+//! evaluation. The design intent is that it is **never rendered on the
+//! per-row scan/compute path** — the type-level invariant holds (no bare
+//! string ever reaches a stored or output column), but three read-side
+//! materialization paths currently fall short of the per-row intent
+//! (ORDER BY on a key, join dimension-key gather, and the ORDER BY/LIMIT
+//! re-encode render one `String` per row where a once-per-distinct-value
+//! rank would suffice); tracked and to be fixed with the key-ordering
+//! decision.
 //!
 //! The dictionary stores its values directly in Arrow's Utf8 layout —
 //! `i32` offsets plus a byte buffer — so C Data Interface export (issue

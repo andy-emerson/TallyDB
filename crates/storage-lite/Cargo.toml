@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-# memmap2 (or similar) for the native mmap backend goes here once that
-# backend is implemented — keep it behind the I/O trait, not a hard
-# dependency of the whole crate, so a future wasm32 build isn't blocked.
+# No mmap dependency: the working-set cut is owned (a table fits in
+# memory; v1 opens decode-into-memory — see DESIGN.md, "The axes"), so
+# an mmap backend is retired, not deferred. If the reopen trigger ever
+# fires, the escape is a zero-copy-open format version behind the I/O
+# trait, and the dependency lands then — not before.
 
 [dev-dependencies]
 corpus = { path = "../corpus" }
