@@ -855,6 +855,32 @@ crossing tax the feed-reactive ruling excludes. The ~120× over a native
 Rust loop is the interpreter / metamethod cost the promotion ladder
 closes, not a property of the convention.
 
+**Decision record — script observability: `log()` (2026-07-26).** Scripts
+get one host-routed diagnostic function, `log(...)`, the replacement for
+Lua's `print`. `print` is removed *not* because of the string invariant —
+its text never becomes a column — but because its **destination**, the
+process's stdout, is not an embeddable library's to own and is
+uncapturable. `log(...)` routes instead to an **embedder-installed sink**:
+a trait the host implements — the shell wires it to stderr, a library
+embedder to its own logger, a headless embedding to a no-op (off by
+default). It is a **pure side-channel**: no return that feeds results, it
+cannot change query output — observational only (a diagnostic that alters
+the answer is not a diagnostic). It logs scalars and short text; a **view
+logs as a summary** (`f64 view, len 4096`), never its contents — a
+diagnostic, not a buffer dump or an exfiltration path. Surface and sink
+are both **flat** (`fn log(&self, msg)`; Lua `log(...)`), single severity:
+the sink is script-only, so a level parameter would be permanently
+degenerate (every message an `info`), and TallyDB carries no speculative
+machinery. Severity, if a real need appears, is added *additively later* —
+a defaulted `log_at(level, msg)` trait method breaks no existing embedder
+(and at 0.0.1 nothing is frozen) — or the sink is deliberately widened to
+an engine-wide diagnostic channel, a named scope expansion rather than a
+default. Runaway volume (a kernel logging per row) is bounded by the
+instruction-count hook (#61) and the batch-not-per-row doctrine: log per
+batch, not per row. Because the sink is host-captured, an agentic harness
+driving the engine reads a script's log as its observable output — the
+"sight" half of #46.
+
 **Decision record — feed-reactive compute (settled direction, 2026-07-26;
 implementation M3+).** Reacting to new ordered data with compute is *in
 scope* — it is a TSDB-native pattern, not a general-DB frill, and kdb+
