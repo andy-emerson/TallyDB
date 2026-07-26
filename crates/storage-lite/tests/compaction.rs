@@ -3,8 +3,46 @@
 //! ids contiguous again, durably and crash-safely.
 
 use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage_lite::{FsBackend, MemBackend, RowValue, StorageBackend, Store};
+use storage_lite::{FsBackend, IoError, MemBackend, RowValue, StorageBackend, Store};
+
+/// A backend that, once armed, fails every `remove` — used to model a
+/// post-commit cleanup failure during compaction (R1).
+struct FailingRemoves {
+    inner: MemBackend,
+    armed: AtomicBool,
+}
+
+impl FailingRemoves {
+    fn new() -> FailingRemoves {
+        FailingRemoves {
+            inner: MemBackend::new(),
+            armed: AtomicBool::new(false),
+        }
+    }
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl StorageBackend for FailingRemoves {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
+        self.inner.write(name, bytes)
+    }
+    fn read(&self, name: &str) -> Result<Vec<u8>, IoError> {
+        self.inner.read(name)
+    }
+    fn list(&self) -> Result<Vec<String>, IoError> {
+        self.inner.list()
+    }
+    fn remove(&self, name: &str) -> Result<(), IoError> {
+        if self.armed.load(Ordering::SeqCst) {
+            return Err(IoError::Backend("injected remove failure".to_owned()));
+        }
+        self.inner.remove(name)
+    }
+}
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -238,6 +276,41 @@ fn crashed_compaction_before_commit_is_invisible() {
             Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
         assert_eq!(reopened.len(), 5);
     });
+}
+
+#[test]
+fn compaction_cleanup_failure_does_not_strand_the_generation() {
+    // R1: the post-commit cleanup of stale objects is best-effort. If a
+    // `remove` fails after the manifest commit, the store must still adopt
+    // the new generation — otherwise memory stays at gen N while disk is
+    // gen N+1, and every later write (gen-N names) is silently dropped at
+    // reopen.
+    let backend = Arc::new(FailingRemoves::new());
+    {
+        let mut store =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+        for i in 0..6i64 {
+            append(&mut store, i, "A", i as f64);
+        }
+        store.flush().unwrap(); // gen-0 objects now exist -> cleanup has work
+                                // Arm the fault: the post-commit removal of the stale gen-0
+                                // segments will fail.
+        backend.arm();
+        // Compaction must still succeed — cleanup is best-effort — and the
+        // generation must advance despite the failed removes.
+        store.compact().unwrap();
+        // A write after the failed-cleanup compaction must land in the new
+        // generation, not a stranded old one.
+        append(&mut store, 100, "A", 100.0);
+        store.flush().unwrap();
+    }
+    // Reopen: all seven rows survive; none were stranded under gen N.
+    let reopened = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+    assert_eq!(reopened.live_len(), 7);
+    assert_eq!(
+        rows(&reopened).iter().map(|row| row.0).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 5, 100]
+    );
 }
 
 #[test]

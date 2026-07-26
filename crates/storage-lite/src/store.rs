@@ -481,7 +481,11 @@ impl Store {
             new_segments.push(buffer.freeze_at(base)?);
             base += rows;
         }
-        // Persist the next generation, commit it, then clean up.
+        // Built now, before the commit point, so adopting the new
+        // generation in memory below cannot fail partway.
+        let fresh_buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+
+        // Persist the next generation and commit it atomically.
         if let Some(backend) = &self.backend {
             let next = self.generation + 1;
             // Pre-clean: a compaction that crashed after writing some
@@ -502,28 +506,44 @@ impl Store {
                     &encode_segment(segment),
                 )?;
             }
+            // The manifest write is the commit point.
             backend.write(
                 MANIFEST,
                 &encode_manifest(&self.schema, self.ordering_key, next),
             )?;
-            // Committed. Old objects are now garbage; reopen would
-            // ignore them regardless, but a clean run leaves nothing.
-            for name in backend.list()? {
-                let current = name.starts_with(&segment_prefix(next))
-                    || name.starts_with(&delete_log_prefix(next));
-                let stale = (name.starts_with("seg-") || name.starts_with("del-")) && !current;
-                if stale {
-                    backend.remove(&name)?;
-                }
-            }
             self.generation = next;
         }
+
+        // In-memory commit: adopt the new generation. Infallible, and run
+        // immediately after the durable commit, so no later error can
+        // leave memory describing the old generation while disk holds the
+        // new one — the stranding that made every subsequent write vanish
+        // at reopen (R1).
         self.segments = new_segments.into_iter().map(Arc::new).collect();
         self.rows = base;
-        self.buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        self.buffer = fresh_buffer;
         self.buffer_base = base;
         self.tombstones.clear();
         self.delete_log_sequence = 0;
+
+        // Best-effort cleanup of the now-stale prior generation. A failure
+        // here only leaves garbage that reopen already ignores (it loads
+        // the one generation the manifest names); it must never fail the
+        // compaction or strand the generation, so a remove error is
+        // swallowed rather than propagated.
+        if let Some(backend) = &self.backend {
+            let current = self.generation;
+            if let Ok(names) = backend.list() {
+                for name in names {
+                    let belongs = name.starts_with(&segment_prefix(current))
+                        || name.starts_with(&delete_log_prefix(current));
+                    let stale = (name.starts_with("seg-") || name.starts_with("del-")) && !belongs;
+                    if stale {
+                        let _ = backend.remove(&name);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
