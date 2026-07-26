@@ -807,6 +807,32 @@ contract for the Lua boundary. The ergonomics layered on top — batch
 reductions, `v:mask()`, `v:get(i, default)` — are additive and do not
 change it.
 
+**Decision record — feed-reactive compute (settled direction, 2026-07-26;
+implementation M3+).** Reacting to new ordered data with compute is *in
+scope* — it is a TSDB-native pattern, not a general-DB frill, and kdb+
+(the reference workload) is built on it. The admitted shapes are **ingest
+hooks** — a kernel invoked at a *batch* boundary inside `append()`
+(segment freeze / batch land), compute-only, app-registered — and
+**continuous queries** — derived data kept fresh on ordered append,
+reduction via a kernel, with a restricted append-friendly incremental
+scheme (details at implementation). Per-row *semantics* are available by
+looping a batch inside one kernel call; **per-row hook *invocation* is
+out** — measured at ~27× the batched loop (near-pure `pcall` crossing
+tax, `values_map_spike`), and against the batch-not-per-row rule, the
+append fast path, and columnar execution. Also out: **catalog-persisted
+stored procedures** (never-a-server; code in the catalog is not
+numeric-or-key — app-registered named kernels, which *are* the Lua-in-SQL
+model, stay in) and **network delivery / push** (the app delivers; the
+engine detects). Recompute-on-demand is not a reactive feature — it folds
+into plain invocation. This is the standing **kdb+-as-floor** principle in
+action: kdb+ sets a soft feature/perf floor at the *user* POV
+(meet-or-exceed unless it conflicts with an invariant), and its own model
+is exactly the batch ingest hook (`upd`), app-registered, no per-row
+triggers, no catalog stored-procs — the same shape, delivered in-process
+rather than via a multi-process server. Interacts with #44 (segment
+freeze = the hook point), #49 (continuous-query SQL surface), and the
+#41 / #47 kernel contract.
+
 The performance story for scripts is a **promotion ladder**, not a JIT:
 write the custom kernel in Lua to get it *correct* — immediately,
 cross-checkably — and if it proves hot, promote it to a curated native
