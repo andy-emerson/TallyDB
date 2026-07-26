@@ -145,14 +145,28 @@ role in a star schema, numeric columns are the *measures*; the
 Kimball vocabulary was considered and set aside because "dimension" and
 "measure" collide with this document's mathematical audience.
 
-## The inclusion principle for the SQL surface
+## The inclusion principle (SQL and Lua)
 
-Include a standard SQL function or verb if it (a) doesn't require a
-non-numeric, non-key column type, and (b) doesn't require a general-purpose
-cost-based optimizer. **"We can't think of a quant use case for it" is
-explicitly NOT a valid reason to exclude something otherwise in scope** —
-real usage regularly surprises the people who built the tool. The
-invariants are the boundary, not our own imagination.
+One principle governs both surfaces: **a capability — a SQL verb or
+function, or a Lua stdlib facility — is in scope by default, and excluded
+only where it would violate a named invariant.** We do not hand-pick a
+feature list, and we do not require a use case to admit something:
+**"we can't think of a quant use case for it" is explicitly NOT a valid
+reason to exclude something otherwise in scope** — real usage regularly
+surprises the people who built the tool. The invariants are the boundary,
+not our imagination. The two surfaces share this *method* and differ only
+in *which* invariants apply.
+
+**SQL is bounded by** (a) numeric-or-key — no non-numeric, non-key column
+type — and (b) no general-purpose cost-based optimizer.
+
+| SQL capability | In / Out | Bounding invariant |
+|---|---|---|
+| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, star-schema equi-joins, window functions, `UPDATE`/`DELETE` | **in** (built) | — |
+| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames | **in** (not yet built) | — |
+| `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
+| general N-way / non-star joins | **out** | (b): needs a cost-based optimizer |
+| a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
 
 **The oracle-set rule for built-in functions (decided 2026-07-25).**
 The inclusion principle bounds which *verbs* are in scope; this rule
@@ -177,6 +191,46 @@ a scalar so SQL could return it, and it migrates to a Role-2 example
 whose NumPy check becomes that example's differential test. Reopen
 condition per function: a function that later becomes standard in the
 oracle set becomes eligible here.
+
+**Lua is bounded by** (a) the sandbox — no filesystem, process, network,
+native code, memory-safety, or escape hazard — (b) determinism unless the
+author opts out, and (c) the same numeric-or-key rule on what may *cross
+into the engine*.
+
+| Lua stdlib | In / Out | Bounding invariant |
+|---|---|---|
+| `math`, `table`, `string`, `utf8`, curated `base` | **in** | — |
+| `math.random` / `randomseed` | **in**, documented | (b) with opt-out — forfeits reproducibility |
+| `io`, `os` | **out** | (a): filesystem / process |
+| `debug`, raw metatable & `raw*` functions | **out** | (a): sandbox escape (shared metatables) |
+| `load` / `loadstring` / `loadfile` / `dofile` | **out** | (a): code injection / memory safety |
+| `package.loadlib`, native `require` | **out** | (a): native code (`package` curated to a pure-Lua searcher) |
+| `coroutine` | **out** (deferred) | *not an invariant* — see exceptions |
+
+### Apparent exceptions (named, so they don't read as drift)
+
+- **`string` is cut in SQL but open in Lua** — not a contradiction. The
+  numeric-or-key invariant governs *what crosses a boundary* (a stored,
+  intermediate, or output value), not *local scratch*. SQL has no scratch:
+  every value is a column, so a string function *is* a text column, and it
+  is out. Lua has scratch (locals), so string manipulation is transient,
+  and the invariant is enforced at the Lua→engine boundary — a returned
+  string interns into a **key**; a bare string column cannot cross. Same
+  invariant, opposite-looking result. (The one real guard is on the
+  *output*: a script synthesizing a unique label per row would blow the
+  low-cardinality key assumption — capped at the boundary, not by
+  crippling `string`.)
+- **`math.random` is admitted despite nondeterminism.** The determinism
+  invariant carries an explicit opt-out: a script may be nondeterministic
+  if the author chooses, at the documented cost of query reproducibility.
+  We can afford this because we are not replicated — unlike Redis before
+  7.0, whose *script* replication forced determinism (Redis 7 relaxed it
+  once it replicated *effects* instead).
+- **`coroutine` is a genuine exception** — excluded for an *implementation*
+  reason, not a principled one. It breaks no invariant; it fights the
+  `pcall`/`longjmp` discipline at the Rust↔C boundary. It is a *deferral*
+  pending a binding that can host it safely, not an invariant-based cut —
+  when the binding can, the principle admits it.
 
 ## Null, NaN, and ordering semantics
 
