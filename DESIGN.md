@@ -486,13 +486,36 @@ rebuild, being wrong about the additive one costs a later layer.
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
 | Concurrency | Single writer, concurrent snapshot readers (facade currently overcuts to single-accessor — corrective work tracked, pre-M3) | One writer at a time is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
-| Deployment | Cut: library, never a server (see *Deployment shapes*) | One application owns the data | Additive |
+| Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
 | Durability | Not cut: publish is atomic **and synced** (power-loss durable at the flush); cadence policy open as #43 | — | — |
 
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
 refusal from oversight.
+
+**Live data, precisely.** The Distribution and Deployment cuts draw the
+line through the middle of the phrase "live feed," so a reader comparing
+TallyDB to a tickerplant must read them together. *Freshness is not
+sacrificed:* a query snapshot includes the live write buffer, not only the
+frozen segments (`Store::snapshot` appends the buffer's rows to the
+segment sequence; the contract is that a snapshot covers exactly the rows
+appended before the call), so a row appended microseconds ago is visible
+to the very next query. Freeze/flush is the *durability and layout*
+boundary — a fresh row is queryable but not power-loss durable until flush
+(cadence is #43) — never a visibility gate. So an application that ingests
+a live feed and recomputes over it in the same process — real-time risk,
+live P&L, a moving regression on the newest window — is squarely in scope,
+and is the compute-without-copying sweet spot: socket → storage → SQL →
+BLAS with no serialization hop. What is *out* is being the tick **server**:
+one process streaming ticks over the network to a farm of subscriber
+processes, which the never-a-server (Deployment) and no-network-boundary
+(Distribution) cuts forbid outright. Stated as a single rule: "live feed"
+as *in-process analytics over freshly-landed data* is in; "live feed" as
+*server-side publish/subscribe fan-out* is out. The reactive-compute shape
+over that fresh data — batch ingest hooks and continuous queries, per-row
+invocation excluded — is the *feed-reactive compute* decision record
+below.
 
 **The access-path cut licenses the planner cut.** A planner exists to
 choose among access paths; with exactly one path there is nothing for
