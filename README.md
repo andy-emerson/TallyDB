@@ -2,41 +2,18 @@
 
 **A small, embeddable, SQL-native database for numeric data — with numeric compute living inside the engine, not bolted on beside it.**
 
-> **Status:** TallyDB is under construction, and a first thin engine runs.
-> The columnar foundation (`arrow-lite`) is implemented and cross-checked
-> against arrow-rs and PyArrow in CI, and a minimal vertical slice now
-> works end to end: append rows one at a time — freely interleaved with
-> queries, into multi-segment storage with internal row ids that
-> persists to disk in a golden-locked columnar format and reopens
-> verified — run a SQL rolling least-squares regression solved by
-> LAPACK inside the engine, and read the results over an Arrow stream —
-> validated row-for-row against NumPy and DuckDB in CI, over data that
-> has round-tripped through storage — plus real `UPDATE`/`DELETE` via
-> tombstone + reinsert, resolved by crash-safe compaction, with
-> end-state semantics diffed against DuckDB in CI. SELECT now carries
-> WHERE (with zone-map pruning), GROUP BY with the standard aggregates,
-> ORDER BY and LIMIT, star-schema joins against dimension tables, and
-> the standard aggregates as window functions over trailing and
-> unbounded frames — every query family born cross-checked by a
-> generated DuckDB differential harness over the checked-in corpus (38
-> query families and counting). Compute has its breadth: symmetric
-> eigenvalues, linear solve, and Cholesky behind the capability trait,
-> least squares running QR with an SVD fallback (#20, criterion
-> measured and documented), native BLAS primitives, and `covar_pop` /
-> `corr` / `eigen_max` as SQL window functions — cross-checked against
-> DuckDB and NumPy in CI. Of M2's plan, only M2.7 remains, and it is
-> underway: the canonical PUC Lua 5.4 interpreter is vendored and
-> compiled into the engine, and zero-copy compute on the engine's own
-> buffers is proven (pointer-verified) and measured. Its two prior
-> design decisions are closed (hand-rolled bindings over the vendored
-> interpreter, #5; ALP as the decided `f64` codec, built later as #42);
-> its implementation has since surfaced the scripting-surface decisions
-> — which SQL/Lua interaction roles, the sandboxed standard-library
-> set, and script semantics — now under active design with the forks
-> tracked as open issues. The developer-facing
-> design lives in
-> [`DESIGN.md`](DESIGN.md); open work and decisions live in the
-> repository's
+> **Status:** Under construction, and a first thin engine runs. The columnar
+> foundation (`arrow-lite`) is implemented and cross-checked against arrow-rs
+> and PyArrow; on top of it, a working vertical slice appends rows one at a
+> time into persistent, crash-safe, multi-segment storage and serves a real
+> SQL subset — `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, star-schema
+> joins, window functions, and `UPDATE`/`DELETE` — with BLAS/LAPACK compute
+> (regression, covariance, PCA) exposed as SQL. Every query family is born
+> cross-checked against DuckDB and NumPy in CI, over data that has
+> round-tripped through storage. M2's final increment — M2.7, embedded Lua
+> computing on the engine's own zero-copy buffers — is underway. The settled
+> design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
+> work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
 
 TallyDB is an HTAP-shaped store: fast, append-heavy ingest (the

@@ -1,10 +1,13 @@
 # TallyDB — Design
 
-This is the **forward-looking developer companion** to `README.md`: what we
-are building, why, and which parts are settled. The README describes where
-the project is now from the user's point of view; this document describes
-where it is going from the developer's. How we work — passes, reviews,
-issues, integration — is `AGENTS.md`.
+This is the **developer companion** to `README.md`: what we are building,
+why, and which parts are settled. The README describes where the project is
+now from the user's point of view; this document describes where it is going
+from the developer's — and, as decisions settle, **why it is the way it is**.
+It is forward-looking today, but written to endure: when the project is
+complete this becomes the durable record of its design decisions and the
+principles behind them — a power-user-level inventory of *why*, not just
+*what*. How we work — passes, reviews, issues, integration — is `AGENTS.md`.
 
 ## What this is (positioning, so scope calls stay anchored)
 
@@ -660,6 +663,39 @@ copying between them. Lua 5.4's numeric model — one number type with a
 `i64`/`f64` column pair, so numeric values cross the script boundary
 without losing exactness; that alignment is a load-bearing reason for
 the 5.4 choice, not a convenience.
+
+**Decision record — NULL across the script boundary (2026-07-26).** NULL
+crosses to Lua as a distinct **sentinel value** — a `pd.NA`-style
+singleton — not as Lua `nil` and not as NaN. *The principle that decided
+it:* a non-editing round trip across any of the three boundaries
+(DB↔SQL, DB↔Lua, Lua↔SQL) must preserve everything, which requires each
+value mapping to be a total, invertible function. `nil` is not total —
+inside a Lua table a `nil` *deletes* the slot, destroying both the value
+and the row's structure, and that failure cannot be prevented inside
+arbitrary user scripts. A distinct sentinel is a real value that survives
+in a table, so the mapping stays total and faithful; it is kept distinct
+from NaN (a computed value — see *Null, NaN, and ordering*) and
+propagates over both numeric subtypes, so `i64` exactness holds. This was
+chosen by a bake-off spike against the `nil` alternative, not by
+argument.
+
+*The cost we do not pay:* the prior art that reached the same conclusion
+(Tarantool `box.NULL`, OpenResty `ngx.null`, pandas `pd.NA`) pays a real
+price — the sentinel is truthy (`if x` is true for a null) and `x == nil`
+silently misses it. Those systems carry data *as language values*, so
+every field access meets the sentinel and its footguns. TallyDB does not:
+columns cross as zero-copy views over engine buffers, and compute is
+batch, not per-row. Null-aware batch ops (`v:sum()`), an out-of-band
+validity view (`v:mask()`), and the curated BLAS ops consume
+`(buffer, validity)` engine-side and never materialize the sentinel. The
+footguns are real but confined to the discouraged manual per-element
+path; the common path never meets them. A sentinel is the faithful
+representation you rarely have to handle — an advantage that follows
+directly from being a zero-copy, compute-in-engine store rather than a
+value-shaped one. (One honest limit: relational `<`/`<=` against the
+sentinel is a loud error, because Lua forces those operators to a
+boolean and three-valued logic cannot propagate through them; arithmetic
+propagates to the sentinel.)
 
 The performance story for scripts is a **promotion ladder**, not a JIT:
 write the custom kernel in Lua to get it *correct* — immediately,
