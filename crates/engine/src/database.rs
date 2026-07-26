@@ -305,6 +305,51 @@ mod join_tests {
     }
 
     #[test]
+    fn join_against_empty_dimension_does_not_panic() {
+        // B2 regression: an empty dimension has no views to sniff a column
+        // type from. The gather must take each column's type from the
+        // dimension *schema*, not default to f64 and mismatch the joined
+        // schema — which panicked `RecordBatch::new` for a key/i64 column.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", fact_schema(), "ts", 3).unwrap())
+            .unwrap();
+        // Created, never appended — an empty dimension (zero snapshot views).
+        db.add_table(Table::with_segment_rows("symbols", dimension_schema(), "id", 2).unwrap())
+            .unwrap();
+        for (i, sym) in ["A", "B", "C"].iter().enumerate() {
+            db.append(
+                "trades",
+                &[
+                    RowValue::I64(i as i64),
+                    RowValue::Key(sym),
+                    RowValue::F64(i as f64),
+                ],
+            )
+            .unwrap();
+        }
+        // INNER: every fact row misses → zero rows, but the gather still
+        // runs (before the live mask), so this is the panic path.
+        let inner = db
+            .query("SELECT ts, sector, weight FROM trades JOIN symbols ON trades.sym = symbols.sym")
+            .unwrap();
+        assert_eq!(inner.num_rows(), 0);
+        // LEFT: all fact rows kept with null dimension cells; the joined
+        // `sector` must come back a Key column, not a defaulted f64.
+        let left = db
+            .query(
+                "SELECT ts, sector, weight FROM trades LEFT JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts",
+            )
+            .unwrap();
+        assert_eq!(left.num_rows(), 3);
+        let Column::Key(sector) = &left.batches[0].columns()[1] else {
+            panic!("sector must stay a key column even against an empty dimension");
+        };
+        assert!((0..sector.len()).all(|row| !sector.is_valid(row)));
+        assert!(f64s(&left, 2).iter().all(Option::is_none));
+    }
+
+    #[test]
     fn left_join_keeps_misses_with_null_dimension_cells() {
         let db = database();
         let output = db

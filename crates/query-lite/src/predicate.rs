@@ -8,9 +8,10 @@
 //! String predicates follow the design's rule for keys: the string test
 //! runs **once per distinct dictionary value**, producing a set of
 //! allowed codes; rows are then matched by integer set-membership, never
-//! by per-row string comparison. Null cells match no predicate (and
-//! `NOT` of no-match is still no-match for them), the standard SQL
-//! three-valued outcome for the fragment this tree can express.
+//! by per-row string comparison. A null cell makes its comparison
+//! UNKNOWN, and the tree composes in three-valued (Kleene) logic — so
+//! `NOT (a AND b)` is TRUE where a is FALSE even if b is UNKNOWN — with
+//! `WHERE` keeping only the rows that come out TRUE.
 
 use crate::plan::QueryError;
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
@@ -267,15 +268,66 @@ pub(crate) fn parse_number(text: &str) -> Result<Number, QueryError> {
         .map_err(|_| QueryError::Parse(format!("bad number literal '{text}'")))
 }
 
-/// Evaluates `predicate` over one segment view, returning a bitmap over
-/// the segment's rows (`true` = matched). Tombstoned rows are evaluated
-/// like any other — callers combine with the live mask; this keeps the
-/// result independent of mutation state.
+/// A three-valued (Kleene) predicate result over a segment's rows:
+/// `truth` marks rows where the predicate is TRUE and `falsity` rows
+/// where it is FALSE; a row in neither is UNKNOWN (a NULL was involved).
+/// `WHERE`/`UPDATE`/`DELETE` keep only TRUE rows, but `AND`/`OR`/`NOT`
+/// must distinguish FALSE from UNKNOWN to compose correctly — e.g.
+/// `NOT (a AND b)` is TRUE when a is FALSE even if b is UNKNOWN, which a
+/// single match/no-match bitmap cannot express.
+struct ThreeValued {
+    truth: Bitmap,
+    falsity: Bitmap,
+}
+
+impl ThreeValued {
+    fn and(self, other: ThreeValued) -> ThreeValued {
+        // TRUE iff both TRUE; FALSE iff either FALSE — FALSE dominates
+        // UNKNOWN, which is exactly what the old blanket null-mask missed.
+        ThreeValued {
+            truth: self.truth.and(&other.truth),
+            falsity: self.falsity.or(&other.falsity),
+        }
+    }
+
+    fn or(self, other: ThreeValued) -> ThreeValued {
+        // TRUE iff either TRUE — TRUE dominates UNKNOWN; FALSE iff both FALSE.
+        ThreeValued {
+            truth: self.truth.or(&other.truth),
+            falsity: self.falsity.and(&other.falsity),
+        }
+    }
+
+    fn not(self) -> ThreeValued {
+        // NOT TRUE = FALSE, NOT FALSE = TRUE, NOT UNKNOWN = UNKNOWN.
+        ThreeValued {
+            truth: self.falsity,
+            falsity: self.truth,
+        }
+    }
+}
+
+/// Evaluates `predicate` over one segment view, returning the bitmap of
+/// rows for which it is TRUE (`true` = matched); UNKNOWN and FALSE rows
+/// are both excluded — SQL's three-valued `WHERE`. Tombstoned rows are
+/// evaluated like any other — callers combine with the live mask; this
+/// keeps the result independent of mutation state.
 pub fn evaluate(
     predicate: &Predicate,
     schema: &Schema,
     view: &SegmentView,
 ) -> Result<Bitmap, QueryError> {
+    Ok(evaluate_3vl(predicate, schema, view)?.truth)
+}
+
+/// The three-valued recursion beneath [`evaluate`]: only the composition
+/// operators need the FALSE/UNKNOWN distinction, so the tree is walked in
+/// Kleene logic and just the final TRUE set is handed back.
+fn evaluate_3vl(
+    predicate: &Predicate,
+    schema: &Schema,
+    view: &SegmentView,
+) -> Result<ThreeValued, QueryError> {
     let batch = view.segment.batch();
     let rows = batch.num_rows();
     match predicate {
@@ -285,22 +337,20 @@ pub fn evaluate(
                 Column::Numeric(NumericData::F64(numeric)) => {
                     let values = numeric.values().as_slice();
                     let target = value.as_f64();
-                    Ok(Bitmap::from_bools((0..rows).map(|row| {
-                        numeric.is_valid(row) && op.holds_f64(values[row], target)
-                    })))
+                    Ok(leaf_result(rows, |row| {
+                        (numeric.is_valid(row), op.holds_f64(values[row], target))
+                    }))
                 }
                 Column::Numeric(NumericData::I64(numeric)) => {
                     let values = numeric.values().as_slice();
-                    Ok(match value {
-                        // Exact integer comparison — no f64 round trip.
-                        Number::Int(target) => Bitmap::from_bools(
-                            (0..rows)
-                                .map(|row| numeric.is_valid(row) && op.holds(values[row], *target)),
-                        ),
-                        Number::Float(target) => Bitmap::from_bools((0..rows).map(|row| {
-                            numeric.is_valid(row) && op.holds_f64(values[row] as f64, *target)
-                        })),
-                    })
+                    Ok(leaf_result(rows, |row| {
+                        let holds = match value {
+                            // Exact integer comparison — no f64 round trip.
+                            Number::Int(target) => op.holds(values[row], *target),
+                            Number::Float(target) => op.holds_f64(values[row] as f64, *target),
+                        };
+                        (numeric.is_valid(row), holds)
+                    }))
                 }
                 Column::Key(_) => Err(QueryError::TypeError(format!(
                     "column '{column}' is a key; compare it to a string"
@@ -318,17 +368,29 @@ pub fn evaluate(
             negated,
         } => key_membership(schema, view, column, values, *negated),
         Predicate::And(left, right) => {
-            Ok(evaluate(left, schema, view)?.and(&evaluate(right, schema, view)?))
+            Ok(evaluate_3vl(left, schema, view)?.and(evaluate_3vl(right, schema, view)?))
         }
         Predicate::Or(left, right) => {
-            Ok(evaluate(left, schema, view)?.or(&evaluate(right, schema, view)?))
+            Ok(evaluate_3vl(left, schema, view)?.or(evaluate_3vl(right, schema, view)?))
         }
-        Predicate::Not(inner) => {
-            // NOT flips matched rows, but a null cell matches nothing on
-            // either side — mask nulls back out afterward.
-            let flipped = evaluate(inner, schema, view)?.not();
-            Ok(mask_out_nulls(inner, schema, view, flipped)?)
-        }
+        Predicate::Not(inner) => Ok(evaluate_3vl(inner, schema, view)?.not()),
+    }
+}
+
+/// Builds a leaf result from a per-row `(valid, holds)` verdict: a valid
+/// row is TRUE when the comparison holds and FALSE when it does not; a
+/// null row (`valid == false`) is UNKNOWN — in neither bitmap.
+fn leaf_result(rows: usize, verdict: impl Fn(usize) -> (bool, bool)) -> ThreeValued {
+    let mut truth = Vec::with_capacity(rows);
+    let mut falsity = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let (valid, holds) = verdict(row);
+        truth.push(valid && holds);
+        falsity.push(valid && !holds);
+    }
+    ThreeValued {
+        truth: Bitmap::from_bools(truth),
+        falsity: Bitmap::from_bools(falsity),
     }
 }
 
@@ -419,14 +481,15 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
 }
 
 /// The string test run once per distinct dictionary value, applied to
-/// rows as integer set-membership.
+/// rows as integer set-membership. A null key cell is UNKNOWN (in neither
+/// bitmap), like any other null.
 fn key_membership(
     schema: &Schema,
     view: &SegmentView,
     column: &str,
     values: &[String],
     negated: bool,
-) -> Result<Bitmap, QueryError> {
+) -> Result<ThreeValued, QueryError> {
     let index = column_index(schema, column)?;
     let Column::Key(keys) = &view.segment.batch().columns()[index] else {
         return Err(QueryError::TypeError(format!(
@@ -441,46 +504,9 @@ fn key_membership(
         })
         .collect();
     let codes = keys.codes().as_slice();
-    Ok(Bitmap::from_bools((0..keys.len()).map(|row| {
-        keys.is_valid(row) && allowed[codes[row] as usize]
-    })))
-}
-
-/// Clears bits for rows where any column `inner` touches is null — the
-/// three-valued-logic repair for `NOT`.
-fn mask_out_nulls(
-    inner: &Predicate,
-    schema: &Schema,
-    view: &SegmentView,
-    mut bitmap: Bitmap,
-) -> Result<Bitmap, QueryError> {
-    let mut columns = Vec::new();
-    collect_columns(inner, &mut columns);
-    for column in columns {
-        let index = column_index(schema, &column)?;
-        let stored = &view.segment.batch().columns()[index];
-        let validity = match stored {
-            Column::Numeric(numeric) => numeric.validity(),
-            Column::Key(keys) => keys.validity(),
-        };
-        if let Some(validity) = validity {
-            bitmap = bitmap.and(validity);
-        }
-    }
-    Ok(bitmap)
-}
-
-fn collect_columns(predicate: &Predicate, out: &mut Vec<String>) {
-    match predicate {
-        Predicate::Compare { column, .. }
-        | Predicate::KeyEquals { column, .. }
-        | Predicate::KeyIn { column, .. } => out.push(column.clone()),
-        Predicate::And(left, right) | Predicate::Or(left, right) => {
-            collect_columns(left, out);
-            collect_columns(right, out);
-        }
-        Predicate::Not(inner) => collect_columns(inner, out),
-    }
+    Ok(leaf_result(keys.len(), |row| {
+        (keys.is_valid(row), allowed[codes[row] as usize])
+    }))
 }
 
 fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
@@ -663,6 +689,22 @@ mod tests {
         assert_eq!(matched("y <= 0"), [3]);
         // Row 1's y is NULL: neither `y > 0` nor its negation matches it.
         assert_eq!(matched("NOT (y > 0)"), [3]);
+    }
+
+    #[test]
+    fn not_composes_in_three_valued_logic() {
+        // B1 regression. `NOT (a AND b)` with a FALSE and b UNKNOWN:
+        // FALSE AND UNKNOWN = FALSE, NOT FALSE = TRUE — the row matches.
+        // Row 1 (x=2.5, y=NULL): x>100 is FALSE, so the AND is FALSE
+        // regardless of y and the NOT is TRUE. The old blanket null-mask
+        // wrongly dropped it; all four rows match.
+        assert_eq!(matched("NOT (x > 100 AND y > 0)"), [0, 1, 2, 3]);
+        // `NOT (a OR b)`: row 1's UNKNOWN stays UNKNOWN under NOT and is
+        // excluded; only row 3 (both operands FALSE) survives.
+        assert_eq!(matched("NOT (x > 100 OR y > 0)"), [3]);
+        // AND with a NULL operand: TRUE AND UNKNOWN = UNKNOWN (row 1 out),
+        // FALSE AND UNKNOWN = FALSE (rows 2, 3 out).
+        assert_eq!(matched("x > 0 AND y > 0"), [0]);
     }
 
     #[test]

@@ -238,6 +238,7 @@ pub fn execute_join(
             columns.push(gather_dimension_column(
                 dimension_views,
                 dimension_column,
+                dimension_schema.fields()[dimension_column].column_type(),
                 &picks,
             ));
         }
@@ -255,19 +256,20 @@ pub fn execute_join(
     execute_single(&joined_schema, &joined_views, plan, registry)
 }
 
-/// One dimension column, gathered per fact row (`None` = no match:
-/// a null cell).
+/// One dimension column, gathered per fact row (`None` pick = no match:
+/// a null cell). The output type comes from the dimension *schema*, not
+/// from the views — so a join against an **empty** dimension (no views to
+/// sniff a type from) still builds a column of the declared type rather
+/// than defaulting to `f64` and mismatching the joined schema.
 fn gather_dimension_column(
     dimension_views: &[SegmentView],
     column_index: usize,
+    column_type: ColumnType,
     picks: &[Option<(usize, usize)>],
 ) -> Column {
     let cell = |view: usize| &dimension_views[view].segment.batch().columns()[column_index];
-    let first_kind = dimension_views
-        .first()
-        .map(|view| view.segment.batch().columns()[column_index].column_type());
-    match first_kind {
-        Some(ColumnType::F64) | None => {
+    match column_type {
+        ColumnType::F64 => {
             let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
             for pick in picks {
@@ -287,7 +289,7 @@ fn gather_dimension_column(
             }
             assemble_numeric_f64(values, validity)
         }
-        Some(ColumnType::I64) => {
+        ColumnType::I64 => {
             let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
             for pick in picks {
@@ -307,7 +309,7 @@ fn gather_dimension_column(
             }
             assemble_numeric_i64(values, validity)
         }
-        Some(ColumnType::Key) => {
+        ColumnType::Key => {
             let mut dictionary = Dictionary::new();
             let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
             let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
