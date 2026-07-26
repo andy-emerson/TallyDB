@@ -43,7 +43,9 @@
 //! not just stored columns), but that does NOT mean "no string operations."
 //! Key columns are dictionary-encoded interned strings, so string
 //! **predicates** on keys — `=`, `IN`, `LIKE`, regex — are in scope: they
-//! emit a row selection, not a string. Implement them efficiently: evaluate
+//! emit a row selection, not a string. (`=` and `IN` are built; `LIKE`
+//! and regex are in scope but not yet implemented, rejected loudly
+//! until then.) Implement them efficiently: evaluate
 //! the predicate once per *distinct* value in the small dictionary to get a
 //! bitmap over dictionary indices, then filter rows by integer set
 //! membership — never re-run the string match per row. What's out is any

@@ -91,13 +91,15 @@ The numeric-or-key rule holds across the *entire pipeline* — stored columns,
 intermediate results, and query outputs are always numeric or key; a bare
 string never exists in the engine. That is more permissive than it sounds:
 
-- **String *predicates* on key columns are in scope.** `WHERE symbol IN
-  (...)`, `WHERE name LIKE '%Bank%'`, regex matching — these consume the
-  interned strings and emit a *row selection*, not a string, so they don't
-  need a third type. Because keys are dictionary-encoded, the predicate is
-  evaluated once per *distinct* value in the small dictionary and then
-  applied as integer set-membership: string filtering is not just allowed,
-  it's cheap.
+- **String *predicates* on key columns are in scope.** `WHERE symbol =
+  '...'` / `IN (...)` are built; `WHERE name LIKE '%Bank%'` and regex
+  matching are in scope but not yet implemented (rejected loudly until
+  then — a todo, not a silent gap). All consume the interned strings and
+  emit a *row selection*, not a string, so they don't need a third type.
+  Because keys are dictionary-encoded, such a predicate is evaluated once
+  per *distinct* value in the small dictionary and then applied as
+  integer set-membership: string filtering is not just allowed, it's
+  cheap.
 - **String *production* is out.** No function may *emit* a string value: no
   `SUBSTRING`/`CONCAT` projection, no `CAST(x AS VARCHAR)`, no
   `GROUP_CONCAT`. A key result comes back as its integer code plus the
