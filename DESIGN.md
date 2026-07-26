@@ -697,6 +697,46 @@ sentinel is a loud error, because Lua forces those operators to a
 boolean and three-valued logic cannot propagate through them; arithmetic
 propagates to the sentinel.)
 
+**Decision record — the value map: return types, coercion, keys
+(2026-07-26).** Three conventions govern how a script's results cross the
+typed boundary, each chosen from TallyDB's own invariants (numeric-or-key,
+exact-or-loud, zero-copy, the fixed-strategy planner), not from any one
+precedent — the outside systems that solve the same problem validate the
+*workload*, they do not get a vote on the *how*.
+
+- **Return type is declared at registration and resolved at plan time** —
+  never inferred from the value a call happens to return. A Lua-backed
+  function names its result type (`f64` / `i64` / `key`) when registered;
+  the planner fixes the output column's type from that, so a query yields
+  the same Arrow schema on every run. Inferring per call would make the
+  output type *data-dependent* (Lua silently floats integers) — the
+  dynamic-typing property the fixed-strategy planner exists to exclude,
+  and the root of bugs B4/B5 (#54). Every statically-typed peer declares
+  it; the choice follows from our own static schema, not from theirs.
+- **Coercion is exact-or-loud.** A Lua `integer` fills an `i64` and a
+  `float` fills an `f64`; a `float` may fill an `i64` *only if it is
+  losslessly integral*, otherwise it is a loud error — never a silent
+  truncation. A Lua `boolean` maps to `i64 {0, 1}`: Booleans are a
+  transient value, never a third column type (the numeric-or-key
+  invariant holds). `nil` is NULL (the sentinel above). A `string` is
+  interned into the output key dictionary — the only way a script
+  produces a key. This closes B6 (#54).
+- **Keys read as codes, with lazy text.** A key element reads as its
+  integer dictionary code, so equality, grouping, and membership stay
+  integer-cheap — which is *why* keys are dictionary-encoded, and what
+  keeps the read zero-copy (the code is in the buffer; a string is not).
+  `v:text(i)` decodes on demand; `v:code_of(literal)` resolves a literal
+  once (the once-per-distinct-value pattern `WHERE` already uses), so
+  `key == literal` is an integer compare. Codes are per-segment (#6); the
+  engine guarantees a script sees one consistent code space per call
+  (per-call or query-lifetime-remapped), so a raw code is never compared
+  across segments.
+
+Together with the NULL sentinel above, this is the frozen value-map
+contract for the Lua boundary. The ergonomics layered on top — batch
+reductions, `v:mask()`, `v:get(i, default)` — are additive and do not
+change it.
+
 The performance story for scripts is a **promotion ladder**, not a JIT:
 write the custom kernel in Lua to get it *correct* — immediately,
 cross-checkably — and if it proves hot, promote it to a curated native
