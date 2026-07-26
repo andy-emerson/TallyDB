@@ -920,4 +920,49 @@ mod tests {
             .expect("runs");
         assert_eq!(code, CScalar::Num(101.0)); // valid, null, valid
     }
+
+    // Earns the perf claim behind the feed-reactive ruling: summing N rows
+    // as ONE batched call (Lua loops the view) vs. N engine calls (one
+    // pcall per row). The ratio is the "per-row invocation" penalty the
+    // ruling excludes. Run:
+    //   cargo test -p compute-lua --release -- --ignored measure_per_row
+    #[test]
+    #[ignore = "measurement, not a check: run explicitly in release"]
+    fn measure_per_row_invocation_penalty() {
+        let n = 4096usize;
+        let values: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let valid = vec![true; n];
+        let mut state = SpikeState::new();
+        let rounds = 100;
+
+        // Batch: one call; Lua loops the whole view.
+        let batch_chunk = "local s = 0.0\nfor i = 1, #v do s = s + v[i] end\nreturn s";
+        let start = std::time::Instant::now();
+        let mut batch_result = 0.0;
+        for _ in 0..rounds {
+            batch_result = state.eval_scalar_nullable(batch_chunk, &values, &valid).unwrap();
+        }
+        let batch = start.elapsed() / rounds;
+
+        // Per-row invocation: N engine calls, one row each, summed in Rust.
+        let start = std::time::Instant::now();
+        let mut per_row_result = 0.0;
+        for _ in 0..rounds {
+            let mut s = 0.0;
+            for i in 0..n {
+                s += state
+                    .eval_scalar_nullable("return v[1]", &values[i..i + 1], &valid[i..i + 1])
+                    .unwrap();
+            }
+            per_row_result = s;
+        }
+        let per_row = start.elapsed() / rounds;
+
+        assert!((batch_result - per_row_result).abs() < 1e-6);
+        println!(
+            "measure_per_row: {n} rows/pass — batch {batch:?}, per-row {per_row:?}, \
+             per-row penalty {:.0}x",
+            per_row.as_secs_f64() / batch.as_secs_f64()
+        );
+    }
 }
