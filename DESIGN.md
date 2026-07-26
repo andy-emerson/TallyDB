@@ -394,6 +394,29 @@ external axis assessment of 2026-07-24 audited this project against
 that method; this section records the outcome so every absence has a
 name and every refusal is visibly deliberate.
 
+**Two defaults govern every cut, each overridden only by a stated
+use-case assumption (the cut-depth principle, 2026-07-25).**
+
+1. *General-purpose by default.* The engine keeps a subsystem until an
+   assumption forces its deletion — no cut without a licensing
+   assumption.
+2. *Clean (endpoint) by default.* Once an assumption licenses a cut,
+   take it to its endpoint — the maximal deletion — unless a further
+   assumption justifies stopping short. A partial cut or a kept surface
+   is itself a decision that must name the assumption permitting it:
+   keeping `UPDATE`/`DELETE` (corrections happen), keeping broad SQL
+   (analysts want it), tolerating out-of-order ingest (reinserts arrive
+   out of order) are all such justified deviations.
+
+Two qualifiers keep this honest. *Tidiness is not a default to trade
+against — it is hygiene:* whatever depth a cut lands at, it carries no
+residual machinery from the deleted subsystem and leaks the deleted
+concern nowhere. A partial cut is allowed; a leaky one never is. And
+*scrutiny scales with reversal cost:* prefer the endpoint, but hold a
+foundational cut's licensing assumption to a far higher standard than
+an additive one's — being wrong about the foundational cut costs a
+rebuild, being wrong about the additive one costs a later layer.
+
 | Axis | Our position | Licensing assumption | Reversal class |
 |---|---|---|---|
 | Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
