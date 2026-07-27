@@ -77,10 +77,11 @@ pub mod harness;
 mod script;
 pub mod table;
 
+pub use compute_lua::LogSink;
 pub use database::Database;
 pub use query_lite::QueryOutput;
 pub use storage_lite::{RowValue, StoreOptions, WalSync};
-pub use table::{schema_from_create, EngineError, Table, TableReader, TableSnapshot};
+pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`
 // runs application-registered Lua kernels as SQL window functions

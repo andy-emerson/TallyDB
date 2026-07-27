@@ -15,10 +15,22 @@
 //! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
 
 use arrow_lite::{Column, ColumnType, NumericData, Schema};
-use engine::{schema_from_create, Database, RowValue, StoreOptions, Table};
+use engine::{schema_from_create, type_name, Database, LogSink, RowValue, StoreOptions, Table};
 use query_lite::{parse_statement, QueryOutput, Statement};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// The console's destination for Lua kernels' `log(...)`: stderr, so
+/// diagnostics land beside error output and never inside a rendered
+/// result table.
+struct StderrSink;
+
+impl LogSink for StderrSink {
+    fn log(&self, message: &str) {
+        eprintln!("[lua] {message}");
+    }
+}
 
 /// A console session over one storage directory: every subdirectory
 /// holding a table manifest opens as a table; `CREATE TABLE` makes a
@@ -28,6 +40,9 @@ pub struct Console {
     database: Database,
     dir: PathBuf,
     options: StoreOptions,
+    /// The Lua `log(...)` destination, installed on every table this
+    /// console opens or creates (see [`StderrSink`]).
+    sink: Arc<dyn LogSink + Sync>,
     /// The advisory process lock: an OS file lock, released by the OS
     /// even if the process dies — no stale-lock cleanup ever needed.
     _lock: std::fs::File,
@@ -65,6 +80,11 @@ impl Console {
             ));
         }
         let mut database = Database::new();
+        // One options value serves both the tables opened here and the
+        // ones `CREATE TABLE` makes later — two separate defaults would
+        // silently drift the day options become configurable.
+        let options = StoreOptions::default();
+        let sink: Arc<dyn LogSink + Sync> = Arc::new(StderrSink);
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|error| format!("reading {}: {error}", dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -77,8 +97,9 @@ impl Console {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("unreadable table directory {}", path.display()))?
                 .to_owned();
-            let table = Table::open(&name, &path, StoreOptions::default())
+            let mut table = Table::open(&name, &path, options)
                 .map_err(|error| format!("opening table '{name}': {error}"))?;
+            table.set_lua_log_sink(Arc::clone(&sink));
             database
                 .add_table(table)
                 .map_err(|error| error.to_string())?;
@@ -86,7 +107,8 @@ impl Console {
         Ok(Console {
             database,
             dir,
-            options: StoreOptions::default(),
+            options,
+            sink,
             _lock: lock,
         })
     }
@@ -142,7 +164,7 @@ impl Console {
             return Err(format!("table '{}' already exists", plan.table));
         }
         let (schema, ordering) = schema_from_create(plan).map_err(|e| e.to_string())?;
-        let table = Table::persistent_with(
+        let mut table = Table::persistent_with(
             &plan.table,
             schema,
             &ordering,
@@ -150,6 +172,7 @@ impl Console {
             self.options,
         )
         .map_err(|e| e.to_string())?;
+        table.set_lua_log_sink(Arc::clone(&self.sink));
         self.database
             .add_table(table)
             .map_err(|error| error.to_string())
@@ -175,7 +198,11 @@ impl Console {
                         .database
                         .table(&name)
                         .ok_or_else(|| format!("unknown table '{name}'"))?;
-                    let _ = writeln!(out, "{}", render_schema(&name, table.schema()));
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        render_schema(&name, table.schema(), table.ordering_key())
+                    );
                 }
                 Ok(Outcome::Note(out.trim_end().to_owned()))
             }
@@ -234,6 +261,11 @@ impl Console {
                 .iter()
                 .position(|field| field.name() == header)
                 .ok_or_else(|| format!("CSV column '{header}' is not in the table"))?;
+            if mapping.contains(&position) {
+                // Two headers on one schema column would silently keep
+                // only the later cell of every row.
+                return Err(format!("CSV column '{header}' appears twice"));
+            }
             mapping.push(position);
         }
         let mut count = 0u64;
@@ -288,29 +320,61 @@ fn parse_lua_command(argument: &str) -> Result<(String, Vec<String>, String), St
     Ok((name, parameters, chunk))
 }
 
-/// Whether a buffered line of input is a complete statement: dot
-/// commands are single-line; SQL ends at `;` outside quotes.
-pub fn statement_complete(buffer: &str) -> bool {
-    let trimmed = buffer.trim();
-    if trimmed.is_empty() || trimmed.starts_with('.') {
-        return true;
-    }
+/// Splits buffered input into the complete statements — cut at every
+/// `;` outside quotes and `--` comments, so `-c "CREATE ...; INSERT
+/// ...;"` runs as two statements and an apostrophe inside a comment
+/// opens no quote — and the unterminated remainder, if any.
+pub fn split_statements(input: &str) -> (Vec<String>, String) {
+    let mut statements = Vec::new();
+    let mut current = String::new();
     let mut quote: Option<char> = None;
-    for c in trimmed.chars() {
+    let mut comment = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if comment {
+            current.push(c);
+            if c == '\n' {
+                comment = false;
+            }
+            continue;
+        }
         match quote {
             Some(open) => {
                 if c == open {
                     quote = None;
                 }
+                current.push(c);
             }
             None => match c {
-                '\'' | '"' => quote = Some(c),
-                ';' => return true,
-                _ => {}
+                '\'' | '"' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                '-' if chars.peek() == Some(&'-') => {
+                    comment = true;
+                    current.push(c);
+                }
+                ';' => {
+                    let statement = current.trim();
+                    if !statement.is_empty() {
+                        statements.push(statement.to_owned());
+                    }
+                    current.clear();
+                }
+                _ => current.push(c),
             },
         }
     }
-    false
+    (statements, current)
+}
+
+/// Whether leftover input is only comments and whitespace — nothing an
+/// executor should be handed at end of input.
+pub fn only_comments(input: &str) -> bool {
+    input.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with("--")
+    })
 }
 
 /// Renders a query result as an aligned text table — keys as their
@@ -398,19 +462,19 @@ fn format_f64(value: f64) -> String {
     }
 }
 
-/// A schema rendered back as the CREATE TABLE that would produce it.
-fn render_schema(name: &str, schema: &Schema) -> String {
+/// A schema rendered back as the CREATE TABLE that would produce it —
+/// round-trippable: feeding the output to `CREATE TABLE` yields an
+/// equivalent table, so the ordering key must be spelled out
+/// (`ORDERING KEY` implies its NOT NULL).
+fn render_schema(name: &str, schema: &Schema, ordering_key: &str) -> String {
     let columns: Vec<String> = schema
         .fields()
         .iter()
         .map(|field| {
-            let type_name = match field.column_type() {
-                ColumnType::I64 => "BIGINT",
-                ColumnType::F64 => "DOUBLE",
-                ColumnType::Key => "KEY",
-            };
-            let mut column = format!("{} {type_name}", field.name());
-            if !field.nullable() {
+            let mut column = format!("{} {}", field.name(), type_name(field.column_type()));
+            if field.name() == ordering_key {
+                column.push_str(" ORDERING KEY");
+            } else if !field.nullable() {
                 column.push_str(" NOT NULL");
             }
             column
@@ -432,6 +496,8 @@ Commands:
   .schema [TABLE]           show table definitions
   .import FILE TABLE        import a CSV (header row maps columns by name)
   .lua NAME(PARAMS) CHUNK   register a Lua window function (f64 result)
+                            on every open table; re-run it after
+                            CREATE TABLE to cover the new table
   .quit                     leave";
 
 #[cfg(test)]
@@ -488,9 +554,21 @@ mod tests {
         let rendered = table(&mut console, "SELECT COUNT(px) AS n FROM ticks;");
         assert!(rendered.contains('2'), "{rendered}");
         let schema = note(&mut console, ".schema ticks");
-        assert!(schema.contains("ts BIGINT NOT NULL"), "{schema}");
+        assert!(schema.contains("ts BIGINT ORDERING KEY"), "{schema}");
         assert!(schema.contains("sym KEY NOT NULL"), "{schema}");
+        // Round-trippable: the rendered definition recreates an
+        // equivalent table in a fresh database.
+        drop(console);
+        let dir_two = scratch("roundtrip-two");
+        let mut console = Console::open(&dir_two).unwrap();
+        note(&mut console, schema.trim());
+        assert_eq!(
+            note(&mut console, ".schema ticks").trim(),
+            schema.trim(),
+            "the definition survives a render → create → render cycle"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir_two).unwrap();
     }
 
     #[test]
@@ -531,6 +609,13 @@ mod tests {
             .execute(&format!(".import {} t", csv_path.display()))
             .unwrap_err();
         assert!(error.contains("'nope'"), "{error}");
+        // A duplicated header is loud — the later cell would silently
+        // overwrite the earlier one in every row.
+        std::fs::write(&csv_path, "ts,ts,x\n1,2,1.0\n").unwrap();
+        let error = console
+            .execute(&format!(".import {} t", csv_path.display()))
+            .unwrap_err();
+        assert!(error.contains("appears twice"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -570,11 +655,44 @@ mod tests {
     }
 
     #[test]
-    fn statement_buffering_understands_quotes() {
-        assert!(statement_complete("SELECT x FROM t;"));
-        assert!(!statement_complete("SELECT x FROM t"));
-        assert!(!statement_complete("SELECT x FROM t WHERE sym = 'a;b'"));
-        assert!(statement_complete("SELECT x FROM t WHERE sym = 'a;b';"));
-        assert!(statement_complete(".help"));
+    fn splitting_understands_quotes_comments_and_boundaries() {
+        // Two statements on one line — the `-c "A; B"` shape — split.
+        let (statements, rest) =
+            split_statements("CREATE TABLE t (ts BIGINT); INSERT INTO t VALUES (1);");
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("CREATE"));
+        assert!(statements[1].starts_with("INSERT"));
+        assert!(rest.trim().is_empty());
+        // A `;` inside quotes is data, not a boundary.
+        let (statements, rest) = split_statements("SELECT x FROM t WHERE sym = 'a;b'");
+        assert!(statements.is_empty());
+        assert_eq!(rest.trim(), "SELECT x FROM t WHERE sym = 'a;b'");
+        // An apostrophe inside a `--` comment opens no quote, and the
+        // `;` after the comment line still terminates.
+        let (statements, rest) =
+            split_statements("SELECT x FROM t -- don't trip here\nWHERE x > 0;");
+        assert_eq!(statements.len(), 1, "{statements:?} / {rest:?}");
+        assert!(statements[0].contains("WHERE x > 0"));
+        assert!(rest.trim().is_empty());
+        // Comment-only leftovers are recognized as nothing to run.
+        assert!(only_comments("  -- trailing note\n\n"));
+        assert!(!only_comments("SELECT 1"));
+    }
+
+    #[test]
+    fn split_statements_run_one_by_one_through_the_console() {
+        let dir = scratch("split");
+        let mut console = Console::open(&dir).unwrap();
+        let (statements, rest) = split_statements(
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE); \
+             INSERT INTO t VALUES (1, 2.5);",
+        );
+        assert!(rest.trim().is_empty());
+        for statement in &statements {
+            console.execute(statement).unwrap();
+        }
+        let rendered = table(&mut console, "SELECT x FROM t;");
+        assert!(rendered.contains("2.5"), "{rendered}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

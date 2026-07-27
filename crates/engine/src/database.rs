@@ -133,8 +133,9 @@ impl Database {
             Statement::Insert(insert) => insert.table,
             Statement::CreateTable(_) => {
                 return Err(EngineError::Query(QueryError::Unsupported(
-                    "CREATE TABLE runs through execute (it makes a table, \
-                     it doesn't mutate one)"
+                    "CREATE TABLE makes a table, it doesn't mutate one — \
+                     build it with schema_from_create + a Table constructor \
+                     and add_table (the console does exactly this)"
                         .to_owned(),
                 )))
             }

@@ -225,8 +225,12 @@ impl WriteBuffer {
         })
     }
 
-    /// Appends one row, checking every cell against the schema.
-    pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<(), StorageError> {
+    /// Checks one row against the schema — arity, cell types, and NOT
+    /// NULL — without touching the buffer. [`WriteBuffer::append`] runs
+    /// this first; [`crate::Store::append`] runs it *before* logging to
+    /// the WAL, so a rejected row can never leave a phantom log record
+    /// behind (a record replay would choke on, or worse, replay).
+    pub fn validate(&self, row: &[RowValue<'_>]) -> Result<(), StorageError> {
         let fields = self.schema.fields();
         if row.len() != fields.len() {
             return Err(StorageError::WrongArity {
@@ -234,8 +238,6 @@ impl WriteBuffer {
                 got: row.len(),
             });
         }
-        // Validate the whole row before touching any builder, so a
-        // rejected row leaves the buffer exactly as it was.
         for (field, cell) in fields.iter().zip(row) {
             let ok = match (field.column_type(), cell) {
                 (_, RowValue::Null) => {
@@ -258,6 +260,14 @@ impl WriteBuffer {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Appends one row, checking every cell against the schema.
+    pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<(), StorageError> {
+        // Validate the whole row before touching any builder, so a
+        // rejected row leaves the buffer exactly as it was.
+        self.validate(row)?;
         for (builder, cell) in self.builders.iter_mut().zip(row) {
             builder.push(cell);
         }

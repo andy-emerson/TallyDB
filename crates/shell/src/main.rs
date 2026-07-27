@@ -4,7 +4,7 @@
 //! `-c "sql"` or piped stdin.
 
 use std::io::{IsTerminal, Read};
-use tallydb_shell::{statement_complete, Console, Outcome};
+use tallydb_shell::{only_comments, split_statements, Console, Outcome};
 
 const USAGE: &str = "usage: tallydb DIR [-c \"sql\"]\n\
   DIR         the database directory (created if absent)\n\
@@ -41,17 +41,22 @@ fn main() {
 
     let piped = !std::io::stdin().is_terminal();
     if !batch.is_empty() || piped {
-        let mut failed = false;
+        let mut run = Run::default();
         for sql in &batch {
-            failed |= run_statements(&mut console, sql);
+            if run.quit {
+                break;
+            }
+            run_statements(&mut console, sql, &mut run);
         }
-        if piped {
+        if piped && !run.quit {
             let mut input = String::new();
             if std::io::stdin().read_to_string(&mut input).is_ok() {
-                failed |= run_statements(&mut console, &input);
+                run_statements(&mut console, &input, &mut run);
             }
         }
-        std::process::exit(if failed { 1 } else { 0 });
+        // `.quit` stops the run but never launders an earlier error
+        // into exit 0 — scripts rely on the code.
+        std::process::exit(if run.failed { 1 } else { 0 });
     }
 
     interactive(&mut console, &dir);
@@ -62,42 +67,57 @@ fn exit_usage(reason: &str) -> ! {
     std::process::exit(2)
 }
 
-/// Splits `input` on statement boundaries (`;` outside quotes; whole
-/// dot-command lines) and executes each. Returns whether any failed.
-fn run_statements(console: &mut Console, input: &str) -> bool {
-    let mut failed = false;
+/// What a batch run has seen so far.
+#[derive(Default)]
+struct Run {
+    failed: bool,
+    quit: bool,
+}
+
+/// Executes `input` statement by statement — `;` boundaries via
+/// [`split_statements`] (several statements on one line included),
+/// whole dot-command lines — recording errors and `.quit` in `run`.
+fn run_statements(console: &mut Console, input: &str, run: &mut Run) {
     let mut buffer = String::new();
     for line in input.lines() {
-        if buffer.is_empty() && line.trim_start().starts_with('.') {
-            failed |= execute(console, line);
+        if run.quit {
+            return;
+        }
+        if buffer.trim().is_empty() && line.trim_start().starts_with('.') {
+            buffer.clear();
+            execute(console, line, run);
             continue;
         }
         buffer.push_str(line);
         buffer.push('\n');
-        if statement_complete(&buffer) {
-            failed |= execute(console, &buffer);
-            buffer.clear();
+        let (complete, rest) = split_statements(&buffer);
+        buffer = rest;
+        for statement in complete {
+            if run.quit {
+                return;
+            }
+            execute(console, &statement, run);
         }
     }
-    if !buffer.trim().is_empty() {
-        failed |= execute(console, &buffer);
+    // A trailing statement without its `;` still runs at end of input;
+    // trailing comments and whitespace do not.
+    if !run.quit && !only_comments(&buffer) {
+        execute(console, buffer.trim(), run);
     }
-    failed
 }
 
-/// Executes one statement, printing its outcome. Returns true on error.
-fn execute(console: &mut Console, statement: &str) -> bool {
+/// Executes one statement, printing its outcome into `run`.
+fn execute(console: &mut Console, statement: &str, run: &mut Run) {
     match console.execute(statement) {
         Ok(Outcome::Table(text)) | Ok(Outcome::Note(text)) => {
             if !text.is_empty() {
                 println!("{text}");
             }
-            false
         }
-        Ok(Outcome::Quit) => std::process::exit(0),
+        Ok(Outcome::Quit) => run.quit = true,
         Err(error) => {
             eprintln!("error: {error}");
-            true
+            run.failed = true;
         }
     }
 }
@@ -126,7 +146,8 @@ fn interactive(console: &mut Console, dir: &str) {
         };
         match editor.readline(prompt) {
             Ok(line) => {
-                if buffer.is_empty() && line.trim_start().starts_with('.') {
+                if buffer.trim().is_empty() && line.trim_start().starts_with('.') {
+                    buffer.clear();
                     let _ = editor.add_history_entry(&line);
                     if execute_interactive(console, &line) {
                         break;
@@ -135,12 +156,18 @@ fn interactive(console: &mut Console, dir: &str) {
                 }
                 buffer.push_str(&line);
                 buffer.push('\n');
-                if statement_complete(&buffer) {
-                    let _ = editor.add_history_entry(buffer.trim());
-                    let statement = std::mem::take(&mut buffer);
+                let (complete, rest) = split_statements(&buffer);
+                buffer = rest;
+                let mut quit = false;
+                for statement in complete {
+                    let _ = editor.add_history_entry(&statement);
                     if execute_interactive(console, &statement) {
+                        quit = true;
                         break;
                     }
+                }
+                if quit {
+                    break;
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => buffer.clear(),

@@ -554,6 +554,13 @@ impl Store {
     fn replay_wal(&mut self) -> Result<(), StorageError> {
         let backend = self.backend.as_ref().expect("replay is a reopen step");
         let recovered = match backend.read(WAL) {
+            // Shorter than one header is the crash window between log
+            // creation (which truncates in place) and the header sync:
+            // no record was ever synced under this log — records follow
+            // the header in the same file — so there is nothing to
+            // recover, and treating it as corruption would leave the
+            // store permanently unopenable over intact segments.
+            Ok(bytes) if bytes.len() < crate::format::WAL_HEADER_LEN => Vec::new(),
             Ok(bytes) => {
                 let wal = crate::format::decode_wal(&bytes, self.schema.fields().len())?;
                 if wal.generation == self.generation {
@@ -579,8 +586,9 @@ impl Store {
                 shared.buffer.append(&cells)?;
                 self.rows += 1;
             }
-            if backend.read(WAL).is_ok() {
-                backend.remove(WAL)?;
+            match backend.remove(WAL) {
+                Ok(()) | Err(IoError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
             }
             return Ok(());
         }
@@ -651,6 +659,15 @@ impl Store {
     /// Appends one row and returns its internal row id. Flushes
     /// automatically when the buffer reaches the segment-row threshold.
     pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<u64, StorageError> {
+        // Validate before logging: a rejected row must leave neither
+        // buffer nor WAL changed. Logged-then-rejected would plant a
+        // phantom record that ends replay's clean prefix early (dropping
+        // every acknowledged row after it) or replays a row the caller
+        // was told failed.
+        {
+            let shared = lock(&self.shared);
+            shared.buffer.validate(row)?;
+        }
         self.wal_append(row)?;
         let must_flush = {
             let mut shared = lock(&self.shared);

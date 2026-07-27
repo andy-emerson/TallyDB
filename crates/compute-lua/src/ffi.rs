@@ -11,9 +11,6 @@
 //! signal recorded in the decision (~two dozen is the budget).
 
 #![allow(non_camel_case_types)]
-// Declarations land ahead of the safe wrapper that consumes them; the
-// allow comes off when the wrapper does.
-#![allow(dead_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 

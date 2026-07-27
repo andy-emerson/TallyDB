@@ -26,6 +26,7 @@
 //! (peak-memory accounting in #56).
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+use compute_lua::LogSink;
 use query_lite::{
     evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
     QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
@@ -146,6 +147,10 @@ pub struct Table {
     /// so a snapshot pins the function set of its moment and a later
     /// registration never mutates what a reader already holds.
     registry: Arc<Mutex<Arc<Registry>>>,
+    /// Where Lua kernels' `log(...)` goes — `None` (the default) keeps
+    /// `log` a no-op, per compute-lua's off-by-default contract. Applies
+    /// to kernels registered *after* it is set.
+    lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
 }
 
 impl Table {
@@ -293,6 +298,7 @@ impl Table {
             name: name.into(),
             store,
             registry: Arc::new(Mutex::new(Arc::new(registry))),
+            lua_log_sink: None,
         }
     }
 
@@ -309,6 +315,21 @@ impl Table {
     /// The table's schema.
     pub fn schema(&self) -> &Schema {
         self.store.schema()
+    }
+
+    /// The ordering-key column's name — the schema alone cannot say
+    /// which column ingest is ordered on, so anything reconstructing a
+    /// full definition (the console's `.schema`) needs this too.
+    pub fn ordering_key(&self) -> &str {
+        self.store.schema().fields()[self.store.ordering_key()].name()
+    }
+
+    /// Installs the destination for Lua kernels' `log(...)` output.
+    /// Until an embedder calls this, `log` is a no-op (compute-lua's
+    /// off-by-default contract); afterwards, every *newly registered*
+    /// kernel routes through the sink — install before registering.
+    pub fn set_lua_log_sink(&mut self, sink: Arc<dyn LogSink + Sync>) {
+        self.lua_log_sink = Some(sink);
     }
 
     /// Appends one row (see [`RowValue`]); every cell is validated
@@ -465,7 +486,12 @@ impl Table {
                             Number::Float(value) => RowValue::F64(*value),
                             Number::Int(value) => {
                                 let as_f64 = *value as f64;
-                                if as_f64 as i64 != *value {
+                                // Compared in i128: the naive `as_f64 as
+                                // i64` saturates, so i64::MAX (rounded
+                                // up to 2^63 by the cast) saturates
+                                // right back and passes a check it
+                                // should fail.
+                                if as_f64 as i128 != i128::from(*value) {
                                     return Err(EngineError::Query(QueryError::TypeError(
                                         format!(
                                             "integer {value} does not fit an f64 exactly \
@@ -611,8 +637,9 @@ impl Table {
                 "function name '{name}' is not callable from SQL"
             )));
         }
-        let window = crate::script::LuaWindow::new(parameters, chunk, output)
-            .map_err(EngineError::Script)?;
+        let window =
+            crate::script::LuaWindow::new(parameters, chunk, output, self.lua_log_sink.clone())
+                .map_err(EngineError::Script)?;
         let mut guard = self.registry.lock().expect("registry lock poisoned");
         let mut next = (**guard).clone();
         next.register(name, Arc::new(window));
@@ -840,6 +867,17 @@ pub fn schema_from_create(
     }
     let ordering = ordering.expect("the planner requires exactly one ORDERING KEY");
     Ok((Schema::new(fields), ordering))
+}
+
+/// The DDL name of a column type — [`schema_from_create`]'s inverse,
+/// kept beside it so a renderer (the console's `.schema`) cannot fork
+/// its own mapping.
+pub fn type_name(column_type: ColumnType) -> &'static str {
+    match column_type {
+        ColumnType::I64 => "BIGINT",
+        ColumnType::F64 => "DOUBLE",
+        ColumnType::Key => "KEY",
+    }
 }
 
 /// A cheap, cloneable, `Send` handle a reader thread holds to mint
@@ -1264,6 +1302,32 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn empty_results_survive_the_materializing_stages() {
+        // ORDER BY, DISTINCT, and HAVING all gather rows into one
+        // batch; each must survive having zero batches to gather.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        let empty = [
+            "SELECT ts FROM t ORDER BY ts",
+            "SELECT ts, sym FROM t ORDER BY ts DESC NULLS LAST LIMIT 3",
+            "SELECT DISTINCT sym FROM t",
+        ];
+        for sql in empty {
+            assert_eq!(table.query(sql).unwrap().num_rows(), 0, "{sql} (no rows)");
+        }
+        for i in 0..6 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        // Rows exist, but the predicate (and pruning) removes them all.
+        for sql in [
+            "SELECT ts FROM t WHERE ts > 100 ORDER BY ts",
+            "SELECT DISTINCT sym FROM t WHERE ts > 100",
+            "SELECT sym, COUNT(x) AS n FROM t GROUP BY sym HAVING COUNT(x) > 100",
+        ] {
+            assert_eq!(table.query(sql).unwrap().num_rows(), 0, "{sql} (filtered)");
+        }
+    }
+
     pub(super) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
         let x = i as f64;
         let (sym, y) = if i % 2 == 0 {
@@ -1643,6 +1707,31 @@ mod ddl_and_insert {
         // non-atomicity is #56/#40 territory); here every statement
         // failed on its only row, so the table is empty.
         assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 0);
+    }
+
+    #[test]
+    fn int_to_double_exactness_holds_at_the_i64_edges() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 4).unwrap();
+        // i64::MAX rounds up to 2^63 as f64; the saturating cast back
+        // lands on i64::MAX again, so a naive round-trip check passes a
+        // value it must refuse.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 9223372036854775807)")
+            .is_err());
+        // 2^53 + 1 is the first plain integer f64 cannot hold.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 9007199254740993)")
+            .is_err());
+        // -2^53 is exactly representable: accepted (and the negative
+        // path through the unary minus works).
+        table
+            .mutate("INSERT INTO t VALUES (1, -9007199254740992)")
+            .unwrap();
+        assert_eq!(table.query("SELECT x FROM t").unwrap().num_rows(), 1);
     }
 
     #[test]

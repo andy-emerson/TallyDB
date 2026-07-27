@@ -185,6 +185,52 @@ fn compaction_resets_the_log_into_the_new_generation() {
 }
 
 #[test]
+fn a_rejected_append_leaves_no_phantom_record() {
+    // A row the schema rejects must leave the WAL untouched: logged
+    // before validation, it would occupy a record replay chokes on —
+    // ending the clean prefix early (dropping every acknowledged row
+    // after it) or replaying a row the caller was told failed.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(backend.clone(), WalSync::Full);
+        append_n(&mut store, 0..3);
+        assert!(store
+            .append(&[
+                RowValue::F64(3.5), // F64 into the I64 ordering column
+                RowValue::Key("A"),
+                RowValue::F64(0.0),
+            ])
+            .is_err());
+        assert!(store.append(&[RowValue::I64(3)]).is_err(), "wrong arity");
+        append_n(&mut store, 3..6);
+    } // power loss
+    let store = open(backend, WalSync::Full);
+    assert_eq!(store.len(), 6, "every acknowledged row, nothing else");
+    assert_eq!(ts_values(&store), (0..6).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_crash_during_log_creation_recovers() {
+    // The window between log creation (truncate-in-place) and the
+    // header sync leaves a log shorter than one header. Nothing was
+    // ever acknowledged under it, so reopen must treat it as empty —
+    // not as corruption that bricks a store whose segments are intact.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(backend.clone(), WalSync::Full);
+        append_n(&mut store, 0..5);
+        store.flush().unwrap(); // rows are segment-durable
+    }
+    for stub in [&[][..], &[0x54, 0x41, 0x4C][..]] {
+        backend.write("wal.tlyw", stub).unwrap();
+        let store = open(backend.clone(), WalSync::Full);
+        assert_eq!(store.len(), 5, "stub of {} bytes", stub.len());
+        assert_eq!(ts_values(&store), (0..5).collect::<Vec<_>>());
+        drop(store);
+    }
+}
+
+#[test]
 fn off_means_no_log_at_all() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     let mut store = open(backend.clone(), WalSync::Off);

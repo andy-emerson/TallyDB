@@ -731,6 +731,11 @@ fn decode_dictionary(reader: &mut Reader<'_>, name: &str) -> Result<Dictionary, 
 pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
 /// WAL format version.
 pub const WAL_VERSION: u16 = 1;
+/// The header's encoded size: magic (8) + version (2) + generation (8)
+/// plus base row id (8). A log file shorter than this never had its
+/// header synced — the create-crash window — and holds no acknowledged
+/// record.
+pub const WAL_HEADER_LEN: usize = 26;
 
 /// Encodes the WAL header: magic, version, generation, and the row id
 /// of the first record — replay skips records already covered by
@@ -739,7 +744,7 @@ pub const WAL_VERSION: u16 = 1;
 /// (compaction reassigns row ids, so cross-generation replay would be
 /// in the wrong id space).
 pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::with_capacity(WAL_HEADER_LEN);
     out.extend_from_slice(&WAL_MAGIC);
     out.extend_from_slice(&WAL_VERSION.to_le_bytes());
     out.extend_from_slice(&generation.to_le_bytes());

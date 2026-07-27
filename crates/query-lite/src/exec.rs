@@ -1729,11 +1729,17 @@ fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> Que
 /// into a fresh dictionary — the sources' per-segment dictionaries don't
 /// share codes.
 fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)]) -> RecordBatch {
-    let columns = (0..schema.fields().len())
-        .map(|column_index| {
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(column_index, field)| {
             let cell_column = |batch: usize| &batches[batch].columns()[column_index];
-            match cell_column(picks.first().map(|&(batch, _)| batch).unwrap_or(0)) {
-                Column::Numeric(NumericData::F64(_)) => {
+            // The schema, not a sample batch, decides each column's
+            // variant: with zero picks there is no batch to sample, and
+            // the empty result still needs correctly-typed columns.
+            match field.column_type() {
+                ColumnType::F64 => {
                     let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
                     for &(batch, row) in picks {
@@ -1745,7 +1751,7 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
                     }
                     assemble_numeric_f64(values, validity)
                 }
-                Column::Numeric(NumericData::I64(_)) => {
+                ColumnType::I64 => {
                     let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
                     for &(batch, row) in picks {
@@ -1757,7 +1763,7 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
                     }
                     assemble_numeric_i64(values, validity)
                 }
-                Column::Key(_) => {
+                ColumnType::Key => {
                     let mut dictionary = Dictionary::new();
                     let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());

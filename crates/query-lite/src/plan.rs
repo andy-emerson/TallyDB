@@ -443,6 +443,14 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
             "IF NOT EXISTS / OR REPLACE".to_owned(),
         ));
     }
+    if let Some(constraint) = create.constraints.first() {
+        // Out-of-scope constructs are refused, never dropped; silence
+        // here would let `UNIQUE (x)` vanish without a trace.
+        return Err(QueryError::Unsupported(format!(
+            "table-level constraint '{constraint}' (columns carry the only \
+             constraints here: NOT NULL and ORDERING KEY)"
+        )));
+    }
     let mut columns = Vec::with_capacity(create.columns.len());
     for column in &create.columns {
         let type_name = match &column.data_type {
@@ -592,18 +600,30 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
     let mut out = String::with_capacity(sql.len());
     let mut quote: Option<char> = None;
     let mut index = 0;
+    // Matches `word_a <whitespace> word_b` at a char position, entirely
+    // in chars (never byte offsets — the two must not mix), returning
+    // the phrase's char length. Both words must sit on word boundaries.
     let phrase_at = |index: usize, word_a: &str, word_b: &str| -> Option<usize> {
-        let rest: String = chars[index..].iter().collect();
-        let lower = rest.to_lowercase();
-        if !lower.starts_with(word_a) {
+        let word = |at: usize, word: &str| -> bool {
+            word.chars().enumerate().all(|(offset, w)| {
+                chars
+                    .get(at + offset)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&w))
+            })
+        };
+        if !word(index, word_a) {
             return None;
         }
-        let after = &lower[word_a.len()..];
-        let spaces = after.len() - after.trim_start().len();
-        if spaces == 0 || !after.trim_start().starts_with(word_b) {
+        let mut spaces = 0;
+        while chars
+            .get(index + word_a.len() + spaces)
+            .is_some_and(|c| c.is_whitespace())
+        {
+            spaces += 1;
+        }
+        if spaces == 0 || !word(index + word_a.len() + spaces, word_b) {
             return None;
         }
-        // Both words must end at word boundaries.
         let end = word_a.len() + spaces + word_b.len();
         let boundary = |position: usize| {
             chars
@@ -611,7 +631,14 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
                 .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
         };
         let start_ok = index == 0 || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_';
-        (start_ok && boundary(end)).then_some(end)
+        // A column *definition* also starts `word KEY` — `ordering KEY,`
+        // declares a key column named `ordering`. A constraint never
+        // opens a definition, so the phrase only counts when the
+        // preceding token is not `(` or `,` (nor the statement start,
+        // where no column list is open yet).
+        let previous = chars[..index].iter().rev().find(|c| !c.is_whitespace());
+        let constraint_position = !matches!(previous, None | Some('(') | Some(','));
+        (start_ok && boundary(end) && constraint_position).then_some(end)
     };
     while index < chars.len() {
         let c = chars[index];
@@ -648,13 +675,22 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
     Ok(out)
 }
 
+/// Whether the statement's first two words are `CREATE TABLE` — the
+/// rewrite gate. Word-wise, not a byte prefix: `CREATE  TABLE` and
+/// `CREATE\tTABLE` are the same statement and must hit the same gate,
+/// or user-typed `PRIMARY KEY` would slip past its refusal.
+fn is_create_table(sql: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    matches!(
+        (words.next(), words.next()),
+        (Some(create), Some(table))
+            if create.eq_ignore_ascii_case("create") && table.eq_ignore_ascii_case("table")
+    )
+}
+
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
     let rewritten;
-    let sql = if sql
-        .trim_start()
-        .get(..12)
-        .is_some_and(|start| start.eq_ignore_ascii_case("create table"))
-    {
+    let sql = if is_create_table(sql) {
         rewritten = rewrite_ordering_key(sql)?;
         &rewritten
     } else {
@@ -947,6 +983,25 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
                 })
             })
             .transpose()?;
+        if having.is_some() {
+            // The hidden columns share the output row with the visible
+            // ones; a visible column occupying a `__having` name would
+            // shadow the filter's target and filter on the wrong value.
+            let output_name = |item: &AggItem| match item {
+                AggItem::Key { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+                AggItem::Call(call) => call.alias.clone().unwrap_or_default(),
+            };
+            if let Some(taken) = items
+                .iter()
+                .map(output_name)
+                .find(|name| name.starts_with("__having"))
+            {
+                return Err(QueryError::Unsupported(format!(
+                    "output name '{taken}' with HAVING (the __having prefix is \
+                     reserved for its hidden columns)"
+                )));
+            }
+        }
         Projection::Aggregate {
             keys,
             items,
@@ -1678,5 +1733,65 @@ mod tests {
     #[test]
     fn parse_errors_surface() {
         assert!(matches!(plan("SELEKT nope"), Err(QueryError::Parse(_))));
+    }
+
+    #[test]
+    fn the_ddl_gate_is_word_wise_not_a_byte_prefix() {
+        // Any whitespace between CREATE and TABLE hits the same gate:
+        // PRIMARY KEY is refused, ORDERING KEY parses.
+        for sql in [
+            "CREATE  TABLE t (ts BIGINT PRIMARY KEY)",
+            "CREATE\tTABLE t (ts BIGINT PRIMARY KEY)",
+            "create   table t (ts BIGINT PRIMARY KEY)",
+        ] {
+            let error = parse_statement(sql).expect_err(sql).to_string();
+            assert!(error.contains("ORDERING KEY"), "{sql}: {error}");
+        }
+        for sql in [
+            "CREATE  TABLE t (ts BIGINT ORDERING KEY)",
+            "CREATE\tTABLE t (ts BIGINT ORDERING  KEY)",
+        ] {
+            assert!(
+                matches!(parse_statement(sql), Ok(Statement::CreateTable(_))),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_named_ordering_is_not_the_constraint() {
+        // `ordering KEY` after `(` or `,` declares a key column named
+        // `ordering`; only the constraint position rewrites.
+        let Ok(Statement::CreateTable(plan)) = parse_statement(
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY, primary_ish DOUBLE)",
+        ) else {
+            panic!("parses as CREATE TABLE")
+        };
+        assert_eq!(plan.columns.len(), 3);
+        assert_eq!(plan.columns[1].name, "ordering");
+        assert_eq!(plan.columns[1].type_name, "KEY");
+        assert!(!plan.columns[1].ordering_key);
+        assert!(plan.columns[0].ordering_key);
+    }
+
+    #[test]
+    fn table_level_constraints_are_refused_not_dropped() {
+        let error =
+            parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE, UNIQUE (x))")
+                .expect_err("refused")
+                .to_string();
+        assert!(error.contains("table-level constraint"), "{error}");
+    }
+
+    #[test]
+    fn the_having_prefix_is_reserved_when_having_is_present() {
+        // A visible column on a __having name would shadow the hidden
+        // filter column and filter on the wrong aggregate.
+        let error = plan("SELECT sym, COUNT(x) AS __having0 FROM t GROUP BY sym HAVING SUM(x) > 4")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("__having"), "{error}");
+        // Without HAVING the name is just a name.
+        assert!(plan("SELECT sym, COUNT(x) AS __having0 FROM t GROUP BY sym").is_ok());
     }
 }
