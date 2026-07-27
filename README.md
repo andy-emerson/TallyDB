@@ -189,7 +189,11 @@ are locked by a committed golden: per-column codec tags with
 delta-of-delta on the ordered ordering key (measured on the checked-in
 corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
 zone maps awaiting query-time pruning, and reopen that verifies schema,
-checksums, and row-id contiguity (durability boundary is the flush).
+checksums, and row-id contiguity. Durability is a sidecar write-ahead
+log with sync levels (default: group commit every 100ms, measured at
+~1µs added per append; `Full` for a zero loss window; `Off` restoring
+the flush boundary for replayable upstreams), crash-tested down to
+torn-record and stale-generation windows.
 Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
 row-id delete logs, reads resolve tombstones through live masks, and
 crash-safe generational compaction merges live rows back into sorted,

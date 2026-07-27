@@ -667,10 +667,39 @@ early drafts named it):
 
 Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
 exact and errors loudly on overflow; query output is one Arrow batch
-per segment; window frames are `ROWS`-only for now. Interim states with
-their decisions still open: durability boundary is the flush (issue
-#43, must close before M3 ships a binary) and segments freeze at a
-fixed row count (issue #44) — the two sibling cadence questions.
+per segment; window frames are `ROWS`-only for now. The two sibling cadence
+questions closed together, both ruled by the Human 2026-07-27 on a
+measurement (recorded in #43/#44 and built in M3.2/M3.3):
+
+**Decision record — durability: WAL with sync levels (#43).** A
+sidecar write-ahead log (the segment format untouched), three levels:
+`Group(interval)` — the default, 100 ms — logs every append and
+group-commits with an in-thread sync, bounding the loss window at the
+interval for +0.4–1µs on a ~1µs append (measured; the in-repo
+`measure_wal_regimes` re-earns the number: off 0.99µs, group-100ms
+2.06µs, full 728µs per append, run 2026-07-27, container fs); `Full`
+syncs every append — zero window at ~700× per-append cost, shipped
+documented, never default; `Off` writes no log and restores the
+flush-boundary contract for replayable upstreams. Replay recovers the
+per-record-CRC clean prefix, skips segment-covered rows, and ignores
+wrong-generation logs (compaction reassigns row ids). *Rejected:*
+flush-boundary-only as the GA contract (strangers assume a database
+keeps what it acknowledged) and per-table dual contracts with no
+default answer. *Reopen trigger:* tail-latency complaints from the
+unlucky append paying the in-thread sync (10–46 ms worst on the
+measured disk) — the fix is a background sync thread, which is the
+may-the-library-own-a-thread question shared with #44's deferred
+time-aligned freezing.
+
+**Decision record — freeze threshold in bytes (#44).** The knob
+speaks bytes (the buffer bound an embedder budgets); numeric-or-key
+makes rows fixed-width, so bytes convert exactly to a per-schema row
+count at construction (8 per number, 4 per key code; dictionaries —
+bounded by distinct values — sit outside the bound, documented).
+Setting rows and bytes together is refused loudly. *Deferred with
+triggers:* time-aligned hybrid freezing — pruning-profile evidence
+from the end-to-end suite (#52), and the library-thread question
+above.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 

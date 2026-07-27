@@ -347,10 +347,13 @@ impl Store {
     /// `schema`/`ordering_key` and every stored segment's checksum,
     /// schema, and row-id contiguity.
     ///
-    /// **Durability boundary: [`Store::flush`].** Rows in the write
-    /// buffer exist only in memory until flushed (automatically at the
-    /// segment-row threshold, or explicitly); a crash loses them and
-    /// reopen sees exactly the flushed segments.
+    /// **Durability:** governed by [`WalSync`] (default
+    /// `Group(100ms)`): acknowledged appends are logged to a sidecar
+    /// WAL and survive a crash up to the sync window; reopen replays
+    /// the log's clean prefix on top of the flushed segments. Under
+    /// [`WalSync::Off`] the durability boundary is [`Store::flush`] —
+    /// rows in the write buffer exist only in memory until flushed,
+    /// and a crash loses them.
     pub fn persistent(
         backend: Arc<dyn StorageBackend>,
         schema: Schema,
