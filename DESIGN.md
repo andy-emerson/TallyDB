@@ -854,10 +854,32 @@ record predicted (`eigen_max` off by 9.6e7 at a 1e12 offset,
 permanently. A **shifted** variant — moments kept about a value near
 the data, accumulator rebuilt every window-length — keeps ~7× and sits
 at 5e-15–1.1e-14, marginally less accurate than the corrected
-recompute but still at the noise floor. So the speed is available at a
-noise-floor accuracy cost; adopting it needs a sequence-shaped window
-seam in the executor, which is not built, and any adoption must keep
-`window_numerics_guard` green.
+recompute but still at the noise floor.
+
+*Shipped 2026-07-27 (#72).* The sequence seam exists — a defaulted
+`evaluate_frames` on `WindowAggregate`: the executor hands each
+aggregate one contiguous run (the snapshot, or one partition) and the
+default recomputes per frame, so only overriders change behavior. The
+rejected seam shapes, for the record: a separate sequence trait
+(needless registry duplication) and executor special-casing of known
+op names (breaks the trait boundary and duplicates the math — rejected
+on sight). `PairStatistic` and `RollingRegression` override with the
+shifted sweep for bounded frames; unbounded frames recompute as
+before; one shared finalization keeps the NULL semantics identical on
+both paths. The guard extended before the speed landed:
+`window_numerics_guard` holds the incremental path — the one every SQL
+window now runs — to the same 1e-12 bound on every corpus, intercept
+included, and was verified to trip (1.07e-12, drifting-timestamp
+corpus) with the re-anchoring rebuild disabled. Arrival numbers
+(`m2_compute_latency_bench.py`, run 2026-07-27, release, container
+hardware, 20k rows, window 64): `regr_slope` 0.6ms — 9.6× ahead of the
+DuckDB+NumPy stack; `covar_pop`/`corr`/`eigen_max` 0.7–1.1ms —
+1.2–1.6× ahead of vectorized NumPy riding TallyDB's own export, 3–4×
+ahead of the DuckDB+NumPy stack. The in-engine path is now the fastest
+measured arrangement for every curated statistic *and* the only one
+holding 1e-12-to-truth at timestamp-scale offsets — the vectorized
+peer's cumsum form is exactly this record's rejected streaming
+algorithm.
 
 ## Batch, not per-row, for Lua and linear-algebra calls
 
