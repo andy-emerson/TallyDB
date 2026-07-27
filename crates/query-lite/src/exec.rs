@@ -42,7 +42,7 @@ use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use storage_lite::{Segment, SegmentView};
 
@@ -437,6 +437,9 @@ fn execute_single(
         Projection::Items(items) => project_items(schema, &views, items, registry)?,
         Projection::Aggregate { keys, items } => project_aggregate(schema, &views, keys, items)?,
     };
+    if plan.distinct {
+        output = distinct_output(output);
+    }
     if let Some(order_by) = &plan.order_by {
         output = sort_output(output, order_by)?;
     }
@@ -444,6 +447,68 @@ fn execute_single(
         output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
     }
     Ok(output)
+}
+
+/// `SELECT DISTINCT`: keeps each projected row's first occurrence.
+/// Row identity is by *value*, type-tagged per cell: key cells compare
+/// as their dictionary strings (per-segment dictionaries make codes
+/// incomparable across batches), `f64` under the one comparison
+/// relation (NaN equals itself; `-0.0` merges with `0.0`, DuckDB's
+/// behavior), and NULLs equal — SQL's DISTINCT semantics. The result
+/// consolidates to one batch.
+fn distinct_output(output: QueryOutput) -> QueryOutput {
+    let mut seen = HashSet::new();
+    let mut picks: Vec<(usize, usize)> = Vec::new();
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        for row in 0..batch.num_rows() {
+            let mut identity = Vec::new();
+            for column in batch.columns() {
+                match column {
+                    Column::Numeric(NumericData::F64(numeric)) => {
+                        if numeric.is_valid(row) {
+                            let value = numeric.values().as_slice()[row];
+                            let canonical = if value.is_nan() {
+                                f64::NAN
+                            } else if value == 0.0 {
+                                0.0
+                            } else {
+                                value
+                            };
+                            identity.push(1u8);
+                            identity.extend_from_slice(&canonical.to_bits().to_le_bytes());
+                        } else {
+                            identity.push(0);
+                        }
+                    }
+                    Column::Numeric(NumericData::I64(numeric)) => {
+                        if numeric.is_valid(row) {
+                            identity.push(2);
+                            identity
+                                .extend_from_slice(&numeric.values().as_slice()[row].to_le_bytes());
+                        } else {
+                            identity.push(0);
+                        }
+                    }
+                    Column::Key(keys) => match keys.value_at(row) {
+                        Some(value) => {
+                            identity.push(3);
+                            identity.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                            identity.extend_from_slice(value.as_bytes());
+                        }
+                        None => identity.push(0),
+                    },
+                }
+            }
+            if seen.insert(identity) {
+                picks.push((batch_index, row));
+            }
+        }
+    }
+    let batch = take_rows(&output.schema, &output.batches, &picks);
+    QueryOutput {
+        schema: output.schema,
+        batches: vec![batch],
+    }
 }
 
 /// The row-per-row projection: plain columns and window calls, one
@@ -1415,11 +1480,17 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
         (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
         (left, right) => left.partial_cmp(right).expect("same variant per column"),
     };
+    // Nulls last in both directions unless the query says otherwise
+    // (NULLS FIRST/LAST) — placement sits outside the DESC reversal.
+    let null_order = if order_by.nulls_first.unwrap_or(false) {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    };
     order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
-        // Nulls last in both directions — outside the reversal.
         (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => null_order,
+        (Some(_), None) => null_order.reverse(),
         (Some(left), Some(right)) => {
             let ordering = compare_values(left, right);
             if order_by.descending {
@@ -2337,6 +2408,101 @@ mod query1_tests {
             matches!(&error, QueryError::Compute(message) if message.contains("1 results for 3 frames")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn distinct_deduplicates_by_value_across_segments() {
+        // Two segments (threshold 2) so 'A' appears under different
+        // dictionary codes; DISTINCT must merge them by value.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "B", 1.0), (3, "A", 1.0), (4, "A", 2.0)],
+            2,
+        );
+        let registry = Registry::new();
+        let sql = "SELECT sym, x FROM t";
+        let all = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(all.num_rows(), 4);
+        let sql = "SELECT DISTINCT sym, x FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 3); // (A,1) (B,1) (A,2)
+        assert_eq!(output.batches.len(), 1, "DISTINCT consolidates");
+        let sql = "SELECT DISTINCT x FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn like_filters_keys_per_distinct_value() {
+        let views = segment(&[(1, "AAPL", 1.0), (2, "MSFT", 2.0), (3, "AMZN", 3.0)]);
+        let registry = Registry::new();
+        let sql = "SELECT x FROM t WHERE sym LIKE 'A%'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
+        let sql = "SELECT x FROM t WHERE sym NOT LIKE '_S%'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
+    }
+
+    #[test]
+    fn nulls_first_overrides_the_default_placement() {
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "C", 3.0)]);
+        // needs2-style: the first window produces NULL.
+        struct NeedsTwo;
+        impl WindowAggregate for NeedsTwo {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok((args[0].len() >= 2).then(|| args[0][args[0].len() - 1]))
+            }
+        }
+        let mut registry = Registry::new();
+        registry.register("needs2", Arc::new(NeedsTwo));
+        let frame = "OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)";
+        let sql = format!("SELECT needs2(x) {frame} AS w FROM t ORDER BY w NULLS FIRST");
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(&sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [None, Some(2.0), Some(3.0)]);
+        let sql = format!("SELECT needs2(x) {frame} AS w FROM t ORDER BY w DESC NULLS LAST");
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(&sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(3.0), Some(2.0), None]);
     }
 
     #[test]

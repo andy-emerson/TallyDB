@@ -148,6 +148,19 @@ pub enum Predicate {
         /// `true` for `<>`.
         negated: bool,
     },
+    /// `column [NOT] LIKE 'pattern'` on a key column: `%` matches any
+    /// run (including empty), `_` any single character; evaluated once
+    /// per *distinct* dictionary value, applied as integer
+    /// set-membership — the same cheap shape as `IN` (#57's LIKE half;
+    /// regex stays tracked there, pending a dependency ruling).
+    KeyLike {
+        /// The key column.
+        column: String,
+        /// The LIKE pattern, verbatim.
+        pattern: String,
+        /// `true` for `NOT LIKE`.
+        negated: bool,
+    },
     /// `column [NOT] IN ('a', 'b', ...)` on a key column.
     KeyIn {
         /// The key column.
@@ -174,6 +187,39 @@ pub fn lower_predicate(expr: &ast::Expr) -> Result<Predicate, QueryError> {
             op: ast::UnaryOperator::Not,
             expr,
         } => Ok(Predicate::Not(Box::new(lower_predicate(expr)?))),
+        ast::Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            any: _,
+        } => {
+            if escape_char.is_some() {
+                return Err(QueryError::Unsupported(
+                    "LIKE ... ESCAPE (use the default escaping)".to_owned(),
+                ));
+            }
+            let ast::Expr::Identifier(column) = expr.as_ref() else {
+                return Err(QueryError::Unsupported(
+                    "LIKE applies to a key column".to_owned(),
+                ));
+            };
+            let ast::Expr::Value(value) = pattern.as_ref() else {
+                return Err(QueryError::Unsupported(
+                    "LIKE takes a string literal pattern".to_owned(),
+                ));
+            };
+            let ast::Value::SingleQuotedString(pattern) = &value.value else {
+                return Err(QueryError::Unsupported(
+                    "LIKE takes a string literal pattern".to_owned(),
+                ));
+            };
+            Ok(Predicate::KeyLike {
+                column: column.value.clone(),
+                pattern: pattern.clone(),
+                negated: *negated,
+            })
+        }
         ast::Expr::BinaryOp { left, op, right } => match op {
             ast::BinaryOperator::And => Ok(Predicate::And(
                 Box::new(lower_predicate(left)?),
@@ -402,6 +448,13 @@ fn evaluate_3vl(
             values,
             negated,
         } => key_membership(schema, view, column, values, *negated),
+        Predicate::KeyLike {
+            column,
+            pattern,
+            negated,
+        } => key_predicate(schema, view, column, *negated, |value| {
+            like_match(pattern, value)
+        }),
         Predicate::And(left, right) => {
             Ok(evaluate_3vl(left, schema, view)?.and(evaluate_3vl(right, schema, view)?))
         }
@@ -511,7 +564,10 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
         // Key membership and NOT don't prune: dictionaries aren't ranges,
         // and negating an interval fact soundly needs exact bounds
         // semantics this test deliberately doesn't attempt.
-        Predicate::KeyEquals { .. } | Predicate::KeyIn { .. } | Predicate::Not(_) => true,
+        Predicate::KeyEquals { .. }
+        | Predicate::KeyIn { .. }
+        | Predicate::KeyLike { .. }
+        | Predicate::Not(_) => true,
     }
 }
 
@@ -525,6 +581,20 @@ fn key_membership(
     values: &[String],
     negated: bool,
 ) -> Result<ThreeValued, QueryError> {
+    key_predicate(schema, view, column, negated, |value| {
+        values.iter().any(|allowed| allowed == value)
+    })
+}
+
+/// Evaluates a string predicate on a key column the dictionary way:
+/// once per *distinct* value, then integer set-membership per row.
+fn key_predicate(
+    schema: &Schema,
+    view: &SegmentView,
+    column: &str,
+    negated: bool,
+    matches: impl Fn(&str) -> bool,
+) -> Result<ThreeValued, QueryError> {
     let index = column_index(schema, column)?;
     let Column::Key(keys) = &view.segment.batch().columns()[index] else {
         return Err(QueryError::TypeError(format!(
@@ -533,15 +603,39 @@ fn key_membership(
     };
     let dictionary = keys.dictionary();
     let allowed: Vec<bool> = (0..dictionary.len() as u32)
-        .map(|code| {
-            let hit = values.iter().any(|value| value == dictionary.value(code));
-            hit != negated
-        })
+        .map(|code| matches(dictionary.value(code)) != negated)
         .collect();
     let codes = keys.codes().as_slice();
     Ok(leaf_result(keys.len(), |row| {
         (keys.is_valid(row), allowed[codes[row] as usize])
     }))
+}
+
+/// The SQL LIKE matcher: `%` any run (including empty), `_` exactly one
+/// character, everything else literal — over characters, not bytes, so
+/// `_` honors multi-byte keys. Iterative with `%`-backtracking.
+pub(crate) fn like_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut s) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern pos after %, text pos)
+    while s < text.len() {
+        if p < pattern.len() && (pattern[p] == '_' || pattern[p] == text[s]) {
+            p += 1;
+            s += 1;
+        } else if p < pattern.len() && pattern[p] == '%' {
+            star = Some((p + 1, s));
+            p += 1;
+        } else if let Some((star_p, star_s)) = star {
+            // Backtrack: let the last % swallow one more character.
+            p = star_p;
+            s = star_s + 1;
+            star = Some((star_p, star_s + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '%')
 }
 
 fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
@@ -550,6 +644,42 @@ fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
         .iter()
         .position(|field| field.name() == name)
         .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::like_match;
+
+    #[test]
+    fn the_matcher_is_sql_like() {
+        for (pattern, text, expected) in [
+            ("%", "", true),
+            ("%", "anything", true),
+            ("", "", true),
+            ("", "a", false),
+            ("abc", "abc", true),
+            ("abc", "abd", false),
+            ("a%", "a", true),
+            ("a%", "abc", true),
+            ("%c", "abc", true),
+            ("%b%", "abc", true),
+            ("a_c", "abc", true),
+            ("a_c", "ac", false),
+            ("a__", "abc", true),
+            ("%Bank%", "First Bank of Testing", true),
+            ("%Bank%", "First Bink of Testing", false),
+            ("a%b%c", "axxbyyc", true),
+            ("a%b%c", "axxcyyb", false),
+            ("_", "é", true), // characters, not bytes
+            ("%%%", "x", true),
+        ] {
+            assert_eq!(
+                like_match(pattern, text),
+                expected,
+                "LIKE '{pattern}' on '{text}'"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

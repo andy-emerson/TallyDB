@@ -167,6 +167,9 @@ pub struct OrderBy {
     pub column: String,
     /// `true` for `DESC`.
     pub descending: bool,
+    /// Explicit `NULLS FIRST` / `NULLS LAST`; `None` keeps the default
+    /// (nulls last in both directions, DuckDB's convention — D2).
+    pub nulls_first: Option<bool>,
 }
 
 /// A star-schema equi-join: the fact table joined to one small
@@ -193,6 +196,11 @@ pub struct Plan {
     pub join: Option<JoinPlan>,
     /// What the SELECT list computes.
     pub projection: Projection,
+    /// `SELECT DISTINCT`: deduplicate the projected rows (plain column
+    /// projections only; keys compare by value across segments, `f64`
+    /// under the one comparison relation — NaN equals itself — and
+    /// NULLs equal, per SQL DISTINCT).
+    pub distinct: bool,
     /// The WHERE predicate, applied before everything else.
     pub predicate: Option<Predicate>,
     /// Top-level ORDER BY, applied to the projected output.
@@ -405,6 +413,7 @@ fn lower_order_by(order_by: Option<&ast::OrderBy>) -> Result<Option<OrderBy>, Qu
             Ok(Some(OrderBy {
                 column: ident(column),
                 descending: order.options.asc == Some(false),
+                nulls_first: order.options.nulls_first,
             }))
         }
         _ => Err(QueryError::Unsupported(
@@ -454,9 +463,16 @@ fn lower_limit(
 }
 
 fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
-    if select.having.is_some() || select.distinct.is_some() {
-        return Err(QueryError::Unsupported("HAVING / DISTINCT".to_owned()));
+    if select.having.is_some() {
+        return Err(QueryError::Unsupported("HAVING".to_owned()));
     }
+    let distinct = match &select.distinct {
+        None | Some(ast::Distinct::All) => false,
+        Some(ast::Distinct::Distinct) => true,
+        Some(ast::Distinct::On(_)) => {
+            return Err(QueryError::Unsupported("DISTINCT ON".to_owned()));
+        }
+    };
     let [table] = select.from.as_slice() else {
         return Err(QueryError::Unsupported(format!(
             "exactly one FROM table, got {}",
@@ -525,10 +541,24 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
         }
         Projection::Items(items)
     };
+    if distinct {
+        match &projection {
+            Projection::Items(items)
+                if items
+                    .iter()
+                    .all(|item| matches!(item, PlanItem::Column { .. })) => {}
+            _ => {
+                return Err(QueryError::Unsupported(
+                    "DISTINCT over window or aggregate projections".to_owned(),
+                ))
+            }
+        }
+    }
     Ok(Plan {
         table,
         join,
         projection,
+        distinct,
         predicate,
         order_by: None,
         limit: None,
@@ -1024,7 +1054,11 @@ mod tests {
             ("SELECT w.x FROM t JOIN u ON t.a = u.a", "names no table"),
             ("SELECT x FROM t ORDER BY x, y", "one column"),
             ("SELECT x FROM t WHERE x > 1 HAVING x > 2", "HAVING"),
-            ("SELECT DISTINCT x FROM t", "DISTINCT"),
+            ("SELECT DISTINCT ON (x) x FROM t", "DISTINCT ON"),
+            (
+                "SELECT DISTINCT count(x) FROM t",
+                "DISTINCT over window or aggregate projections",
+            ),
             (
                 "SELECT x, sum(y) FROM t GROUP BY x, x + 1",
                 "plain key columns",
