@@ -107,7 +107,13 @@ unsafe extern "C" fn host_call(state: *mut ffi::lua_State) -> c_int {
                 drop(message);
                 ffi::lua_error(state)
             }
-            Err(_) => values::raise(state, c"host function panicked"),
+            Err(payload) => {
+                // Drop the caught panic payload before raising — the
+                // longjmp must cross no live destructor (ASan caught
+                // the Err(_) form leaking exactly this box).
+                drop(payload);
+                values::raise(state, c"host function panicked")
+            }
         }
     }
 }
