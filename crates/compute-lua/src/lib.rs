@@ -30,10 +30,11 @@
 //!   hand-rolled thin bindings to the 5.4 C API (settled 2026-07-24; the
 //!   full decision record, including LuaJIT and `mlua` as rejected
 //!   alternatives with reopen conditions, lives in DESIGN.md, *The Lua
-//!   layer*). Binding discipline is verified with Lua's own enforcement:
-//!   `LUA_USE_APICHECK` test builds, `ltests.c` GC/allocation torture,
-//!   the official Lua test suite over the vendored build, and
-//!   ASan/UBSan — no binding dependency, shipped or dev.
+//!   layer*). Binding discipline is checked with Lua's own enforcement:
+//!   `LUA_USE_APICHECK` test builds run today (the `apicheck` feature);
+//!   `ltests.c` GC/allocation torture, the official Lua test suite over
+//!   the vendored build, and ASan/UBSan are planned CI hardening,
+//!   tracked in #41 — no binding dependency, shipped or dev.
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — also Lua 5.4, so both targets
 //!   share one language semantics and one C API. Both backends sit
@@ -65,15 +66,14 @@ mod values;
 pub use state::LuaState;
 pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 
-// TODO: Lua backend trait (native vendored-5.4 implementation first;
-//       first act is the zero-copy userdata-view spike, pointer-verified)
-// TODO: surface the standard-library set as a decision before this
-//       crate's public API lands: base/math/string/table are opened
-//       today; io/os/debug/package are not (package is unlinkable in
-//       the ANSI build). Expanding the set is user-visible script
-//       semantics — the hygiene tripwire applies.
-// TODO: batch calling convention: hand a whole column/window buffer to
-//       a Lua chunk in one call
+// The batch calling convention (whole columns per call) and the F1–F4
+// value map are built — `LuaState::eval_column` / `eval_scalar` over
+// `values`. The curated standard-library set is a settled decision
+// (DESIGN.md, *The inclusion principle*): base/math/string/table in;
+// io/os/debug out; package not even linked.
+//
+// TODO: Lua backend trait, extracted when the WASM backend starts —
+//       nothing above this crate should need to know which is active
 // TODO: expose compute-blas and compute-lapack ops as callable Lua
 //       functions, sharing buffers (no copy)
 // TODO: pure-Lua module loader (package.path-style); explicitly do NOT
