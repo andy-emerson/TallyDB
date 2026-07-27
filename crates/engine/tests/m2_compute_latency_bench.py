@@ -12,7 +12,7 @@ result back in application memory?
 Both configurations, precisely:
   in-engine  one SQL query against a prebuilt table (fixture built once,
              outside all timing): window function runs inside TallyDB
-             (native LAPACK/BLAS op, or a registered Lua kernel), result
+             (native curated op, or a registered Lua kernel), result
              exported over ArrowArrayStream and materialized in Python.
   peer       per iteration, the full round trip an external-compute
              design pays on data it stores in TallyDB: export the raw
@@ -30,8 +30,8 @@ The spread runs cheap -> heavy, plus the interpreter-only case:
               script dispatch)         peer: NumPy rolling dot (cumsum)
   lua_mad     pure-Lua kernel (no native op — the promotion ladder's
               first rung)              peer: vectorized NumPy MAD
-  regr_slope  native least squares     peer: DuckDB's regr_slope window
-              (LAPACK dgels per window)      (incremental running moments)
+  regr_slope  closed-form least squares peer: DuckDB's regr_slope window
+              per window                     (incremental running moments)
   eigen_max   native closed-form 2x2   peer: NumPy closed-form 2x2 from
               eigenvalue per window         rolling moments (same math,
                                             vectorized over the column)
@@ -236,7 +236,7 @@ def main():
     elapsed, values = engine(f"SELECT regr_slope(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = duckdb_peer()
     check("regr_slope", values, peer_values, 1e-6, 1e-9)
-    results.append(("regr_slope (LAPACK)", "DuckDB window", elapsed, peer_time))
+    results.append(("regr_slope (closed form)", "DuckDB window", elapsed, peer_time))
 
     elapsed, values = engine(f"SELECT eigen_max(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = peer(lambda px, py: peer_eigen(px, py))

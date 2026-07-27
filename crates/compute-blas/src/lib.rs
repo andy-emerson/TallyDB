@@ -1,21 +1,20 @@
 //! `compute-blas` — multiplication-class BLAS operations, callable from the
 //! query executor and from `compute-lua`.
 //!
-//! ## Scope: BLAS only. LAPACK lives next door.
-//! This crate wraps the *multiplication-class* primitives — dot products,
-//! matrix-vector (gemv), matrix-matrix (gemm) — and nothing else. The
-//! analytical solves and decompositions (least-squares, symmetric
-//! eigendecomposition, general solve, Cholesky) are LAPACK-class and live in
-//! the separate `compute-lapack` crate. Don't conflate them: BLAS is
-//! necessary but not sufficient, and "we have BLAS" is not "we're done."
+//! ## Scope: multiplication-class primitives only
+//! This crate wraps dot products, matrix-vector (gemv), and matrix-matrix
+//! (gemm), and nothing else. The analytical solves and decompositions —
+//! least squares, symmetric eigendecomposition, general solve, Cholesky —
+//! are LAPACK-class, and TallyDB does not build them: every statistic the
+//! engine currently computes has an exact closed form at the two
+//! parameters or two dimensions it needs, and a general solver's per-call
+//! overhead dwarfs that arithmetic at window scale. A LAPACK-class
+//! dependency returns only when an op needs more than that, where no
+//! closed form exists. See DESIGN.md, *Curated compute: what the engine
+//! calls, and why*.
 //!
-//! The split follows a real boundary — different libraries (LAPACK is built
-//! on BLAS), different consumers (the primitives here are called directly by
-//! the executor's window/numeric inner loops and by Lua scripts through
-//! `compute-lua`'s registered functions, whereas the
-//! LAPACK curated set is the higher-level analytics surface), and different
-//! WASM-availability timelines (`blas.wasm` exists today; a LAPACK-in-WASM
-//! layer does not).
+//! Keeping this crate's scope narrow is still the point: BLAS is
+//! necessary but not sufficient, and "we have BLAS" is not "we're done."
 //!
 //! ## Native backend: link as-is
 //! OpenBLAS (or MKL/Accelerate) via FFI, no fork, no rebuild — mature,

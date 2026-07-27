@@ -12,7 +12,7 @@ principles behind them — a power-user-level inventory of *why*, not just
 ## What this is (positioning, so scope calls stay anchored)
 
 An **append-ordered numeric store**: embeddable, SQL-native, with numeric
-compute (Lua + BLAS/LAPACK) running *inside* the engine on its own buffers,
+compute (Lua + curated native ops) running *inside* the engine on its own buffers,
 zero-copy. Time-series / sensor / quant are **use cases**, not the
 definition — what's load-bearing is *ordered ingest on a key*, not that the
 key means "time." The one-line frame: an open, SQL-native, embeddable kdb+
@@ -57,7 +57,7 @@ two flavors with distinct roles:
   type.** Nanosecond timestamps, money as scaled integers, volumes, counts.
   Exact, bit-for-bit reproducible, and — bonus — ordered `i64` columns are
   exactly what delta / delta-of-delta compression is built for.
-- **`f64` — the analytic / derived type.** Anything BLAS/LAPACK touches.
+- **`f64` — the analytic / derived type.** Anything the numeric ops touch.
   Regression coefficients, covariance eigenvalues, correlations, portfolio
   weights are *irrational in general*, so the analytics layer is inherently
   floating-point; this is also what keeps NumPy interop and the DuckDB
@@ -126,8 +126,8 @@ This isn't a naming convention — it's enforced in the type system. A column
 is either:
 
 - **Numeric** (`f64` or `i64`): usable in arithmetic, aggregation,
-  comparison, and — for `f64` — passed directly into BLAS/LAPACK/Lua as raw
-  numeric buffers.
+  comparison, and — for `f64` — passed directly into the numeric ops and
+  Lua as raw numeric buffers.
 - **Key**: dictionary-encoded to an integer at ingest (string interning,
   similar to kdb+'s symbol type or Arrow's dictionary encoding), usable in
   equality/grouping/joins and string *predicates*, never in arithmetic.
@@ -180,7 +180,7 @@ differential harness like everything else, rather than needing a
 hand-built check), and every admitted built-in is *guessable* (users
 find functions by knowing standard analytical SQL, which the oracle
 set curates). Everything else TallyDB can compute — decompositions,
-solves, anything BLAS/LAPACK-shaped — is reached through the Lua
+solves, anything matrix-shaped — is reached through the Lua
 surface, where results need not fit SQL's scalar-per-cell type system.
 The rule governs what *we* ship built-in; a user's own registered
 functions are their code, named as they please. Applied at adoption:
@@ -373,7 +373,7 @@ compaction resolves tombstones and merges segments. This means:
 We are building the **native build first** — Linux/Mac/Windows, linked into
 an application. A WASM build (and eventually a WASM compute layer) is a real
 future direction, not current scope — do not add WASM-target dependencies
-(`lua.wasm`, `blas.wasm`, LAPACK-wasm) or write WASM-specific code paths
+(`lua.wasm`, `blas.wasm`) or write WASM-specific code paths
 yet. What *is* required now: keep I/O and compute behind trait boundaries
 from day one (storage backend, scripting backend, math backends), with no
 filesystem, threading, or dependency assumptions baked into the core crates
@@ -381,8 +381,9 @@ that would block a future `wasm32` target. That discipline is cheap today
 and expensive to retrofit — don't skip it, but don't build the WASM side of
 it either. WASM matters to this project specifically because the two hardest
 WASM pieces — [`blas.wasm`](https://github.com/andy-emerson/blas.wasm) and
-`lua.wasm` — already exist, authored by the same author, with a
-LAPACK-in-WASM layer as their next milestone.
+`lua.wasm` — already exist, authored by the same author. A LAPACK-in-WASM
+layer was the third piece; removing LAPACK from the query path took it off
+the critical path (see *Curated compute: what the engine calls, and why*).
 
 ## Design philosophy
 
@@ -397,7 +398,7 @@ actually novel.**
   compiled into the engine unmodified, which is the embedding model Lua
   is designed and distributed for. (Not LuaJIT, and not via `mlua` — see
   *The Lua layer* below for the decision record.)
-- **Native BLAS/LAPACK** (OpenBLAS/MKL/Accelerate) — via FFI.
+- **Native BLAS** (OpenBLAS/MKL/Accelerate) — via FFI.
 
 These are mature, narrow, embedding-oriented dependencies — linking them
 whole is safe because their entire purpose is being called into by a host
@@ -666,14 +667,15 @@ fixed row count (issue #44) — the two sibling cadence questions.
 - **Compiled Lua C extensions** (`package.loadlib`). Pure-Lua libraries are
   fine and need no special handling. (See *The Lua layer* below for the full
   reasoning.)
-- **A general LAPACK surface.** `compute-lapack` wraps a curated set: a
-  least-squares solve, symmetric eigendecomposition, a general linear solve,
-  and Cholesky — chosen because specific workflows (regression,
-  covariance/PCA, portfolio weights) need exactly these. Don't add routines
-  because LAPACK has them; add them because a named workflow needs them.
-  (The multiplication-class primitives — dot, gemv, gemm — live in the
-  separate `compute-blas` crate; see *The compute split* below. Don't
-  conflate the two.)
+- **A LAPACK dependency, at all, until an op needs more than two
+  parameters or two dimensions.** Not "a general LAPACK surface" — any
+  LAPACK surface. Every statistic the engine computes today has an exact
+  closed form at the size it needs, and the removal is what frees the WASM
+  build from a LAPACK-in-WASM layer that does not exist. When a wider op
+  is committed, the rule that governed the old curated set still governs
+  its replacement: don't add routines because LAPACK has them; add them
+  because a named workflow needs them. See *Curated compute: what the
+  engine calls, and why*.
 - **Autodiff / a Torch-style tensor framework.** Different computational
   paradigm than anything the target workload (closed-form / classical
   numerical methods) needs. If a specific, repeated, real need shows up
@@ -695,38 +697,77 @@ If something on this list seems newly justified, that's a conversation to
 have explicitly (update this document and its companions together), not a
 decision to make silently inside an implementation PR.
 
-## The compute split: `compute-blas` vs `compute-lapack`
+## Curated compute: what the engine calls, and why
 
 Compute sits behind trait boundaries the `engine` calls through, so native
 implementations can eventually be joined by WASM ones without changing
-anything above. The compute layer is **two crates**, following the real
-library boundary (LAPACK is built on BLAS and calls into it), the consumer
-boundary, and the WASM-availability boundary:
+anything above. Today there is **one** compute library crate plus the
+script layer:
 
 - **`compute-blas`** — multiplication-class primitives (dot, gemv, gemm).
-  Direct consumers: the executor's window/numeric inner loops and Lua
-  scripts through `compute-lua`'s registered functions. Native: OpenBLAS
-  BLAS. WASM (future): `blas.wasm`, which exists.
-- **`compute-lapack`** — the curated analytical solves/decompositions, each
-  justified by a named workflow: least-squares solve (rolling regression),
-  symmetric eigendecomposition (covariance/PCA), general linear solve
-  (portfolio weights/factor models), Cholesky (positive-definite covariance
-  fast path). Native: LAPACK. WASM (future): a LAPACK-in-WASM layer that
-  does **not** exist yet and is the next milestone of the `blas.wasm`
-  project.
+  Direct consumers: Lua scripts through `compute-lua`'s registered host
+  functions, and eventually the executor's numeric inner loops (still
+  profiling-gated). Native: system BLAS. WASM (future): `blas.wasm`,
+  which exists.
+- **`compute-lua`** — the scripting tier and the promotion ladder's first
+  rung (see *The Lua layer*).
 
-`compute-lapack` does **not** depend on `compute-blas` at the Rust level —
-it calls the LAPACK library, which internally calls its own BLAS. Both are
-siblings over `arrow-lite`; `engine` depends on both.
+**Decision record — no LAPACK on the query path (2026-07-27).** The
+`compute-lapack` crate is removed and the engine links no LAPACK routine.
+The reason is a measurement, not a preference: **LAPACK's value scales
+with parameter count, not data size**, and every statistic the engine
+currently exposes is two-dimensional. A two-parameter least squares and a
+2 × 2 symmetric eigenvalue both have exact closed forms costing a handful
+of flops, while a general solver is dominated by its own per-call
+overhead at window scale — measured at roughly 2.3µs of `regr_slope`'s
+2.5µs per 64-row window, and 0.68µs per window for `dsyev` on a 2 × 2.
+Replacing both with closed forms left `regr_slope` costing the same as
+the other two-pass window statistics, where it had cost ~11× more, and
+moved it from 5× behind DuckDB's `regr_slope` window to **3.3× ahead**
+(`m2_compute_latency_bench.py`, run 2026-07-27, release, container
+hardware, 20k rows, window 64).
 
-The design-critical part (do this now, it's what keeps WASM from being a
-rewrite): keep the two behind **distinct traits with independently gated
-backends**, and make **capability negotiation** first-class — "this op is
-unavailable on this backend" is a returnable answer, not a panic. That's how
-a WASM build lands with storage + query + Lua + BLAS-class ops working and
-LAPACK-class analytics gracefully degraded until LAPACK-in-WASM ships. The
-crate split itself is the honest expression of that boundary; don't hide
-LAPACK inside a crate named "blas."
+*What this bought beyond speed:* the engine no longer requires a system
+LAPACK to build or embed, which repairs the link-it-in-like-SQLite
+property, and **M4 no longer waits on a LAPACK-in-WASM layer** — the
+current feature set can reach WASM parity without one.
+
+*The closed forms are the corrected ones, and that distinction is
+load-bearing.* The rolling regression uses the corrected two-pass form
+(Chan–Golub–LeVeque), which carries `Σ(x − x̄)` rather than assuming
+centering left it exactly zero. Measured against the SVD answer before
+the removal (`measure_closed_form`, release, container hardware,
+2026-07-27), worst predicted-y drift over the data:
+
+| design | QR (`dgels`) | corrected | naive |
+|---|---|---|---|
+| 64-row window, x offset 1e9 | 1.07e-14 | 2.84e-14 | 8.31e-7 |
+| 64-row window, x offset 1e12 | 1.42e-14 | 2.49e-14 | 1.01e-3 |
+| near-degenerate, spread 1e-10 | 2.84e-14 | 1.99e-13 | 6.75e-7 |
+
+The corrected form tracks QR within a small constant factor — both at the
+float noise floor against `|y|` of order 10–200 — while the **naive** form
+is a real regression at timestamp-scale offsets, bug #45's regime. That
+comparison needed LAPACK as its reference and cannot be re-run now that
+the dependency is gone; what guards the property going forward is
+`regression_numerics` in `engine`, which checks the shipped form against
+a cancellation-free reference computed about `x[0]` and asserts the
+correction beats the naive form on irregular offset data.
+
+*Reopen trigger:* the first committed op needing **more than two
+parameters or two dimensions** — multi-regressor regression, PCA beyond
+2 × 2, portfolio solves, Cholesky. No closed form exists there, and a
+LAPACK-class backend (system LAPACK, or a pure-Rust implementation that
+also compiles to WASM) comes back behind the same capability-negotiating
+trait shape. The engine's ops should then dispatch on parameter count:
+closed form at two, a solver above it.
+
+The design-critical part survives the removal and must keep surviving:
+compute stays behind **distinct traits with independently gated
+backends**, and **capability negotiation** stays first-class — "this op is
+unavailable on this backend" is a returnable answer, not a panic. That is
+what keeps a WASM build from being a rewrite, and what lets a LAPACK-class
+backend return later without touching a caller.
 
 **Decision record — the honest zero-copy claim (column-group arena
 considered and set aside).** LAPACK wants column-major matrices in one
@@ -757,10 +798,23 @@ at offset 1e6). It may return later as an explicit opt-in fast path
 with its accuracy caveat documented; reopen trigger: profiling shows
 per-window factorization dominating a real workload.
 
+*Updated 2026-07-27:* the factorization is gone — the window solves in
+closed form (see *Curated compute*) — and the centering it required
+remains, in corrected two-pass form. The streaming alternative was
+measured directly (`measure_3b`, release, container hardware): naive
+running sums are ~7.5× faster and reproduce exactly the failure this
+record predicted, with relative error reaching 1.1e2 on `eigen_max` at a
+1e9 offset and `corr`/`slope` going undefined where the recompute has an
+answer. A **shifted** variant — moments kept about a value near the data,
+accumulator rebuilt every window-length — keeps the ~7× and tracks the
+recompute to 5e-15. So the speed is available without the accuracy loss,
+but only in the shifted form; the naive one stays rejected. Adopting it
+needs a sequence-shaped window seam in the executor, which is not built.
+
 ## Batch, not per-row, for Lua and BLAS/LAPACK calls
 
 Every call from the query executor into `compute-lua`, `compute-blas`, or
-`compute-lapack` should operate on a whole column or window per call, not
+`compute-blas` should operate on a whole column or window per call, not
 element-by-element. Per-row calls throw away the entire performance
 rationale for pairing a columnar engine with these compute layers. If an API
 makes per-row calls the easy/obvious way to use it, that's a bug in the API
@@ -776,7 +830,7 @@ and its accessors are implemented on the Rust side, so no bytes are
 copied. Stated precisely, in the same spirit as the compute-split's
 zero-copy record above: *access* is zero-copy, but each element read is
 a metamethod dispatch rather than a compiled raw load. The curated
-`compute-blas`/`compute-lapack` ops are exposed to scripts as registered
+curated `compute-blas` and engine ops are exposed to scripts as registered
 functions operating over those same views — sharing buffers, not
 copying between them. Lua 5.4's numeric model — one number type with a
 64-bit integer subtype and a 64-bit float subtype — is exactly TallyDB's
@@ -1131,10 +1185,8 @@ tallydb/
                     #   numeric-or-key as a hard schema rule
     compute-lua/    # Lua scripting behind a trait; vendored PUC Lua 5.4,
                     #   hand-rolled bindings (lua.wasm, also 5.4, later)
-    compute-blas/   # multiplication-class BLAS behind a trait; OpenBLAS via
-                    #   FFI for now (blas.wasm later)
-    compute-lapack/ # curated LAPACK solves/decompositions behind a trait;
-                    #   native LAPACK via FFI for now (LAPACK-wasm later)
+    compute-blas/   # multiplication-class BLAS behind a trait; system BLAS
+                    #   via FFI for now (blas.wasm later)
     corpus/         # dev-only: the seeded synthetic generators of "The
                     #   corpus" above; measurement and differential-test
                     #   data, never linked by the engine
@@ -1164,7 +1216,7 @@ after that the rest is a wide front, and the ordering below is a
    row id, per-segment dictionaries; see *Storage* above.)
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
-4. `compute-lua` / `compute-blas` / `compute-lapack` — native backends
+4. `compute-lua` / `compute-blas` — native backends
    (vendored Lua 5.4, OpenBLAS, LAPACK); can be developed in parallel with
    `query-lite` once `arrow-lite`'s buffer format is stable, since they
    consume it directly.
@@ -1173,7 +1225,7 @@ after that the rest is a wide front, and the ordering below is a
 **The one sequencing constraint that matters most:** the differentiator is
 compute-fusion (zero-copy numeric ops on stored buffers), and that's the
 riskiest, least-trodden part. Reach a thin end-to-end proof of it *early* —
-ingest numeric+key rows → a windowed query that calls a `compute-lapack` op
+ingest numeric+key rows → a windowed query that calls a curated numeric op
 on stored buffers with no copy → Arrow out — rather than leaving it for
 last. Building the storage engine beautifully while the compute story slips
 just yields "another embeddable TSDB" and misses the point.

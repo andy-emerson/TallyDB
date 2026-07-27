@@ -25,25 +25,34 @@
 //! ## What this crate is
 //! The public entry point: schema definition/validation, wiring
 //! `storage-lite` + `query-lite` together, and exposing the compute
-//! backends (`compute-lua`, `compute-blas`, `compute-lapack`) to SQL as
-//! callable functions. Application code depends on this crate, not on the
+//! backends (`compute-lua`, `compute-blas`) to SQL as callable
+//! functions. Application code depends on this crate, not on the
 //! lower-level crates directly.
 //!
 //! ## Compute backend selection
-//! `compute-blas` and `compute-lapack` are consumed here through their
-//! trait interfaces (see those crates), not through concrete types;
-//! `compute-lua` is currently consumed as its concrete native state
-//! (its backend trait is extracted when the WASM backend starts — see
-//! that crate's docs). Right now the native implementations (vendored
-//! Lua 5.4, native BLAS, native LAPACK) are the only ones that exist —
-//! but this crate should never hardcode that assumption. Select the
-//! concrete implementation with
+//! `compute-blas` is consumed here through its trait interface (see that
+//! crate), not through a concrete type; `compute-lua` is currently
+//! consumed as its concrete native state (its backend trait is extracted
+//! when the WASM backend starts — see that crate's docs). Right now the
+//! native implementations (vendored Lua 5.4, native BLAS) are the only
+//! ones that exist — but this crate should never hardcode that
+//! assumption. Select the concrete implementation with
 //! `cfg(target_arch = "wasm32")` / a Cargo feature at the point where a
-//! concrete type is actually needed, not throughout this crate's logic. Route
-//! compute calls so that a backend reporting an op as unavailable (e.g. a
-//! future WASM build with BLAS but not yet LAPACK) surfaces as a clean
-//! "unsupported here" error, not a panic — the compute crates expose that
-//! capability signal on their traits.
+//! concrete type is actually needed, not throughout this crate's logic.
+//! Route compute calls so that a backend reporting an op as unavailable
+//! surfaces as a clean "unsupported here" error, not a panic — the
+//! compute crates expose that capability signal on their traits.
+//!
+//! ## No LAPACK on the query path
+//! Every window function this crate registers is solved in closed form:
+//! a two-parameter regression and a 2 × 2 symmetric eigenvalue both have
+//! exact solutions, and a general solver's per-call overhead dwarfs their
+//! arithmetic at window scale. The engine therefore does not depend on
+//! `compute-lapack` at all, which is what lets a WASM build reach parity
+//! with the current feature set without a LAPACK-in-WASM layer. A
+//! LAPACK-class dependency returns only when an op needs more than two
+//! parameters or dimensions — where no closed form exists. See DESIGN.md,
+//! *Curated compute: what the engine calls, and why*.
 //!
 //! ## Current milestone: native only
 //! Nothing here should assume a filesystem, threading model, or blocking
@@ -65,13 +74,13 @@ pub use table::{EngineError, Table};
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`
 // runs application-registered Lua kernels as SQL window functions
-// through the same seam as the curated LAPACK windows (the `script`
+// through the same seam as the curated native windows (the `script`
 // module; whole window per call, never per-row), and kernels call the
 // curated ops — dot, regr_slope/intercept, covar_pop/corr/eigen_max —
 // over the same views, no copy.
 //
-// TODO: expose compute-blas (multiplication-class) ops and the remaining
-//       compute-lapack ops as callable SQL functions, with
-//       backend-capability errors surfaced cleanly (not panics)
+// TODO: expose the remaining compute-blas (multiplication-class) ops as
+//       callable SQL functions, with backend-capability errors surfaced
+//       cleanly (not panics)
 // TODO: the scalar-projection Lua slot (deferred: PlanItem is
 //       Column|WindowAgg only; computed projections aren't built)

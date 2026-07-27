@@ -2,7 +2,7 @@
 //!
 //! A [`LuaWindow`] adapts an application-registered Lua kernel to
 //! `query-lite`'s `WindowAggregate` seam — the same seam the curated
-//! LAPACK windows (`regr_slope`, `eigen_max`, …) ship through. The
+//! native windows (`regr_slope`, `eigen_max`, …) ship through. The
 //! engine drives the framing; the kernel reduces one frame to one
 //! scalar, reading its arguments as zero-copy column views and
 //! returning a number or `NULL` — the window half of the vectorized
@@ -33,7 +33,6 @@
 use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
 use compute_blas::{BlasBackend, NativeBlas};
-use compute_lapack::NativeLapack;
 use compute_lua::{Chunk, ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
@@ -89,26 +88,20 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
 }
 
 /// Installs the curated compute spread into a kernel's state: `dot`
-/// (BLAS), `regr_slope` / `regr_intercept` (least squares), and
+/// (BLAS), `regr_slope` / `regr_intercept` (closed-form least squares),
+/// and
 /// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
 /// implementations the SQL windows run, reading the same view buffers
 /// with no copy. This is the compute-without-copying surface inside a
 /// script: engine buffers, curated native ops, and the interpreter all
 /// share memory.
 fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
-    let lapack = NativeLapack;
     state.register_host_function("dot", Box::new(DotOp(NativeBlas)))?;
     for (name, output) in [
         ("regr_slope", RegressionOutput::Slope),
         ("regr_intercept", RegressionOutput::Intercept),
     ] {
-        state.register_host_function(
-            name,
-            Box::new(CuratedOp(RollingRegression {
-                backend: lapack,
-                output,
-            })),
-        )?;
+        state.register_host_function(name, Box::new(CuratedOp(RollingRegression { output })))?;
     }
     for (name, kind) in [
         ("covar_pop", PairKind::CovarPop),
