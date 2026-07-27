@@ -257,3 +257,100 @@ mod tests {
         assert!(backend.supports(BlasOp::MatMat));
     }
 }
+
+#[cfg(test)]
+mod measure_dot {
+    //! Is the FFI call to BLAS `ddot` worth it at TallyDB's shapes?
+    //!
+    //! The engine's `dot` is called once per window — 64 elements is the
+    //! benchmark's shape, and even a large window is thousands, not
+    //! millions. At that size a BLAS call is mostly call: argument
+    //! marshalling by pointer, the library's own dispatch, and no chance
+    //! to amortize any of it. A plain Rust loop has none of that, and
+    //! LLVM vectorizes it.
+    //!
+    //! Two things are measured, because both matter for the decision:
+    //! **time** across window sizes, and **bit-agreement** — a Rust loop
+    //! sums strictly left to right, while a BLAS kernel may block and
+    //! reassociate, so the two need not agree to the last bit. Whether
+    //! they do bears directly on native/WASM reproducibility.
+    //!
+    //! Read the bit-agreement result with care: it is a statement about
+    //! *the BLAS that happens to be linked*, not about BLAS. Reference
+    //! netlib BLAS accumulates in a plain loop and matches; a blocked,
+    //! SIMD-kernel implementation (OpenBLAS, MKL) reassociates and need
+    //! not. That variability across implementations is itself the point
+    //! when the goal is a reproducible answer on every target.
+    //!
+    //! Run explicitly, in release:
+    //!
+    //! ```text
+    //! cargo test -p compute-blas --release measure_dot -- --ignored --nocapture
+    //! ```
+
+    use super::*;
+
+    /// The obvious Rust dot product: strict left-to-right accumulation.
+    fn rust_dot(x: &[f64], y: &[f64]) -> f64 {
+        x.iter().zip(y).map(|(&a, &b)| a * b).sum()
+    }
+
+    /// Deterministic values in [-1, 1).
+    fn sample(len: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "measurement — run explicitly in release mode"]
+    fn measure_dot_rust_vs_blas() {
+        use std::hint::black_box;
+        let backend = NativeBlas;
+        println!(
+            "dot product: Rust loop vs BLAS ddot through FFI \
+             (per-call time; ratio > 1 favors Rust)"
+        );
+        for len in [16usize, 64, 256, 1_024, 4_096, 65_536] {
+            let x = sample(len, 0x2545_F491_4F6C_DD1D);
+            let y = sample(len, 0x9E37_79B9_7F4A_7C15);
+            // Enough repetitions that the timer resolution is irrelevant
+            // at the small sizes the engine actually uses.
+            let rounds = (1 << 22) / len.max(1);
+
+            let start = std::time::Instant::now();
+            let mut rust_result = 0.0;
+            for _ in 0..rounds {
+                rust_result = black_box(rust_dot(black_box(&x), black_box(&y)));
+            }
+            let rust_time = start.elapsed().as_secs_f64() / rounds as f64;
+
+            let start = std::time::Instant::now();
+            let mut blas_result = 0.0;
+            for _ in 0..rounds {
+                blas_result = black_box(backend.dot(black_box(&x), black_box(&y)).unwrap());
+            }
+            let blas_time = start.elapsed().as_secs_f64() / rounds as f64;
+
+            let agree = rust_result.to_bits() == blas_result.to_bits();
+            let relative = if blas_result == 0.0 {
+                0.0
+            } else {
+                ((rust_result - blas_result) / blas_result).abs()
+            };
+            println!(
+                "  len {len:>6}:  Rust {:>9.1}ns   BLAS {:>9.1}ns   \
+                 BLAS/Rust {:>5.2}x   bit-identical {agree:<5}  rel {relative:.1e}",
+                rust_time * 1e9,
+                blas_time * 1e9,
+                blas_time / rust_time,
+            );
+        }
+    }
+}
