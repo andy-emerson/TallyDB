@@ -33,7 +33,7 @@
 //!   layer*). Binding discipline is checked with Lua's own enforcement
 //!   and the sanitizers, both in CI on every change: `LUA_USE_APICHECK`
 //!   test builds (the `apicheck` feature) and an ASan/UBSan job with
-//!   the vendored C compiled sanitized. Still planned under #41:
+//!   the vendored C compiled sanitized. Still planned, under #69:
 //!   `ltests.c` GC/allocation torture and the official Lua test suite
 //!   over the vendored build — both need files the deliberately
 //!   embedding-set-only vendor tree does not carry, vendored with

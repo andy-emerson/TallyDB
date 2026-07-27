@@ -82,5 +82,5 @@ pub use table::{EngineError, Table};
 // TODO: expose the remaining compute-linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced
 //       cleanly (not panics)
-// TODO: the scalar-projection Lua slot (deferred: PlanItem is
+// TODO: the scalar-projection Lua slot (#53, post-M2: PlanItem is
 //       Column|WindowAgg only; computed projections aren't built)
