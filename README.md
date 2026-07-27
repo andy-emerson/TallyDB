@@ -144,7 +144,7 @@ storage, dictionary-encoded keys, in-database compute — each exists
 somewhere. The differentiator is the *combination and packaging*: numeric
 compute (regression, covariance, factor math) running inside an
 **embeddable, SQL-native** engine, over **off-the-shelf** numeric libraries
-(canonical Lua, BLAS) on **zero-copy shared buffers** — rather than a
+(canonical Lua, pure-Rust linear algebra) on **zero-copy shared buffers** — rather than a
 bespoke array language (kdb+'s q) or a serialization hop (DuckDB ↔ Python).
 The honest one-line framing is *"an open, SQL-native, embeddable kdb+ for
 teams below kdb+ scale"*: the workload kdb+ proved over 25 years, minus the
@@ -225,11 +225,17 @@ backend returns only when an op needs more than two parameters or
 dimensions, where no closed form exists — see `DESIGN.md`, *Curated
 compute: what the engine calls, and why*. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
-are the bounded copies, as recorded in the crate docs. `compute-blas`
-links system BLAS behind the same capability-negotiating trait shape
-(`dot`, matrix–vector, matrix–matrix — checked against hand
-computations; not yet called from query inner loops, which stays
-profiling-gated). `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
+are the bounded copies, as recorded in the crate docs. `compute-linalg`
+provides the multiplication-class kernels behind the same
+capability-negotiating trait shape (`dot`, matrix–vector, matrix–matrix
+— checked against hand computations; not yet called from query inner
+loops, which stays profiling-gated), and it is pure Rust: `dot` is a
+source-fixed loop, bit-identical on every CPU and target and measured
+fastest at window scale, while the matrix products use faer, measured
+3.7–10× ahead of a naive loop (and ahead of reference BLAS) at the Gram
+shapes a future multi-parameter op would need. The engine links no
+system math library at all — no BLAS, no LAPACK — and the compute stack
+compiles for wasm32 as-is. `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
 unmodified) behind the frozen value-map contract: nullable columns
 cross as zero-copy views (NULL is the `NULL` sentinel, three-valued
 through arithmetic; keys read as codes with `text()`/`code_of()`),
@@ -259,12 +265,13 @@ recompute, not the arithmetic. Incremental windows would close it — a
 executor change that is not built. The zero-copy property itself is
 pointer-verified and stands; a blanket wall-clock win is not yet an
 earned claim.
-`blas.wasm` and `lua.wasm` (the WASM
-compute dependencies, for later) are real, working, MIT-licensed projects
-already in progress by the same author — tracked as future dependencies,
-not part of the current native-first build. (A LAPACK-in-WASM layer was
-their next planned milestone; removing LAPACK from the query path took it
-off TallyDB's critical path.)
+`lua.wasm` (the one WASM compute
+dependency still to come, for later) is a real, working, MIT-licensed
+project already in progress by the same author — tracked as a future
+dependency, not part of the current native-first build. (Its sibling
+`blas.wasm` is no longer needed: with LAPACK removed and system BLAS
+replaced by pure Rust, TallyDB's linear algebra compiles for wasm32
+directly.)
 
 ## How we work
 

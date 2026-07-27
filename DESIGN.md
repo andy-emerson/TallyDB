@@ -71,7 +71,7 @@ a bignum rational is variable-width and kills the fixed-width Arrow-interop
 and SIMD story, and — decisively — rationals can't even *represent* the
 irrational outputs (√, log, eigenvalues) the analytics produce.
 Floating-point *done carefully* is the right tool; where reproducibility
-matters, it is handled at the BLAS build level (non-FMA kernels — see
+matters, it is handled by fixing the operation order in source (see
 *Numerical consistency*), not by dropping floats.
 
 **Decision record — `f32` (considered and set aside, kept cheap to add).**
@@ -345,8 +345,8 @@ compaction resolves tombstones and merges segments. This means:
 > What the shell shape pulls in (all additive, none a refactor): DDL
 > (`CREATE TABLE` with the numeric-or-key types and the declared
 > ordering key) and ingest (`INSERT`, plus a bulk import) in SQL;
-> statically linked compute (which dovetails with the pinned
-> from-source OpenBLAS build recorded under *Numerical consistency*);
+> statically linked compute (already the default: the compute stack is
+> pure Rust plus the vendored Lua sources);
 > a process lock on the storage directory (two processes opening one
 > table is undefined until then); and per-platform release builds in
 > CI. Rendering key columns as text in the shell is fine — the shell
@@ -373,17 +373,19 @@ compaction resolves tombstones and merges segments. This means:
 We are building the **native build first** — Linux/Mac/Windows, linked into
 an application. A WASM build (and eventually a WASM compute layer) is a real
 future direction, not current scope — do not add WASM-target dependencies
-(`lua.wasm`, `blas.wasm`) or write WASM-specific code paths
+(`lua.wasm`) or write WASM-specific code paths
 yet. What *is* required now: keep I/O and compute behind trait boundaries
 from day one (storage backend, scripting backend, math backends), with no
 filesystem, threading, or dependency assumptions baked into the core crates
 that would block a future `wasm32` target. That discipline is cheap today
 and expensive to retrofit — don't skip it, but don't build the WASM side of
-it either. WASM matters to this project specifically because the two hardest
-WASM pieces — [`blas.wasm`](https://github.com/andy-emerson/blas.wasm) and
-`lua.wasm` — already exist, authored by the same author. A LAPACK-in-WASM
-layer was the third piece; removing LAPACK from the query path took it off
-the critical path (see *Curated compute: what the engine calls, and why*).
+it either. WASM matters to this project specifically because its hardest pieces are
+already in hand: `lua.wasm` (also Lua 5.4, same author) exists, and the
+linear-algebra layer needs no WASM port at all — `compute-linalg` is pure
+Rust and compiles for `wasm32-unknown-unknown` as-is (verified
+2026-07-27; see *Curated compute: what the engine calls, and why*). A
+LAPACK-in-WASM layer left the critical path when LAPACK left the query
+path; `blas.wasm` left it with the system-BLAS removal.
 
 ## Design philosophy
 
@@ -398,7 +400,9 @@ actually novel.**
   compiled into the engine unmodified, which is the embedding model Lua
   is designed and distributed for. (Not LuaJIT, and not via `mlua` — see
   *The Lua layer* below for the decision record.)
-- **Native BLAS** (OpenBLAS/MKL/Accelerate) — via FFI.
+- **faer** — pure-Rust linear-algebra kernels (slim feature set: no
+  thread pool, no RNG), consumed by `compute-linalg` for the matrix
+  products.
 
 These are mature, narrow, embedding-oriented dependencies — linking them
 whole is safe because their entire purpose is being called into by a host
@@ -508,7 +512,7 @@ boundary — a fresh row is queryable but not power-loss durable until flush
 a live feed and recomputes over it in the same process — real-time risk,
 live P&L, a moving regression on the newest window — is squarely in scope,
 and is the compute-without-copying sweet spot: socket → storage → SQL →
-BLAS with no serialization hop. What is *out* is being the tick **server**:
+curated compute with no serialization hop. What is *out* is being the tick **server**:
 one process streaming ticks over the network to a farm of subscriber
 processes, which the never-a-server (Deployment) and no-network-boundary
 (Distribution) cuts forbid outright. Stated as a single rule: "live feed"
@@ -704,11 +708,13 @@ implementations can eventually be joined by WASM ones without changing
 anything above. Today there is **one** compute library crate plus the
 script layer:
 
-- **`compute-blas`** — multiplication-class primitives (dot, gemv, gemm).
-  Direct consumers: Lua scripts through `compute-lua`'s registered host
-  functions, and eventually the executor's numeric inner loops (still
-  profiling-gated). Native: system BLAS. WASM (future): `blas.wasm`,
-  which exists.
+- **`compute-linalg`** — multiplication-class primitives (dot,
+  matrix–vector, matrix–matrix). Direct consumers: Lua scripts through
+  `compute-lua`'s registered host functions, and eventually the
+  executor's numeric inner loops (still profiling-gated). Pure Rust — a
+  source-fixed loop for `dot`, faer for the matrix products — so one
+  implementation serves native and wasm32 (see the decision record
+  below).
 - **`compute-lua`** — the scripting tier and the promotion ladder's first
   rung (see *The Lua layer*).
 
@@ -757,17 +763,50 @@ correction beats the naive form on irregular offset data.
 *Reopen trigger:* the first committed op needing **more than two
 parameters or two dimensions** — multi-regressor regression, PCA beyond
 2 × 2, portfolio solves, Cholesky. No closed form exists there, and a
-LAPACK-class backend (system LAPACK, or a pure-Rust implementation that
-also compiles to WASM) comes back behind the same capability-negotiating
-trait shape. The engine's ops should then dispatch on parameter count:
+solver-class backend comes back behind the same capability-negotiating
+trait shape — the measured candidate is faer's solver family, which beat
+reference LAPACK's `dgels` at k = 2–4 in the same-run three-way
+measurement (see the kernel decision record below) and compiles to
+wasm32. The engine's ops should then dispatch on parameter count:
 closed form at two, a solver above it.
 
 The design-critical part survives the removal and must keep surviving:
 compute stays behind **distinct traits with independently gated
 backends**, and **capability negotiation** stays first-class — "this op is
 unavailable on this backend" is a returnable answer, not a panic. That is
-what keeps a WASM build from being a rewrite, and what lets a LAPACK-class
+what keeps a WASM build from being a rewrite, and what lets a solver-class
 backend return later without touching a caller.
+
+**Decision record — system BLAS replaced by pure-Rust kernels
+(2026-07-27).** `compute-blas` (system BLAS via FFI) is now
+`compute-linalg`: the same trait seam, implemented in pure Rust — a
+strict left-to-right loop for `dot`, faer (slim features: no thread
+pool, no RNG, no file formats) for the matrix products. A three-way
+measurement (plain Rust vs system reference BLAS/LAPACK vs faer,
+release, container hardware, run 2026-07-27) drove the split: at window
+scale (≤ 64 elements) the plain loop beats both libraries — there is
+nothing to amortize — while faer wins long dots by 2.4–4.7×
+(256–4096 elements) and Gram-shaped products by 3.7–10× (k = 4–16 over
+64 rows), shapes where reference `dgemm` also loses to it. Accuracy is
+a wash: identical least-squares residuals, eigenpair residuals at the
+1e-16 floor on both sides. What the swap buys is packaging: no system
+math library to install, link, or version (CI drops `libblas-dev`;
+`ldd` on the engine library shows none), and the whole compute stack
+compiles for `wasm32-unknown-unknown` — verified — so `blas.wasm` is no
+longer a TallyDB dependency at all. The `dot` loop is the one kernel
+whose result is bit-identical on every CPU and target, and deliberately
+the only kernel on a per-window path today.
+
+*Rejected alternatives:* keeping system BLAS — wins no measured shape
+the engine runs and costs the system dependency; reopen if a platform
+BLAS (Accelerate, MKL) is measured materially ahead at a shape that has
+reached a query path. OpenBLAS pinned from source with
+`TARGET=SANDYBRIDGE` — the old determinism plan; heavier to build,
+still a C dependency, and source-fixed Rust loops achieve the property
+more directly for the paths that promise it. *Reopen trigger for the
+dot split itself:* profiling showing a long-vector dot on a hot path —
+then the loop yields to faer above a measured length threshold, trading
+bit-portability knowingly.
 
 **Decision record — the honest zero-copy claim (column-group arena
 considered and set aside).** LAPACK wants column-major matrices in one
@@ -820,10 +859,10 @@ noise-floor accuracy cost; adopting it needs a sequence-shaped window
 seam in the executor, which is not built, and any adoption must keep
 `window_numerics_guard` green.
 
-## Batch, not per-row, for Lua and BLAS/LAPACK calls
+## Batch, not per-row, for Lua and linear-algebra calls
 
-Every call from the query executor into `compute-lua`, `compute-blas`, or
-`compute-blas` should operate on a whole column or window per call, not
+Every call from the query executor into `compute-lua` or
+`compute-linalg` should operate on a whole column or window per call, not
 element-by-element. Per-row calls throw away the entire performance
 rationale for pairing a columnar engine with these compute layers. If an API
 makes per-row calls the easy/obvious way to use it, that's a bug in the API
@@ -839,7 +878,7 @@ and its accessors are implemented on the Rust side, so no bytes are
 copied. Stated precisely, in the same spirit as the compute-split's
 zero-copy record above: *access* is zero-copy, but each element read is
 a metamethod dispatch rather than a compiled raw load. The curated
-curated `compute-blas` and engine ops are exposed to scripts as registered
+`compute-linalg` and engine ops are exposed to scripts as registered
 functions operating over those same views — sharing buffers, not
 copying between them. Lua 5.4's numeric model — one number type with a
 64-bit integer subtype and a 64-bit float subtype — is exactly TallyDB's
@@ -885,7 +924,7 @@ silently misses it. Those systems carry data *as language values*, so
 every field access meets the sentinel and its footguns. TallyDB does not:
 columns cross as zero-copy views over engine buffers, and compute is
 batch, not per-row. Null-aware batch ops (`v:sum()`), an out-of-band
-validity view (`v:mask()`), and the curated BLAS ops consume
+validity view (`v:mask()`), and the curated compute ops consume
 `(buffer, validity)` engine-side and never materialize the sentinel. The
 footguns are real but confined to the discouraged manual per-element
 path; the common path never meets them. A sentinel is the faithful
@@ -1019,7 +1058,8 @@ cross-checkably — and if it proves hot, promote it to a curated native
 op to make it *fast*. That is the pattern `regr_slope`, `covar_pop`,
 `corr`, and `eigen_max` already followed. Interpreter speed is a
 comfort, not a foundation: the engine's speed lives in columnar storage
-and pruning, BLAS/LAPACK, and the batch calling convention above, none
+and pruning, the curated native ops, and the batch calling convention
+above, none
 of which pass through the interpreter's inner loop.
 
 **Decision record — interpreter and binding (2026-07-24).** Two
@@ -1084,15 +1124,18 @@ each other rather than being separate decisions.
 
 Native and WASM builds won't be bit-identical by default — floating-point
 addition isn't associative, and different SIMD widths / FMA usage change
-summation order. We're not solving full native/WASM bit-identity now; that's
-future work once a WASM build exists. But it's cheap to build toward:
-`blas.wasm` already defers fused-FMA variants specifically to preserve
-determinism, and native OpenBLAS built from source with `TARGET=SANDYBRIDGE`
-forces pre-FMA kernels (AVX, no FMA) while staying fast on essentially any
-x86_64 CPU from 2011 onward — meaningfully faster than the more conservative
-`TARGET=NEHALEM` (SSE-only) for the same determinism guarantee. There's no
-off-the-shelf "non-FMA" package — it's a build-time `TARGET=` decision, not
-a switch, and a known low-effort one to make when it's actually needed.
+summation order. We're not solving full native/WASM bit-identity now; the
+portability *standard* (bit-exact, or bounded-difference, and over which
+ops) is set when M4 starts. But the ground is mostly already held: every
+closed-form window statistic and the `dot` kernel fix their operation
+order in source — plain Rust loops, no runtime dispatch — so their
+results are bit-identical across CPUs and targets by construction. The
+two known holes, tracked rather than solved: faer's matrix kernels
+dispatch SIMD at runtime and may round differently across CPU
+generations (today they sit on no query path — the exposure begins if a
+multi-parameter op adopts them); and `eigen_max` calls `hypot`, whose
+last bit is libm-implementation-specific — switching to
+`sqrt(a² + b²)` is a one-line fix to make when the standard is set.
 
 ## How we test this repository
 
@@ -1119,10 +1162,11 @@ lists, corpus entries — belong with the tests, not in this file.
 3. **Deterministic where promised.** Same seeded input, same pinned
    compute backend → bit-identical segment bytes and result buffers,
    checked against committed goldens. Storage bytes are promised
-   backend-independent; `f64` results are promised per the pinned non-FMA
-   OpenBLAS build (see *Numerical consistency*). A change that moves those
-   bits is a behavioral change, not a refactor — re-blessing the goldens
-   is part of its review.
+   backend-independent; `f64` results are promised for the source-fixed
+   paths — the closed-form window statistics and `dot` — and not yet for
+   faer's matrix kernels (see *Numerical consistency*). A change that
+   moves those bits is a behavioral change, not a refactor — re-blessing
+   the goldens is part of its review.
 4. **Meets its own spec** where no reference exists — `storage-lite`'s
    tests are the spec (see the reference map).
 
@@ -1132,7 +1176,7 @@ lists, corpus entries — belong with the tests, not in this file.
 |---|---|---|
 | `query-lite` SQL semantics | DuckDB (primary) / DataFusion (secondary) | independent oracle |
 | `arrow-lite` layout + C Data Interface | arrow-rs / PyArrow round-trips, dev-only | independent oracle |
-| compute seam (our calls into BLAS/LAPACK) | NumPy/SciPy on the same inputs | independent oracle |
+| compute seam (curated ops and kernels) | NumPy/SciPy on the same inputs | independent oracle |
 | determinism (storage bytes; pinned-backend results) | committed goldens | prior output |
 | `storage-lite` behavior (append, compaction, tombstones) | its own spec-tests | none — tests are the spec |
 
@@ -1194,8 +1238,8 @@ tallydb/
                     #   numeric-or-key as a hard schema rule
     compute-lua/    # Lua scripting behind a trait; vendored PUC Lua 5.4,
                     #   hand-rolled bindings (lua.wasm, also 5.4, later)
-    compute-blas/   # multiplication-class BLAS behind a trait; system BLAS
-                    #   via FFI for now (blas.wasm later)
+    compute-linalg/ # multiplication-class kernels behind a trait; pure
+                    #   Rust (faer + a source-fixed dot), wasm32-ready
     corpus/         # dev-only: the seeded synthetic generators of "The
                     #   corpus" above; measurement and differential-test
                     #   data, never linked by the engine
@@ -1225,8 +1269,8 @@ after that the rest is a wide front, and the ordering below is a
    row id, per-segment dictionaries; see *Storage* above.)
 3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
    once `storage-lite` is stable enough to query.
-4. `compute-lua` / `compute-blas` — native backends
-   (vendored Lua 5.4, OpenBLAS, LAPACK); can be developed in parallel with
+4. `compute-lua` / `compute-linalg` — compute backends
+   (vendored Lua 5.4, faer); can be developed in parallel with
    `query-lite` once `arrow-lite`'s buffer format is stable, since they
    consume it directly.
 5. `engine` — last, since it's the integration point for everything above.
