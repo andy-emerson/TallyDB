@@ -48,3 +48,5 @@ jobs:
         run: python3 crates/engine/tests/m2_mutation_oracle.py target/debug/libengine.so
       - name: M2.4 differential harness — generated queries vs DuckDB (issue #36)
         run: python3 crates/engine/tests/m2_differential_oracle.py target/debug/libengine.so
+      - name: M2.7 Lua-window oracle — NumPy differential (issue #41)
+        run: python3 crates/engine/tests/m2_lua_window_oracle.py target/debug/libengine.so

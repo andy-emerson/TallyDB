@@ -260,6 +260,91 @@ pub unsafe extern "C" fn tallydb_corpus_query_stream(
     }
 }
 
+/// The Lua-window family's frame: 9 preceding + current = 10 rows
+/// (deliberately different from the M1 regression window, so the two
+/// oracles cannot mask each other).
+const LUA_PRECEDING: usize = 9;
+
+/// The Lua-window family's frame size, so the oracle script never
+/// hard-codes it out of sync.
+#[no_mangle]
+pub extern "C" fn tallydb_lua_window_preceding() -> u64 {
+    LUA_PRECEDING as u64
+}
+
+/// The Lua-window oracle family (M2.7): four application-registered
+/// kernels — a pure-Lua MAD, a kernel calling the BLAS `dot` host
+/// function, an `I64`-declared count, and a kernel that returns `NULL`
+/// on short windows — run as partitioned SQL windows over the M1
+/// fixture (persistent, reopened from disk, multi-segment), exporting
+/// inputs and outputs together. The oracle script re-derives every
+/// window with NumPy and diffs.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
+    let mut table = fixture_table();
+    table
+        .register_lua_window(
+            "lua_mad",
+            &["x"],
+            "local n = #x\n\
+             local mean = 0.0\n\
+             for i = 1, n do mean = mean + x[i] end\n\
+             mean = mean / n\n\
+             local mad = 0.0\n\
+             for i = 1, n do mad = mad + math.abs(x[i] - mean) end\n\
+             return mad / n",
+            ColumnType::F64,
+        )
+        .expect("lua_mad registers");
+    table
+        .register_lua_window("lua_wdot", &["y", "x"], "return dot(y, x)", ColumnType::F64)
+        .expect("lua_wdot registers");
+    table
+        .register_lua_window(
+            "lua_npos",
+            &["x"],
+            "local n = 0\nfor i = 1, #x do if x[i] > 5.0 then n = n + 1 end end\nreturn n",
+            ColumnType::I64,
+        )
+        .expect("lua_npos registers");
+    table
+        .register_lua_window(
+            "lua_spread",
+            &["x"],
+            "if #x < 3 then return NULL end\n\
+             local lo, hi = x[1], x[1]\n\
+             for i = 2, #x do\n\
+               local v = x[i]\n\
+               if v < lo then lo = v end\n\
+               if v > hi then hi = v end\n\
+             end\n\
+             return hi - lo",
+            ColumnType::F64,
+        )
+        .expect("lua_spread registers");
+    let frame = format!(
+        "OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN {LUA_PRECEDING} PRECEDING \
+         AND CURRENT ROW)"
+    );
+    let sql = format!(
+        "SELECT ts, sym, x, y, \
+         lua_mad(x) {frame} AS mad, \
+         lua_wdot(y, x) {frame} AS wdot, \
+         lua_npos(x) {frame} AS npos, \
+         lua_spread(x) {frame} AS spread \
+         FROM trades"
+    );
+    match table.query_stream(&sql) {
+        // SAFETY: the caller (the oracle script) provides a valid,
+        // writable destination struct.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("lua-window fixture query failed: {error}"),
+    }
+}
+
 /// An open benchmark context: one prebuilt table, so the timed calls
 /// measure query + export only — never fixture construction.
 pub struct BenchContext {
