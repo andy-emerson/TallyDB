@@ -34,7 +34,7 @@ use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression}
 use arrow_lite::ColumnType;
 use compute_blas::{BlasBackend, NativeBlas};
 use compute_lapack::NativeLapack;
-use compute_lua::{ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
+use compute_lua::{Chunk, ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
@@ -115,13 +115,7 @@ fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
         ("corr", PairKind::Corr),
         ("eigen_max", PairKind::EigenMax),
     ] {
-        state.register_host_function(
-            name,
-            Box::new(CuratedOp(PairStatistic {
-                backend: lapack,
-                kind,
-            })),
-        )?;
+        state.register_host_function(name, Box::new(CuratedOp(PairStatistic { kind })))?;
     }
     Ok(())
 }
@@ -129,11 +123,11 @@ fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
 /// An application-registered Lua window kernel behind the
 /// `WindowAggregate` seam.
 pub(crate) struct LuaWindow {
-    /// The interpreter, serialized per the concurrency note above.
-    state: Mutex<LuaState>,
-    /// The kernel source; compiled per call, syntax-checked once at
-    /// registration.
-    chunk: String,
+    /// The interpreter and its compiled kernel, serialized per the
+    /// concurrency note above. The chunk is compiled once at
+    /// registration and called per window — parsing per frame is the
+    /// dominant cost of a script kernel, and it belongs to neither.
+    state: Mutex<(LuaState, Chunk)>,
     /// Positional argument names, bound as globals for each call.
     parameters: Vec<CString>,
     /// The declared output type (F2): `F64` or `I64`, fixed at
@@ -180,10 +174,11 @@ impl LuaWindow {
         }
         let mut state = LuaState::new()?;
         install_curated_ops(&mut state)?;
-        state.check(chunk)?; // syntax errors surface here, not mid-query
+        // Compiling here is both the loud-early syntax check and the
+        // per-window saving: queries call the compiled function.
+        let compiled = state.compile(chunk)?;
         Ok(LuaWindow {
-            state: Mutex::new(state),
-            chunk: chunk.to_owned(),
+            state: Mutex::new((state, compiled)),
             parameters: names,
             output,
         })
@@ -200,10 +195,11 @@ impl WindowAggregate for LuaWindow {
     }
 
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .map_err(|_| "lua window interpreter poisoned".to_owned())?;
+        let (state, chunk) = &mut *guard;
         let views: Vec<(&CStr, ColumnView<'_>)> = self
             .parameters
             .iter()
@@ -223,7 +219,7 @@ impl WindowAggregate for LuaWindow {
             ColumnType::I64 => ReturnType::I64,
             _ => ReturnType::F64, // Key refused at registration
         };
-        match state.eval_scalar(&self.chunk, &views, declared)? {
+        match state.eval_scalar(chunk, &views, declared)? {
             ScalarValue::F64(value) => Ok(Some(value)),
             ScalarValue::I64(value) => {
                 // The executor carries window results as f64 and casts

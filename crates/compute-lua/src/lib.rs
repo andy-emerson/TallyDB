@@ -71,7 +71,7 @@ mod values;
 
 pub use host::HostFunction;
 pub use log::LogSink;
-pub use state::LuaState;
+pub use state::{Chunk, LuaState};
 pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 
 // The batch calling convention (whole columns per call) and the F1–F4

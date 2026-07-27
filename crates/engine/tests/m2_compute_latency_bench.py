@@ -31,9 +31,10 @@ The spread runs cheap -> heavy, plus the interpreter-only case:
   lua_mad     pure-Lua kernel (no native op — the promotion ladder's
               first rung)              peer: vectorized NumPy MAD
   regr_slope  native least squares     peer: DuckDB's regr_slope window
-  eigen_max   native dsyev per window  peer: NumPy closed-form 2x2
-              eigenvalue from rolling moments (the strongest vectorized
-              rewrite of the same statistic)
+              (LAPACK dgels per window)      (incremental running moments)
+  eigen_max   native closed-form 2x2   peer: NumPy closed-form 2x2 from
+              eigenvalue per window         rolling moments (same math,
+                                            vectorized over the column)
 
 Usage: m2_compute_latency_bench.py [libengine.so] [rows] [iters]
 Defaults: target/debug/libengine.so, 20000 rows, 3 iterations (min
@@ -215,7 +216,7 @@ def main():
     elapsed, values = engine(f"SELECT eigen_max(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = peer(lambda px, py: peer_eigen(px, py))
     check("eigen_max", values, peer_values, 1e-6, 1e-9)
-    results.append(("eigen_max (dsyev)", "NumPy closed-form", elapsed, peer_time))
+    results.append(("eigen_max (closed form)", "NumPy closed-form", elapsed, peer_time))
 
     # ---- the latency shape: one window over the latest rows ----
     # The bulk sweep above amortizes the round trip over n windows; a

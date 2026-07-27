@@ -236,21 +236,18 @@ impl Table {
         registry.register(
             "covar_pop",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::CovarPop,
             }),
         );
         registry.register(
             "corr",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::Corr,
             }),
         );
         registry.register(
             "eigen_max",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::EigenMax,
             }),
         );
@@ -717,7 +714,6 @@ pub(crate) enum PairKind {
 /// Two-column window statistics over `(y, x)`, sharing one accumulation
 /// of the population moments.
 pub(crate) struct PairStatistic {
-    pub(crate) backend: NativeLapack,
     pub(crate) kind: PairKind,
 }
 
@@ -756,15 +752,19 @@ impl WindowAggregate for PairStatistic {
                 if n < 2 {
                     return Ok(None);
                 }
-                if !self.backend.supports(Op::SymmetricEigen) {
-                    return Err("symmetric eigen is unavailable on this compute backend".to_owned());
-                }
-                let covariance = [var_y, covar, covar, var_x];
-                let (eigenvalues, _) = self
-                    .backend
-                    .symmetric_eigen(ColMajor::new(&covariance, 2, 2))
-                    .map_err(|error| error.to_string())?;
-                Ok(Some(eigenvalues[1])) // ascending: the last is largest
+                // The largest eigenvalue of a symmetric 2 × 2 in closed
+                // form: λ_max = t + r for half-trace t = (var_y + var_x)/2
+                // and radius r = √(((var_y − var_x)/2)² + covar²). Both
+                // terms are non-negative (variances are), so the sum
+                // carries no cancellation — this is the well-conditioned
+                // half of the quadratic (λ_min, the differenced one, is
+                // not computed here). A general eigensolver on a 2 × 2 is
+                // dominated by its own call overhead; see DESIGN.md, the
+                // curated-op cost record.
+                let half_trace = (var_y + var_x) / 2.0;
+                let half_gap = (var_y - var_x) / 2.0;
+                let radius = half_gap.hypot(covar);
+                Ok(Some(half_trace + radius))
             }
         }
     }
