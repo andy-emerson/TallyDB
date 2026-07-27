@@ -42,8 +42,10 @@
 //! - **Key columns:** `u32` dictionary codes per row (u32 only — no u64
 //!   variant) plus an interning table of distinct values.
 //! - **Views:** zero-copy slices (offset + length) over any column —
-//!   Arrow-native offsets. This is what lets window functions feed compute
-//!   with pointer arithmetic instead of a copy per window.
+//!   Arrow-native offsets. The general slicing surface of the format;
+//!   note the engine's window executor currently feeds compute through
+//!   raw value slices directly, so nothing above this crate calls the
+//!   view types today (kept as format surface, on the record).
 //! - **Logical-type annotations:** an optional tag (`Timestamp(ns)`,
 //!   `Decimal64(scale)`) over the same physical `i64` buffer, consulted
 //!   only at export, so ecosystem consumers see datetimes and decimals

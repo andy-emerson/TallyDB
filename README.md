@@ -193,7 +193,7 @@ self-describing, CRC-checked, deterministic on-disk format whose bytes
 are locked by a committed golden: per-column codec tags with
 delta-of-delta on the ordered ordering key (measured on the checked-in
 corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
-zone maps awaiting query-time pruning, and reopen that verifies schema,
+zone maps (driving query-time pruning), and reopen that verifies schema,
 checksums, and row-id contiguity. Durability is a sidecar write-ahead
 log with sync levels (default: group commit every 100ms, measured at
 ~1µs added per append; `Full` for a zero loss window; `Off` restoring

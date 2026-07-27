@@ -95,8 +95,8 @@ intermediate results, and query outputs are always numeric or key; a bare
 string never exists in the engine. That is more permissive than it sounds:
 
 - **String *predicates* on key columns are in scope.** `WHERE symbol =
-  '...'` / `IN (...)` are built; `WHERE name LIKE '%Bank%'` and regex
-  matching are in scope but not yet implemented (rejected loudly until
+  '...'` / `IN (...)` / `WHERE name LIKE '%Bank%'` are built; regex
+  matching is in scope but not yet implemented (rejected loudly until
   then — a todo, not a silent gap). All consume the interned strings and
   emit a *row selection*, not a string, so they don't need a third type.
   Because keys are dictionary-encoded, such a predicate is evaluated once
@@ -162,8 +162,8 @@ type — and (b) no general-purpose cost-based optimizer.
 
 | SQL capability | In / Out | Bounding invariant |
 |---|---|---|
-| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE` | **in** (built) | — |
-| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
+| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE`, scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE` on keys, `NULLS FIRST`/`LAST`, `CREATE TABLE`/`INSERT` | **in** (built) | — |
+| regex on keys (#57), `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
 | `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
 | joins no structural fact licenses — neither side small enough to materialize, inputs not co-ordered on the join key, join-*order* search | **out** | (b): would need a cost-based optimizer (see *the join constraint, completed*) |
 | a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
@@ -257,8 +257,8 @@ into the engine*.
 > (they put absence *on* the number line for sorting while predicates
 > keep it off — one seam, two answers), and IEEE-strict predicates
 > (NaN invisible to every operator but `<>` while sorting as a value —
-> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is an
-> additive todo. The choice was made from the numeric-or-key thesis,
+> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is built
+> (M3.4). The choice was made from the numeric-or-key thesis,
 > not oracle convenience: where the SQL standard leaves semantics
 > implementation-defined, the choice is ours and the differential
 > harness normalizes.
@@ -537,11 +537,11 @@ rebuild, being wrong about the additive one costs a later layer.
 | Write | **Refused**: cheap online single-row append is the design center | — | n/a |
 | Transaction | Cut: submitted units only — no `BEGIN`/`COMMIT`/`ROLLBACK`, no session state (contract below) | Work arrives as single statements | Invasive |
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
-| Concurrency | Single writer, concurrent snapshot readers (facade currently overcuts to single-accessor — corrective work tracked, pre-M3) | One writer at a time is enough | Additive to correct |
+| Concurrency | Single writer, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds | One writer at a time is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
 | Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
-| Durability | Not cut: publish is atomic **and synced** (power-loss durable at the flush); cadence policy open as #43 | — | — |
+| Durability | Not cut: publish is atomic **and synced**, and the write buffer sits behind a sidecar WAL with sync levels (#43, ruled on measurement: default group commit ≤ 100ms, `Full` for a zero loss window, `Off` restoring the flush boundary) | — | — |
 
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
@@ -555,8 +555,8 @@ frozen segments (`Store::snapshot` appends the buffer's rows to the
 segment sequence; the contract is that a snapshot covers exactly the rows
 appended before the call), so a row appended microseconds ago is visible
 to the very next query. Freeze/flush is the *durability and layout*
-boundary — a fresh row is queryable but not power-loss durable until flush
-(cadence is #43) — never a visibility gate. So an application that ingests
+boundary for segments; power-loss durability of the newest rows is the
+WAL's, at the configured sync level (#43) — neither is a visibility gate. So an application that ingests
 a live feed and recomputes over it in the same process — real-time risk,
 live P&L, a moving regression on the newest window — is squarely in scope,
 and is the compute-without-copying sweet spot: socket → storage → SQL →
@@ -607,17 +607,18 @@ mutations after the call are invisible to it (test:
 `snapshot_is_isolated_from_later_appends`). One guarantee — snapshot
 isolation at statement granularity — no isolation-level menu.
 
-*One consistency obligation for the concurrent-reader work (#51):* a
-statement that reads more than one table — today only a join, which
-snapshots the fact table and each dimension separately
-(`table.rs:311-312`) — takes multiple `snapshot()` calls at distinct
-instants. This is sound under the current single-writer model because
-no writer can interleave between them, but the moment concurrent
-writers exist (#51) those inputs could come from different instants —
-a cross-table torn read. The snapshot-handle design must give a
-multi-input statement one consistent snapshot epoch across all inputs;
-the single-`snapshot()`-per-input mechanism does not survive #51
-unchanged.
+*Cross-table consistency, as shipped (#51, M3.1):* a statement that
+reads more than one table — today only a join, which snapshots the
+fact table and each dimension separately — takes multiple `snapshot()`
+calls at distinct instants. Through a `Database` handle this is sound:
+the writer needs `&mut` on the same handle, so no write interleaves
+mid-statement. The detached reader handles are **single-table by
+scope** (`TableSnapshot` serves `SELECT` over its one table; joins
+resolve only through a `Database`), so no shipped path can take a
+cross-table torn read — and no cross-table snapshot epoch is promised.
+#51 kept the single writer; concurrent *writers* never arrived. If a
+future surface lets detached readers span tables, the one-epoch
+obligation recorded here revives with it.
 
 **Truth values — decided (2026-07-25).** There is no boolean type and
 none is coming. A flag column is `i64` in {0, 1} — which is the right
@@ -1358,10 +1359,10 @@ tallydb/
                     #   buffers, u32-dictionary keys, C Data Interface export;
                     #   arrow-rs/PyArrow as dev-only round-trip oracles)
     storage-lite/   # append-optimized segments partitioned on the ordering
-                    #   key; compaction; zone maps; I/O behind a backend
-                    #   trait (native = a directory of files; mmap/ranged
-                    #   reads when pruning or profiling asks; OPFS/WASM
-                    #   backend can be added later)
+                    #   key; compaction; zone maps; the WAL; I/O behind a
+                    #   backend trait (native = a directory of files;
+                    #   decode-into-memory is the owned working-set cut —
+                    #   see *What v1 cuts*; OPFS/WASM backend later)
     query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
@@ -1370,6 +1371,8 @@ tallydb/
                     #   hand-rolled bindings (lua.wasm, also 5.4, later)
     compute-linalg/ # multiplication-class kernels behind a trait; pure
                     #   Rust (faer + a source-fixed dot), wasm32-ready
+    shell/          # the tallydb console binary: rustyline + csv live here,
+                    #   the engine stays dependency-clean (#39's separation)
     corpus/         # dev-only: the seeded synthetic generators of "The
                     #   corpus" above; measurement and differential-test
                     #   data, never linked by the engine
@@ -1413,7 +1416,7 @@ on stored buffers with no copy → Arrow out — rather than leaving it for
 last. Building the storage engine beautifully while the compute story slips
 just yields "another embeddable TSDB" and misses the point.
 
-Don't try to scaffold all seven crates' real implementations in one pass.
+Don't try to scaffold all eight crates' real implementations in one pass.
 
 ## Who we write for
 

@@ -1,13 +1,16 @@
 //! Parsing and lowering: SQL text → logical plans.
 //!
 //! sqlparser-rs parses (taken as-is, pinned); the subsetting happens
-//! here, in what this lowering accepts. Three statements lower today:
+//! here, in what this lowering accepts. Five statements lower today:
 //!
 //! ```sql
-//! SELECT <columns | window calls | GROUP BY keys + aggregates>
+//! SELECT [DISTINCT] <columns | scalar expressions | CASE | window calls
+//!                    | GROUP BY keys + aggregates>
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
-//! [WHERE predicate] [GROUP BY keys]
-//! [ORDER BY column [DESC]] [LIMIT n] [OFFSET n];
+//! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
+//! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
+//! CREATE TABLE t (col BIGINT|DOUBLE|KEY [NOT NULL|ORDERING KEY], ...);
+//! INSERT INTO t [(columns)] VALUES (literals), ...;
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];
 //! ```
@@ -16,11 +19,10 @@
 //! window calls are `fn(args) OVER ([PARTITION BY key] ORDER BY
 //! ordering_key ROWS BETWEEN n PRECEDING AND CURRENT ROW)`; aggregates
 //! are `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over plain columns). Everything
-//! else — joins, subqueries, HAVING, DISTINCT, other frame shapes, SET
-//! or projection expressions beyond literals and columns — is rejected
-//! with a message naming what was rejected. The rejection is scope
-//! honesty, not a parser limit: those features arrive through this same
-//! lowering as M2 proceeds.
+//! else — extra joins, subqueries, CTEs, other frame shapes — is
+//! rejected with a message naming what was rejected. The rejection is
+//! scope honesty, not a parser limit: what the inclusion principle
+//! admits arrives through this same lowering.
 
 use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;
@@ -385,7 +387,6 @@ pub enum Statement {
     Delete(DeletePlan),
 }
 
-/// Parses and lowers one SQL statement.
 /// One column of a `CREATE TABLE` plan.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ColumnSpec {

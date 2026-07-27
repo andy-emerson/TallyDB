@@ -78,7 +78,11 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<BTreeSet<u64>, FormatError> {
     Ok(ids)
 }
 
-/// The same IEEE CRC-32 the segment format uses.
+/// IEEE CRC-32 (polynomial `0xEDB8_8320`). Note this is *not* the
+/// segment format's checksum — that is CRC-32**C** (Castagnoli, see
+/// `format.rs`). Both are golden-locked on disk, so each stays what it
+/// shipped as; the difference is recorded here so nobody "unifies"
+/// them into a format break.
 fn crc32(bytes: &[u8]) -> u32 {
     const TABLE: [u32; 256] = {
         let mut table = [0u32; 256];

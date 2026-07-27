@@ -3,10 +3,9 @@
 //!
 //! These are the pieces [`crate::store::Store`] composes into a table's
 //! storage — the buffer validates and accumulates arriving rows, the
-//! segment is the immutable unit readers see. Still ahead, in build
-//! order: the on-disk format and I/O backend trait (M2.2 — designed
-//! together, so the trait doesn't freeze memory-only assumptions), then
-//! tombstones and compaction (M2.3).
+//! segment is the immutable unit readers see. The layers above (the
+//! on-disk format, the backend trait, tombstones, compaction, the WAL)
+//! are built; see the crate docs for the full scope.
 //!
 //! What this layer holds to:
 //!

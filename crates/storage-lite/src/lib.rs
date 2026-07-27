@@ -81,14 +81,19 @@
 //! ([`codec`], measurement cited there), persistence with
 //! reopen-and-verify behind the backend trait ([`io`]), row-id
 //! tombstones with append-only delete logs ([`tombstone`]), live-masked
-//! snapshots, and crash-safe generational compaction that resolves
+//! snapshots, crash-safe generational compaction that resolves
 //! tombstones, restores order, and reassigns contiguous row ids
-//! ([`store::Store::compact`]). Durability boundary:
-//! [`store::Store::flush`].
+//! ([`store::Store::compact`]), detached concurrent readers
+//! ([`store::StoreReader`], #51), and the sidecar write-ahead log with
+//! sync levels ([`store::WalSync`], #43) — crash-tested down to
+//! torn-record and stale-generation windows. Durability: the WAL at
+//! its configured sync level guards the write buffer;
+//! [`store::Store::flush`] makes segments; under `WalSync::Off` the
+//! flush is the boundary. (Zone maps feed query-time pruning in
+//! `query-lite`.)
 //!
-//! Still ahead: zone-map pruning at query time (with WHERE, M2.4) and
-//! the general-`f64` codec (#30, deferred by ruling — uncompressed
-//! behind the tag is the shipped interim answer).
+//! Still ahead: the general-`f64` codec (#30, deferred by ruling —
+//! uncompressed behind the tag is the shipped interim answer).
 //!
 //! ## Explicitly NOT in scope for this crate
 //! No SQL, no query planning — that's `query-lite`. No schema-level

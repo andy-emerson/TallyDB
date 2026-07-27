@@ -4,9 +4,8 @@
 //! routes each query to the table it names. It adds no storage or
 //! execution machinery of its own — each table still owns its store and
 //! its registered compute — but it is the shape applications program
-//! against (`create_table` / `append` / `query`), and it is where
-//! star-schema joins will resolve their dimension tables when they arrive
-//! (M2.5).
+//! against (`add_table` / `append` / `query` / `mutate`), and it is
+//! where star-schema joins resolve their dimension tables.
 
 use crate::table::{EngineError, Table};
 use arrow_lite::{ArrowArrayStream, Schema};
@@ -71,7 +70,6 @@ impl Database {
         self.tables.get(name)
     }
 
-    /// The named table, mutably (for appends through the table handle).
     /// A reader handle for `table` — see [`Table::reader`]: reader
     /// threads mint point-in-time snapshots from it while this database
     /// handle keeps writing.
@@ -86,6 +84,8 @@ impl Database {
         self.tables.keys().cloned().collect()
     }
 
+    /// The named table, mutably (for appends and registration through
+    /// the table handle).
     pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
         self.tables.get_mut(name)
     }

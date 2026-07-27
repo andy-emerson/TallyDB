@@ -232,8 +232,12 @@ pub enum WalSync {
     /// from an offset after a crash.
     Off,
     /// Append every row to the log, sync when this much time has
-    /// passed since the last sync (in-thread group commit): a crash
-    /// loses at most this window. The default is 100 ms.
+    /// passed since the last sync (in-thread group commit): under a
+    /// steady append stream, a crash loses at most this window of
+    /// appends. Precisely: the sync rides the next append after the
+    /// interval elapses, so a tail written and then left idle stays
+    /// unsynced (OS-buffered — it survives a process crash, not power
+    /// loss) until the next append or flush. The default is 100 ms.
     Group(std::time::Duration),
     /// Sync every append: zero loss window, measured ~670× slower per
     /// append on ordinary disks. For the caller who insists.
