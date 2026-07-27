@@ -48,3 +48,27 @@ jobs:
         run: python3 crates/engine/tests/m2_mutation_oracle.py target/debug/libengine.so
       - name: M2.4 differential harness — generated queries vs DuckDB (issue #36)
         run: python3 crates/engine/tests/m2_differential_oracle.py target/debug/libengine.so
+      - name: M2.7 Lua-window oracle — NumPy differential (issue #41)
+        run: python3 crates/engine/tests/m2_lua_window_oracle.py target/debug/libengine.so
+      - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
+        run: cargo test -p compute-lua --features apicheck
+
+  # The C boundary under the sanitizers: the vendored interpreter and the
+  # binding's C accessors compiled with ASan (leaks included — the
+  # longjmp-over-destructor discipline is exactly a leak generator when
+  # violated) and UBSan in trap mode. Nightly because sanitizers are -Z
+  # flags. The remaining #41 hardening — ltests.c torture and the official
+  # Lua suite over the vendored build — needs files this repo does not
+  # carry (the vendor tree is deliberately the embedding set, no lua.c);
+  # they land when the suite can be vendored with provenance.
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain (sanitizers are -Z flags)
+        run: rustup toolchain install nightly --profile minimal
+      - name: ASan + UBSan over compute-lua (vendored C included)
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          CFLAGS: -fsanitize=address -fsanitize=undefined -fsanitize-undefined-trap-on-error
+        run: cargo +nightly test -p compute-lua --features apicheck --target x86_64-unknown-linux-gnu

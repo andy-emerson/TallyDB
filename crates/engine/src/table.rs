@@ -4,9 +4,11 @@
 //! A [`Table`] owns the whole pipeline for its rows: schema definition
 //! (numeric-or-key and the declared `NOT NULL` ordering key, enforced at
 //! definition time), one-row-at-a-time ingest through `storage-lite`'s
-//! multi-segment [`Store`], SQL through `query-lite`, and the
-//! LAPACK-backed rolling regressions registered as the window functions
-//! `regr_slope(y, x)` / `regr_intercept(y, x)`. Appends and queries
+//! multi-segment [`Store`], SQL through `query-lite`, the LAPACK-backed
+//! rolling regressions registered as the window functions
+//! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
+//! registered Lua window kernels via [`Table::register_lua_window`]
+//! (the `script` module). Appends and queries
 //! interleave freely: a query runs over a point-in-time snapshot of the
 //! store, and appends after it never disturb the result. Results leave as
 //! a [`QueryOutput`] — one batch per segment — or as an
@@ -50,6 +52,9 @@ pub enum EngineError {
     DuplicateTable(String),
     /// The declared ordering key is not a column of the schema.
     UnknownOrderingKey(String),
+    /// Registering a script-backed function failed (bad kernel syntax,
+    /// unusable parameter name, unsupported output type).
+    Script(String),
 }
 
 impl fmt::Display for EngineError {
@@ -65,6 +70,7 @@ impl fmt::Display for EngineError {
             EngineError::UnknownOrderingKey(name) => {
                 write!(f, "ordering key '{name}' is not a column")
             }
+            EngineError::Script(message) => write!(f, "script: {message}"),
         }
     }
 }
@@ -359,6 +365,87 @@ impl Table {
         Ok(self.store.compact()?)
     }
 
+    /// Registers a Lua kernel as a SQL window function on this table —
+    /// the Lua-in-SQL window slot (#41). `parameters` names the frame's
+    /// column arguments, positionally, as the globals the kernel reads
+    /// them through (zero-copy views, oldest row first); the kernel
+    /// returns one number per frame, or `NULL`. `output` declares the
+    /// result column's type (F2): `F64` or `I64` — never inferred from
+    /// what a call returns. Everything that can fail confusingly at
+    /// query time fails loudly here instead: kernel syntax, unusable
+    /// parameter names, a key-typed output.
+    ///
+    /// Kernels can call the curated native ops over the same views —
+    /// `dot(x, y)` (BLAS), `regr_slope(y, x)` / `regr_intercept(y, x)`,
+    /// `covar_pop(y, x)` / `corr(y, x)` / `eigen_max(y, x)` — the very
+    /// implementations the SQL windows run, sharing buffers with no
+    /// copy; each returns a number, or `NULL` where undefined.
+    ///
+    /// A registration under a built-in name shadows the built-in; a
+    /// second registration under the same name replaces the first.
+    ///
+    /// ```
+    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::{RowValue, Table};
+    ///
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("trades", schema, "ts").unwrap();
+    /// for i in 0..40 {
+    ///     table
+    ///         .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+    ///         .unwrap();
+    /// }
+    /// // Mean absolute deviation — a loop the built-ins don't cover.
+    /// table
+    ///     .register_lua_window(
+    ///         "mad",
+    ///         &["x"],
+    ///         "local n = #x\n\
+    ///          local mean = 0.0\n\
+    ///          for i = 1, n do mean = mean + x[i] end\n\
+    ///          mean = mean / n\n\
+    ///          local mad = 0.0\n\
+    ///          for i = 1, n do mad = mad + math.abs(x[i] - mean) end\n\
+    ///          return mad / n",
+    ///         ColumnType::F64,
+    ///     )
+    ///     .unwrap();
+    /// let output = table
+    ///     .query(
+    ///         "SELECT mad(x) OVER (ORDER BY ts ROWS BETWEEN 3 PRECEDING \
+    ///          AND CURRENT ROW) AS m FROM trades",
+    ///     )
+    ///     .unwrap();
+    /// // A ramp's full 4-row window deviates by exactly 1.0.
+    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    ///     &output.batches[0].columns()[0]
+    /// else {
+    ///     panic!("expected f64")
+    /// };
+    /// assert_eq!(m.values().as_slice()[0], 0.0); // one-row window
+    /// assert!(m.values().as_slice()[4..].iter().all(|&v| v == 1.0));
+    /// ```
+    pub fn register_lua_window(
+        &mut self,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+        output: ColumnType,
+    ) -> Result<(), EngineError> {
+        if !crate::script::is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let window = crate::script::LuaWindow::new(parameters, chunk, output)
+            .map_err(EngineError::Script)?;
+        self.registry.register(name, Arc::new(window));
+        Ok(())
+    }
+
     fn check_table(&self, named: &str) -> Result<(), EngineError> {
         if named != self.name {
             return Err(EngineError::WrongTable {
@@ -546,7 +633,7 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 
 /// Which coefficient of the per-window fit `y ≈ intercept + slope · x`
 /// an instance returns.
-enum RegressionOutput {
+pub(crate) enum RegressionOutput {
     Slope,
     Intercept,
 }
@@ -555,9 +642,9 @@ enum RegressionOutput {
 /// `compute-lapack` (QR via `dgels` today; decision #20 ruled
 /// QR-fast-path-plus-SVD-fallback, and the SVD side arrives with the M2
 /// work on that op).
-struct RollingRegression {
-    backend: NativeLapack,
-    output: RegressionOutput,
+pub(crate) struct RollingRegression {
+    pub(crate) backend: NativeLapack,
+    pub(crate) output: RegressionOutput,
 }
 
 impl WindowAggregate for RollingRegression {
@@ -614,7 +701,7 @@ impl WindowAggregate for RollingRegression {
 }
 
 /// Which pair statistic an instance computes.
-enum PairKind {
+pub(crate) enum PairKind {
     /// Population covariance of `(y, x)` — 0 for a single point,
     /// matching `covar_pop`.
     CovarPop,
@@ -629,9 +716,9 @@ enum PairKind {
 
 /// Two-column window statistics over `(y, x)`, sharing one accumulation
 /// of the population moments.
-struct PairStatistic {
-    backend: NativeLapack,
-    kind: PairKind,
+pub(crate) struct PairStatistic {
+    pub(crate) backend: NativeLapack,
+    pub(crate) kind: PairKind,
 }
 
 impl WindowAggregate for PairStatistic {
