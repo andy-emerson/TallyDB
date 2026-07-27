@@ -4,9 +4,11 @@
 //! A [`Table`] owns the whole pipeline for its rows: schema definition
 //! (numeric-or-key and the declared `NOT NULL` ordering key, enforced at
 //! definition time), one-row-at-a-time ingest through `storage-lite`'s
-//! multi-segment [`Store`], SQL through `query-lite`, and the
-//! LAPACK-backed rolling regressions registered as the window functions
-//! `regr_slope(y, x)` / `regr_intercept(y, x)`. Appends and queries
+//! multi-segment [`Store`], SQL through `query-lite`, the LAPACK-backed
+//! rolling regressions registered as the window functions
+//! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
+//! registered Lua window kernels via [`Table::register_lua_window`]
+//! (the `script` module). Appends and queries
 //! interleave freely: a query runs over a point-in-time snapshot of the
 //! store, and appends after it never disturb the result. Results leave as
 //! a [`QueryOutput`] — one batch per segment — or as an

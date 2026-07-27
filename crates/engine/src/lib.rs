@@ -30,11 +30,14 @@
 //! lower-level crates directly.
 //!
 //! ## Compute backend selection
-//! `compute-lua`, `compute-blas`, and `compute-lapack` are consumed here
-//! through their trait interfaces (see those crates), not through concrete
-//! types. Right now that means the native implementations (vendored Lua 5.4,
-//! native BLAS, native LAPACK) are the only ones that exist — but this crate should
-//! never hardcode that assumption. Select the concrete implementation with
+//! `compute-blas` and `compute-lapack` are consumed here through their
+//! trait interfaces (see those crates), not through concrete types;
+//! `compute-lua` is currently consumed as its concrete native state
+//! (its backend trait is extracted when the WASM backend starts — see
+//! that crate's docs). Right now the native implementations (vendored
+//! Lua 5.4, native BLAS, native LAPACK) are the only ones that exist —
+//! but this crate should never hardcode that assumption. Select the
+//! concrete implementation with
 //! `cfg(target_arch = "wasm32")` / a Cargo feature at the point where a
 //! concrete type is actually needed, not throughout this crate's logic. Route
 //! compute calls so that a backend reporting an op as unavailable (e.g. a
@@ -60,9 +63,14 @@ pub use query_lite::QueryOutput;
 pub use storage_lite::RowValue;
 pub use table::{EngineError, Table};
 
+// The Lua-in-SQL window slot is built: `Table::register_lua_window`
+// runs application-registered Lua kernels as SQL window functions
+// through the same seam as the curated LAPACK windows (the `script`
+// module; whole window per call, never per-row).
+//
 // TODO: expose compute-blas (multiplication-class) ops and the remaining
 //       compute-lapack ops as callable SQL functions, with
 //       backend-capability errors surfaced cleanly (not panics)
-// TODO: expose compute-lua as a callable-from-SQL scripting layer
-//       (batch calling convention — whole column/window per call, not
-//       per-row; see compute-lua's docs)
+// TODO: expose the curated native ops to Lua kernels over shared views
+//       (M2.7 increment D), and later the scalar-projection Lua slot
+//       (deferred: PlanItem is Column|WindowAgg only)
