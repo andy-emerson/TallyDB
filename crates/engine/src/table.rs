@@ -1279,3 +1279,301 @@ mod mutation_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod measure_incremental_windows {
+    //! The 3b A/B: **incremental** window moments against the shipped
+    //! **recompute-per-window** algorithm — speed *and* numerics, because
+    //! for this change accuracy is the whole question, not a footnote.
+    //!
+    //! All four pair statistics (`covar_pop`, `corr`, `eigen_max`, and a
+    //! regression slope) derive from one set of window moments, so a
+    //! single accumulator serves them all. The three algorithms under
+    //! test:
+    //!
+    //! - **A — recompute** (what ships): two passes per window, the
+    //!   second about the window's own means. O(n·w) work, and the most
+    //!   numerically stable arrangement available — the accuracy
+    //!   reference every other variant is judged against.
+    //! - **B — naive incremental**: keep raw `Σx, Σy, Σxx, Σyy, Σxy`;
+    //!   slide by adding the entering row and subtracting the leaving
+    //!   one; recover variance as `E[x²] − E[x]²`. O(n) work and the
+    //!   fastest thing possible — and the textbook cancellation trap
+    //!   (bug #45's shape) once the data carries an offset.
+    //! - **C — shifted incremental with re-baselining**: the same O(1)
+    //!   slide, but moments are kept about a shift `K` near the data, and
+    //!   the accumulator is rebuilt from scratch every `w` steps so
+    //!   rounding cannot accumulate across the whole column. Rebuilding
+    //!   every `w` steps costs one extra pass overall, so the total stays
+    //!   O(n).
+    //!
+    //! Run explicitly, in release:
+    //!
+    //! ```text
+    //! cargo test -p engine --release measure_3b -- --ignored --nocapture
+    //! ```
+
+    /// The four statistics one moment set yields, in the order reported.
+    #[derive(Clone, Copy, Default)]
+    struct Stats {
+        covar: f64,
+        corr: f64,
+        eigen_max: f64,
+        slope: f64,
+    }
+
+    /// Derives the statistics from centered moments (the shared tail of
+    /// every algorithm here, so differences are in the moments alone).
+    fn stats_from(var_y: f64, var_x: f64, covar: f64) -> Stats {
+        let corr = if var_y > 0.0 && var_x > 0.0 {
+            covar / (var_y * var_x).sqrt()
+        } else {
+            f64::NAN
+        };
+        let half_trace = (var_y + var_x) / 2.0;
+        let radius = ((var_y - var_x) / 2.0).hypot(covar);
+        Stats {
+            covar,
+            corr,
+            eigen_max: half_trace + radius,
+            slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
+        }
+    }
+
+    /// A — recompute per window, two-pass and centered (the shipped
+    /// arrangement, and the accuracy reference).
+    fn recompute(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        (0..y.len())
+            .map(|i| {
+                let lo = (i + 1).saturating_sub(w);
+                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
+                let n = wy.len() as f64;
+                let mean_y = wy.iter().sum::<f64>() / n;
+                let mean_x = wx.iter().sum::<f64>() / n;
+                let (mut vy, mut vx, mut cxy) = (0.0, 0.0, 0.0);
+                for (&yi, &xi) in wy.iter().zip(wx) {
+                    let (dy, dx) = (yi - mean_y, xi - mean_x);
+                    vy += dy * dy;
+                    vx += dx * dx;
+                    cxy += dy * dx;
+                }
+                stats_from(vy / n, vx / n, cxy / n)
+            })
+            .collect()
+    }
+
+    /// Running raw moments; `shift` is subtracted from every value as it
+    /// enters (zero for the naive variant).
+    #[derive(Default, Clone, Copy)]
+    struct Moments {
+        n: f64,
+        sy: f64,
+        sx: f64,
+        syy: f64,
+        sxx: f64,
+        sxy: f64,
+        ky: f64,
+        kx: f64,
+    }
+
+    impl Moments {
+        fn add(&mut self, yi: f64, xi: f64) {
+            let (dy, dx) = (yi - self.ky, xi - self.kx);
+            self.n += 1.0;
+            self.sy += dy;
+            self.sx += dx;
+            self.syy += dy * dy;
+            self.sxx += dx * dx;
+            self.sxy += dy * dx;
+        }
+
+        fn remove(&mut self, yi: f64, xi: f64) {
+            let (dy, dx) = (yi - self.ky, xi - self.kx);
+            self.n -= 1.0;
+            self.sy -= dy;
+            self.sx -= dx;
+            self.syy -= dy * dy;
+            self.sxx -= dx * dx;
+            self.sxy -= dy * dx;
+        }
+
+        fn stats(&self) -> Stats {
+            let (my, mx) = (self.sy / self.n, self.sx / self.n);
+            stats_from(
+                self.syy / self.n - my * my,
+                self.sxx / self.n - mx * mx,
+                self.sxy / self.n - my * mx,
+            )
+        }
+    }
+
+    /// B — naive incremental: raw moments, no shift, never rebuilt.
+    fn incremental_naive(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        let mut moments = Moments::default();
+        (0..y.len())
+            .map(|i| {
+                moments.add(y[i], x[i]);
+                if i >= w {
+                    moments.remove(y[i - w], x[i - w]);
+                }
+                moments.stats()
+            })
+            .collect()
+    }
+
+    /// C — shifted incremental, rebuilt every `w` steps about a shift
+    /// taken from the current window (so values stay small relative to
+    /// their own spread, and rounding cannot accumulate column-wide).
+    fn incremental_shifted(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        let mut moments = Moments::default();
+        let mut since_rebuild = usize::MAX; // force a build on the first row
+        (0..y.len())
+            .map(|i| {
+                if since_rebuild >= w {
+                    let lo = (i + 1).saturating_sub(w);
+                    moments = Moments {
+                        ky: y[i],
+                        kx: x[i],
+                        ..Moments::default()
+                    };
+                    for j in lo..=i {
+                        moments.add(y[j], x[j]);
+                    }
+                    since_rebuild = 0;
+                } else {
+                    moments.add(y[i], x[i]);
+                    if i >= w {
+                        moments.remove(y[i - w], x[i - w]);
+                    }
+                    since_rebuild += 1;
+                }
+                moments.stats()
+            })
+            .collect()
+    }
+
+    /// Worst relative difference against the reference, over full
+    /// windows only (short leading windows are a different regime).
+    fn worst_relative_error(got: &[Stats], reference: &[Stats], w: usize) -> Stats {
+        let mut worst = Stats::default();
+        let relative = |a: f64, b: f64| {
+            if b == 0.0 || !b.is_finite() || !a.is_finite() {
+                if a == b || (a.is_nan() && b.is_nan()) {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            } else {
+                ((a - b) / b).abs()
+            }
+        };
+        for i in w..got.len() {
+            worst.covar = worst.covar.max(relative(got[i].covar, reference[i].covar));
+            worst.corr = worst.corr.max(relative(got[i].corr, reference[i].corr));
+            worst.eigen_max = worst
+                .eigen_max
+                .max(relative(got[i].eigen_max, reference[i].eigen_max));
+            worst.slope = worst.slope.max(relative(got[i].slope, reference[i].slope));
+        }
+        worst
+    }
+
+    /// One algorithm under test: window statistics for a whole column.
+    type WindowAlgorithm = &'static dyn Fn(&[f64], &[f64], usize) -> Vec<Stats>;
+
+    /// Deterministic pseudo-random values in [0, 1).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// `(name, y, x)` corpora spanning the benign case and the offset
+    /// shapes where cancellation bites — the regime bug #45 was about.
+    fn corpora(rows: usize) -> Vec<(&'static str, Vec<f64>, Vec<f64>)> {
+        let mut sets = Vec::new();
+        for (name, offset) in [
+            ("benign (x ~ 0..10)", 0.0),
+            ("offset 1e6", 1e6),
+            ("offset 1e9 (unix seconds)", 1e9),
+            ("offset 1e12 (unix millis)", 1e12),
+        ] {
+            let mut rng = Lcg(0x3B_5EED_1234_5678);
+            let mut x = Vec::with_capacity(rows);
+            let mut y = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                let xi = offset + rng.next() * 10.0;
+                x.push(xi);
+                y.push(2.0 * (xi - offset) + rng.next());
+            }
+            sets.push((name, y, x));
+        }
+        // A monotonic ordering key: the timestamp-regressor shape, where
+        // the data also drifts away from any fixed shift.
+        let mut rng = Lcg(0x99_5EED_8765_4321);
+        let mut x = Vec::with_capacity(rows);
+        let mut y = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let xi = 1e9 + i as f64 * 0.05;
+            x.push(xi);
+            y.push(0.5 * (i as f64 * 0.05) + rng.next());
+        }
+        sets.push(("monotonic ts (1e9 + 0.05·i)", y, x));
+        sets
+    }
+
+    #[test]
+    #[ignore = "measurement — run explicitly in release mode"]
+    fn measure_3b_incremental_vs_recompute() {
+        let rows = 20_000;
+        let w = 64;
+        println!(
+            "3b A/B: {rows} rows, window {w}; A = recompute (shipped), \
+             B = naive incremental, C = shifted incremental rebuilt every {w}"
+        );
+        for (name, y, x) in corpora(rows) {
+            // Timing: best of a few passes, black-boxed against DCE.
+            let time = |f: WindowAlgorithm| {
+                let mut best = f64::INFINITY;
+                let mut last = Vec::new();
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    last = f(&y, &x, w);
+                    best = best.min(start.elapsed().as_secs_f64());
+                    std::hint::black_box(&last);
+                }
+                (best, last)
+            };
+            let (time_a, reference) = time(&recompute);
+            let (time_b, naive) = time(&incremental_naive);
+            let (time_c, shifted) = time(&incremental_shifted);
+            let error_b = worst_relative_error(&naive, &reference, w);
+            let error_c = worst_relative_error(&shifted, &reference, w);
+            println!("\n  {name}");
+            println!(
+                "    time    A {:>8.2}ms   B {:>8.2}ms ({:>5.1}x)   C {:>8.2}ms ({:>5.1}x)",
+                time_a * 1e3,
+                time_b * 1e3,
+                time_a / time_b,
+                time_c * 1e3,
+                time_a / time_c
+            );
+            println!(
+                "    worst relative error vs A — B: covar {:.2e} corr {:.2e} \
+                 eigen {:.2e} slope {:.2e}",
+                error_b.covar, error_b.corr, error_b.eigen_max, error_b.slope
+            );
+            println!(
+                "                                C: covar {:.2e} corr {:.2e} \
+                 eigen {:.2e} slope {:.2e}",
+                error_c.covar, error_c.corr, error_c.eigen_max, error_c.slope
+            );
+        }
+    }
+}

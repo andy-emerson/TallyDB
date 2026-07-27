@@ -35,6 +35,12 @@ The spread runs cheap -> heavy, plus the interpreter-only case:
   eigen_max   native closed-form 2x2   peer: NumPy closed-form 2x2 from
               eigenvalue per window         rolling moments (same math,
                                             vectorized over the column)
+  covar_pop   window moments, two-pass peer: NumPy rolling moments
+  corr        window moments, two-pass peer: NumPy rolling moments
+
+The last two are the pure recompute-vs-vectorized comparison: identical
+arithmetic, so the gap is entirely O(n·w) per-window recompute against
+the peer's O(n) sweep.
 
 Usage: m2_compute_latency_bench.py [libengine.so] [rows] [iters]
 Defaults: target/debug/libengine.so, 20000 rows, 3 iterations (min
@@ -131,16 +137,35 @@ def peer_mad(x):
     return result
 
 
-def peer_eigen(x, y):
+def rolling_moments(x, y):
+    """Rolling (var_x, var_y, cov_xy) by the cumsum trick — the peers'
+    shared O(n) core."""
     counts = np.minimum(np.arange(1, len(x) + 1), WINDOW).astype(float)
     mean_x = rolling_sum(x, WINDOW) / counts
     mean_y = rolling_sum(y, WINDOW) / counts
-    cov_xx = rolling_sum(x * x, WINDOW) / counts - mean_x * mean_x
-    cov_yy = rolling_sum(y * y, WINDOW) / counts - mean_y * mean_y
+    var_x = rolling_sum(x * x, WINDOW) / counts - mean_x * mean_x
+    var_y = rolling_sum(y * y, WINDOW) / counts - mean_y * mean_y
     cov_xy = rolling_sum(x * y, WINDOW) / counts - mean_x * mean_y
-    half_trace = (cov_xx + cov_yy) / 2.0
-    radius = np.sqrt(((cov_xx - cov_yy) / 2.0) ** 2 + cov_xy**2)
+    return var_x, var_y, cov_xy
+
+
+def peer_eigen(x, y):
+    var_x, var_y, cov_xy = rolling_moments(x, y)
+    half_trace = (var_x + var_y) / 2.0
+    radius = np.sqrt(((var_y - var_x) / 2.0) ** 2 + cov_xy**2)
     return half_trace + radius
+
+
+def peer_covar(x, y):
+    return rolling_moments(x, y)[2]
+
+
+def peer_corr(x, y):
+    var_x, var_y, cov_xy = rolling_moments(x, y)
+    # Leading windows can be degenerate (a one-row window has zero
+    # variance); those rows are outside the compared range.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return cov_xy / np.sqrt(var_y * var_x)
 
 
 def check(name, engine_values, peer_values, rtol, atol):
@@ -217,6 +242,16 @@ def main():
     peer_time, peer_values = peer(lambda px, py: peer_eigen(px, py))
     check("eigen_max", values, peer_values, 1e-6, 1e-9)
     results.append(("eigen_max (closed form)", "NumPy closed-form", elapsed, peer_time))
+
+    elapsed, values = engine(f"SELECT covar_pop(y, x) {FRAME} AS r FROM bench", "r")
+    peer_time, peer_values = peer(lambda px, py: peer_covar(px, py))
+    check("covar_pop", values, peer_values, 1e-6, 1e-9)
+    results.append(("covar_pop (moments)", "NumPy rolling moments", elapsed, peer_time))
+
+    elapsed, values = engine(f"SELECT corr(y, x) {FRAME} AS r FROM bench", "r")
+    peer_time, peer_values = peer(lambda px, py: peer_corr(px, py))
+    check("corr", values, peer_values, 1e-6, 1e-9)
+    results.append(("corr (moments)", "NumPy rolling moments", elapsed, peer_time))
 
     # ---- the latency shape: one window over the latest rows ----
     # The bulk sweep above amortizes the round trip over n windows; a
