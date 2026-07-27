@@ -1304,9 +1304,12 @@ mod measure_incremental_windows {
     //! test:
     //!
     //! - **A — recompute** (what ships): two passes per window, the
-    //!   second about the window's own means. O(n·w) work, and the most
-    //!   numerically stable arrangement available — the accuracy
-    //!   reference every other variant is judged against.
+    //!   second about the window's own means, without the residual
+    //!   correction. O(n·w) work. It was assumed to be the most stable
+    //!   arrangement available and used as the accuracy reference; the
+    //!   compensated reference below shows that assumption was wrong at
+    //!   timestamp-scale offsets, where A is the *least* accurate of the
+    //!   three defensible variants.
     //! - **B — naive incremental**: keep raw `Σx, Σy, Σxx, Σyy, Σxy`;
     //!   slide by adding the entering row and subtracting the leaving
     //!   one; recover variance as `E[x²] − E[x]²`. O(n) work and the
@@ -1464,8 +1467,87 @@ mod measure_incremental_windows {
             .collect()
     }
 
-    /// Worst relative difference against the reference, over full
-    /// windows only (short leading windows are a different regime).
+    // ---- a higher-precision reference, so "closer to truth" is answerable ----
+
+    /// Compensated (Neumaier) accumulation: keeps the rounding error of
+    /// every addition in a second term, so a sum of n values carries
+    /// error of order eps² rather than n·eps. Enough extra precision to
+    /// judge f64 results that differ in their last digits.
+    #[derive(Default, Clone, Copy)]
+    struct Compensated {
+        hi: f64,
+        lo: f64,
+    }
+
+    impl Compensated {
+        fn add(&mut self, value: f64) {
+            // Knuth's two-sum: `sum` plus `error` reproduces the operands
+            // exactly, whichever is larger.
+            let sum = self.hi + value;
+            let shifted = sum - self.hi;
+            self.lo += (self.hi - (sum - shifted)) + (value - shifted);
+            self.hi = sum;
+        }
+
+        /// Adds `a · b`, keeping the product's own rounding error too —
+        /// `mul_add` is a fused multiply-add, so it yields that error
+        /// exactly.
+        fn add_product(&mut self, a: f64, b: f64) {
+            let product = a * b;
+            self.add(product);
+            self.lo += a.mul_add(b, -product);
+        }
+
+        fn value(self) -> f64 {
+            self.hi + self.lo
+        }
+    }
+
+    /// The statistics computed to far better than f64 — the yardstick
+    /// both the shipped recompute and the incremental variants are
+    /// judged against, so "which is closer to the true answer" has an
+    /// answer rather than an assumption.
+    ///
+    /// Moments are taken about `(x[0], y[0])` rather than the means:
+    /// for offset data those shifts are exact (the values share a
+    /// binade, so the subtraction is), which removes the cancellation
+    /// the means introduce, and the shifted values are then accumulated
+    /// with compensation.
+    fn high_precision(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        (0..y.len())
+            .map(|i| {
+                let lo = (i + 1).saturating_sub(w);
+                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
+                let n = wy.len() as f64;
+                let (x0, y0) = (wx[0], wy[0]);
+                let (mut sdx, mut sdy) = (Compensated::default(), Compensated::default());
+                let (mut sxx, mut syy, mut sxy) = (
+                    Compensated::default(),
+                    Compensated::default(),
+                    Compensated::default(),
+                );
+                for (&yi, &xi) in wy.iter().zip(wx) {
+                    let (dx, dy) = (xi - x0, yi - y0);
+                    sdx.add(dx);
+                    sdy.add(dy);
+                    sxx.add_product(dx, dx);
+                    syy.add_product(dy, dy);
+                    sxy.add_product(dx, dy);
+                }
+                let (sdx, sdy) = (sdx.value(), sdy.value());
+                // Central moments from the shifted ones, exactly as the
+                // algebra prescribes.
+                let var_x = (sxx.value() - sdx * sdx / n) / n;
+                let var_y = (syy.value() - sdy * sdy / n) / n;
+                let covar = (sxy.value() - sdx * sdy / n) / n;
+                stats_from(var_y, var_x, covar)
+            })
+            .collect()
+    }
+
+    /// Worst relative difference against the high-precision reference,
+    /// over full windows only (short leading windows are a different
+    /// regime).
     fn worst_relative_error(got: &[Stats], reference: &[Stats], w: usize) -> Stats {
         let mut worst = Stats::default();
         let relative = |a: f64, b: f64| {
@@ -1547,7 +1629,9 @@ mod measure_incremental_windows {
         let w = 64;
         println!(
             "3b A/B: {rows} rows, window {w}; A = recompute (shipped), \
-             B = naive incremental, C = shifted incremental rebuilt every {w}"
+             B = naive incremental, C = shifted incremental rebuilt every {w}.\n\
+             Errors are worst relative deviation from a compensated \
+             high-precision reference."
         );
         for (name, y, x) in corpora(rows) {
             // Timing: best of a few passes, black-boxed against DCE.
@@ -1562,9 +1646,15 @@ mod measure_incremental_windows {
                 }
                 (best, last)
             };
-            let (time_a, reference) = time(&recompute);
+            let (time_a, recomputed) = time(&recompute);
             let (time_b, naive) = time(&incremental_naive);
             let (time_c, shifted) = time(&incremental_shifted);
+            // Judged against the high-precision answer, not against each
+            // other: the question is which is closer to the truth, and
+            // treating the shipped algorithm as the yardstick cannot
+            // answer that.
+            let reference = high_precision(&y, &x, w);
+            let error_a = worst_relative_error(&recomputed, &reference, w);
             let error_b = worst_relative_error(&naive, &reference, w);
             let error_c = worst_relative_error(&shifted, &reference, w);
             println!("\n  {name}");
@@ -1576,16 +1666,16 @@ mod measure_incremental_windows {
                 time_c * 1e3,
                 time_a / time_c
             );
-            println!(
-                "    worst relative error vs A — B: covar {:.2e} corr {:.2e} \
-                 eigen {:.2e} slope {:.2e}",
-                error_b.covar, error_b.corr, error_b.eigen_max, error_b.slope
-            );
-            println!(
-                "                                C: covar {:.2e} corr {:.2e} \
-                 eigen {:.2e} slope {:.2e}",
-                error_c.covar, error_c.corr, error_c.eigen_max, error_c.slope
-            );
+            for (label, error) in [
+                ("A recompute (shipped)", error_a),
+                ("B naive incremental  ", error_b),
+                ("C shifted incremental", error_c),
+            ] {
+                println!(
+                    "    {label}  covar {:.2e}  corr {:.2e}  eigen {:.2e}  slope {:.2e}",
+                    error.covar, error.corr, error.eigen_max, error.slope
+                );
+            }
         }
     }
 }
