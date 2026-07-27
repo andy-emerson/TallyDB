@@ -47,9 +47,9 @@
 //! Every window function this crate registers is solved in closed form:
 //! a two-parameter regression and a 2 × 2 symmetric eigenvalue both have
 //! exact solutions, and a general solver's per-call overhead dwarfs their
-//! arithmetic at window scale. The engine therefore does not depend on
-//! `compute-lapack` at all, which is what lets a WASM build reach parity
-//! with the current feature set without a LAPACK-in-WASM layer. A
+//! arithmetic at window scale. The engine therefore links no LAPACK
+//! routine at all, which is what lets a WASM build reach parity with the
+//! current feature set without a LAPACK-in-WASM layer. A
 //! LAPACK-class dependency returns only when an op needs more than two
 //! parameters or dimensions — where no closed form exists. See DESIGN.md,
 //! *Curated compute: what the engine calls, and why*.

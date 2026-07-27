@@ -5,7 +5,7 @@
 //! TallyDB's numeric-or-key invariant means every value column is a flat,
 //! fixed-width buffer. If that layout matches Apache Arrow's columnar spec,
 //! the *same bytes* serve three consumers with zero copying: compute (raw
-//! pointers into BLAS/LAPACK/Lua), storage (serialize/mmap into segments),
+//! pointers into BLAS/Lua/curated ops), storage (serialize/mmap into segments),
 //! and the outside world (query results handed to NumPy/Polars/DuckDB via
 //! the Arrow C Data Interface with no conversion step). That third boundary
 //! is the reason to be *Arrow*-shaped specifically — the first two only need
@@ -68,9 +68,11 @@
 //! - No Arrow IPC / Flight / Parquet — the C Data Interface is the entire
 //!   interop surface. File formats are the application's job via ecosystem
 //!   tools that already speak C-Data.
-//! - No matrix/column-group arena for LAPACK-shaped allocations —
-//!   considered and deferred (issue #4): the design-matrix gather is
-//!   O(n·k) against an O(n·k²) solve. Revisit only with profiling evidence.
+//! - No matrix/column-group arena for matrix-shaped allocations —
+//!   considered and deferred (issue #4): a design-matrix gather is O(n·k)
+//!   against an O(n·k²) solve, and the engine no longer assembles one at
+//!   all (its statistics are closed-form). Revisit only with profiling
+//!   evidence from an op that needs a real matrix.
 
 pub mod bitmap;
 pub mod buffer;

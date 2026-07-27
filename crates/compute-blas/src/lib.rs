@@ -37,8 +37,8 @@
 //! ## Capability negotiation
 //! Ops are exposed through [`backend::BlasBackend`], which answers
 //! "unavailable on this backend" as a first-class result rather than
-//! panicking — the same seam `compute-lapack` uses, so `engine` treats
-//! both compute crates uniformly.
+//! panicking — the seam that lets a backend be swapped or reported
+//! missing without a caller changing.
 //!
 //! ## WASM backend: future, not current milestone
 //! `blas.wasm` (github.com/andy-emerson/blas.wasm) already exists,
@@ -52,8 +52,8 @@
 //! in the API shape.
 //!
 //! ## Explicitly NOT in scope
-//! No LAPACK-class routines (see `compute-lapack`). No autodiff. No general
-//! tensor operations.
+//! No LAPACK-class routines — TallyDB builds none at all (see the scope
+//! note above). No autodiff. No general tensor operations.
 
 pub mod backend;
 

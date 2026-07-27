@@ -1,8 +1,8 @@
 //! The BLAS backend seam: capability negotiation plus the
 //! multiplication-class primitives, native implementation first.
 //!
-//! Same trait shape as `compute-lapack` — `supports` answers honestly,
-//! inputs are borrowed column-major slices, and the backend never
+//! The shape every compute backend here follows — `supports` answers
+//! honestly, inputs are borrowed column-major slices, and it never
 //! clobbers a caller's buffer (these routines write only their output
 //! argument). System BLAS is linked as-is; the executor does **not**
 //! call these yet — wiring BLAS into query inner loops is
