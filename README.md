@@ -11,7 +11,9 @@
 > (regression, covariance, PCA) exposed as SQL. Every query family is born
 > cross-checked against DuckDB and NumPy in CI, over data that has
 > round-tripped through storage. M2's final increment — M2.7, embedded Lua
-> computing on the engine's own zero-copy buffers — is underway. The settled
+> computing on the engine's own zero-copy buffers — is built: scripted
+> window kernels, the curated ops callable from scripts, and a
+> NumPy-checked oracle family in CI. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -215,9 +217,31 @@ and `eigen_max` (the window's first principal-component variance, via
 independently by NumPy and DuckDB in CI, over a fixture that spans
 several segments and a storage round trip. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
-are the bounded copies, as recorded in the crate docs. `compute-blas` and
-`compute-lua` remain scaffolds: documented boundaries and settled
-contracts, not yet implementations. `blas.wasm` and `lua.wasm` (the WASM
+are the bounded copies, as recorded in the crate docs. `compute-blas`
+links system BLAS behind the same capability-negotiating trait shape
+(`dot`, matrix–vector, matrix–matrix — checked against hand
+computations; not yet called from query inner loops, which stays
+profiling-gated). `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
+unmodified) behind the frozen value-map contract: nullable columns
+cross as zero-copy views (NULL is the `NULL` sentinel, three-valued
+through arithmetic; keys read as codes with `text()`/`code_of()`),
+results coerce exact-or-loud to a type declared at registration, and
+application kernels run as SQL window functions
+(`Table::register_lua_window`) with the curated BLAS/LAPACK ops
+callable from scripts over the same buffers — every kernel family
+re-derived by NumPy in CI over a multi-segment storage round trip, the
+C boundary additionally run under `LUA_USE_APICHECK` and ASan/UBSan in
+CI, and `log()` routing script diagnostics to an embedder-installed
+sink (`print` is gone; stdout is not an embedded library's to own). One
+honest number to hold beside the design: the first in-engine-vs-round-trip
+latency benchmark (`m2_compute_latency_bench.py`, run 2026-07-27,
+container hardware) came out **against** the in-engine path at the
+shapes tried — exporting over Arrow and computing in vectorized NumPy
+or DuckDB won by 2–100×, because the Arrow hop is nearly free
+in-process while per-window interpreter and solver costs are not. The
+zero-copy property itself is pointer-verified and stands; the
+wall-clock win is open optimization work, not an earned claim.
+`blas.wasm` and `lua.wasm` (the WASM
 compute dependencies, for later) are real, working, MIT-licensed projects
 already in progress by the same author, with LAPACK-in-WASM as their next
 planned milestone — tracked as future dependencies, not part of the current
@@ -242,8 +266,11 @@ repo-specific half lives here:
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
   GA · M4 WASM parity.
 - **Checks:** GitHub Actions on every push to `main` — fmt, clippy, build,
-  tests including doctests, rustdoc with warnings as errors. Doctests are
-  this repository's preferred executable evidence.
+  tests including doctests, rustdoc with warnings as errors, the Python
+  oracle suite (PyArrow round trip; DuckDB and NumPy differentials,
+  the Lua-window family included), the Lua `apicheck` build, and an
+  ASan/UBSan job over the C boundary. Doctests are this repository's
+  preferred executable evidence.
 - **Audience:** documentation is written for a reader with a BS in applied
   mathematics and a CS minor; code for the CS-minor side — see DESIGN.md,
   *Who we write for*.
