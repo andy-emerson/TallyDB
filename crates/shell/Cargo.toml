@@ -1,0 +1,20 @@
+[package]
+name = "tallydb-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tallydb"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+arrow-lite = { path = "../arrow-lite" }
+query-lite = { path = "../query-lite" }
+# The console's two dependencies, both mature and narrow, both confined
+# to this crate — the engine stays dependency-clean (#39, ruled
+# 2026-07-27): line editing, and CSV whose edge cases are not worth
+# reinventing.
+rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+csv = "1"

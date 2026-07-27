@@ -81,6 +81,11 @@ impl Database {
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))
     }
 
+    /// The open tables' names, in arbitrary order.
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
     pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
         self.tables.get_mut(name)
     }
