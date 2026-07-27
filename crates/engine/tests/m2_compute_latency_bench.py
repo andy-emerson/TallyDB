@@ -26,7 +26,7 @@ results are cross-checked (full windows, tolerance-based) — a benchmark
 that computes wrong answers measures nothing.
 
 The spread runs cheap -> heavy, plus the interpreter-only case:
-  lua_dot     Lua kernel calling the BLAS dot host function (cheap op,
+  lua_dot     Lua kernel calling the native dot host function (cheap op,
               script dispatch)         peer: NumPy rolling dot (cumsum)
   lua_mad     pure-Lua kernel (no native op — the promotion ladder's
               first rung)              peer: vectorized NumPy MAD
@@ -226,7 +226,7 @@ def main():
     elapsed, values = engine(f"SELECT lua_dot(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = peer(lambda px, py: peer_dot(px, py))
     check("lua_dot", values, peer_values, 1e-9, 1e-9)
-    results.append(("lua_dot (Lua->BLAS)", "NumPy rolling dot", elapsed, peer_time))
+    results.append(("lua_dot (Lua->native)", "NumPy rolling dot", elapsed, peer_time))
 
     elapsed, values = engine(f"SELECT lua_mad(x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = peer(lambda px, py: peer_mad(px))
