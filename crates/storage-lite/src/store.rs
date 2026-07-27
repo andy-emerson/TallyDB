@@ -38,7 +38,7 @@ use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
 use arrow_lite::{Bitmap, Column, NumericData, Schema};
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Rows per segment before an automatic flush. Large enough that segment
 /// bookkeeping is noise, small enough that a segment is a reasonable unit
@@ -158,19 +158,85 @@ pub struct Store {
     schema: Schema,
     ordering_key: usize,
     segment_rows: usize,
-    buffer: WriteBuffer,
-    /// Row id of the buffer's first row.
-    buffer_base: u64,
-    segments: Vec<Arc<Segment>>,
     rows: u64,
-    /// Row ids the table has tombstoned (decision #1: ids, never keys).
-    tombstones: BTreeSet<u64>,
     /// Sequence number for the next delete log.
     delete_log_sequence: u64,
     /// The current storage generation (bumped by each compaction).
     generation: u64,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
+    /// The reader-visible state, shared with every [`StoreReader`]. The
+    /// lock is held only to read or swap it — never across encoding,
+    /// backend I/O, or compaction's merge — so a reader's `snapshot()`
+    /// waits microseconds at worst (bounded by one write-buffer copy).
+    shared: Arc<Mutex<Shared>>,
+}
+
+/// What a snapshot reads: the published segments, the live write buffer,
+/// and the tombstone set. Everything else in [`Store`] belongs to the
+/// single writer alone.
+struct Shared {
+    segments: Vec<Arc<Segment>>,
+    buffer: WriteBuffer,
+    /// Row id of the buffer's first row.
+    buffer_base: u64,
+    /// Row ids the table has tombstoned (decision #1: ids, never keys).
+    tombstones: BTreeSet<u64>,
+}
+
+/// A cheap, cloneable handle that mints point-in-time snapshots while
+/// the single writer proceeds — the concurrent-reader half of the
+/// single-writer/concurrent-readers cut (#51). `Send`: hand one to a
+/// reader thread; every [`StoreReader::snapshot`] briefly takes the
+/// same per-store lock the writer takes around its state swaps, and the
+/// returned views are fully detached (`Arc`-backed, immutable).
+#[derive(Clone)]
+pub struct StoreReader {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl StoreReader {
+    /// A point-in-time view, exactly as [`Store::snapshot`] — callable
+    /// from any thread while the writer appends, mutates, or compacts.
+    pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
+        snapshot_of(&lock(&self.shared))
+    }
+}
+
+/// Takes the shared-state lock. A poisoned lock means a writer panicked
+/// mid-operation and the buffer may hold a torn row: refuse loudly to
+/// serve possibly-torn state rather than limp on.
+fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
+    shared
+        .lock()
+        .expect("table state lock poisoned: a writer panicked mid-operation")
+}
+
+/// The snapshot algorithm over locked state: every frozen segment plus
+/// (if the buffer holds rows) a segment frozen from a copy of it, each
+/// carrying the live mask its tombstones impose.
+fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
+    let mut segments = shared.segments.clone();
+    if !shared.buffer.is_empty() {
+        segments.push(Arc::new(shared.buffer.snapshot_at(shared.buffer_base)?));
+    }
+    Ok(segments
+        .into_iter()
+        .map(|segment| {
+            let base = segment.base_row_id();
+            let end = base + segment.batch().num_rows() as u64;
+            if shared.tombstones.range(base..end).next().is_none() {
+                SegmentView::all_live(segment)
+            } else {
+                let live =
+                    Bitmap::from_bools((base..end).map(|id| !shared.tombstones.contains(&id)));
+                SegmentView {
+                    segment,
+                    live: Some(live),
+                }
+            }
+        })
+        .collect())
 }
 
 impl Store {
@@ -193,14 +259,16 @@ impl Store {
             schema,
             ordering_key,
             segment_rows,
-            buffer,
-            buffer_base: 0,
-            segments: Vec::new(),
             rows: 0,
-            tombstones: BTreeSet::new(),
             delete_log_sequence: 0,
             generation: 0,
             backend: None,
+            shared: Arc::new(Mutex::new(Shared {
+                segments: Vec::new(),
+                buffer,
+                buffer_base: 0,
+                tombstones: BTreeSet::new(),
+            })),
         })
     }
 
@@ -302,10 +370,13 @@ impl Store {
         if let Some(&bad) = tombstones.iter().find(|&&id| id >= expected_base) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
-        store.segments = segments;
+        {
+            let mut shared = lock(&store.shared);
+            shared.segments = segments;
+            shared.buffer_base = expected_base;
+            shared.tombstones = tombstones;
+        }
         store.rows = expected_base;
-        store.buffer_base = expected_base;
-        store.tombstones = tombstones;
         store.delete_log_sequence = next_sequence;
         store.generation = generation;
         store.backend = Some(backend);
@@ -333,7 +404,8 @@ impl Store {
     /// appended, and the reopen check rejects any log that would, but an
     /// underflow must degrade to zero rather than wrap.
     pub fn live_len(&self) -> u64 {
-        self.rows.saturating_sub(self.tombstones.len() as u64)
+        self.rows
+            .saturating_sub(lock(&self.shared).tombstones.len() as u64)
     }
 
     /// Whether no rows have ever been appended.
@@ -343,16 +415,29 @@ impl Store {
 
     /// Frozen segments so far (not counting the live buffer).
     pub fn segment_count(&self) -> usize {
-        self.segments.len()
+        lock(&self.shared).segments.len()
+    }
+
+    /// A cheap, cloneable reader handle: mints point-in-time snapshots
+    /// from any thread while this store's single writer proceeds. See
+    /// [`StoreReader`].
+    pub fn reader(&self) -> StoreReader {
+        StoreReader {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Appends one row and returns its internal row id. Flushes
     /// automatically when the buffer reaches the segment-row threshold.
     pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<u64, StorageError> {
-        self.buffer.append(row)?;
+        let must_flush = {
+            let mut shared = lock(&self.shared);
+            shared.buffer.append(row)?;
+            shared.buffer.len() >= self.segment_rows
+        };
         let id = self.rows;
         self.rows += 1;
-        if self.buffer.len() >= self.segment_rows {
+        if must_flush {
             self.flush()?;
         }
         Ok(id)
@@ -364,19 +449,29 @@ impl Store {
     /// is registered, so a failure at any point leaves both the backend
     /// and the buffer — rows included — exactly as they were.
     pub fn flush(&mut self) -> Result<(), StorageError> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let segment = self.buffer.snapshot_at(self.buffer_base)?;
+        // Copy the buffer under the brief lock; encode and publish with
+        // the lock released. Readers between the two locks still see the
+        // rows — in the buffer, where they were — so every snapshot is
+        // consistent; the single-writer cut means nothing else moves.
+        let segment = {
+            let shared = lock(&self.shared);
+            if shared.buffer.is_empty() {
+                return Ok(());
+            }
+            shared.buffer.snapshot_at(shared.buffer_base)?
+        };
         if let Some(backend) = &self.backend {
             backend.write(
-                &segment_name(self.generation, self.buffer_base),
+                &segment_name(self.generation, segment.base_row_id()),
                 &encode_segment(&segment),
             )?;
         }
-        self.segments.push(Arc::new(segment));
-        self.buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
-        self.buffer_base = self.rows;
+        // Built before the lock so adoption below cannot fail partway.
+        let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        let mut shared = lock(&self.shared);
+        shared.segments.push(Arc::new(segment));
+        shared.buffer = fresh;
+        shared.buffer_base = self.rows;
         Ok(())
     }
 
@@ -390,11 +485,15 @@ impl Store {
         if let Some(&bad) = ids.iter().find(|&&id| id >= self.rows) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
-        let newly: BTreeSet<u64> = ids
-            .iter()
-            .copied()
-            .filter(|id| !self.tombstones.contains(id))
-            .collect();
+        let (newly, buffer_base) = {
+            let shared = lock(&self.shared);
+            let newly: BTreeSet<u64> = ids
+                .iter()
+                .copied()
+                .filter(|id| !shared.tombstones.contains(id))
+                .collect();
+            (newly, shared.buffer_base)
+        };
         if newly.is_empty() {
             return Ok(0);
         }
@@ -407,7 +506,7 @@ impl Store {
         // delete against a row that never reached disk, and reopen would
         // carry a tombstone for a row id it then reissues (silent
         // shadow-kill of future rows).
-        if self.backend.is_some() && newly.iter().any(|&id| id >= self.buffer_base) {
+        if self.backend.is_some() && newly.iter().any(|&id| id >= buffer_base) {
             self.flush()?;
         }
         if let Some(backend) = &self.backend {
@@ -418,7 +517,7 @@ impl Store {
             self.delete_log_sequence += 1;
         }
         let count = newly.len() as u64;
-        self.tombstones.extend(newly);
+        lock(&self.shared).tombstones.extend(newly);
         Ok(count)
     }
 
@@ -449,7 +548,8 @@ impl Store {
         // Collect every live row's (ordering value, row id, location),
         // buffer included via an ephemeral snapshot.
         let views = self.snapshot()?;
-        let mut order: Vec<(i64, u64, usize, usize)> = Vec::with_capacity(self.live_len() as usize);
+        let capacity = views.iter().map(SegmentView::live_rows).sum();
+        let mut order: Vec<(i64, u64, usize, usize)> = Vec::with_capacity(capacity);
         for (view_index, view) in views.iter().enumerate() {
             let Column::Numeric(NumericData::I64(ordering)) =
                 &view.segment.batch().columns()[self.ordering_key]
@@ -524,16 +624,21 @@ impl Store {
             self.generation = next;
         }
 
-        // In-memory commit: adopt the new generation. Infallible, and run
-        // immediately after the durable commit, so no later error can
-        // leave memory describing the old generation while disk holds the
-        // new one — the stranding that made every subsequent write vanish
-        // at reopen (R1).
-        self.segments = new_segments.into_iter().map(Arc::new).collect();
+        // In-memory commit: adopt the new generation. Infallible, taken
+        // under one brief lock, and run immediately after the durable
+        // commit, so no later error can leave memory describing the old
+        // generation while disk holds the new one — the stranding that
+        // made every subsequent write vanish at reopen (R1). A reader
+        // holding pre-swap views keeps its segments alive through their
+        // `Arc`s — read-copy-update, no coordination needed.
+        {
+            let mut shared = lock(&self.shared);
+            shared.segments = new_segments.into_iter().map(Arc::new).collect();
+            shared.buffer = fresh_buffer;
+            shared.buffer_base = base;
+            shared.tombstones.clear();
+        }
         self.rows = base;
-        self.buffer = fresh_buffer;
-        self.buffer_base = base;
-        self.tombstones.clear();
         self.delete_log_sequence = 0;
 
         // Best-effort cleanup of the now-stale prior generation. A failure
@@ -563,27 +668,7 @@ impl Store {
     /// mask-free — the zero-copy common case. Appends and tombstones
     /// after the call don't affect the returned views.
     pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
-        let mut segments = self.segments.clone();
-        if !self.buffer.is_empty() {
-            segments.push(Arc::new(self.buffer.snapshot_at(self.buffer_base)?));
-        }
-        Ok(segments
-            .into_iter()
-            .map(|segment| {
-                let base = segment.base_row_id();
-                let end = base + segment.batch().num_rows() as u64;
-                if self.tombstones.range(base..end).next().is_none() {
-                    SegmentView::all_live(segment)
-                } else {
-                    let live =
-                        Bitmap::from_bools((base..end).map(|id| !self.tombstones.contains(&id)));
-                    SegmentView {
-                        segment,
-                        live: Some(live),
-                    }
-                }
-            })
-            .collect())
+        snapshot_of(&lock(&self.shared))
     }
 }
 

@@ -108,4 +108,4 @@ pub use format::{
 };
 pub use io::{FsBackend, IoError, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, StorageError, WriteBuffer, ZoneMap};
-pub use store::{SegmentView, Store, DEFAULT_SEGMENT_ROWS};
+pub use store::{SegmentView, Store, StoreReader, DEFAULT_SEGMENT_ROWS};

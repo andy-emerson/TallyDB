@@ -31,8 +31,10 @@ use query_lite::{
     QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
 };
 use std::fmt;
-use std::sync::Arc;
-use storage_lite::{FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store};
+use std::sync::{Arc, Mutex};
+use storage_lite::{
+    FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store, StoreReader,
+};
 
 /// Why a table or database operation failed.
 #[derive(Debug)]
@@ -138,7 +140,11 @@ impl From<QueryError> for EngineError {
 pub struct Table {
     name: String,
     store: Store,
-    registry: Registry,
+    /// SQL name → window implementation, shared with every reader
+    /// handle. The lock is held only to clone or swap the inner `Arc`,
+    /// so a snapshot pins the function set of its moment and a later
+    /// registration never mutates what a reader already holds.
+    registry: Arc<Mutex<Arc<Registry>>>,
 }
 
 impl Table {
@@ -249,8 +255,13 @@ impl Table {
         Table {
             name: name.into(),
             store,
-            registry,
+            registry: Arc::new(Mutex::new(Arc::new(registry))),
         }
+    }
+
+    /// The registry as of now — a cheap `Arc` clone under a brief lock.
+    fn current_registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry.lock().expect("registry lock poisoned"))
     }
 
     /// The table's name.
@@ -297,7 +308,7 @@ impl Table {
             self.store.schema(),
             &segments,
             plan,
-            &self.registry,
+            &self.current_registry(),
         )?)
     }
 
@@ -316,8 +327,51 @@ impl Table {
             dimension.store.schema(),
             &dimension_views,
             plan,
-            &self.registry,
+            &self.current_registry(),
         )?)
+    }
+
+    /// A cheap, cloneable handle for reader threads: it mints
+    /// point-in-time [`TableSnapshot`]s while this table's single
+    /// writer (whoever holds `&mut Table`) appends, mutates, or
+    /// compacts. This is the single-writer/concurrent-readers cut made
+    /// visible in the types: exactly one `&mut Table` can exist, and
+    /// readers can neither block it for longer than a snapshot's
+    /// microseconds nor observe a torn state (#51).
+    ///
+    /// ```
+    /// # use arrow_lite::{ColumnType, Field, Schema};
+    /// # use engine::{RowValue, Table};
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("t", schema, "ts").unwrap();
+    /// for i in 0..10 {
+    ///     table.append(&[RowValue::I64(i), RowValue::F64(i as f64)]).unwrap();
+    /// }
+    /// let reader = table.reader();
+    /// let worker = std::thread::spawn(move || {
+    ///     let snapshot = reader.snapshot().unwrap();
+    ///     snapshot.query("SELECT x FROM t").unwrap().batches.len()
+    /// });
+    /// // The writer keeps writing while the reader thread queries.
+    /// table.append(&[RowValue::I64(10), RowValue::F64(10.0)]).unwrap();
+    /// assert!(worker.join().unwrap() >= 1);
+    /// ```
+    pub fn reader(&self) -> TableReader {
+        TableReader {
+            name: self.name.clone(),
+            schema: self.store.schema().clone(),
+            store: self.store.reader(),
+            registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// A point-in-time snapshot, directly from the writer's thread —
+    /// equivalent to `table.reader().snapshot()`.
+    pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
+        self.reader().snapshot()
     }
 
     /// Runs one SQL query and exports the result as an
@@ -434,7 +488,10 @@ impl Table {
         }
         let window = crate::script::LuaWindow::new(parameters, chunk, output)
             .map_err(EngineError::Script)?;
-        self.registry.register(name, Arc::new(window));
+        let mut guard = self.registry.lock().expect("registry lock poisoned");
+        let mut next = (**guard).clone();
+        next.register(name, Arc::new(window));
+        *guard = Arc::new(next);
         Ok(())
     }
 
@@ -621,6 +678,78 @@ fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineEr
 fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend>, EngineError> {
     let backend = FsBackend::new(dir.as_ref()).map_err(StorageError::from)?;
     Ok(Arc::new(backend))
+}
+
+/// A cheap, cloneable, `Send` handle a reader thread holds to mint
+/// point-in-time [`TableSnapshot`]s while the table's single writer
+/// proceeds. Created by [`Table::reader`]; see there for the
+/// concurrency contract. Each [`TableReader::snapshot`] takes the
+/// table's brief state lock (bounded by one write-buffer copy — the
+/// freeze threshold caps it) and returns fully detached views.
+#[derive(Clone)]
+pub struct TableReader {
+    name: String,
+    schema: Schema,
+    store: StoreReader,
+    registry: Arc<Mutex<Arc<Registry>>>,
+}
+
+impl TableReader {
+    /// A point-in-time snapshot: the rows and the registered functions
+    /// exactly as of this call. Appends, mutations, compactions, and
+    /// registrations after it never affect the returned snapshot.
+    pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
+        let views = self.store.snapshot()?;
+        Ok(TableSnapshot {
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            views,
+            registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
+        })
+    }
+}
+
+/// An immutable point-in-time view of one table: query it as often as
+/// desired, from any thread, entirely independent of the writer. Old
+/// segments a compaction replaced stay alive for as long as a snapshot
+/// references them (`Arc`-backed) — read-copy-update, no coordination.
+/// `Send + Sync`: share it or move it freely; Lua-backed window
+/// functions serialize internally on their interpreter's mutex.
+///
+/// Scope: single-table `SELECT`s. Joins resolve dimension tables
+/// through a [`crate::Database`], and no cross-table snapshot
+/// consistency is promised (by design — see DESIGN.md); mutation is
+/// the writer's alone.
+pub struct TableSnapshot {
+    name: String,
+    schema: Schema,
+    views: Vec<SegmentView>,
+    registry: Arc<Registry>,
+}
+
+impl TableSnapshot {
+    /// Runs one SQL `SELECT` over this frozen view.
+    pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+        let plan = plan(sql)?;
+        if plan.table != self.name {
+            return Err(EngineError::WrongTable {
+                expected: self.name.clone(),
+                got: plan.table,
+            });
+        }
+        Ok(execute(&self.schema, &self.views, &plan, &self.registry)?)
+    }
+
+    /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
+    pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
+        let QueryOutput { schema, batches } = self.query(sql)?;
+        Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+    }
+
+    /// The snapshot's schema.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 /// Which coefficient of the per-window fit `y ≈ intercept + slope · x`
@@ -1278,6 +1407,121 @@ mod tests {
             Table::new("t", m1_schema(), "x"),
             Err(EngineError::Storage(StorageError::BadOrderingKey { .. }))
         ));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_concurrency {
+    //! #51's evidence: single writer + concurrent snapshot readers. One
+    //! test sequences the interleaving deterministically over channels
+    //! (a held snapshot survives a delete, appends, and a compaction —
+    //! the generation swap — unchanged); one races freely as a smoke
+    //! test; one pins the Send/Sync story at compile time.
+
+    use super::tests::{linear_row, m1_schema};
+    use super::*;
+
+    /// COUNT over the snapshot — one number summarizing what it sees.
+    fn count(snapshot: &TableSnapshot) -> f64 {
+        let output = snapshot.query("SELECT COUNT(x) AS c FROM t").unwrap();
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(c)) =
+            &output.batches[0].columns()[0]
+        else {
+            panic!("COUNT returns i64");
+        };
+        c.values().as_slice()[0] as f64
+    }
+
+    #[test]
+    fn a_held_snapshot_survives_delete_append_and_compaction() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
+        for i in 0..100i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let reader = table.reader();
+        let (to_reader, reader_gate) = std::sync::mpsc::channel::<()>();
+        let (to_main, main_gate) = std::sync::mpsc::channel::<f64>();
+        let worker = std::thread::spawn(move || {
+            let held = reader.snapshot().unwrap();
+            to_main.send(count(&held)).unwrap();
+            // Main deletes, appends, and compacts before releasing us.
+            reader_gate.recv().unwrap();
+            // Point-in-time stability: the held snapshot's answer is
+            // unchanged across the mutation storm and the generation
+            // swap — its old segments live on through their Arcs.
+            to_main.send(count(&held)).unwrap();
+            // A fresh snapshot sees the new world.
+            let fresh = reader.snapshot().unwrap();
+            to_main.send(count(&fresh)).unwrap();
+        });
+        assert_eq!(main_gate.recv().unwrap(), 100.0);
+        table.mutate("DELETE FROM t WHERE ts < 10").unwrap();
+        for i in 100..150i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        table.compact().unwrap();
+        to_reader.send(()).unwrap();
+        assert_eq!(main_gate.recv().unwrap(), 100.0, "held snapshot moved");
+        assert_eq!(main_gate.recv().unwrap(), 140.0, "fresh snapshot wrong");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn snapshots_race_a_live_writer_safely() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 16).unwrap();
+        table.append(&linear_row(0)).unwrap();
+        let reader = table.reader();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut last = 0.0f64;
+            let mut snapshots = 0u32;
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let snapshot = reader.snapshot().unwrap();
+                let seen = count(&snapshot);
+                // An append-only writer can never make a later snapshot
+                // smaller; a torn read would.
+                assert!(seen >= last, "count went backwards: {seen} < {last}");
+                last = seen;
+                snapshots += 1;
+            }
+            snapshots
+        });
+        for i in 1..2_000i64 {
+            table.append(&linear_row(i)).unwrap();
+            if i % 900 == 0 {
+                table.compact().unwrap();
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let snapshots = worker.join().unwrap();
+        assert!(snapshots > 0, "the reader never got a snapshot in");
+    }
+
+    #[test]
+    fn reader_and_snapshot_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TableReader>();
+        assert_send_sync::<TableSnapshot>();
+    }
+
+    #[test]
+    fn snapshots_pin_the_functions_of_their_moment() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
+        for i in 0..4i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let before = table.snapshot().unwrap();
+        table
+            .register_lua_window("twice", &["x"], "return 2 * dot(x, x)", ColumnType::F64)
+            .unwrap();
+        let after = table.snapshot().unwrap();
+        let sql = "SELECT twice(x) OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING                    AND CURRENT ROW) AS d FROM t";
+        assert!(
+            before.query(sql).is_err(),
+            "pre-registration snapshot knows the function"
+        );
+        assert!(after.query(sql).is_ok());
     }
 }
 

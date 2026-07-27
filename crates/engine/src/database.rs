@@ -72,6 +72,15 @@ impl Database {
     }
 
     /// The named table, mutably (for appends through the table handle).
+    /// A reader handle for `table` — see [`Table::reader`]: reader
+    /// threads mint point-in-time snapshots from it while this database
+    /// handle keeps writing.
+    pub fn reader(&self, table: &str) -> Result<crate::TableReader, EngineError> {
+        self.table(table)
+            .map(Table::reader)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))
+    }
+
     pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
         self.tables.get_mut(name)
     }
