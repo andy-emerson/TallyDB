@@ -65,7 +65,7 @@ impl fmt::Display for QueryError {
 impl std::error::Error for QueryError {}
 
 /// One item of the SELECT list.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum PlanItem {
     /// A stored column, passed through.
     Column {
@@ -73,6 +73,14 @@ pub enum PlanItem {
         name: String,
         /// Output name, if aliased.
         alias: Option<String>,
+    },
+    /// A computed scalar projection (`x + 1`, `ABS(x)`, `CASE ...`).
+    Computed {
+        /// The expression.
+        expr: ScalarExpr,
+        /// The output column name: the alias, or the expression's SQL
+        /// text when unaliased.
+        name: String,
     },
     /// A window aggregate over a trailing frame.
     WindowAgg {
@@ -89,6 +97,99 @@ pub enum PlanItem {
         preceding: Option<usize>,
         /// Output name, if aliased.
         alias: Option<String>,
+    },
+}
+
+/// A scalar arithmetic operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArithOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/` (IEEE: `x/0` is ±inf or NaN, never an error — NaN is a value)
+    Div,
+    /// `%` (f64 remainder)
+    Mod,
+}
+
+/// A built-in scalar function of the projection slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarFunction {
+    /// `ABS(x)`
+    Abs,
+    /// `ROUND(x)` — half away from zero
+    Round,
+    /// `FLOOR(x)`
+    Floor,
+    /// `CEIL(x)` / `CEILING(x)`
+    Ceil,
+    /// `SQRT(x)` — IEEE: negative input yields NaN
+    Sqrt,
+    /// `LN(x)`
+    Ln,
+    /// `EXP(x)`
+    Exp,
+    /// `POWER(x, y)`
+    Power,
+}
+
+impl ScalarFunction {
+    fn from_name(name: &str) -> Option<(ScalarFunction, usize)> {
+        Some(match name {
+            "abs" => (ScalarFunction::Abs, 1),
+            "round" => (ScalarFunction::Round, 1),
+            "floor" => (ScalarFunction::Floor, 1),
+            "ceil" | "ceiling" => (ScalarFunction::Ceil, 1),
+            "sqrt" => (ScalarFunction::Sqrt, 1),
+            "ln" => (ScalarFunction::Ln, 1),
+            "exp" => (ScalarFunction::Exp, 1),
+            "power" | "pow" => (ScalarFunction::Power, 2),
+            _ => return None,
+        })
+    }
+}
+
+/// A scalar expression over one row — the computed-projection slot
+/// (#49; also the seam #53's Lua scalar functions will plug into).
+/// Everything computes in `f64` under three-valued logic: a NULL
+/// operand makes the result NULL. `i64` columns are refused loudly for
+/// now (exact integer expression arithmetic is #40's territory); key
+/// columns are refused by numeric-or-key (no string production).
+#[derive(Clone, PartialEq, Debug)]
+pub enum ScalarExpr {
+    /// A stored `f64` column's value.
+    Column(String),
+    /// A numeric literal.
+    Literal(f64),
+    /// Unary minus.
+    Negate(Box<ScalarExpr>),
+    /// A binary arithmetic operation.
+    Binary {
+        /// The operator.
+        op: ArithOp,
+        /// Left operand.
+        left: Box<ScalarExpr>,
+        /// Right operand.
+        right: Box<ScalarExpr>,
+    },
+    /// A built-in scalar function call.
+    Call {
+        /// The function.
+        function: ScalarFunction,
+        /// Arguments, in call order.
+        args: Vec<ScalarExpr>,
+    },
+    /// `CASE WHEN p THEN e ... [ELSE e] END` — conditions are the WHERE
+    /// grammar (three-valued: an UNKNOWN condition falls through), a
+    /// missing ELSE yields NULL.
+    Case {
+        /// The WHEN arms, in order.
+        whens: Vec<(crate::Predicate, ScalarExpr)>,
+        /// The ELSE arm.
+        otherwise: Option<Box<ScalarExpr>>,
     },
 }
 
@@ -147,7 +248,7 @@ pub enum AggItem {
 }
 
 /// What the SELECT list computes.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Projection {
     /// Plain columns and window calls, one output row per input row.
     Items(Vec<PlanItem>),
@@ -157,7 +258,23 @@ pub enum Projection {
         keys: Vec<String>,
         /// The SELECT list.
         items: Vec<AggItem>,
+        /// The `HAVING` filter, if present.
+        having: Option<Having>,
     },
+}
+
+/// A lowered `HAVING` clause: every aggregate call it references is
+/// computed as a hidden output column (aliased `__having{i}`, dropped
+/// after filtering), so the filter itself is ordinary WHERE grammar
+/// over the aggregate output row — group keys included. Standard SQL
+/// semantics: a group survives only where the predicate is TRUE
+/// (UNKNOWN filters, like WHERE).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Having {
+    /// The hidden aggregate columns.
+    pub items: Vec<AggItem>,
+    /// The filter, referencing output names (hidden ones included).
+    pub predicate: Predicate,
 }
 
 /// Top-level `ORDER BY`: one output column, a direction.
@@ -255,8 +372,9 @@ pub struct DeletePlan {
 /// One supported SQL statement, lowered.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Statement {
-    /// A `SELECT`.
-    Select(Plan),
+    /// A `SELECT`. Boxed: a `Plan` (with its projection expressions)
+    /// dwarfs the mutation variants, and statements are moved around.
+    Select(Box<Plan>),
     /// An `UPDATE ... SET ... [WHERE ...]`.
     Update(UpdatePlan),
     /// A `DELETE FROM ... [WHERE ...]`.
@@ -274,7 +392,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
         )));
     };
     match statement {
-        ast::Statement::Query(query) => Ok(Statement::Select(lower_query(query)?)),
+        ast::Statement::Query(query) => Ok(Statement::Select(Box::new(lower_query(query)?))),
         ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
         ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
         _ => Err(QueryError::Unsupported(
@@ -287,7 +405,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
 /// [`parse_statement`]).
 pub fn plan(sql: &str) -> Result<Plan, QueryError> {
     match parse_statement(sql)? {
-        Statement::Select(plan) => Ok(plan),
+        Statement::Select(plan) => Ok(*plan),
         Statement::Update(_) | Statement::Delete(_) => Err(QueryError::Unsupported(
             "mutations run through the mutation entry point, not query".to_owned(),
         )),
@@ -463,9 +581,6 @@ fn lower_limit(
 }
 
 fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
-    if select.having.is_some() {
-        return Err(QueryError::Unsupported("HAVING".to_owned()));
-    }
     let distinct = match &select.distinct {
         None | Some(ast::Distinct::All) => false,
         Some(ast::Distinct::Distinct) => true,
@@ -526,15 +641,39 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
                 ast::SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => return false,
             };
-            matches!(expr, ast::Expr::Function(function) if function.over.is_none())
+            matches!(expr, ast::Expr::Function(function) if function.over.is_none()
+                && object_name(&function.name)
+                    .map(|name| AggFunction::from_name(&name.to_lowercase()).is_some())
+                    .unwrap_or(false))
         });
     let projection = if aggregate_shaped {
         let mut items = Vec::with_capacity(select_projection.len());
         for item in select_projection {
             items.push(lower_agg_item(item, &keys)?);
         }
-        Projection::Aggregate { keys, items }
+        let having = select
+            .having
+            .as_ref()
+            .map(|expr| {
+                let mut hidden = Vec::new();
+                let rewritten = extract_having_calls(expr, &mut hidden)?;
+                Ok::<Having, QueryError>(Having {
+                    items: hidden,
+                    predicate: crate::predicate::lower_predicate(&rewritten)?,
+                })
+            })
+            .transpose()?;
+        Projection::Aggregate {
+            keys,
+            items,
+            having,
+        }
     } else {
+        if select.having.is_some() {
+            return Err(QueryError::Unsupported(
+                "HAVING without aggregation (use WHERE)".to_owned(),
+            ));
+        }
         let mut items = Vec::with_capacity(select_projection.len());
         for item in select_projection {
             items.push(lower_item(item)?);
@@ -833,6 +972,42 @@ fn lower_agg_argument(
     }
 }
 
+/// Rewrites a HAVING expression: every aggregate call becomes a
+/// reference to a hidden output column (`__having{i}`), collected into
+/// `hidden` for the executor to compute alongside the SELECT list.
+fn extract_having_calls(
+    expr: &ast::Expr,
+    hidden: &mut Vec<AggItem>,
+) -> Result<ast::Expr, QueryError> {
+    Ok(match expr {
+        ast::Expr::Nested(inner) => {
+            ast::Expr::Nested(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(extract_having_calls(expr, hidden)?),
+        },
+        ast::Expr::BinaryOp { left, op, right } => ast::Expr::BinaryOp {
+            left: Box::new(extract_having_calls(left, hidden)?),
+            op: op.clone(),
+            right: Box::new(extract_having_calls(right, hidden)?),
+        },
+        ast::Expr::Function(function) if function.over.is_none() => {
+            let name = format!("__having{}", hidden.len());
+            let item = lower_agg_item(
+                &ast::SelectItem::ExprWithAlias {
+                    expr: expr.clone(),
+                    alias: ast::Ident::new(name.clone()),
+                },
+                &[],
+            )?;
+            hidden.push(item);
+            ast::Expr::Identifier(ast::Ident::new(name))
+        }
+        other => other.clone(),
+    })
+}
+
 fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
     let (expr, alias) = match item {
         ast::SelectItem::UnnamedExpr(expr) => (expr, None),
@@ -848,9 +1023,126 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
             name: ident(name),
             alias,
         }),
-        ast::Expr::Function(function) => lower_window_call(function, alias),
+        ast::Expr::Function(function) if function.over.is_some() => {
+            lower_window_call(function, alias)
+        }
+        other => {
+            let scalar = lower_scalar_expr(other)?;
+            Ok(PlanItem::Computed {
+                expr: scalar,
+                name: alias.unwrap_or_else(|| other.to_string()),
+            })
+        }
+    }
+}
+
+/// Lowers a scalar expression for the computed-projection slot (#49):
+/// arithmetic, the built-in scalar functions, and `CASE` with WHERE
+/// grammar conditions. Anything else is refused loudly.
+fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
+    match expr {
+        ast::Expr::Nested(inner) => lower_scalar_expr(inner),
+        ast::Expr::Identifier(name) => Ok(ScalarExpr::Column(ident(name))),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Number(text, _) => {
+                let number = crate::predicate::parse_number(text)?;
+                Ok(ScalarExpr::Literal(match number {
+                    Number::Int(value) => value as f64,
+                    Number::Float(value) => value,
+                }))
+            }
+            other => Err(QueryError::Unsupported(format!(
+                "literal '{other}' in a scalar expression (numbers only)"
+            ))),
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(expr)?))),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => lower_scalar_expr(expr),
+        ast::Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                ast::BinaryOperator::Plus => ArithOp::Add,
+                ast::BinaryOperator::Minus => ArithOp::Sub,
+                ast::BinaryOperator::Multiply => ArithOp::Mul,
+                ast::BinaryOperator::Divide => ArithOp::Div,
+                ast::BinaryOperator::Modulo => ArithOp::Mod,
+                other => {
+                    return Err(QueryError::Unsupported(format!(
+                        "operator '{other}' in a scalar expression"
+                    )))
+                }
+            };
+            Ok(ScalarExpr::Binary {
+                op,
+                left: Box::new(lower_scalar_expr(left)?),
+                right: Box::new(lower_scalar_expr(right)?),
+            })
+        }
+        ast::Expr::Function(function) => {
+            let name = object_name(&function.name)?.to_lowercase();
+            if function.over.is_some() {
+                return Err(QueryError::Unsupported(
+                    "a window call inside a scalar expression".to_owned(),
+                ));
+            }
+            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
+                return Err(QueryError::Unsupported(format!("scalar function '{name}'")));
+            };
+            let ast::FunctionArguments::List(list) = &function.args else {
+                return Err(QueryError::Unsupported(format!(
+                    "{name} without an argument list"
+                )));
+            };
+            let mut args = Vec::with_capacity(list.args.len());
+            for arg in &list.args {
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+                    return Err(QueryError::Unsupported(format!(
+                        "argument '{arg}' in {name}"
+                    )));
+                };
+                args.push(lower_scalar_expr(expr)?);
+            }
+            if args.len() != arity {
+                return Err(QueryError::Unsupported(format!(
+                    "{name} takes {arity} argument(s), got {}",
+                    args.len()
+                )));
+            }
+            Ok(ScalarExpr::Call {
+                function: scalar,
+                args,
+            })
+        }
+        ast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if operand.is_some() {
+                return Err(QueryError::Unsupported(
+                    "CASE <operand> WHEN (use CASE WHEN <condition>)".to_owned(),
+                ));
+            }
+            let mut whens = Vec::with_capacity(conditions.len());
+            for case_when in conditions {
+                whens.push((
+                    crate::predicate::lower_predicate(&case_when.condition)?,
+                    lower_scalar_expr(&case_when.result)?,
+                ));
+            }
+            let otherwise = else_result
+                .as_ref()
+                .map(|expr| lower_scalar_expr(expr).map(Box::new))
+                .transpose()?;
+            Ok(ScalarExpr::Case { whens, otherwise })
+        }
         other => Err(QueryError::Unsupported(format!(
-            "expression '{other}' (columns and window calls only)"
+            "expression '{other}' in a projection"
         ))),
     }
 }

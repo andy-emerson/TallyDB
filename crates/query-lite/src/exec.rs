@@ -36,8 +36,11 @@
 //! remapped into a query-lifetime key space (the query-time remap
 //! decision #6 accepted).
 
-use crate::plan::{AggCall, AggFunction, AggItem, OrderBy, Plan, PlanItem, Projection, QueryError};
-use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate};
+use crate::plan::{
+    AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
+    ScalarExpr, ScalarFunction,
+};
+use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
@@ -435,7 +438,19 @@ fn execute_single(
     let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
     let mut output = match &plan.projection {
         Projection::Items(items) => project_items(schema, &views, items, registry)?,
-        Projection::Aggregate { keys, items } => project_aggregate(schema, &views, keys, items)?,
+        Projection::Aggregate {
+            keys,
+            items,
+            having,
+        } => match having {
+            None => project_aggregate(schema, &views, keys, items)?,
+            Some(having) => {
+                let mut extended = items.to_vec();
+                extended.extend(having.items.iter().cloned());
+                let output = project_aggregate(schema, &views, keys, &extended)?;
+                filter_having(output, &having.predicate, items.len())?
+            }
+        },
     };
     if plan.distinct {
         output = distinct_output(output);
@@ -524,6 +539,7 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
+            PlanItem::Computed { expr, name } => computed_column(schema, views, expr, name)?,
             PlanItem::WindowAgg {
                 function,
                 args,
@@ -554,6 +570,182 @@ fn project_items(
         .map(|columns| RecordBatch::new(schema.clone(), columns))
         .collect();
     Ok(QueryOutput { schema, batches })
+}
+
+/// Applies `HAVING`: the filter runs over the aggregate output rows —
+/// hidden `__having{i}` columns included — through the same predicate
+/// machinery WHERE uses (the output wraps as a query-lifetime segment,
+/// so numeric and key comparison semantics cannot diverge), keeps the
+/// TRUE rows (UNKNOWN filters, per SQL), and drops the hidden columns.
+fn filter_having(
+    output: QueryOutput,
+    predicate: &Predicate,
+    visible: usize,
+) -> Result<QueryOutput, QueryError> {
+    let full_schema = output.schema.clone();
+    let mut picks: Vec<(usize, usize)> = Vec::new();
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        let view = SegmentView::all_live(Arc::new(Segment::from_batch(batch.clone(), 0, false)));
+        let matched = evaluate_predicate(predicate, &full_schema, &view)?;
+        for row in 0..batch.num_rows() {
+            if matched.get(row) {
+                picks.push((batch_index, row));
+            }
+        }
+    }
+    let filtered = take_rows(&full_schema, &output.batches, &picks);
+    let schema = Schema::new(full_schema.fields()[..visible].to_vec());
+    let columns = filtered.columns()[..visible].to_vec();
+    Ok(QueryOutput {
+        schema: schema.clone(),
+        batches: vec![RecordBatch::new(schema, columns)],
+    })
+}
+
+/// The computed-projection slot (#49): evaluates a scalar expression
+/// per view, vectorized over the live rows, three-valued throughout —
+/// the output is a nullable `f64` column per view.
+fn computed_column(
+    schema: &Schema,
+    views: &[&SegmentView],
+    expr: &ScalarExpr,
+    name: &str,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let mut columns = Vec::with_capacity(views.len());
+    for view in views {
+        let (values, validity) = evaluate_scalar(expr, schema, view)?;
+        columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values, validity,
+        ))));
+    }
+    Ok((Field::new(name, ColumnType::F64, true), columns))
+}
+
+/// One view's worth of a scalar expression: `(values, validity)` over
+/// the live rows, in stored order.
+fn evaluate_scalar(
+    expr: &ScalarExpr,
+    schema: &Schema,
+    view: &SegmentView,
+) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+    let rows = view.live_rows();
+    match expr {
+        ScalarExpr::Column(name) => {
+            let (index, field) = resolve(schema, name)?;
+            match &view.segment.batch().columns()[index] {
+                Column::Numeric(NumericData::F64(numeric)) => {
+                    let raw = numeric.values().as_slice();
+                    let mut values = Vec::with_capacity(rows);
+                    let mut validity = Vec::with_capacity(rows);
+                    for row in live_rows(view) {
+                        values.push(raw[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    Ok((values, validity))
+                }
+                Column::Numeric(NumericData::I64(_)) => Err(QueryError::TypeError(format!(
+                    "column '{name}' is i64: exact integer expression arithmetic \
+                     is not built (#40); cast at ingest or use an f64 column"
+                ))),
+                Column::Key(_) => Err(QueryError::TypeError(format!(
+                    "column '{}' is a key: expressions are numeric (numeric-or-key)",
+                    field.name()
+                ))),
+            }
+        }
+        ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
+        ScalarExpr::Negate(inner) => {
+            let (mut values, validity) = evaluate_scalar(inner, schema, view)?;
+            for value in &mut values {
+                *value = -*value;
+            }
+            Ok((values, validity))
+        }
+        ScalarExpr::Binary { op, left, right } => {
+            let (lv, lval) = evaluate_scalar(left, schema, view)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view)?;
+            let values = lv
+                .iter()
+                .zip(&rv)
+                .map(|(&a, &b)| match op {
+                    ArithOp::Add => a + b,
+                    ArithOp::Sub => a - b,
+                    ArithOp::Mul => a * b,
+                    ArithOp::Div => a / b,
+                    ArithOp::Mod => a % b,
+                })
+                .collect();
+            let validity = lval.iter().zip(&rval).map(|(&a, &b)| a && b).collect();
+            Ok((values, validity))
+        }
+        ScalarExpr::Call { function, args } => {
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(evaluate_scalar(arg, schema, view)?);
+            }
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let valid = evaluated.iter().all(|(_, v)| v[row]);
+                validity.push(valid);
+                let arg = |i: usize| evaluated[i].0[row];
+                values.push(match function {
+                    ScalarFunction::Abs => arg(0).abs(),
+                    ScalarFunction::Round => arg(0).round(),
+                    ScalarFunction::Floor => arg(0).floor(),
+                    ScalarFunction::Ceil => arg(0).ceil(),
+                    ScalarFunction::Sqrt => arg(0).sqrt(),
+                    ScalarFunction::Ln => arg(0).ln(),
+                    ScalarFunction::Exp => arg(0).exp(),
+                    ScalarFunction::Power => arg(0).powf(arg(1)),
+                });
+            }
+            Ok((values, validity))
+        }
+        ScalarExpr::Case { whens, otherwise } => {
+            // Conditions evaluate vectorized, once per view (the WHERE
+            // machinery); selection is then per live row, first TRUE arm
+            // wins, UNKNOWN falls through like FALSE.
+            let mut conditions = Vec::with_capacity(whens.len());
+            let mut arms = Vec::with_capacity(whens.len());
+            for (predicate, arm) in whens {
+                conditions.push(evaluate_predicate(predicate, schema, view)?);
+                arms.push(evaluate_scalar(arm, schema, view)?);
+            }
+            let fallback = otherwise
+                .as_ref()
+                .map(|expr| evaluate_scalar(expr, schema, view))
+                .transpose()?;
+            let mut values = vec![0.0f64; rows];
+            let mut validity = vec![false; rows];
+            for (out, row) in live_rows(view).enumerate() {
+                let mut chosen = None;
+                for (condition, arm) in conditions.iter().zip(&arms) {
+                    if condition.get(row) {
+                        chosen = Some((arm.0[out], arm.1[out]));
+                        break;
+                    }
+                }
+                let (value, valid) = chosen.unwrap_or_else(|| match &fallback {
+                    Some((values, validity)) => (values[out], validity[out]),
+                    None => (0.0, false),
+                });
+                values[out] = value;
+                validity[out] = valid;
+            }
+            Ok((values, validity))
+        }
+    }
+}
+
+/// Builds a nullable `f64` column from parallel values/validity.
+fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
+    let buffer = Buffer::from_slice(&values);
+    if validity.iter().all(|&valid| valid) {
+        NumericColumn::new_non_null(buffer)
+    } else {
+        NumericColumn::new_nullable(buffer, Bitmap::from_bools(validity))
+    }
 }
 
 /// Looks up a column by name in the table schema.
@@ -2447,6 +2639,110 @@ mod query1_tests {
         )
         .unwrap();
         assert_eq!(flatten(&output, 0), [Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn computed_projections_evaluate_vectorized() {
+        let views = segmented(&[(1, "A", 1.0), (2, "B", 4.0), (3, "A", 9.0)], 2);
+        let registry = Registry::new();
+        let sql = "SELECT x * 2 + 1 AS y, SQRT(x) AS r FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(9.0), Some(19.0)]);
+        assert_eq!(flatten(&output, 1), [Some(1.0), Some(2.0), Some(3.0)]);
+        // Unaliased names render the expression's SQL text.
+        let sql = "SELECT x + 1 FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.schema.fields()[0].name(), "x + 1");
+        // Nested function arguments work.
+        let sql = "SELECT ABS(1 - x) AS d FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(0.0), Some(3.0), Some(8.0)]);
+        // i64 and key columns are refused loudly (numeric-or-key, #40).
+        for sql in ["SELECT ts + 1 FROM t", "SELECT sym * 2 FROM t"] {
+            let error = crate::plan::plan(sql)
+                .and_then(|plan| execute(&schema(), &views, &plan, &registry));
+            assert!(error.is_err(), "{sql} should be refused");
+        }
+    }
+
+    #[test]
+    fn case_selects_per_row_with_three_valued_conditions() {
+        let views = segmented(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 3.0)], 2);
+        let registry = Registry::new();
+        let sql = "SELECT CASE WHEN x > 2 THEN 100 WHEN sym = 'A' THEN x ELSE 0 END AS c FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(0.0), Some(100.0)]);
+        // Missing ELSE yields NULL.
+        let sql = "SELECT CASE WHEN x > 2 THEN 1 END AS c FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [None, None, Some(1.0)]);
+    }
+
+    #[test]
+    fn having_filters_groups_and_hides_its_columns() {
+        let views = segmented(
+            &[
+                (1, "A", 1.0),
+                (2, "B", 2.0),
+                (3, "A", 3.0),
+                (4, "B", 4.0),
+                (5, "C", 10.0),
+            ],
+            2,
+        );
+        let registry = Registry::new();
+        let sql = "SELECT sym, SUM(x) AS s FROM t GROUP BY sym HAVING SUM(x) > 4 ORDER BY s";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.schema.fields().len(), 2, "hidden columns dropped");
+        assert_eq!(flatten(&output, 1), [Some(6.0), Some(10.0)]); // B=6, C=10... A=4 filtered
+                                                                  // HAVING may reference the group key too.
+        let sql = "SELECT sym, COUNT(x) AS c FROM t GROUP BY sym HAVING sym <> 'C'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 2);
+        // HAVING without aggregation is refused toward WHERE.
+        assert!(crate::plan::plan("SELECT x FROM t HAVING x > 1").is_err());
     }
 
     #[test]
