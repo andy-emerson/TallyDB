@@ -711,6 +711,7 @@ impl WindowAggregate for RollingRegression {
 }
 
 /// Which pair statistic an instance computes.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum PairKind {
     /// Population covariance of `(y, x)` — 0 for a single point,
     /// matching `covar_pop`.
@@ -742,16 +743,26 @@ impl WindowAggregate for PairStatistic {
         }
         let count = n as f64;
         let (mean_y, mean_x) = (y.iter().sum::<f64>() / count, x.iter().sum::<f64>() / count);
+        // The corrected two-pass (Chan–Golub–LeVeque), same as the
+        // rolling regression: `sum_dy`/`sum_dx` are zero in exact
+        // arithmetic but only small in floating point, and dropping the
+        // correction costs ~4.9e-8 relative error at a 1e12 offset where
+        // carrying it holds the noise floor (~1e-14) — measured against
+        // the compensated reference in `window_truth`, and guarded by
+        // `window_numerics_guard` below.
+        let (mut sum_dy, mut sum_dx) = (0.0f64, 0.0f64);
         let (mut var_y, mut var_x, mut covar) = (0.0f64, 0.0f64, 0.0f64);
         for (&yi, &xi) in y.iter().zip(x) {
             let (dy, dx) = (yi - mean_y, xi - mean_x);
+            sum_dy += dy;
+            sum_dx += dx;
             var_y += dy * dy;
             var_x += dx * dx;
             covar += dy * dx;
         }
-        var_y /= count;
-        var_x /= count;
-        covar /= count;
+        var_y = (var_y - sum_dy * sum_dy / count) / count;
+        var_x = (var_x - sum_dx * sum_dx / count) / count;
+        covar = (covar - sum_dy * sum_dx / count) / count;
         match self.kind {
             PairKind::CovarPop => Ok(Some(covar)),
             PairKind::Corr => {
@@ -1293,53 +1304,28 @@ mod mutation_tests {
 }
 
 #[cfg(test)]
-mod measure_incremental_windows {
-    //! The 3b A/B: **incremental** window moments against the shipped
-    //! **recompute-per-window** algorithm — speed *and* numerics, because
-    //! for this change accuracy is the whole question, not a footnote.
-    //!
-    //! All four pair statistics (`covar_pop`, `corr`, `eigen_max`, and a
-    //! regression slope) derive from one set of window moments, so a
-    //! single accumulator serves them all. The three algorithms under
-    //! test:
-    //!
-    //! - **A — recompute** (what ships): two passes per window, the
-    //!   second about the window's own means, without the residual
-    //!   correction. O(n·w) work. It was assumed to be the most stable
-    //!   arrangement available and used as the accuracy reference; the
-    //!   compensated reference below shows that assumption was wrong at
-    //!   timestamp-scale offsets, where A is the *least* accurate of the
-    //!   three defensible variants.
-    //! - **B — naive incremental**: keep raw `Σx, Σy, Σxx, Σyy, Σxy`;
-    //!   slide by adding the entering row and subtracting the leaving
-    //!   one; recover variance as `E[x²] − E[x]²`. O(n) work and the
-    //!   fastest thing possible — and the textbook cancellation trap
-    //!   (bug #45's shape) once the data carries an offset.
-    //! - **C — shifted incremental with re-baselining**: the same O(1)
-    //!   slide, but moments are kept about a shift `K` near the data, and
-    //!   the accumulator is rebuilt from scratch every `w` steps so
-    //!   rounding cannot accumulate across the whole column. Rebuilding
-    //!   every `w` steps costs one extra pass overall, so the total stays
-    //!   O(n).
-    //!
-    //! Run explicitly, in release:
-    //!
-    //! ```text
-    //! cargo test -p engine --release measure_3b -- --ignored --nocapture
-    //! ```
+mod window_truth {
+    //! The accuracy yardstick for every window statistic: a compensated
+    //! high-precision computation, far better than plain f64, so "which
+    //! algorithm is closer to the true answer" is a measurable question
+    //! rather than an assumption. The lesson this module encodes: every
+    //! wrong accuracy conclusion this project has drawn came from judging
+    //! one f64 algorithm against another — a metric blind to the quantity
+    //! under test, or the shipped code standing in for truth. Nothing may
+    //! be judged accurate by comparison with itself.
 
-    /// The four statistics one moment set yields, in the order reported.
+    /// The four statistics one window's moments yield.
     #[derive(Clone, Copy, Default)]
-    struct Stats {
-        covar: f64,
-        corr: f64,
-        eigen_max: f64,
-        slope: f64,
+    pub(crate) struct Stats {
+        pub(crate) covar: f64,
+        pub(crate) corr: f64,
+        pub(crate) eigen_max: f64,
+        pub(crate) slope: f64,
     }
 
-    /// Derives the statistics from centered moments (the shared tail of
-    /// every algorithm here, so differences are in the moments alone).
-    fn stats_from(var_y: f64, var_x: f64, covar: f64) -> Stats {
+    /// Derives the statistics from centered moments — the shared tail of
+    /// every algorithm under test, so differences are in the moments.
+    pub(crate) fn stats_from(var_y: f64, var_x: f64, covar: f64) -> Stats {
         let corr = if var_y > 0.0 && var_x > 0.0 {
             covar / (var_y * var_x).sqrt()
         } else {
@@ -1355,8 +1341,237 @@ mod measure_incremental_windows {
         }
     }
 
-    /// A — recompute per window, two-pass and centered (the shipped
-    /// arrangement, and the accuracy reference).
+    /// Compensated (Neumaier) accumulation: keeps the rounding error of
+    /// every addition in a second term, so a sum of n values carries
+    /// error of order eps² rather than n·eps.
+    #[derive(Default, Clone, Copy)]
+    pub(crate) struct Compensated {
+        hi: f64,
+        lo: f64,
+    }
+
+    impl Compensated {
+        pub(crate) fn add(&mut self, value: f64) {
+            // Knuth's two-sum: `sum` plus `error` reproduces the
+            // operands exactly, whichever is larger.
+            let sum = self.hi + value;
+            let shifted = sum - self.hi;
+            self.lo += (self.hi - (sum - shifted)) + (value - shifted);
+            self.hi = sum;
+        }
+
+        /// Adds `a · b`, keeping the product's own rounding error too —
+        /// `mul_add` is a fused multiply-add, so it yields that error
+        /// exactly.
+        pub(crate) fn add_product(&mut self, a: f64, b: f64) {
+            let product = a * b;
+            self.add(product);
+            self.lo += a.mul_add(b, -product);
+        }
+
+        pub(crate) fn value(self) -> f64 {
+            self.hi + self.lo
+        }
+    }
+
+    /// The reference: per trailing window, moments about `(x[0], y[0])`
+    /// — exact shifts for offset data, removing the cancellation the
+    /// means introduce — accumulated with compensation.
+    pub(crate) fn high_precision(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        (0..y.len())
+            .map(|i| {
+                let lo = (i + 1).saturating_sub(w);
+                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
+                let n = wy.len() as f64;
+                let (x0, y0) = (wx[0], wy[0]);
+                let (mut sdx, mut sdy) = (Compensated::default(), Compensated::default());
+                let (mut sxx, mut syy, mut sxy) = (
+                    Compensated::default(),
+                    Compensated::default(),
+                    Compensated::default(),
+                );
+                for (&yi, &xi) in wy.iter().zip(wx) {
+                    let (dx, dy) = (xi - x0, yi - y0);
+                    sdx.add(dx);
+                    sdy.add(dy);
+                    sxx.add_product(dx, dx);
+                    syy.add_product(dy, dy);
+                    sxy.add_product(dx, dy);
+                }
+                let (sdx, sdy) = (sdx.value(), sdy.value());
+                let var_x = (sxx.value() - sdx * sdx / n) / n;
+                let var_y = (syy.value() - sdy * sdy / n) / n;
+                let covar = (sxy.value() - sdx * sdy / n) / n;
+                stats_from(var_y, var_x, covar)
+            })
+            .collect()
+    }
+
+    /// Deterministic pseudo-random values in [0, 1).
+    pub(crate) struct Lcg(pub(crate) u64);
+
+    impl Lcg {
+        pub(crate) fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// `(name, y, x)` corpora spanning the benign case and the offset
+    /// shapes where cancellation bites — the regime bug #45 was about.
+    /// Constructed so every statistic sits well away from zero, keeping
+    /// plain relative error meaningful.
+    pub(crate) fn corpora(rows: usize) -> Vec<(&'static str, Vec<f64>, Vec<f64>)> {
+        let mut sets = Vec::new();
+        for (name, offset) in [
+            ("benign (x ~ 0..10)", 0.0),
+            ("offset 1e6", 1e6),
+            ("offset 1e9 (unix seconds)", 1e9),
+            ("offset 1e12 (unix millis)", 1e12),
+        ] {
+            let mut rng = Lcg(0x3B_5EED_1234_5678);
+            let mut x = Vec::with_capacity(rows);
+            let mut y = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                let xi = offset + rng.next() * 10.0;
+                x.push(xi);
+                y.push(2.0 * (xi - offset) + rng.next());
+            }
+            sets.push((name, y, x));
+        }
+        // A monotonic ordering key: the timestamp-regressor shape, where
+        // the data also drifts away from any fixed shift.
+        let mut rng = Lcg(0x99_5EED_8765_4321);
+        let mut x = Vec::with_capacity(rows);
+        let mut y = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let xi = 1e9 + i as f64 * 0.05;
+            x.push(xi);
+            y.push(0.5 * (i as f64 * 0.05) + rng.next());
+        }
+        sets.push(("monotonic ts (1e9 + 0.05·i)", y, x));
+        sets
+    }
+}
+
+#[cfg(test)]
+mod window_numerics_guard {
+    //! The permanent accuracy contract, run in CI on every change (not
+    //! ignored, not a measurement): every shipped window statistic must
+    //! track the compensated reference at the float noise floor over the
+    //! adversarial corpora — offsets to 1e12 and a drifting monotonic
+    //! ordering key included. This is what makes "improved performance
+    //! without sacrificing correctness" a checked property instead of a
+    //! claim: any future change to these ops that trades accuracy away
+    //! fails here, loudly, before it lands.
+    //!
+    //! The bound is 1e-12 relative — two orders above the ~1e-14 the
+    //! corrected two-pass achieves (headroom for corpus changes), four
+    //! orders below the ~4.9e-8 the uncorrected form degraded to at a
+    //! 1e12 offset (the defect this guard exists to keep out; disabling
+    //! the correction trips this test at the first 1e12 window,
+    //! verified by hand 2026-07-27).
+
+    use super::window_truth::{corpora, high_precision};
+    use super::*;
+
+    const BOUND: f64 = 1e-12;
+
+    fn relative(got: f64, reference: f64) -> f64 {
+        ((got - reference) / reference).abs()
+    }
+
+    #[test]
+    fn shipped_window_statistics_track_the_compensated_reference() {
+        let rows = 2_000;
+        let w = 64;
+        for (name, y, x) in corpora(rows) {
+            let reference = high_precision(&y, &x, w);
+            for i in (w - 1)..rows {
+                let lo = (i + 1).saturating_sub(w);
+                let window: [&[f64]; 2] = [&y[lo..=i], &x[lo..=i]];
+                let truth = reference[i];
+                // The guard guards itself: a statistic near zero would
+                // make relative error meaningless, so the corpora must
+                // keep them all well away from it.
+                assert!(
+                    truth.covar.abs() > 1e-3
+                        && truth.corr.abs() > 1e-3
+                        && truth.eigen_max.abs() > 1e-3
+                        && truth.slope.abs() > 1e-3,
+                    "{name} row {i}: corpus left a statistic near zero"
+                );
+                for (kind, expected) in [
+                    (PairKind::CovarPop, truth.covar),
+                    (PairKind::Corr, truth.corr),
+                    (PairKind::EigenMax, truth.eigen_max),
+                ] {
+                    let got = PairStatistic { kind }
+                        .evaluate(&window)
+                        .unwrap()
+                        .expect("defined on these corpora");
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} {kind:?}: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
+                }
+                let got = RollingRegression {
+                    output: RegressionOutput::Slope,
+                }
+                .evaluate(&window)
+                .unwrap()
+                .expect("defined on these corpora");
+                assert!(
+                    relative(got, truth.slope) < BOUND,
+                    "{name} row {i} slope: {got} vs {} (relative {:.2e})",
+                    truth.slope,
+                    relative(got, truth.slope)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod measure_incremental_windows {
+    //! The 3b A/B: **incremental** window moments against the shipped
+    //! **recompute-per-window** algorithm — speed *and* numerics, every
+    //! variant judged against `window_truth`'s compensated reference
+    //! (never against another f64 algorithm; see that module's note).
+    //!
+    //! The three algorithms:
+    //!
+    //! - **A — recompute** (what ships): corrected two-pass per window
+    //!   (Chan–Golub–LeVeque), matching `PairStatistic` and
+    //!   `RollingRegression`. O(n·w) work. (The earlier *uncorrected*
+    //!   two-pass shipped until 2026-07-27 and degraded to ~4.9e-8
+    //!   relative at a 1e12 offset — the defect `window_numerics_guard`
+    //!   now keeps out.)
+    //! - **B — naive incremental**: raw running `Σx, Σy, Σxx, Σyy, Σxy`,
+    //!   variance as `E[x²] − E[x]²`. O(n), fastest possible, and the
+    //!   textbook cancellation trap (bug #45's shape) — kept here as the
+    //!   permanent cautionary contrast, never to ship.
+    //! - **C — shifted incremental with re-baselining**: the same O(1)
+    //!   slide, moments kept about a shift near the data, accumulator
+    //!   rebuilt every `w` steps so rounding cannot accumulate across
+    //!   the column. One extra pass overall; still O(n).
+    //!
+    //! Run explicitly, in release:
+    //!
+    //! ```text
+    //! cargo test -p engine --release measure_3b -- --ignored --nocapture
+    //! ```
+
+    use super::window_truth::{corpora, high_precision, stats_from, Stats};
+
+    /// One algorithm under test: window statistics for a whole column.
+    type WindowAlgorithm<'a> = &'a dyn Fn(&[f64], &[f64], usize) -> Vec<Stats>;
+
+    /// A — the shipped arrangement: corrected two-pass per window.
     fn recompute(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
         (0..y.len())
             .map(|i| {
@@ -1365,20 +1580,27 @@ mod measure_incremental_windows {
                 let n = wy.len() as f64;
                 let mean_y = wy.iter().sum::<f64>() / n;
                 let mean_x = wx.iter().sum::<f64>() / n;
-                let (mut vy, mut vx, mut cxy) = (0.0, 0.0, 0.0);
+                let (mut sdy, mut sdx) = (0.0f64, 0.0f64);
+                let (mut vy, mut vx, mut cxy) = (0.0f64, 0.0f64, 0.0f64);
                 for (&yi, &xi) in wy.iter().zip(wx) {
                     let (dy, dx) = (yi - mean_y, xi - mean_x);
+                    sdy += dy;
+                    sdx += dx;
                     vy += dy * dy;
                     vx += dx * dx;
                     cxy += dy * dx;
                 }
-                stats_from(vy / n, vx / n, cxy / n)
+                stats_from(
+                    (vy - sdy * sdy / n) / n,
+                    (vx - sdx * sdx / n) / n,
+                    (cxy - sdy * sdx / n) / n,
+                )
             })
             .collect()
     }
 
-    /// Running raw moments; `shift` is subtracted from every value as it
-    /// enters (zero for the naive variant).
+    /// Running raw moments; `ky`/`kx` are subtracted from every value as
+    /// it enters (zero for the naive variant).
     #[derive(Default, Clone, Copy)]
     struct Moments {
         n: f64,
@@ -1437,8 +1659,7 @@ mod measure_incremental_windows {
     }
 
     /// C — shifted incremental, rebuilt every `w` steps about a shift
-    /// taken from the current window (so values stay small relative to
-    /// their own spread, and rounding cannot accumulate column-wide).
+    /// taken from the current window.
     fn incremental_shifted(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
         let mut moments = Moments::default();
         let mut since_rebuild = usize::MAX; // force a build on the first row
@@ -1463,84 +1684,6 @@ mod measure_incremental_windows {
                     since_rebuild += 1;
                 }
                 moments.stats()
-            })
-            .collect()
-    }
-
-    // ---- a higher-precision reference, so "closer to truth" is answerable ----
-
-    /// Compensated (Neumaier) accumulation: keeps the rounding error of
-    /// every addition in a second term, so a sum of n values carries
-    /// error of order eps² rather than n·eps. Enough extra precision to
-    /// judge f64 results that differ in their last digits.
-    #[derive(Default, Clone, Copy)]
-    struct Compensated {
-        hi: f64,
-        lo: f64,
-    }
-
-    impl Compensated {
-        fn add(&mut self, value: f64) {
-            // Knuth's two-sum: `sum` plus `error` reproduces the operands
-            // exactly, whichever is larger.
-            let sum = self.hi + value;
-            let shifted = sum - self.hi;
-            self.lo += (self.hi - (sum - shifted)) + (value - shifted);
-            self.hi = sum;
-        }
-
-        /// Adds `a · b`, keeping the product's own rounding error too —
-        /// `mul_add` is a fused multiply-add, so it yields that error
-        /// exactly.
-        fn add_product(&mut self, a: f64, b: f64) {
-            let product = a * b;
-            self.add(product);
-            self.lo += a.mul_add(b, -product);
-        }
-
-        fn value(self) -> f64 {
-            self.hi + self.lo
-        }
-    }
-
-    /// The statistics computed to far better than f64 — the yardstick
-    /// both the shipped recompute and the incremental variants are
-    /// judged against, so "which is closer to the true answer" has an
-    /// answer rather than an assumption.
-    ///
-    /// Moments are taken about `(x[0], y[0])` rather than the means:
-    /// for offset data those shifts are exact (the values share a
-    /// binade, so the subtraction is), which removes the cancellation
-    /// the means introduce, and the shifted values are then accumulated
-    /// with compensation.
-    fn high_precision(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
-        (0..y.len())
-            .map(|i| {
-                let lo = (i + 1).saturating_sub(w);
-                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
-                let n = wy.len() as f64;
-                let (x0, y0) = (wx[0], wy[0]);
-                let (mut sdx, mut sdy) = (Compensated::default(), Compensated::default());
-                let (mut sxx, mut syy, mut sxy) = (
-                    Compensated::default(),
-                    Compensated::default(),
-                    Compensated::default(),
-                );
-                for (&yi, &xi) in wy.iter().zip(wx) {
-                    let (dx, dy) = (xi - x0, yi - y0);
-                    sdx.add(dx);
-                    sdy.add(dy);
-                    sxx.add_product(dx, dx);
-                    syy.add_product(dy, dy);
-                    sxy.add_product(dx, dy);
-                }
-                let (sdx, sdy) = (sdx.value(), sdy.value());
-                // Central moments from the shifted ones, exactly as the
-                // algebra prescribes.
-                let var_x = (sxx.value() - sdx * sdx / n) / n;
-                let var_y = (syy.value() - sdy * sdy / n) / n;
-                let covar = (sxy.value() - sdx * sdy / n) / n;
-                stats_from(var_y, var_x, covar)
             })
             .collect()
     }
@@ -1572,70 +1715,20 @@ mod measure_incremental_windows {
         worst
     }
 
-    /// One algorithm under test: window statistics for a whole column.
-    type WindowAlgorithm = &'static dyn Fn(&[f64], &[f64], usize) -> Vec<Stats>;
-
-    /// Deterministic pseudo-random values in [0, 1).
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> f64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
-
-    /// `(name, y, x)` corpora spanning the benign case and the offset
-    /// shapes where cancellation bites — the regime bug #45 was about.
-    fn corpora(rows: usize) -> Vec<(&'static str, Vec<f64>, Vec<f64>)> {
-        let mut sets = Vec::new();
-        for (name, offset) in [
-            ("benign (x ~ 0..10)", 0.0),
-            ("offset 1e6", 1e6),
-            ("offset 1e9 (unix seconds)", 1e9),
-            ("offset 1e12 (unix millis)", 1e12),
-        ] {
-            let mut rng = Lcg(0x3B_5EED_1234_5678);
-            let mut x = Vec::with_capacity(rows);
-            let mut y = Vec::with_capacity(rows);
-            for _ in 0..rows {
-                let xi = offset + rng.next() * 10.0;
-                x.push(xi);
-                y.push(2.0 * (xi - offset) + rng.next());
-            }
-            sets.push((name, y, x));
-        }
-        // A monotonic ordering key: the timestamp-regressor shape, where
-        // the data also drifts away from any fixed shift.
-        let mut rng = Lcg(0x99_5EED_8765_4321);
-        let mut x = Vec::with_capacity(rows);
-        let mut y = Vec::with_capacity(rows);
-        for i in 0..rows {
-            let xi = 1e9 + i as f64 * 0.05;
-            x.push(xi);
-            y.push(0.5 * (i as f64 * 0.05) + rng.next());
-        }
-        sets.push(("monotonic ts (1e9 + 0.05·i)", y, x));
-        sets
-    }
-
     #[test]
     #[ignore = "measurement — run explicitly in release mode"]
     fn measure_3b_incremental_vs_recompute() {
         let rows = 20_000;
         let w = 64;
         println!(
-            "3b A/B: {rows} rows, window {w}; A = recompute (shipped), \
+            "3b A/B: {rows} rows, window {w}; A = corrected recompute (shipped), \
              B = naive incremental, C = shifted incremental rebuilt every {w}.\n\
-             Errors are worst relative deviation from a compensated \
+             Errors are worst relative deviation from the compensated \
              high-precision reference."
         );
         for (name, y, x) in corpora(rows) {
             // Timing: best of a few passes, black-boxed against DCE.
-            let time = |f: WindowAlgorithm| {
+            let time = |f: WindowAlgorithm<'_>| {
                 let mut best = f64::INFINITY;
                 let mut last = Vec::new();
                 for _ in 0..5 {
@@ -1649,10 +1742,6 @@ mod measure_incremental_windows {
             let (time_a, recomputed) = time(&recompute);
             let (time_b, naive) = time(&incremental_naive);
             let (time_c, shifted) = time(&incremental_shifted);
-            // Judged against the high-precision answer, not against each
-            // other: the question is which is closer to the truth, and
-            // treating the shipped algorithm as the yardstick cannot
-            // answer that.
             let reference = high_precision(&y, &x, w);
             let error_a = worst_relative_error(&recomputed, &reference, w);
             let error_b = worst_relative_error(&naive, &reference, w);
