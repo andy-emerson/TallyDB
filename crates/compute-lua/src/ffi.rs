@@ -75,9 +75,13 @@ unsafe extern "C" {
     pub(crate) fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int;
     pub(crate) fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
     pub(crate) fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void;
+    /// Converts any value to a string honoring `__tostring`, pushing the
+    /// result on the stack (the caller pops it).
+    pub(crate) fn luaL_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
 
     // Pushes.
     pub(crate) fn lua_pushboolean(L: *mut lua_State, b: c_int);
+    pub(crate) fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void);
     pub(crate) fn lua_pushnil(L: *mut lua_State);
     pub(crate) fn lua_pushnumber(L: *mut lua_State, n: lua_Number);
     pub(crate) fn lua_pushinteger(L: *mut lua_State, n: lua_Integer);
@@ -109,6 +113,12 @@ unsafe extern "C" {
     pub(crate) fn luaopen_math(L: *mut lua_State) -> c_int;
     pub(crate) fn luaopen_string(L: *mut lua_State) -> c_int;
     pub(crate) fn luaopen_table(L: *mut lua_State) -> c_int;
+}
+
+/// `lua_upvalueindex` as the 5.4 macro expands it: the pseudo-index of
+/// a C closure's `i`-th upvalue.
+pub(crate) const fn lua_upvalueindex(i: c_int) -> c_int {
+    LUA_REGISTRYINDEX - i
 }
 
 /// `lua_pcall` as the 5.4 macro expands it.

@@ -60,9 +60,11 @@
 //! DESIGN.md for the reasoning.
 
 mod ffi;
+mod log;
 mod state;
 mod values;
 
+pub use log::LogSink;
 pub use state::LuaState;
 pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 

@@ -987,6 +987,63 @@ unsafe extern "C" fn null_tostring(state: *mut ffi::lua_State) -> c_int {
     }
 }
 
+/// A short type-and-length summary of the view or mask at `idx`, if it
+/// is one — what `log()` renders instead of buffer contents (a
+/// diagnostic, not a buffer dump). Reads only the payload, never the
+/// buffers, so it is safe even on a poisoned view. Formats into a
+/// fixed buffer (no heap) so the caller can push it from a C frame
+/// under the module discipline.
+///
+/// # Safety
+/// `raw` must be a state [`install`] has prepared and `idx` a valid
+/// stack index.
+pub(crate) unsafe fn view_summary(
+    raw: *mut ffi::lua_State,
+    idx: c_int,
+) -> Option<([u8; 48], usize)> {
+    unsafe {
+        let (kind, type_name, len) = {
+            let input = ffi::luaL_testudata(raw, idx, META_INPUT.as_ptr());
+            if !input.is_null() {
+                let payload = *input.cast::<InputPayload>();
+                ("view", Some(tag_name(payload.tag)), payload.len)
+            } else {
+                let output = ffi::luaL_testudata(raw, idx, META_OUTPUT.as_ptr());
+                if !output.is_null() {
+                    let payload = *output.cast::<OutputPayload>();
+                    ("output", Some(tag_name(payload.tag)), payload.len)
+                } else {
+                    let mask = ffi::luaL_testudata(raw, idx, META_MASK.as_ptr());
+                    if mask.is_null() {
+                        return None;
+                    }
+                    ("mask", None, (*mask.cast::<MaskPayload>()).len)
+                }
+            }
+        };
+        let mut buffer = [0u8; 48];
+        let written = {
+            use std::io::Write;
+            let mut cursor = &mut buffer[..];
+            let _ = match type_name {
+                Some(name) => write!(cursor, "{name} {kind}, len {len}"),
+                None => write!(cursor, "{kind}, len {len}"),
+            };
+            let remaining = cursor.len();
+            buffer.len() - remaining
+        };
+        Some((buffer, written))
+    }
+}
+
+fn tag_name(tag: u8) -> &'static str {
+    match tag {
+        TAG_F64 => "f64",
+        TAG_I64 => "i64",
+        _ => "key",
+    }
+}
+
 /// The data pointer a view userdata (input or output) carries — the
 /// zero-copy proof hook, compared against the source buffer's pointer
 /// in tests exactly like the engine's passthrough pointer checks.

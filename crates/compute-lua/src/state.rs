@@ -39,6 +39,7 @@
 //! native op rather than the interpreter getting a JIT.
 
 use crate::ffi;
+use crate::log::{self, LogSink, SinkSlot};
 use crate::values::{self, ColumnView, OutputColumn, ReturnType, ScalarValue};
 use std::ffi::CStr;
 
@@ -51,6 +52,9 @@ pub struct LuaState {
     /// The registry-anchored generation counter view lifetimes are
     /// checked against; bumped on every `eval_*` exit.
     generation: *mut u64,
+    /// The `log()` sink slot — boxed so the `log` closure's upvalue
+    /// pointer survives moves of this struct; freed in `Drop`.
+    sink: *mut SinkSlot,
 }
 
 impl LuaState {
@@ -68,7 +72,21 @@ impl LuaState {
             ffi::luaL_requiref(raw, c"table".as_ptr(), ffi::luaopen_table, 1);
             ffi::lua_settop(raw, 0);
             let generation = values::install(raw);
-            Ok(LuaState { raw, generation })
+            let sink = Box::into_raw(Box::new(SinkSlot(None)));
+            log::install(raw, sink);
+            Ok(LuaState {
+                raw,
+                generation,
+                sink,
+            })
+        }
+    }
+
+    /// Installs the destination for scripts' `log(...)` output —
+    /// off (a no-op) until the embedder installs one. See [`LogSink`].
+    pub fn set_log_sink(&mut self, sink: Box<dyn LogSink>) {
+        unsafe {
+            (*self.sink).0 = Some(sink);
         }
     }
 
@@ -209,7 +227,9 @@ impl LuaState {
 //    created in `new`, closed in `Drop`, and the pointer is never
 //    copied out of the struct (`view_data_pointer` returns buffer
 //    pointers, not the state). `generation` points into that same
-//    interpreter's registry-anchored allocation, so it moves with it.
+//    interpreter's registry-anchored allocation, and `sink` into a Box
+//    this struct alone owns (its `LogSink` contents are themselves
+//    `Send` by the trait's bound), so both move with it.
 // 2. Every operation takes `&mut self`, so after a move to another
 //    thread exactly one thread touches the interpreter at a time.
 // 3. Vendored PUC Lua 5.4, compiled unmodified with the ANSI config,
@@ -228,7 +248,12 @@ unsafe impl Send for LuaState {}
 
 impl Drop for LuaState {
     fn drop(&mut self) {
-        unsafe { ffi::lua_close(self.raw) }
+        unsafe {
+            ffi::lua_close(self.raw);
+            // After close nothing can reach the log closure's upvalue;
+            // the slot is safe to free.
+            drop(Box::from_raw(self.sink));
+        }
     }
 }
 
@@ -1051,6 +1076,82 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("2 bits for 3 values"), "{error}");
+    }
+
+    // ---- log(): the host-routed diagnostic side-channel ----
+
+    /// A capture sink for tests.
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl LogSink for Capture {
+        fn log(&self, message: &str) {
+            self.0.lock().unwrap().push(message.to_owned());
+        }
+    }
+
+    #[test]
+    fn log_routes_to_the_installed_sink_and_summarizes_views() {
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = LuaState::new().unwrap();
+        state.set_log_sink(Box::new(Capture(messages.clone())));
+        let values = [0.25f64, 0.5, 0.75];
+        let result = state
+            .eval_scalar(
+                "log('x:', 42, 1.5, nil, NULL, v, v:mask())\nreturn v:sum()",
+                &[(c"v", f64s(&values))],
+                ReturnType::F64,
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::F64(1.5));
+        let captured = messages.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        // Arguments tab-joined; scalars as text, the sentinel by name —
+        // and views as summaries, never their contents.
+        assert_eq!(
+            captured[0],
+            "x:\t42\t1.5\tnil\tNULL\tf64 view, len 3\tmask, len 3"
+        );
+        assert!(!captured[0].contains("0.25"), "no buffer dump");
+    }
+
+    #[test]
+    fn log_is_a_pure_side_channel() {
+        // No sink installed: log is a no-op, not an error.
+        let mut state = LuaState::new().unwrap();
+        let result = state
+            .eval_scalar("log('into the void')\nreturn 7", &[], ReturnType::I64)
+            .unwrap();
+        assert_eq!(result, ScalarValue::I64(7));
+        // log returns nothing, so it cannot feed a result.
+        let result = state
+            .eval_scalar(
+                "local r = log('x')\nif r == nil then return 1 else return 0 end",
+                &[],
+                ReturnType::I64,
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::I64(1));
+        // The answer is identical with and without a sink.
+        let quiet = state
+            .eval_scalar("return 2 + 2", &[], ReturnType::I64)
+            .unwrap();
+        state.set_log_sink(Box::new(Capture(Default::default())));
+        let logged = state
+            .eval_scalar("log('computing')\nreturn 2 + 2", &[], ReturnType::I64)
+            .unwrap();
+        assert_eq!(quiet, logged);
+    }
+
+    #[test]
+    fn print_and_warn_are_removed() {
+        // Their destinations (stdout, stderr) are process streams an
+        // embedded library does not own; both fail loudly, pointing the
+        // kernel author at log().
+        let mut state = LuaState::new().unwrap();
+        for chunk in ["print(1)", "warn('w')"] {
+            let error = state.eval_scalar(chunk, &[], ReturnType::I64).unwrap_err();
+            assert!(error.contains("nil"), "{chunk}: {error}");
+        }
     }
 
     #[test]
