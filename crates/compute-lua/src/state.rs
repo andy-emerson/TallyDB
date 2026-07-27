@@ -46,7 +46,10 @@ use std::ffi::CStr;
 /// An embedded Lua 5.4 interpreter with the curated library set
 /// (base, math, string, table — no io, no os, no debug; the package
 /// library is not even linked, per the ANSI build), the view
-/// metatables, and the `NULL` sentinel installed.
+/// metatables, and the `NULL` sentinel installed. Base opens minus
+/// `print` and `warn` (process streams are not this library's to own);
+/// `log(...)` is the diagnostic, routed to the embedder's [`LogSink`]
+/// via [`LuaState::set_log_sink`].
 pub struct LuaState {
     raw: *mut ffi::lua_State,
     /// The registry-anchored generation counter view lifetimes are
