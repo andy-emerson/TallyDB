@@ -374,6 +374,48 @@ compaction resolves tombstones and merges segments. This means:
 > No reopen condition is foreseen for the listener; the
 > network-boundary argument is structural.
 
+## The console, and the deployment roadmap beyond it
+
+**Decision record — the M3.5 console (#39, ruled 2026-07-27).** The
+shell / security / systems separation is the architecture: the engine
+(systems) stays dependency-clean; `tallydb-shell`'s `Console` is a
+reusable module a future served product embeds; `main.rs` is a thin
+skin. Rulings, each with its losing alternatives: **dependencies** —
+rustyline and csv only, confined to the shell crate (zero-dep
+hand-rolling rejected as reinvention; a CLI framework rejected as
+surface without need). **DDL grammar** — `BIGINT` / `DOUBLE` / the
+coined `KEY`, one `ORDERING KEY` column constraint; `VARCHAR`/`TEXT`
+refused with the keys-are-interned-labels teaching error rather than
+aliased (an alias teaches the wrong model); user-typed `PRIMARY KEY`
+refused with its own teaching error (the ordering key is not a
+uniqueness constraint — duplicates are first-class), while serving
+internally as the parser's carrier for the `ORDERING KEY` phrase.
+**Import** — CSV in the shell layer feeding the ordinary append path;
+the engine never parses CSV. **Code registration** — the explicit
+`.lua` dot-command only; `CREATE FUNCTION ... LANGUAGE LUA` is
+deliberately *not* SQL, so a SQL string is never a code-injection
+vector — the SQL form is a recorded decision for the served product's
+threat model, not before. Local security posture: an OS file lock
+(released by the OS on death — no stale locks) admits one process per
+directory; table names stay identifiers (they become directory names).
+
+**The roadmap beyond native GA (recorded 2026-07-27; three deployment
+models, one engine).** M3 ships *embed in your application* plus the
+console. M4 (WASM parity) adds *embed in a browser*: the compute stack
+already compiles for wasm32; the remaining work is a browser
+`StorageBackend` (OPFS/IndexedDB behind the existing trait — written
+knowing an HTTP-fetch sibling comes later), the JS bindings, and
+`lua.wasm`. M5 adds *embed in a server*: a Servette-shaped served
+product and a workbench UI, both **separate artifacts embedding the
+engine** (the never-a-server guardrail's sanctioned form), the console
+module reused as the server's shell. The load-bearing observation for
+M5's sync story: **segments are immutable, self-describing, CRC'd
+objects committed by a generation manifest — the storage format is
+already the replication format.** A read-only browser or client
+replica fetches the manifest and pulls segments lazily (zone maps
+prune the fetch), verified by the same checks reopen runs; the single
+writer stays wherever the WAL is. Nothing in M4 may foreclose this.
+
 ## Current milestone: native only
 
 We are building the **native build first** — Linux/Mac/Windows, linked into
@@ -725,7 +767,7 @@ DuckDB differential family; the shell's help cites this table.
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule |
 | `ASOF` / ordered-merge joins | in, later | #65 |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
-| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, M3.5 | ships inside the shell increment (#39) |
+| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `ORDERING KEY` constraint; `VARCHAR` and `PRIMARY KEY` refused with teaching errors |
 | non-correlated subqueries / CTEs | in, later | named subplans |
 | `UNION ALL` (then `UNION`) | in, later | low priority |
 | correlated subqueries | **out** | the road to a cost-based optimizer — settled no |

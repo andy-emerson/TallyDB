@@ -13,11 +13,14 @@
 > round-tripped through storage. M2 (feature-complete) is merged: its
 > final increment, M2.7, put embedded Lua on the engine's own zero-copy
 > buffers — scripted window kernels, the curated ops callable from
-> scripts, a NumPy-checked oracle family in CI. M3 has opened with the
-> increment that earns the compute claim: the curated window statistics
-> evaluate incrementally and now beat both DuckDB+NumPy and
-> NumPy-over-our-own-export in every measured shape, under a
-> compensated-truth accuracy guard in CI (see *Where things stand*). The settled
+> scripts, a NumPy-checked oracle family in CI. M3 (native GA) is built
+> on the working branch: incremental window evaluation that beats both
+> DuckDB+NumPy and NumPy-over-our-own-export in every measured shape
+> under a compensated-truth CI guard, single-writer/concurrent-reader
+> snapshots, a crash-tested WAL with sync levels, the ruled SQL
+> IN-tier (`HAVING`, `DISTINCT`, scalar expressions, `CASE`, `LIKE`,
+> DDL), and the `tallydb` console binary with per-platform release
+> builds — awaiting the closing merges. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -103,9 +106,9 @@ always numeric or key; a bare string never exists in the engine. That is
 more permissive than it sounds:
 
 - **String *predicates* on key columns are in scope.** `WHERE symbol =
-  '...'` and `WHERE symbol IN (...)` are built today; `WHERE name LIKE
-  '%Bank%'` and regex matching are in scope but not yet implemented
-  (tracked as a todo — the engine rejects them loudly until then). All
+  '...'`, `WHERE symbol IN (...)`, and `WHERE name LIKE '%Bank%'` are
+  built today; regex matching is in scope but not yet implemented
+  (tracked as a todo — the engine rejects it loudly until then). All
   of them consume the interned strings and emit a *row selection*, not a
   string. Because keys are dictionary-encoded, such a predicate is
   evaluated once per *distinct* value and applied as integer
@@ -127,8 +130,10 @@ boundary, not our own foresight.
 
 - Link it into your application like SQLite or DuckDB — no server process,
   no separate database to administer. (A standalone single-file CLI
-  binary per release — the `sqlite3`-shell shape, still no server — is
-  planned for native GA; see `DESIGN.md`, *Deployment shapes*.)
+  binary per release — the `sqlite3`-shell shape, still no server — ships
+  with M3: `tallydb <dir>` opens a console with line editing, `CREATE
+  TABLE`/`INSERT`/CSV import, the full query surface, and `.lua` kernel
+  registration; see `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded

@@ -92,5 +92,6 @@ pub use table::{schema_from_create, EngineError, Table, TableReader, TableSnapsh
 // TODO: expose the remaining compute-linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced
 //       cleanly (not panics)
-// TODO: the scalar-projection Lua slot (#53, post-M2: PlanItem is
-//       Column|WindowAgg only; computed projections aren't built)
+// TODO: the Lua half of scalar projections (#53): the computed-
+//       projection slot exists (PlanItem::Computed, M3.4) — what's
+//       left is letting a registered Lua function appear in it
