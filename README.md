@@ -247,24 +247,31 @@ re-derived by NumPy in CI over a multi-segment storage round trip, the
 C boundary additionally run under `LUA_USE_APICHECK` and ASan/UBSan in
 CI, and `log()` routing script diagnostics to an embedder-installed
 sink (`print` is gone; stdout is not an embedded library's to own). One
-honest set of numbers to hold beside the design: the in-engine-vs-round-trip
-latency benchmark (`m2_compute_latency_bench.py`, run 2026-07-27,
-container hardware, 20k rows, window 64) is now **mixed**. In-engine wins
-`regr_slope` by **3.3×** against DuckDB's equivalent window and reaches
-parity on a single-window query. It still loses the pair statistics
-(`covar_pop`, `corr`, `eigen_max`) by ~2.5× and the Lua kernels by ~14×
-to exporting over Arrow and computing in vectorized NumPy — because the
-Arrow hop is nearly free in-process, while the engine recomputes each
-window from scratch where the vectorized peer sweeps the column once.
-Three rounds of overhead have come off already (kernels compile once
-rather than per window; the 2×2 eigenvalue and the two-parameter
-regression are solved in closed form rather than by a general solver),
-and the remaining gap is measured and understood: it is the O(n·w)
-recompute, not the arithmetic. Incremental windows would close it — a
-7× algorithmic win, measured, with the numerics settled — and need an
-executor change that is not built. The zero-copy property itself is
-pointer-verified and stands; a blanket wall-clock win is not yet an
-earned claim.
+honest set of numbers to hold beside the design: the latency benchmark
+(`m2_compute_latency_bench.py`, run 2026-07-27, container hardware, 20k
+rows, window 64) now measures **two peers** — vectorized NumPy riding
+TallyDB's own ~0.1ms Arrow export (the *marginal* question: given data
+in TallyDB, is in-engine compute worth it?) and the competitor stack
+entire, the same rows stored in DuckDB with NumPy pulling from DuckDB
+(the *product* question: TallyDB, or DuckDB + NumPy?). Against the
+competitor stack, in-engine wins `regr_slope` by **2.4×**, holds parity
+on the pair statistics (`covar_pop`, `corr`, `eigen_max`: 0.84–1.08),
+and wins the live-query shape — the newest window, now — by **7–9×**,
+because pulling even 64 rows out of DuckDB costs ~1ms before any math
+happens, while the append-ordered engine serves the whole query in
+~120µs. Against the marginal peer the pair statistics still lose ~2.5×
+and the Lua kernels ~14×: the Arrow hop is nearly free in-process, and
+the engine recomputes each window from scratch where the vectorized
+peer sweeps the column once. Three rounds of overhead have come off
+already (kernels compile once rather than per window; the 2×2
+eigenvalue and the two-parameter regression are solved in closed form
+rather than by a general solver), and the remaining gap is measured and
+understood: it is the O(n·w) recompute, not the arithmetic. Incremental
+windows would close it — a 7× algorithmic win, measured, with the
+numerics settled — and need an executor change that is not built. The
+zero-copy property itself is pointer-verified and stands; the earned
+wall-clock claim is bulk parity and a decisive latency win against the
+stack a user would actually deploy, not a blanket win in every shape.
 `lua.wasm` (the one WASM compute
 dependency still to come, for later) is a real, working, MIT-licensed
 project already in progress by the same author — tracked as a future
