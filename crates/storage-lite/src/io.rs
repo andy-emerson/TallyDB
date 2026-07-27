@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Why a backend operation failed.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,6 +64,26 @@ pub trait StorageBackend: Send + Sync {
 
     /// Removes the object named `name` (an error if absent).
     fn remove(&self, name: &str) -> Result<(), IoError>;
+
+    /// Creates (or truncates) the append-only log named `name` and
+    /// returns its writer. The log lists and reads back like any
+    /// object, but its durability is governed by [`LogWriter::sync`] —
+    /// not `write`'s atomic-publish contract — because a log's whole
+    /// point is accumulating small appends between syncs (the WAL,
+    /// decision #43).
+    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError>;
+}
+
+/// An open append-only log. Bytes accumulate with `append`; `sync`
+/// makes everything appended so far durable against power loss.
+/// Dropping a writer without syncing loses at most the unsynced tail —
+/// the WAL's per-record CRCs turn that into a clean torn tail at
+/// replay, never corruption.
+pub trait LogWriter: Send {
+    /// Appends `bytes` to the log.
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError>;
+    /// Makes every appended byte durable against power loss.
+    fn sync(&mut self) -> Result<(), IoError>;
 }
 
 /// The native backend: one directory, one file per object. Writes go to
@@ -88,6 +108,27 @@ impl FsBackend {
             dir,
             write_counter: AtomicU64::new(0),
         })
+    }
+}
+
+/// [`LogWriter`] over one native file: `write(2)` per append,
+/// `fdatasync` per sync.
+struct FsLogWriter {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl LogWriter for FsLogWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+        std::io::Write::write_all(&mut self.file, bytes).map_err(|error| {
+            IoError::Backend(format!("appending {}: {error}", self.path.display()))
+        })
+    }
+
+    fn sync(&mut self) -> Result<(), IoError> {
+        self.file
+            .sync_data()
+            .map_err(|error| IoError::Backend(format!("syncing {}: {error}", self.path.display())))
     }
 }
 
@@ -162,6 +203,19 @@ impl StorageBackend for FsBackend {
         Ok(names)
     }
 
+    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        let path = self.dir.join(name);
+        let file = std::fs::File::create(&path)
+            .map_err(|error| IoError::Backend(format!("creating {}: {error}", path.display())))?;
+        // Sync the directory so the log's existence survives power loss.
+        std::fs::File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| {
+                IoError::Backend(format!("syncing {}: {error}", self.dir.display()))
+            })?;
+        Ok(Box::new(FsLogWriter { file, path }))
+    }
+
     fn remove(&self, name: &str) -> Result<(), IoError> {
         let path = self.dir.join(name);
         match std::fs::remove_file(&path) {
@@ -181,7 +235,38 @@ impl StorageBackend for FsBackend {
 /// non-filesystem backends. Ordered map so `list` is deterministic.
 #[derive(Default)]
 pub struct MemBackend {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+}
+
+/// [`LogWriter`] over a [`MemBackend`] object, modeling power loss:
+/// appends buffer in the writer and only `sync` publishes them to the
+/// shared map, so a "crash" (drop the store, reopen over the same
+/// backend) sees exactly the synced prefix — which is what makes the
+/// crash-injection tests honest about sync levels.
+struct MemLogWriter {
+    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    name: String,
+    pending: Vec<u8>,
+}
+
+impl LogWriter for MemLogWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), IoError> {
+        if !self.pending.is_empty() {
+            self.objects
+                .lock()
+                .expect("no poisoned locks")
+                .entry(self.name.clone())
+                .or_default()
+                .extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        Ok(())
+    }
 }
 
 impl MemBackend {
@@ -217,6 +302,20 @@ impl StorageBackend for MemBackend {
             .keys()
             .cloned()
             .collect())
+    }
+
+    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        // Creation is immediate (models the synced directory entry);
+        // record bytes arrive only at sync.
+        self.objects
+            .lock()
+            .expect("no poisoned locks")
+            .insert(name.to_owned(), Vec::new());
+        Ok(Box::new(MemLogWriter {
+            objects: Arc::clone(&self.objects),
+            name: name.to_owned(),
+            pending: Vec::new(),
+        }))
     }
 
     fn remove(&self, name: &str) -> Result<(), IoError> {

@@ -79,7 +79,7 @@ pub mod table;
 
 pub use database::Database;
 pub use query_lite::QueryOutput;
-pub use storage_lite::RowValue;
+pub use storage_lite::{RowValue, StoreOptions, WalSync};
 pub use table::{EngineError, Table, TableReader, TableSnapshot};
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`

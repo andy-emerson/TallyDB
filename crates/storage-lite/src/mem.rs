@@ -43,6 +43,8 @@ pub enum RowValue<'a> {
 /// Why an append or freeze was refused.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StorageError {
+    /// The store's configuration is contradictory.
+    Options(String),
     /// The row has the wrong number of cells.
     WrongArity { expected: usize, got: usize },
     /// A cell's type disagrees with its column.
@@ -73,6 +75,7 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StorageError::Options(reason) => write!(f, "store options: {reason}"),
             StorageError::WrongArity { expected, got } => {
                 write!(f, "row has {got} cells, schema has {expected} columns")
             }

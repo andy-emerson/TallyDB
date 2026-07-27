@@ -36,7 +36,7 @@ use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_seg
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
-use arrow_lite::{Bitmap, Column, NumericData, Schema};
+use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,11 @@ pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
 /// see below) with its own magic, CRC, and versioning; the format lives
 /// in `format.rs` beside the segment's.
 const MANIFEST: &str = "table.tlym";
+
+/// The write-ahead log's one name per table. Its header carries the
+/// generation, so a log stranded by a crashed compaction is recognized
+/// and ignored rather than replayed into the wrong row-id space.
+const WAL: &str = "wal.tlyw";
 
 /// Segment and delete-log names carry a generation number, and the
 /// manifest names the current one. This is what makes compaction
@@ -165,6 +170,11 @@ pub struct Store {
     generation: u64,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
+    /// The open write-ahead log, when `wal_sync` is not `Off` and the
+    /// store is persistent.
+    wal: Option<Box<dyn crate::LogWriter>>,
+    wal_sync: WalSync,
+    last_wal_sync: std::time::Instant,
     /// The reader-visible state, shared with every [`StoreReader`]. The
     /// lock is held only to read or swap it — never across encoding,
     /// backend I/O, or compaction's merge — so a reader's `snapshot()`
@@ -210,6 +220,62 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
     shared
         .lock()
         .expect("table state lock poisoned: a writer panicked mid-operation")
+}
+
+/// When acknowledged appends become durable — decision #43, ruled on a
+/// measurement (2026-07-27: group commit at ≤ 100ms cost +0.4µs on a
+/// 1.11µs append; fsync-per-append cost ~670×).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalSync {
+    /// No write-ahead log: the durability boundary is the flush, the
+    /// original contract — for replayable upstreams that re-ingest
+    /// from an offset after a crash.
+    Off,
+    /// Append every row to the log, sync when this much time has
+    /// passed since the last sync (in-thread group commit): a crash
+    /// loses at most this window. The default is 100 ms.
+    Group(std::time::Duration),
+    /// Sync every append: zero loss window, measured ~670× slower per
+    /// append on ordinary disks. For the caller who insists.
+    Full,
+}
+
+impl Default for WalSync {
+    fn default() -> WalSync {
+        WalSync::Group(std::time::Duration::from_millis(100))
+    }
+}
+
+/// Store configuration beyond the required schema and ordering key.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreOptions {
+    /// Rows the write buffer accumulates before freezing a segment;
+    /// `None` means [`DEFAULT_SEGMENT_ROWS`] (unless `segment_bytes`
+    /// decides instead).
+    pub segment_rows: Option<usize>,
+    /// The buffer's memory bound in bytes — the knob an embedder
+    /// actually budgets (#44). Numeric-or-key makes every column
+    /// fixed-width (`i64`/`f64`: 8 bytes; key codes: 4), so bytes
+    /// convert exactly to a per-schema row count at construction; key
+    /// dictionaries (bounded by distinct values) sit outside the
+    /// bound, as documented. Setting both this and `segment_rows` is
+    /// refused loudly.
+    pub segment_bytes: Option<usize>,
+    /// The durability level (persistent stores only; an in-memory
+    /// store has nothing to sync to).
+    pub wal_sync: WalSync,
+}
+
+/// One stored row's fixed width under `schema` — the #44 conversion.
+fn row_width(schema: &Schema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| match field.column_type() {
+            ColumnType::I64 | ColumnType::F64 => 8,
+            ColumnType::Key => 4,
+        })
+        .sum()
 }
 
 /// The snapshot algorithm over locked state: every frozen segment plus
@@ -263,6 +329,9 @@ impl Store {
             delete_log_sequence: 0,
             generation: 0,
             backend: None,
+            wal: None,
+            wal_sync: WalSync::Off,
+            last_wal_sync: std::time::Instant::now(),
             shared: Arc::new(Mutex::new(Shared {
                 segments: Vec::new(),
                 buffer,
@@ -297,7 +366,37 @@ impl Store {
         ordering_key: usize,
         segment_rows: usize,
     ) -> Result<Store, StorageError> {
+        Store::persistent_with(
+            backend,
+            schema,
+            ordering_key,
+            StoreOptions {
+                segment_rows: Some(segment_rows),
+                ..StoreOptions::default()
+            },
+        )
+    }
+
+    /// As [`Store::persistent`], with explicit [`StoreOptions`] — the
+    /// segment threshold and the durability level (#43).
+    pub fn persistent_with(
+        backend: Arc<dyn StorageBackend>,
+        schema: Schema,
+        ordering_key: usize,
+        options: StoreOptions,
+    ) -> Result<Store, StorageError> {
+        let segment_rows = match (options.segment_rows, options.segment_bytes) {
+            (Some(_), Some(_)) => {
+                return Err(StorageError::Options(
+                    "set segment_rows or segment_bytes, not both".to_owned(),
+                ))
+            }
+            (Some(rows), None) => rows,
+            (None, Some(bytes)) => (bytes / row_width(&schema)).max(1),
+            (None, None) => DEFAULT_SEGMENT_ROWS,
+        };
         let mut store = Store::with_segment_rows(schema, ordering_key, segment_rows)?;
+        store.wal_sync = options.wal_sync;
         let generation = match backend.read(MANIFEST) {
             Ok(bytes) => {
                 let manifest = decode_manifest(&bytes)?;
@@ -380,6 +479,7 @@ impl Store {
         store.delete_log_sequence = next_sequence;
         store.generation = generation;
         store.backend = Some(backend);
+        store.replay_wal()?;
         Ok(store)
     }
 
@@ -427,9 +527,114 @@ impl Store {
         }
     }
 
+    /// Replays the write-ahead log at reopen: rows past the flushed
+    /// segments re-enter the write buffer (and a fresh log), rows a
+    /// crash left as a torn tail end the clean prefix silently, and a
+    /// log stranded by a crashed compaction (wrong generation) is
+    /// ignored — its rows are already in the new generation's segments.
+    /// Ends with the log in steady state for the configured level:
+    /// recreated and synced under `Group`/`Full`, removed under `Off`.
+    fn replay_wal(&mut self) -> Result<(), StorageError> {
+        let backend = self.backend.as_ref().expect("replay is a reopen step");
+        let recovered = match backend.read(WAL) {
+            Ok(bytes) => {
+                let wal = crate::format::decode_wal(&bytes, self.schema.fields().len())?;
+                if wal.generation == self.generation {
+                    let skip = usize::try_from(self.rows.saturating_sub(wal.base_row_id))
+                        .expect("row counts fit usize");
+                    wal.rows.into_iter().skip(skip).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(IoError::NotFound(_)) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if self.wal_sync == WalSync::Off {
+            // Recovered rows re-enter the buffer under the flush-boundary
+            // contract; the log itself goes away.
+            for row in &recovered {
+                let cells: Vec<RowValue<'_>> = row
+                    .iter()
+                    .map(crate::format::WalCell::as_row_value)
+                    .collect();
+                let mut shared = lock(&self.shared);
+                shared.buffer.append(&cells)?;
+                self.rows += 1;
+            }
+            if backend.read(WAL).is_ok() {
+                backend.remove(WAL)?;
+            }
+            return Ok(());
+        }
+        // Fresh log first, so the recovered rows go back in and stay
+        // durable across a crash during recovery itself.
+        let mut wal = backend.create_log(WAL)?;
+        wal.append(&crate::format::encode_wal_header(
+            self.generation,
+            self.rows,
+        ))?;
+        for row in &recovered {
+            let cells: Vec<RowValue<'_>> = row
+                .iter()
+                .map(crate::format::WalCell::as_row_value)
+                .collect();
+            wal.append(&crate::format::encode_wal_record(&cells))?;
+            let mut shared = lock(&self.shared);
+            shared.buffer.append(&cells)?;
+            self.rows += 1;
+        }
+        wal.sync()?;
+        self.wal = Some(wal);
+        self.last_wal_sync = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Recreates the log empty at the current row watermark — the
+    /// truncation that follows a flush or compaction, once every row
+    /// the old log guarded is segment-durable.
+    fn reset_wal(&mut self) -> Result<(), StorageError> {
+        if self.wal.is_none() {
+            return Ok(());
+        }
+        let backend = self.backend.as_ref().expect("a WAL implies a backend");
+        let mut wal = backend.create_log(WAL)?;
+        wal.append(&crate::format::encode_wal_header(
+            self.generation,
+            self.rows,
+        ))?;
+        wal.sync()?;
+        self.wal = Some(wal);
+        self.last_wal_sync = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Logs one appended row and applies the sync level.
+    fn wal_append(&mut self, row: &[RowValue<'_>]) -> Result<(), StorageError> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        wal.append(&crate::format::encode_wal_record(row))?;
+        match self.wal_sync {
+            WalSync::Full => {
+                wal.sync()?;
+                self.last_wal_sync = std::time::Instant::now();
+            }
+            WalSync::Group(interval) => {
+                if self.last_wal_sync.elapsed() >= interval {
+                    wal.sync()?;
+                    self.last_wal_sync = std::time::Instant::now();
+                }
+            }
+            WalSync::Off => unreachable!("Off never opens a log"),
+        }
+        Ok(())
+    }
+
     /// Appends one row and returns its internal row id. Flushes
     /// automatically when the buffer reaches the segment-row threshold.
     pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<u64, StorageError> {
+        self.wal_append(row)?;
         let must_flush = {
             let mut shared = lock(&self.shared);
             shared.buffer.append(row)?;
@@ -468,10 +673,16 @@ impl Store {
         }
         // Built before the lock so adoption below cannot fail partway.
         let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
-        let mut shared = lock(&self.shared);
-        shared.segments.push(Arc::new(segment));
-        shared.buffer = fresh;
-        shared.buffer_base = self.rows;
+        {
+            let mut shared = lock(&self.shared);
+            shared.segments.push(Arc::new(segment));
+            shared.buffer = fresh;
+            shared.buffer_base = self.rows;
+        }
+        // Every row the log guarded is now segment-durable: truncate.
+        // A crash before this point replays a prefix the segments
+        // already cover — the header's base row id makes replay skip it.
+        self.reset_wal()?;
         Ok(())
     }
 
@@ -640,6 +851,9 @@ impl Store {
         }
         self.rows = base;
         self.delete_log_sequence = 0;
+        // The old log's rows — buffer included — are all in the new
+        // generation's segments; recreate it under the new generation.
+        self.reset_wal()?;
 
         // Best-effort cleanup of the now-stale prior generation. A failure
         // here only leaves garbage that reopen already ignores (it loads

@@ -33,7 +33,8 @@ use query_lite::{
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use storage_lite::{
-    FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store, StoreReader,
+    FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store, StoreOptions,
+    StoreReader,
 };
 
 /// Why a table or database operation failed.
@@ -187,6 +188,27 @@ impl Table {
         Ok(Table::from_store(
             name,
             Store::persistent(backend, schema, index)?,
+        ))
+    }
+
+    /// As [`Table::persistent`], with explicit [`StoreOptions`]: the
+    /// freeze threshold (rows, or bytes — the memory bound an embedder
+    /// actually budgets, #44) and the durability level (#43's ruling:
+    /// default `Group(100ms)`, measured ~free; `Full` for a zero loss
+    /// window at ~670× per-append cost; `Off` for the flush-boundary
+    /// contract and replayable upstreams).
+    pub fn persistent_with(
+        name: impl Into<String>,
+        schema: Schema,
+        ordering_key: &str,
+        dir: impl AsRef<std::path::Path>,
+        options: StoreOptions,
+    ) -> Result<Table, EngineError> {
+        let index = ordering_index(&schema, ordering_key)?;
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::persistent_with(backend, schema, index, options)?,
         ))
     }
 
