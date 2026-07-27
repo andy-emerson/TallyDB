@@ -30,11 +30,15 @@
 //!   hand-rolled thin bindings to the 5.4 C API (settled 2026-07-24; the
 //!   full decision record, including LuaJIT and `mlua` as rejected
 //!   alternatives with reopen conditions, lives in DESIGN.md, *The Lua
-//!   layer*). Binding discipline is checked with Lua's own enforcement:
-//!   `LUA_USE_APICHECK` test builds run today (the `apicheck` feature);
-//!   `ltests.c` GC/allocation torture, the official Lua test suite over
-//!   the vendored build, and ASan/UBSan are planned CI hardening,
-//!   tracked in #41 — no binding dependency, shipped or dev.
+//!   layer*). Binding discipline is checked with Lua's own enforcement
+//!   and the sanitizers, both in CI on every change: `LUA_USE_APICHECK`
+//!   test builds (the `apicheck` feature) and an ASan/UBSan job with
+//!   the vendored C compiled sanitized. Still planned under #41:
+//!   `ltests.c` GC/allocation torture and the official Lua test suite
+//!   over the vendored build — both need files the deliberately
+//!   embedding-set-only vendor tree does not carry, vendored with
+//!   provenance when a network path allows. No binding dependency,
+//!   shipped or dev.
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — also Lua 5.4, so both targets
 //!   share one language semantics and one C API. Both backends sit
