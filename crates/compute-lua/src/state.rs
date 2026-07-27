@@ -39,9 +39,10 @@
 //! native op rather than the interpreter getting a JIT.
 
 use crate::ffi;
+use crate::host::{self, HostFunction, HostSlot};
 use crate::log::{self, LogSink, SinkSlot};
 use crate::values::{self, ColumnView, OutputColumn, ReturnType, ScalarValue};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 /// An embedded Lua 5.4 interpreter with the curated library set
 /// (base, math, string, table — no io, no os, no debug; the package
@@ -58,6 +59,9 @@ pub struct LuaState {
     /// The `log()` sink slot — boxed so the `log` closure's upvalue
     /// pointer survives moves of this struct; freed in `Drop`.
     sink: *mut SinkSlot,
+    /// Registered host functions, one stable box each (the closures'
+    /// upvalues point at them); freed in `Drop`.
+    host_functions: Vec<*mut HostSlot>,
 }
 
 impl LuaState {
@@ -81,8 +85,35 @@ impl LuaState {
                 raw,
                 generation,
                 sink,
+                host_functions: Vec::new(),
             })
         }
+    }
+
+    /// Registers an engine-side operation as the global `name`,
+    /// callable from scripts over zero-copy views — the seam the
+    /// curated `compute-blas` / `compute-lapack` ops are exposed
+    /// through. See [`HostFunction`]. A second registration under the
+    /// same name replaces the first (the old function's storage is
+    /// retained until the state drops).
+    pub fn register_host_function(
+        &mut self,
+        name: &str,
+        function: Box<dyn HostFunction>,
+    ) -> Result<(), String> {
+        if function.arity() == 0 || function.arity() > host::MAX_ARGS {
+            return Err(format!(
+                "host function '{name}' takes {} arguments; supported range is 1..={}",
+                function.arity(),
+                host::MAX_ARGS
+            ));
+        }
+        let global = CString::new(name)
+            .map_err(|_| format!("function name '{name}' contains an interior NUL"))?;
+        let slot = Box::into_raw(Box::new(HostSlot(function)));
+        unsafe { host::install(self.raw, &global, slot) };
+        self.host_functions.push(slot);
+        Ok(())
     }
 
     /// Installs the destination for scripts' `log(...)` output —
@@ -230,9 +261,10 @@ impl LuaState {
 //    created in `new`, closed in `Drop`, and the pointer is never
 //    copied out of the struct (`view_data_pointer` returns buffer
 //    pointers, not the state). `generation` points into that same
-//    interpreter's registry-anchored allocation, and `sink` into a Box
-//    this struct alone owns (its `LogSink` contents are themselves
-//    `Send` by the trait's bound), so both move with it.
+//    interpreter's registry-anchored allocation; `sink` and each
+//    `host_functions` entry point into Boxes this struct alone owns
+//    (their `LogSink` / `HostFunction` contents are themselves `Send`
+//    by the traits' bounds), so all of it moves with it.
 // 2. Every operation takes `&mut self`, so after a move to another
 //    thread exactly one thread touches the interpreter at a time.
 // 3. Vendored PUC Lua 5.4, compiled unmodified with the ANSI config,
@@ -253,9 +285,12 @@ impl Drop for LuaState {
     fn drop(&mut self) {
         unsafe {
             ffi::lua_close(self.raw);
-            // After close nothing can reach the log closure's upvalue;
-            // the slot is safe to free.
+            // After close nothing can reach the closures' upvalues; the
+            // slots are safe to free.
             drop(Box::from_raw(self.sink));
+            for slot in self.host_functions.drain(..) {
+                drop(Box::from_raw(slot));
+            }
         }
     }
 }
@@ -1155,6 +1190,172 @@ mod tests {
             let error = state.eval_scalar(chunk, &[], ReturnType::I64).unwrap_err();
             assert!(error.contains("nil"), "{chunk}: {error}");
         }
+    }
+
+    // ---- host functions: engine compute over shared views ----
+
+    use crate::host::HostFunction;
+
+    /// Sums its one argument and records the slice pointer it was
+    /// handed — the zero-copy probe.
+    struct PointerProbe(std::sync::Arc<std::sync::Mutex<usize>>);
+
+    impl HostFunction for PointerProbe {
+        fn arity(&self) -> usize {
+            1
+        }
+        fn call(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+            *self.0.lock().unwrap() = args[0].as_ptr() as usize;
+            Ok(Some(args[0].iter().sum()))
+        }
+    }
+
+    #[test]
+    fn host_functions_see_the_engine_buffer_itself() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mut state = LuaState::new().unwrap();
+        state
+            .register_host_function("probe", Box::new(PointerProbe(seen.clone())))
+            .unwrap();
+        let values: Vec<f64> = (0..64).map(|i| f64::from(i) * 0.5).collect();
+        let result = state
+            .eval_scalar("return probe(v)", &[(c"v", f64s(&values))], ReturnType::F64)
+            .unwrap();
+        assert_eq!(result, ScalarValue::F64(values.iter().sum()));
+        // The pointer-verified no-copy claim: the host function received
+        // the bound buffer itself, through Lua, with no bytes moved.
+        assert_eq!(*seen.lock().unwrap(), values.as_ptr() as usize);
+    }
+
+    /// A function that reports undefined (None), errors, or panics on
+    /// demand — the trampoline's three non-value outcomes.
+    struct Moody(u8);
+
+    impl HostFunction for Moody {
+        fn arity(&self) -> usize {
+            1
+        }
+        fn call(&self, _args: &[&[f64]]) -> Result<Option<f64>, String> {
+            match self.0 {
+                0 => Ok(None),
+                1 => Err("op declined".to_owned()),
+                _ => panic!("embedder bug"),
+            }
+        }
+    }
+
+    #[test]
+    fn host_function_outcomes_map_to_null_error_and_contained_panic() {
+        let values = [1.0f64];
+        let mut state = LuaState::new().unwrap();
+        state
+            .register_host_function("undefined", Box::new(Moody(0)))
+            .unwrap();
+        state
+            .register_host_function("failing", Box::new(Moody(1)))
+            .unwrap();
+        state
+            .register_host_function("panicking", Box::new(Moody(2)))
+            .unwrap();
+        // Undefined → the NULL sentinel, exactly like a SQL window.
+        let result = state
+            .eval_scalar(
+                "if undefined(v) == NULL then return 1 else return 0 end",
+                &[(c"v", f64s(&values))],
+                ReturnType::I64,
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::I64(1));
+        // An op error is the script's error, loudly.
+        let error = state
+            .eval_scalar(
+                "return failing(v)",
+                &[(c"v", f64s(&values))],
+                ReturnType::F64,
+            )
+            .unwrap_err();
+        assert!(error.contains("op declined"), "{error}");
+        // A panicking embedder function is contained — a loud Lua error,
+        // never an unwind into C — and the state survives.
+        let error = state
+            .eval_scalar(
+                "return panicking(v)",
+                &[(c"v", f64s(&values))],
+                ReturnType::F64,
+            )
+            .unwrap_err();
+        assert!(error.contains("panicked"), "{error}");
+        let alive = state.eval_scalar("return 1", &[], ReturnType::I64).unwrap();
+        assert_eq!(alive, ScalarValue::I64(1));
+    }
+
+    #[test]
+    fn host_function_misuse_fails_loudly() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mut state = LuaState::new().unwrap();
+        state
+            .register_host_function("probe", Box::new(PointerProbe(seen)))
+            .unwrap();
+        let values = [1.0f64, 2.0];
+        // Wrong argument count.
+        let error = state
+            .eval_scalar(
+                "return probe(v, v)",
+                &[(c"v", f64s(&values))],
+                ReturnType::F64,
+            )
+            .unwrap_err();
+        assert!(error.contains("wrong number"), "{error}");
+        // A plain number is not a view.
+        let error = state
+            .eval_scalar("return probe(3)", &[], ReturnType::F64)
+            .unwrap_err();
+        assert!(error.contains("column views"), "{error}");
+        // An i64 view is the wrong element type for the f64 ops.
+        let i64s = [1i64, 2];
+        let error = state
+            .eval_scalar(
+                "return probe(v)",
+                &[(
+                    c"v",
+                    ColumnView::I64 {
+                        values: &i64s,
+                        validity: None,
+                    },
+                )],
+                ReturnType::F64,
+            )
+            .unwrap_err();
+        assert!(error.contains("f64 views"), "{error}");
+        // A null-bearing view is refused: the ops take dense input.
+        let validity = Bitmap::from_bools([true, false]);
+        let error = state
+            .eval_scalar(
+                "return probe(v)",
+                &[(
+                    c"v",
+                    ColumnView::F64 {
+                        values: &values,
+                        validity: Some(&validity),
+                    },
+                )],
+                ReturnType::F64,
+            )
+            .unwrap_err();
+        assert!(error.contains("NULL"), "{error}");
+        // Registration bounds the arity.
+        struct TooWide;
+        impl HostFunction for TooWide {
+            fn arity(&self) -> usize {
+                99
+            }
+            fn call(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(None)
+            }
+        }
+        assert!(state
+            .register_host_function("wide", Box::new(TooWide))
+            .is_err());
     }
 
     #[test]

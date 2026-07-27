@@ -565,7 +565,7 @@ fn float_as_i64_exact(float: f64) -> Option<i64> {
 
 /// Pushes `message` and raises it — tail position only, `Copy` state
 /// only (the module discipline).
-unsafe fn raise(state: *mut ffi::lua_State, message: &CStr) -> c_int {
+pub(crate) unsafe fn raise(state: *mut ffi::lua_State, message: &CStr) -> c_int {
     unsafe {
         let bytes = message.to_bytes();
         ffi::lua_pushlstring(state, bytes.as_ptr().cast::<c_char>(), bytes.len());
@@ -574,7 +574,7 @@ unsafe fn raise(state: *mut ffi::lua_State, message: &CStr) -> c_int {
 }
 
 /// Pushes the NULL sentinel.
-unsafe fn push_null(state: *mut ffi::lua_State) {
+pub(crate) unsafe fn push_null(state: *mut ffi::lua_State) {
     unsafe {
         ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, REG_NULL.as_ptr());
     }
@@ -984,6 +984,38 @@ unsafe extern "C" fn null_tostring(state: *mut ffi::lua_State) -> c_int {
         let text = b"NULL";
         ffi::lua_pushlstring(state, text.as_ptr().cast::<c_char>(), text.len());
         1
+    }
+}
+
+/// The non-null `f64` slice behind the input view at `idx` — the
+/// zero-copy hand-off host functions (the curated native ops) consume.
+/// Loud on everything else: a non-view, a poisoned view, a non-`f64`
+/// view, or a view carrying NULLs (the ops take dense numeric input;
+/// nulls must be handled script-side first).
+///
+/// # Safety
+/// `raw` must be a state [`install`] has prepared and `idx` a valid
+/// stack index; the returned pointer is valid for the current call.
+pub(crate) unsafe fn f64_view_slice(
+    raw: *mut ffi::lua_State,
+    idx: c_int,
+) -> Result<(*const f64, usize), &'static CStr> {
+    unsafe {
+        let payload = ffi::luaL_testudata(raw, idx, META_INPUT.as_ptr()).cast::<InputPayload>();
+        if payload.is_null() {
+            return Err(c"curated ops take column views as arguments");
+        }
+        let view = *payload;
+        if *view.generation != view.born {
+            return Err(c"view used outside its call");
+        }
+        if view.tag != TAG_F64 {
+            return Err(c"curated ops take f64 views");
+        }
+        if !view.validity.is_null() && (*view.validity).count_set() != view.len {
+            return Err(c"curated ops take non-null input; this view carries NULLs");
+        }
+        Ok((view.data.cast::<f64>(), view.len))
     }
 }
 

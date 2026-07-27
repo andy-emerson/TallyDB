@@ -375,6 +375,12 @@ impl Table {
     /// query time fails loudly here instead: kernel syntax, unusable
     /// parameter names, a key-typed output.
     ///
+    /// Kernels can call the curated native ops over the same views —
+    /// `dot(x, y)` (BLAS), `regr_slope(y, x)` / `regr_intercept(y, x)`,
+    /// `covar_pop(y, x)` / `corr(y, x)` / `eigen_max(y, x)` — the very
+    /// implementations the SQL windows run, sharing buffers with no
+    /// copy; each returns a number, or `NULL` where undefined.
+    ///
     /// A registration under a built-in name shadows the built-in; a
     /// second registration under the same name replaces the first.
     ///
@@ -627,7 +633,7 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 
 /// Which coefficient of the per-window fit `y ≈ intercept + slope · x`
 /// an instance returns.
-enum RegressionOutput {
+pub(crate) enum RegressionOutput {
     Slope,
     Intercept,
 }
@@ -636,9 +642,9 @@ enum RegressionOutput {
 /// `compute-lapack` (QR via `dgels` today; decision #20 ruled
 /// QR-fast-path-plus-SVD-fallback, and the SVD side arrives with the M2
 /// work on that op).
-struct RollingRegression {
-    backend: NativeLapack,
-    output: RegressionOutput,
+pub(crate) struct RollingRegression {
+    pub(crate) backend: NativeLapack,
+    pub(crate) output: RegressionOutput,
 }
 
 impl WindowAggregate for RollingRegression {
@@ -695,7 +701,7 @@ impl WindowAggregate for RollingRegression {
 }
 
 /// Which pair statistic an instance computes.
-enum PairKind {
+pub(crate) enum PairKind {
     /// Population covariance of `(y, x)` — 0 for a single point,
     /// matching `covar_pop`.
     CovarPop,
@@ -710,9 +716,9 @@ enum PairKind {
 
 /// Two-column window statistics over `(y, x)`, sharing one accumulation
 /// of the population moments.
-struct PairStatistic {
-    backend: NativeLapack,
-    kind: PairKind,
+pub(crate) struct PairStatistic {
+    pub(crate) backend: NativeLapack,
+    pub(crate) kind: PairKind,
 }
 
 impl WindowAggregate for PairStatistic {

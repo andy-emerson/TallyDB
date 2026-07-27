@@ -30,8 +30,11 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
+use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
-use compute_lua::{ColumnView, LuaState, ReturnType, ScalarValue};
+use compute_blas::{BlasBackend, NativeBlas};
+use compute_lapack::NativeLapack;
+use compute_lua::{ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
@@ -52,6 +55,75 @@ pub(crate) fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `dot(x, y)` — BLAS `ddot` as a script-callable op, the cheap end of
+/// the curated spread.
+struct DotOp(NativeBlas);
+
+impl HostFunction for DotOp {
+    fn arity(&self) -> usize {
+        2
+    }
+    fn call(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        self.0
+            .dot(args[0], args[1])
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Adapts a native window statistic to the host-function seam — the
+/// same argument shape (dense `f64` slices) and the same
+/// undefined-is-NULL convention, so one implementation serves both the
+/// SQL window registry and scripts.
+struct CuratedOp<A>(A);
+
+impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
+    fn arity(&self) -> usize {
+        self.0.arity()
+    }
+    fn call(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        self.0.evaluate(args)
+    }
+}
+
+/// Installs the curated compute spread into a kernel's state: `dot`
+/// (BLAS), `regr_slope` / `regr_intercept` (least squares), and
+/// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
+/// implementations the SQL windows run, reading the same view buffers
+/// with no copy. This is the compute-without-copying surface inside a
+/// script: engine buffers, curated native ops, and the interpreter all
+/// share memory.
+fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
+    let lapack = NativeLapack;
+    state.register_host_function("dot", Box::new(DotOp(NativeBlas)))?;
+    for (name, output) in [
+        ("regr_slope", RegressionOutput::Slope),
+        ("regr_intercept", RegressionOutput::Intercept),
+    ] {
+        state.register_host_function(
+            name,
+            Box::new(CuratedOp(RollingRegression {
+                backend: lapack,
+                output,
+            })),
+        )?;
+    }
+    for (name, kind) in [
+        ("covar_pop", PairKind::CovarPop),
+        ("corr", PairKind::Corr),
+        ("eigen_max", PairKind::EigenMax),
+    ] {
+        state.register_host_function(
+            name,
+            Box::new(CuratedOp(PairStatistic {
+                backend: lapack,
+                kind,
+            })),
+        )?;
+    }
+    Ok(())
 }
 
 /// An application-registered Lua window kernel behind the
@@ -107,6 +179,7 @@ impl LuaWindow {
             names.push(name);
         }
         let mut state = LuaState::new()?;
+        install_curated_ops(&mut state)?;
         state.check(chunk)?; // syntax errors surface here, not mid-query
         Ok(LuaWindow {
             state: Mutex::new(state),
@@ -445,6 +518,116 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("at least one"), "{error}");
+    }
+
+    // ---- the curated-op spread (increment D) ----
+
+    fn pair_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("y", ColumnType::F64, false),
+        ])
+    }
+
+    #[test]
+    fn curated_ops_from_lua_agree_with_their_sql_window_selves() {
+        // The same native implementations serve the SQL window registry
+        // and the script surface; running both paths over one dataset in
+        // one query must agree bit-for-bit, NULLs included (short
+        // windows are undefined on both sides). Data spans segments.
+        let mut table = Table::with_segment_rows("t", pair_schema(), "ts", 4).unwrap();
+        for i in 0..14i64 {
+            let x = (i as f64) * 0.5 + ((i % 3) as f64);
+            let y = 2.5 * x + ((i % 5) as f64) * 0.25 - 1.0;
+            table
+                .append(&[
+                    RowValue::I64(i),
+                    RowValue::Key("A"),
+                    RowValue::F64(x),
+                    RowValue::F64(y),
+                ])
+                .unwrap();
+        }
+        for (name, op) in [
+            ("lua_regr", "regr_slope"),
+            ("lua_intercept", "regr_intercept"),
+            ("lua_covar", "covar_pop"),
+            ("lua_corr", "corr"),
+            ("lua_eigen", "eigen_max"),
+        ] {
+            table
+                .register_lua_window(
+                    name,
+                    &["y", "x"],
+                    &format!("return {op}(y, x)"),
+                    ColumnType::F64,
+                )
+                .unwrap();
+        }
+        let frame = "OVER (ORDER BY ts ROWS BETWEEN 4 PRECEDING AND CURRENT ROW)";
+        for (lua_name, native_name) in [
+            ("lua_regr", "regr_slope"),
+            ("lua_intercept", "regr_intercept"),
+            ("lua_covar", "covar_pop"),
+            ("lua_corr", "corr"),
+            ("lua_eigen", "eigen_max"),
+        ] {
+            let output = table
+                .query(&format!(
+                    "SELECT {native_name}(y, x) {frame} AS native, \
+                     {lua_name}(y, x) {frame} AS scripted FROM t"
+                ))
+                .unwrap();
+            let native = f64s(&output, 0);
+            let scripted = f64s(&output, 1);
+            assert_eq!(native.len(), 14);
+            for row in 0..native.len() {
+                assert_eq!(
+                    native[row].map(f64::to_bits),
+                    scripted[row].map(f64::to_bits),
+                    "{native_name} row {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dot_from_lua_matches_the_blas_backend() {
+        use compute_blas::{BlasBackend, NativeBlas};
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        let data: Vec<f64> = (0..10).map(|i| (i as f64) * 0.75 - 3.0).collect();
+        for (i, &x) in data.iter().enumerate() {
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(x),
+                ])
+                .unwrap();
+        }
+        table
+            .register_lua_window("sumsq", &["x"], "return dot(x, x)", ColumnType::F64)
+            .unwrap();
+        let output = table
+            .query(
+                "SELECT sumsq(x) OVER (ORDER BY ts ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) \
+                 AS s FROM t",
+            )
+            .unwrap();
+        let results = f64s(&output, 0);
+        // The same ddot on the same window slices: identical bits.
+        let backend = NativeBlas;
+        for (row, result) in results.iter().enumerate() {
+            let window = &data[row.saturating_sub(3)..=row];
+            let reference = backend.dot(window, window).unwrap();
+            assert_eq!(
+                result.map(f64::to_bits),
+                Some(reference.to_bits()),
+                "row {row}"
+            );
+        }
     }
 
     #[test]
