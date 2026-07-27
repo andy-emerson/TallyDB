@@ -364,9 +364,15 @@ compaction resolves tombstones and merges segments. This means:
 > rqlite wraps SQLite and MotherDuck wraps DuckDB. The engine-side
 > obligation that keeps third-party servers viable is only this: stay
 > embeddable in a concurrent host — snapshot reads through `&self`,
-> single writer, a clean `Send`/`Sync` story. No reopen condition is
-> foreseen for the listener; the network-boundary argument is
-> structural.
+> single writer, a clean `Send`/`Sync` story. *Satisfied 2026-07-27
+> (#51):* `Table::reader()` hands any thread a cloneable `Send + Sync`
+> handle minting point-in-time `TableSnapshot`s while the one
+> `&mut Table` writer appends, mutates, or compacts — the shared state
+> sits behind a per-table lock held only for reads and swaps (bounded
+> by one write-buffer copy), compaction is read-copy-update through the
+> segment `Arc`s, and the single-writer cut stays a compile-time fact.
+> No reopen condition is foreseen for the listener; the
+> network-boundary argument is structural.
 
 ## Current milestone: native only
 

@@ -54,6 +54,16 @@
 //! parameters or dimensions — where no closed form exists. See DESIGN.md,
 //! *Curated compute: what the engine calls, and why*.
 //!
+//! ## Concurrency: single writer, concurrent snapshot readers
+//! Exactly one `&mut Table` writer exists at a time — a compile-time
+//! fact, not a runtime policy — while any number of threads hold
+//! [`TableReader`]s and query point-in-time [`TableSnapshot`]s. A
+//! snapshot never blocks the writer for longer than one write-buffer
+//! copy under a brief per-table lock, and a compaction never
+//! invalidates a held snapshot (its segments stay alive through their
+//! `Arc`s). Cross-table snapshot consistency is deliberately not
+//! promised.
+//!
 //! ## Current milestone: native only
 //! Nothing here should assume a filesystem, threading model, or blocking
 //! I/O that would foreclose a future wasm32 build — but building that
