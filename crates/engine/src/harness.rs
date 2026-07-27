@@ -260,6 +260,113 @@ pub unsafe extern "C" fn tallydb_corpus_query_stream(
     }
 }
 
+/// An open benchmark context: one prebuilt table, so the timed calls
+/// measure query + export only — never fixture construction.
+pub struct BenchContext {
+    table: Table,
+}
+
+/// The benchmark fixture's segment threshold — production-shaped (many
+/// windows per segment), unlike the oracle fixtures' deliberately tiny
+/// segments.
+const BENCH_SEGMENT_ROWS: usize = 4096;
+
+/// The pure-Lua mean-absolute-deviation kernel the bench registers —
+/// the interpreter-only case (no native op involved).
+const BENCH_MAD: &str = "local n = #x\n\
+                         local mean = 0.0\n\
+                         for i = 1, n do mean = mean + x[i] end\n\
+                         mean = mean / n\n\
+                         local mad = 0.0\n\
+                         for i = 1, n do mad = mad + math.abs(x[i] - mean) end\n\
+                         return mad / n";
+
+/// Builds the benchmark table — `rows` rows, 8 symbols, strictly
+/// increasing `ts`, non-null LCG-generated `x`/`y` — and registers the
+/// Lua kernels the benchmark queries: `lua_dot(y, x)` (a kernel calling
+/// the BLAS `dot` host function) and `lua_mad(x)` (pure interpreter).
+/// Returns an owned context; release it with [`tallydb_bench_close`].
+#[no_mangle]
+pub extern "C" fn tallydb_bench_open(rows: u64) -> *mut BenchContext {
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("x", ColumnType::F64, false),
+        Field::new("y", ColumnType::F64, false),
+    ]);
+    let mut table = Table::with_segment_rows("bench", schema, "ts", BENCH_SEGMENT_ROWS)
+        .expect("bench schema is valid");
+    let mut rng = Lcg(0xBE9C_11FE_D0D0_5EED);
+    for i in 0..rows as i64 {
+        let label = format!("K{:03}", i % 8);
+        let x = rng.next_f64() * 10.0;
+        let y = 2.0 * x + (rng.next_f64() - 0.5);
+        table
+            .append(&[
+                RowValue::I64(i),
+                RowValue::Key(&label),
+                RowValue::F64(x),
+                RowValue::F64(y),
+            ])
+            .expect("bench rows are valid");
+    }
+    table
+        .register_lua_window("lua_dot", &["y", "x"], "return dot(y, x)", ColumnType::F64)
+        .expect("lua_dot registers");
+    table
+        .register_lua_window("lua_mad", &["x"], BENCH_MAD, ColumnType::F64)
+        .expect("lua_mad registers");
+    Box::into_raw(Box::new(BenchContext { table }))
+}
+
+/// Runs one SQL statement against the context's table and exports the
+/// result. Returns 0 on success; on failure prints to stderr and
+/// returns 1 with `out` untouched.
+///
+/// # Safety
+/// `context` must come from [`tallydb_bench_open`] and not be closed;
+/// `sql` must be a valid NUL-terminated string; `out` a valid, writable
+/// destination not holding a live export.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_bench_query(
+    context: *mut BenchContext,
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_bench_query: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    // SAFETY: caller contract — a live context from tallydb_bench_open.
+    let table = unsafe { &(*context).table };
+    match table.query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_bench_query: {sql}: {error}");
+            1
+        }
+    }
+}
+
+/// Releases a benchmark context.
+///
+/// # Safety
+/// `context` must come from [`tallydb_bench_open`] and not have been
+/// closed already.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_bench_close(context: *mut BenchContext) {
+    // SAFETY: caller contract — exactly one close per open.
+    drop(unsafe { Box::from_raw(context) });
+}
+
 /// The mutation sequence the differential oracle replays in DuckDB.
 /// KEEP IN SYNC with `MUTATIONS` in `tests/m2_mutation_oracle.py` — a
 /// mismatch fails the oracle loudly, it cannot pass silently.
