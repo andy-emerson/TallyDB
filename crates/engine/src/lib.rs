@@ -52,6 +52,7 @@
 pub mod database;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
+mod script;
 pub mod table;
 
 pub use database::Database;

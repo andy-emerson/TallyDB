@@ -119,6 +119,30 @@ impl LuaState {
         }
     }
 
+    /// Compiles `chunk` (text only) without running it — the loud-early
+    /// hook for registration time, so a kernel's syntax error surfaces
+    /// when it is registered, not when its first query runs.
+    pub fn check(&mut self, chunk: &str) -> Result<(), String> {
+        unsafe {
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            let status = ffi::luaL_loadbufferx(
+                self.raw,
+                chunk.as_ptr().cast(),
+                chunk.len(),
+                c"script".as_ptr(),
+                c"t".as_ptr(),
+            );
+            let result = if status == ffi::LUA_OK {
+                ffi::lua_settop(self.raw, -2); // discard the compiled chunk
+                Ok(())
+            } else {
+                Err(self.pop_error("load"))
+            };
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            result
+        }
+    }
+
     unsafe fn bind_inputs(&mut self, inputs: &[(&CStr, ColumnView<'_>)]) -> Result<(), String> {
         for (name, view) in inputs {
             unsafe { values::bind_input(self.raw, self.generation, name, view)? };
@@ -178,6 +202,29 @@ impl LuaState {
         unsafe { values::view_data_pointer(self.raw, view_global) }
     }
 }
+
+// SAFETY (the Send argument, written once and load-bearing):
+//
+// 1. `LuaState` uniquely owns its interpreter: the raw `lua_State` is
+//    created in `new`, closed in `Drop`, and the pointer is never
+//    copied out of the struct (`view_data_pointer` returns buffer
+//    pointers, not the state). `generation` points into that same
+//    interpreter's registry-anchored allocation, so it moves with it.
+// 2. Every operation takes `&mut self`, so after a move to another
+//    thread exactly one thread touches the interpreter at a time.
+// 3. Vendored PUC Lua 5.4, compiled unmodified with the ANSI config,
+//    keeps all interpreter state inside the `lua_State`/`global_State`
+//    allocation: no thread-locals, no mutable process globals in the
+//    linked subset (base/math/string/table; no io, no os), and the
+//    default allocator is C `realloc`/`free`, which is thread-safe.
+// 4. No borrow outlives a call: views over engine buffers are
+//    generation-poisoned when their `eval_*` returns, so a moved state
+//    carries no live aliases into another thread.
+//
+// `Sync` is NOT implied and not implemented: two threads sharing
+// `&LuaState` would race the interpreter. A holder that needs `Sync`
+// wraps the state in a `Mutex` (the engine's Lua-backed window does).
+unsafe impl Send for LuaState {}
 
 impl Drop for LuaState {
     fn drop(&mut self) {
@@ -1004,6 +1051,50 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("2 bits for 3 values"), "{error}");
+    }
+
+    #[test]
+    fn lua_state_moves_across_threads() {
+        // The Send impl, exercised: build state on one thread, run it on
+        // another, with interpreter state (a global) carried across the
+        // move. &mut discipline means one thread at a time — which is
+        // exactly what std::thread::spawn's move closure proves.
+        let mut state = LuaState::new().unwrap();
+        state
+            .eval_scalar("g = 7\nreturn 0", &[], ReturnType::I64)
+            .unwrap();
+        let result = std::thread::spawn(move || {
+            let mut state = state;
+            state.eval_scalar("return g + 35", &[], ReturnType::I64)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, ScalarValue::I64(42));
+    }
+
+    #[test]
+    fn check_compiles_without_running() {
+        let mut state = LuaState::new().unwrap();
+        // A valid chunk checks clean — and provably did not run: its
+        // side effect never happened.
+        state.check("ran = true").unwrap();
+        let ran = state
+            .eval_scalar(
+                "if ran then return 1 else return 0 end",
+                &[],
+                ReturnType::I64,
+            )
+            .unwrap();
+        assert_eq!(ran, ScalarValue::I64(0));
+        // A syntax error is loud at check time.
+        let error = state.check("return ((").unwrap_err();
+        assert!(error.contains("load"), "{error}");
+        // The state survives a failed check.
+        assert_eq!(
+            state.eval_scalar("return 1", &[], ReturnType::I64).unwrap(),
+            ScalarValue::I64(1)
+        );
     }
 
     #[test]

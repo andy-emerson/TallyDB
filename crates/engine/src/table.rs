@@ -50,6 +50,9 @@ pub enum EngineError {
     DuplicateTable(String),
     /// The declared ordering key is not a column of the schema.
     UnknownOrderingKey(String),
+    /// Registering a script-backed function failed (bad kernel syntax,
+    /// unusable parameter name, unsupported output type).
+    Script(String),
 }
 
 impl fmt::Display for EngineError {
@@ -65,6 +68,7 @@ impl fmt::Display for EngineError {
             EngineError::UnknownOrderingKey(name) => {
                 write!(f, "ordering key '{name}' is not a column")
             }
+            EngineError::Script(message) => write!(f, "script: {message}"),
         }
     }
 }
@@ -357,6 +361,81 @@ impl Table {
     /// compaction contract).
     pub fn compact(&mut self) -> Result<(), EngineError> {
         Ok(self.store.compact()?)
+    }
+
+    /// Registers a Lua kernel as a SQL window function on this table —
+    /// the Lua-in-SQL window slot (#41). `parameters` names the frame's
+    /// column arguments, positionally, as the globals the kernel reads
+    /// them through (zero-copy views, oldest row first); the kernel
+    /// returns one number per frame, or `NULL`. `output` declares the
+    /// result column's type (F2): `F64` or `I64` — never inferred from
+    /// what a call returns. Everything that can fail confusingly at
+    /// query time fails loudly here instead: kernel syntax, unusable
+    /// parameter names, a key-typed output.
+    ///
+    /// A registration under a built-in name shadows the built-in; a
+    /// second registration under the same name replaces the first.
+    ///
+    /// ```
+    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::{RowValue, Table};
+    ///
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("trades", schema, "ts").unwrap();
+    /// for i in 0..40 {
+    ///     table
+    ///         .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+    ///         .unwrap();
+    /// }
+    /// // Mean absolute deviation — a loop the built-ins don't cover.
+    /// table
+    ///     .register_lua_window(
+    ///         "mad",
+    ///         &["x"],
+    ///         "local n = #x\n\
+    ///          local mean = 0.0\n\
+    ///          for i = 1, n do mean = mean + x[i] end\n\
+    ///          mean = mean / n\n\
+    ///          local mad = 0.0\n\
+    ///          for i = 1, n do mad = mad + math.abs(x[i] - mean) end\n\
+    ///          return mad / n",
+    ///         ColumnType::F64,
+    ///     )
+    ///     .unwrap();
+    /// let output = table
+    ///     .query(
+    ///         "SELECT mad(x) OVER (ORDER BY ts ROWS BETWEEN 3 PRECEDING \
+    ///          AND CURRENT ROW) AS m FROM trades",
+    ///     )
+    ///     .unwrap();
+    /// // A ramp's full 4-row window deviates by exactly 1.0.
+    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    ///     &output.batches[0].columns()[0]
+    /// else {
+    ///     panic!("expected f64")
+    /// };
+    /// assert_eq!(m.values().as_slice()[0], 0.0); // one-row window
+    /// assert!(m.values().as_slice()[4..].iter().all(|&v| v == 1.0));
+    /// ```
+    pub fn register_lua_window(
+        &mut self,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+        output: ColumnType,
+    ) -> Result<(), EngineError> {
+        if !crate::script::is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let window = crate::script::LuaWindow::new(parameters, chunk, output)
+            .map_err(EngineError::Script)?;
+        self.registry.register(name, Arc::new(window));
+        Ok(())
     }
 
     fn check_table(&self, named: &str) -> Result<(), EngineError> {
