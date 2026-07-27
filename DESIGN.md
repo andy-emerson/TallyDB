@@ -800,16 +800,25 @@ per-window factorization dominating a real workload.
 
 *Updated 2026-07-27:* the factorization is gone — the window solves in
 closed form (see *Curated compute*) — and the centering it required
-remains, in corrected two-pass form. The streaming alternative was
-measured directly (`measure_3b`, release, container hardware): naive
-running sums are ~7.5× faster and reproduce exactly the failure this
-record predicted, with relative error reaching 1.1e2 on `eigen_max` at a
-1e9 offset and `corr`/`slope` going undefined where the recompute has an
-answer. A **shifted** variant — moments kept about a value near the data,
-accumulator rebuilt every window-length — keeps the ~7× and tracks the
-recompute to 5e-15. So the speed is available without the accuracy loss,
-but only in the shifted form; the naive one stays rejected. Adopting it
-needs a sequence-shaped window seam in the executor, which is not built.
+remains, now in **corrected** two-pass form in every window statistic
+(`RollingRegression` and `PairStatistic` alike; the uncorrected form
+carried up to 4.9e-8 relative error at a 1e12 offset). Accuracy is
+judged against a compensated high-precision reference and enforced in
+CI by `window_numerics_guard`: every shipped window statistic must
+track that reference within 1e-12 relative over corpora spanning
+offsets to 1e12 and a drifting monotonic ordering key — the shipped
+form measures 1–2e-15. The streaming alternative was measured against
+the same reference (`measure_3b`, release, container hardware): naive
+running sums are ~8× faster and reproduce exactly the failure this
+record predicted (`eigen_max` off by 9.6e7 at a 1e12 offset,
+`corr`/`slope` undefined where the recompute has an answer) — rejected
+permanently. A **shifted** variant — moments kept about a value near
+the data, accumulator rebuilt every window-length — keeps ~7× and sits
+at 5e-15–1.1e-14, marginally less accurate than the corrected
+recompute but still at the noise floor. So the speed is available at a
+noise-floor accuracy cost; adopting it needs a sequence-shaped window
+seam in the executor, which is not built, and any adoption must keep
+`window_numerics_guard` green.
 
 ## Batch, not per-row, for Lua and BLAS/LAPACK calls
 
