@@ -37,7 +37,9 @@ pub(crate) const LUA_OK: c_int = 0;
 pub(crate) const LUA_REGISTRYINDEX: c_int = -1_001_000;
 /// `lua_type` tags used by the wrapper.
 pub(crate) const LUA_TNIL: c_int = 0;
+pub(crate) const LUA_TBOOLEAN: c_int = 1;
 pub(crate) const LUA_TNUMBER: c_int = 3;
+pub(crate) const LUA_TSTRING: c_int = 4;
 
 unsafe extern "C" {
     // State lifecycle.
@@ -67,6 +69,7 @@ unsafe extern "C" {
     pub(crate) fn lua_type(L: *mut lua_State, idx: c_int) -> c_int;
 
     // Reads.
+    pub(crate) fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int;
     pub(crate) fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number;
     pub(crate) fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer;
     pub(crate) fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int;
@@ -74,6 +77,7 @@ unsafe extern "C" {
     pub(crate) fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void;
 
     // Pushes.
+    pub(crate) fn lua_pushboolean(L: *mut lua_State, b: c_int);
     pub(crate) fn lua_pushnil(L: *mut lua_State);
     pub(crate) fn lua_pushnumber(L: *mut lua_State, n: lua_Number);
     pub(crate) fn lua_pushinteger(L: *mut lua_State, n: lua_Integer);
