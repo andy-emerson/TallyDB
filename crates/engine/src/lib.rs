@@ -66,11 +66,12 @@ pub use table::{EngineError, Table};
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`
 // runs application-registered Lua kernels as SQL window functions
 // through the same seam as the curated LAPACK windows (the `script`
-// module; whole window per call, never per-row).
+// module; whole window per call, never per-row), and kernels call the
+// curated ops — dot, regr_slope/intercept, covar_pop/corr/eigen_max —
+// over the same views, no copy.
 //
 // TODO: expose compute-blas (multiplication-class) ops and the remaining
 //       compute-lapack ops as callable SQL functions, with
 //       backend-capability errors surfaced cleanly (not panics)
-// TODO: expose the curated native ops to Lua kernels over shared views
-//       (M2.7 increment D), and later the scalar-projection Lua slot
-//       (deferred: PlanItem is Column|WindowAgg only)
+// TODO: the scalar-projection Lua slot (deferred: PlanItem is
+//       Column|WindowAgg only; computed projections aren't built)

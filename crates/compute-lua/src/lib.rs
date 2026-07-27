@@ -74,12 +74,14 @@ pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 // value map are built — `LuaState::eval_column` / `eval_scalar` over
 // `values`. The curated standard-library set is a settled decision
 // (DESIGN.md, *The inclusion principle*): base/math/string/table in;
-// io/os/debug out; package not even linked.
+// io/os/debug out; package not even linked. Host compute reaches
+// scripts through `register_host_function` (`host`) — the seam the
+// engine exposes the curated BLAS/LAPACK ops through, over the same
+// zero-copy views — and `log()` routes diagnostics to the embedder's
+// `LogSink`.
 //
 // TODO: Lua backend trait, extracted when the WASM backend starts —
 //       nothing above this crate should need to know which is active
-// TODO: expose compute-blas and compute-lapack ops as callable Lua
-//       functions, sharing buffers (no copy)
 // TODO: pure-Lua module loader (package.path-style); explicitly do NOT
 //       wire up package.loadlib / C extension loading
 
