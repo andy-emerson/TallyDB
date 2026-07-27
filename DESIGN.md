@@ -701,6 +701,37 @@ triggers:* time-aligned hybrid freezing — pruning-profile evidence
 from the end-to-end suite (#52), and the library-thread question
 above.
 
+## The SQL stdlib — the surface, tabulated (#49, ruled 2026-07-27)
+
+One table, so the in/out line is a deliberate record instead of an
+accumulation of implementation accidents. Every IN row is born with a
+DuckDB differential family; the shell's help cites this table.
+
+| Construct | Status | Note |
+|---|---|---|
+| `SELECT` projection, aliases | in, built | |
+| `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
+| regex on keys | in, later | needs a dependency ruling (#57) |
+| `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
+| `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
+| `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
+| scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
+| `CASE WHEN` | in, built | conditions are WHERE grammar; UNKNOWN falls through |
+| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention) |
+| multi-column `ORDER BY` | in, later | additive lowering |
+| `LIMIT`/`OFFSET` | in, built | |
+| window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
+| `RANGE` frames | in, later | needs ordering-key-typed ranges |
+| star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule |
+| `ASOF` / ordered-merge joins | in, later | #65 |
+| `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
+| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, M3.5 | ships inside the shell increment (#39) |
+| non-correlated subqueries / CTEs | in, later | named subplans |
+| `UNION ALL` (then `UNION`) | in, later | low priority |
+| correlated subqueries | **out** | the road to a cost-based optimizer — settled no |
+| string production (`CONCAT`, `CAST AS VARCHAR`, …) | **out** | numeric-or-key invariant |
+| `DISTINCT` over window/aggregate projections | out until asked | refused loudly today |
+
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
 - **Compiled Lua C extensions** (`package.loadlib`). Pure-Lua libraries are

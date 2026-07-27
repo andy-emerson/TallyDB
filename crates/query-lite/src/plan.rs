@@ -1117,6 +1117,23 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                 args,
             })
         }
+        // sqlparser gives FLOOR and CEIL dedicated AST nodes.
+        floor_or_ceil @ (ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field }) => {
+            let ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime) = field else {
+                return Err(QueryError::Unsupported(
+                    "FLOOR/CEIL with a scale or datetime field".to_owned(),
+                ));
+            };
+            let function = if matches!(floor_or_ceil, ast::Expr::Floor { .. }) {
+                ScalarFunction::Floor
+            } else {
+                ScalarFunction::Ceil
+            };
+            Ok(ScalarExpr::Call {
+                function,
+                args: vec![lower_scalar_expr(expr)?],
+            })
+        }
         ast::Expr::Case {
             operand,
             conditions,

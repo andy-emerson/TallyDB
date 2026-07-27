@@ -143,6 +143,30 @@ def families() -> list[str]:
         "GROUP BY sym ORDER BY sym",
         "SELECT count(*) AS n FROM corpus WHERE x > 1e12",
     ]
+    # The M3.4 IN-tier (#49): computed projections, CASE, LIKE on keys,
+    # DISTINCT, HAVING, NULLS FIRST/LAST. Everything computes as DOUBLE
+    # (the engine's expression type); sqrt keeps its argument
+    # non-negative so both engines stay in IEEE territory.
+    queries += [
+        "SELECT ts, x * 2 + 1 AS a, x - y AS b, x / 7 AS c FROM corpus ORDER BY ts",
+        "SELECT ts, abs(100.0 - x) AS d, sqrt(abs(y - 100)) AS r FROM corpus ORDER BY ts",
+        "SELECT ts, floor(x) AS f, ceil(y) AS c, round(x) AS rn FROM corpus ORDER BY ts",
+        "SELECT ts, power(x / 100, 3) AS p, exp((100 - x) / 50) AS e FROM corpus ORDER BY ts",
+        "SELECT ts, CASE WHEN x > 100 THEN 1 WHEN x > 99.5 THEN 0.5 ELSE 0 END AS tier "
+        "FROM corpus ORDER BY ts",
+        "SELECT ts, CASE WHEN sym = 'K003' THEN x ELSE 0 - x END AS signed_x "
+        "FROM corpus ORDER BY ts",
+        "SELECT ts, CASE WHEN y > 140 THEN y END AS high_y FROM corpus ORDER BY ts",
+        "SELECT ts, sym, x FROM corpus WHERE sym LIKE 'K00%' ORDER BY ts",
+        "SELECT ts, sym, x FROM corpus WHERE sym LIKE '_00_' ORDER BY ts",
+        "SELECT ts, sym, x FROM corpus WHERE sym NOT LIKE '%3' ORDER BY ts",
+        "SELECT DISTINCT sym FROM corpus ORDER BY sym",
+        "SELECT sym, sum(x) AS s FROM corpus GROUP BY sym HAVING sum(x) > 100 ORDER BY sym",
+        "SELECT sym, count(y) AS n FROM corpus GROUP BY sym "
+        "HAVING count(y) >= 1 AND sym <> 'K001' ORDER BY sym",
+        "SELECT sym, avg(x) AS a FROM corpus GROUP BY sym HAVING NOT (avg(x) > 100) "
+        "ORDER BY sym",
+    ]
     return queries
 
 
@@ -152,6 +176,11 @@ def families() -> list[str]:
 TIE_QUERIES = [
     ("SELECT ts, sym FROM corpus ORDER BY sym", ["sym", "ts"]),
     ("SELECT ts, sym, x FROM corpus WHERE x > 100 ORDER BY sym DESC", ["sym", "ts"]),
+    # NULLS FIRST/LAST: the null rows tie on the sort key, so their
+    # internal order is engine-arbitrary; placement is what's checked.
+    ("SELECT ts, y FROM corpus ORDER BY y NULLS FIRST", ["y", "ts"]),
+    ("SELECT ts, y FROM corpus ORDER BY y DESC NULLS FIRST", ["y", "ts"]),
+    ("SELECT ts, y FROM corpus ORDER BY y NULLS LAST", ["y", "ts"]),
 ]
 
 WINDOW_QUERIES = [
@@ -285,20 +314,29 @@ def main() -> None:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(sql).to_arrow_table()
         # The ORDER BY column itself must come back correctly ordered...
-        order_column = sql.split("ORDER BY ")[1].split()[0]
-        descending = sql.rstrip().endswith("DESC")
+        tail = sql.split("ORDER BY ")[1]
+        order_column = tail.split()[0]
+        descending = " DESC" in tail
+        nulls_first = "NULLS FIRST" in tail
         sequence = engine[order_column].to_pylist()
-        expected = sorted(sequence, reverse=descending)
+        values = sorted(
+            (v for v in sequence if v is not None), reverse=descending
+        )
+        nones = [None] * (len(sequence) - len(values))
+        expected = nones + values if nulls_first else values + nones
         if sequence != expected:
             sys.exit(f"FAIL {sql}\n  engine '{order_column}' not in order")
         # ...and the row multisets must agree, under a total re-sort
-        # (python-side: pyarrow cannot sort dictionary columns).
+        # (python-side: pyarrow cannot sort dictionary columns; None
+        # sorts via an explicit is-None rank).
         def rows_of(table: pa.Table) -> list[tuple]:
             columns = [table[c].to_pylist() for c in table.column_names]
             rows = list(zip(*columns))
             order = [table.column_names.index(c) for c in canonical]
+            def rank(cell):
+                return (1, 0) if cell is None else (0, cell)
             return sorted(
-                rows, key=lambda row: tuple(row[i] for i in order)
+                rows, key=lambda row: tuple(rank(row[i]) for i in order)
             )
         if rows_of(engine) != rows_of(oracle):
             sys.exit(f"FAIL {sql}\n  row multisets differ")
