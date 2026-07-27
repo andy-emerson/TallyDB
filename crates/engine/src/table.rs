@@ -27,8 +27,8 @@
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, DeletePlan, Number, Plan, QueryError,
-    QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
+    evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
+    QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -708,6 +708,45 @@ impl WindowAggregate for RollingRegression {
             RegressionOutput::Intercept => centered_intercept - slope * mean_x,
         }))
     }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            // Recompute per frame, exactly as before this override.
+            return recompute_frames(self, columns, None);
+        };
+        let (y, x) = (columns[0], columns[1]);
+        let mut results = Vec::with_capacity(y.len());
+        shifted_sweep(y, x, preceding + 1, |moments| {
+            results.push(self.value_from_shifted(moments));
+        });
+        Ok(results)
+    }
+}
+
+impl RollingRegression {
+    /// The regression's value from shifted moments — mirroring [`Self::evaluate`]'s
+    /// semantics exactly: NULL under two rows or non-positive `Sxx` (NaN
+    /// checked explicitly), `slope = Sxy / Sxx` over corrected sums, the
+    /// intercept extrapolated to `x = 0` from the window means.
+    fn value_from_shifted(&self, moments: &ShiftedMoments) -> Option<f64> {
+        if moments.rows() < 2 {
+            return None;
+        }
+        let (_, var_x, covar) = moments.population();
+        if var_x <= 0.0 || var_x.is_nan() {
+            return None;
+        }
+        let slope = covar / var_x;
+        Some(match self.output {
+            RegressionOutput::Slope => slope,
+            RegressionOutput::Intercept => moments.mean_y() - slope * moments.mean_x(),
+        })
+    }
 }
 
 /// Which pair statistic an instance computes.
@@ -763,17 +802,45 @@ impl WindowAggregate for PairStatistic {
         var_y = (var_y - sum_dy * sum_dy / count) / count;
         var_x = (var_x - sum_dx * sum_dx / count) / count;
         covar = (covar - sum_dy * sum_dx / count) / count;
+        Ok(self.value_from_moments(n, var_y, var_x, covar))
+    }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            // Recompute per frame, exactly as before this override.
+            return recompute_frames(self, columns, None);
+        };
+        let (y, x) = (columns[0], columns[1]);
+        let mut results = Vec::with_capacity(y.len());
+        shifted_sweep(y, x, preceding + 1, |moments| {
+            let (var_y, var_x, covar) = moments.population();
+            results.push(self.value_from_moments(moments.rows(), var_y, var_x, covar));
+        });
+        Ok(results)
+    }
+}
+
+impl PairStatistic {
+    /// The statistic's value from finished population moments — one
+    /// finalization shared by the per-window and incremental paths, so
+    /// the NULL semantics cannot diverge between them.
+    fn value_from_moments(&self, rows: usize, var_y: f64, var_x: f64, covar: f64) -> Option<f64> {
         match self.kind {
-            PairKind::CovarPop => Ok(Some(covar)),
+            PairKind::CovarPop => Some(covar),
             PairKind::Corr => {
                 if var_y <= 0.0 || var_x <= 0.0 {
-                    return Ok(None); // undefined, per corr's definition
+                    return None; // undefined, per corr's definition
                 }
-                Ok(Some(covar / (var_y * var_x).sqrt()))
+                Some(covar / (var_y * var_x).sqrt())
             }
             PairKind::EigenMax => {
-                if n < 2 {
-                    return Ok(None);
+                if rows < 2 {
+                    return None;
                 }
                 // The largest eigenvalue of a symmetric 2 × 2 in closed
                 // form: λ_max = t + r for half-trace t = (var_y + var_x)/2
@@ -787,9 +854,108 @@ impl WindowAggregate for PairStatistic {
                 let half_trace = (var_y + var_x) / 2.0;
                 let half_gap = (var_y - var_x) / 2.0;
                 let radius = half_gap.hypot(covar);
-                Ok(Some(half_trace + radius))
+                Some(half_trace + radius)
             }
         }
+    }
+}
+
+/// Running moments about a shift taken from the data — the
+/// shifted-incremental window algorithm (3b-C) behind the
+/// `evaluate_frames` overrides above. Values enter and leave as
+/// deviations from `(ky, kx)`, so the accumulated sums stay at the
+/// window's own scale even when the data sits at a 1e12 offset; the
+/// E[d²] − E[d]² form is safe here for exactly that reason (about the
+/// *raw* values it is bug #45's catastrophic form — see
+/// `measure_incremental_windows`, variant B, rejected permanently).
+#[derive(Default, Clone, Copy)]
+struct ShiftedMoments {
+    n: f64,
+    sy: f64,
+    sx: f64,
+    syy: f64,
+    sxx: f64,
+    sxy: f64,
+    ky: f64,
+    kx: f64,
+}
+
+impl ShiftedMoments {
+    fn add(&mut self, yi: f64, xi: f64) {
+        let (dy, dx) = (yi - self.ky, xi - self.kx);
+        self.n += 1.0;
+        self.sy += dy;
+        self.sx += dx;
+        self.syy += dy * dy;
+        self.sxx += dx * dx;
+        self.sxy += dy * dx;
+    }
+
+    fn remove(&mut self, yi: f64, xi: f64) {
+        let (dy, dx) = (yi - self.ky, xi - self.kx);
+        self.n -= 1.0;
+        self.sy -= dy;
+        self.sx -= dx;
+        self.syy -= dy * dy;
+        self.sxx -= dx * dx;
+        self.sxy -= dy * dx;
+    }
+
+    /// Population `(var_y, var_x, covar)` about the window means.
+    fn population(&self) -> (f64, f64, f64) {
+        let (my, mx) = (self.sy / self.n, self.sx / self.n);
+        (
+            self.syy / self.n - my * my,
+            self.sxx / self.n - mx * mx,
+            self.sxy / self.n - my * mx,
+        )
+    }
+
+    fn mean_y(&self) -> f64 {
+        self.ky + self.sy / self.n
+    }
+
+    fn mean_x(&self) -> f64 {
+        self.kx + self.sx / self.n
+    }
+
+    fn rows(&self) -> usize {
+        self.n as usize
+    }
+}
+
+/// Sweeps one contiguous run with trailing frames of up to `w` rows,
+/// calling `emit` once per position with that frame's moments. O(run):
+/// each step slides by one `add` and one `remove`, and the accumulator
+/// is rebuilt about a fresh shift every `w` steps so rounding cannot
+/// accumulate across the column. Measured (`measure_3b`, 2026-07-27):
+/// ~7× the per-window recompute at 20k rows / window 64, worst relative
+/// error 5e-15–1.1e-14 against the compensated reference — held to
+/// 1e-12 in CI by `window_numerics_guard`, which runs this exact path.
+fn shifted_sweep(y: &[f64], x: &[f64], w: usize, mut emit: impl FnMut(&ShiftedMoments)) {
+    debug_assert!(w >= 1 && y.len() == x.len());
+    let mut moments = ShiftedMoments::default();
+    let mut since_rebuild = usize::MAX; // force a build on the first row
+    for i in 0..y.len() {
+        if since_rebuild >= w {
+            let lo = (i + 1).saturating_sub(w);
+            moments = ShiftedMoments {
+                ky: y[i],
+                kx: x[i],
+                ..Default::default()
+            };
+            for j in lo..=i {
+                moments.add(y[j], x[j]);
+            }
+            since_rebuild = 0;
+        } else {
+            moments.add(y[i], x[i]);
+            if i >= w {
+                moments.remove(y[i - w], x[i - w]);
+            }
+            since_rebuild += 1;
+        }
+        emit(&moments);
     }
 }
 
@@ -1314,13 +1480,16 @@ mod window_truth {
     //! under test, or the shipped code standing in for truth. Nothing may
     //! be judged accurate by comparison with itself.
 
-    /// The four statistics one window's moments yield.
+    /// The statistics one window's moments yield. `intercept` needs the
+    /// window means as well as the central moments, so only
+    /// `high_precision` fills it; `stats_from` leaves it NaN.
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Stats {
         pub(crate) covar: f64,
         pub(crate) corr: f64,
         pub(crate) eigen_max: f64,
         pub(crate) slope: f64,
+        pub(crate) intercept: f64,
     }
 
     /// Derives the statistics from centered moments — the shared tail of
@@ -1338,6 +1507,7 @@ mod window_truth {
             corr,
             eigen_max: half_trace + radius,
             slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
+            intercept: f64::NAN,
         }
     }
 
@@ -1402,7 +1572,11 @@ mod window_truth {
                 let var_x = (sxx.value() - sdx * sdx / n) / n;
                 let var_y = (syy.value() - sdy * sdy / n) / n;
                 let covar = (sxy.value() - sdx * sdy / n) / n;
-                stats_from(var_y, var_x, covar)
+                let mut stats = stats_from(var_y, var_x, covar);
+                // The window means recover exactly from the shifts (x0,
+                // y0 are data values) plus the compensated residuals.
+                stats.intercept = (y0 + sdy / n) - stats.slope * (x0 + sdx / n);
+                stats
             })
             .collect()
     }
@@ -1475,7 +1649,7 @@ mod window_numerics_guard {
     //! the correction trips this test at the first 1e12 window,
     //! verified by hand 2026-07-27).
 
-    use super::window_truth::{corpora, high_precision};
+    use super::window_truth::{corpora, high_precision, Stats};
     use super::*;
 
     const BOUND: f64 = 1e-12;
@@ -1519,18 +1693,72 @@ mod window_numerics_guard {
                         relative(got, expected)
                     );
                 }
-                let got = RollingRegression {
-                    output: RegressionOutput::Slope,
+                for (output, expected) in [
+                    (RegressionOutput::Slope, truth.slope),
+                    (RegressionOutput::Intercept, truth.intercept),
+                ] {
+                    let got = RollingRegression { output }
+                        .evaluate(&window)
+                        .unwrap()
+                        .expect("defined on these corpora");
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} regression: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
                 }
-                .evaluate(&window)
-                .unwrap()
-                .expect("defined on these corpora");
-                assert!(
-                    relative(got, truth.slope) < BOUND,
-                    "{name} row {i} slope: {got} vs {} (relative {:.2e})",
-                    truth.slope,
-                    relative(got, truth.slope)
-                );
+            }
+        }
+    }
+
+    /// The incremental path (`evaluate_frames`, the shifted sweep) is
+    /// held to the same reference as the per-window path — the executor
+    /// routes every SQL window through it, so it inherits the contract.
+    #[test]
+    fn incremental_frame_sequences_track_the_compensated_reference() {
+        let rows = 2_000;
+        let w = 64;
+        for (name, y, x) in corpora(rows) {
+            let reference = high_precision(&y, &x, w);
+            let columns: [&[f64]; 2] = [&y, &x];
+            let check = |label: &str, results: Vec<Option<f64>>, pick: &dyn Fn(&Stats) -> f64| {
+                for (i, result) in results.iter().enumerate().skip(w - 1) {
+                    let got = result.expect("defined on these corpora");
+                    let expected = pick(&reference[i]);
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} {label}: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
+                }
+            };
+            for (kind, pick) in [
+                (
+                    PairKind::CovarPop,
+                    &(|s: &Stats| s.covar) as &dyn Fn(&Stats) -> f64,
+                ),
+                (PairKind::Corr, &|s: &Stats| s.corr),
+                (PairKind::EigenMax, &|s: &Stats| s.eigen_max),
+            ] {
+                let results = PairStatistic { kind }
+                    .evaluate_frames(&columns, Some(w - 1))
+                    .unwrap();
+                check(&format!("{kind:?}"), results, pick);
+            }
+            for (output, label, pick) in [
+                (
+                    RegressionOutput::Slope,
+                    "slope",
+                    &(|s: &Stats| s.slope) as &dyn Fn(&Stats) -> f64,
+                ),
+                (RegressionOutput::Intercept, "intercept", &|s: &Stats| {
+                    s.intercept
+                }),
+            ] {
+                let results = RollingRegression { output }
+                    .evaluate_frames(&columns, Some(w - 1))
+                    .unwrap();
+                check(label, results, pick);
             }
         }
     }

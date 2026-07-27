@@ -573,11 +573,21 @@ mod tests {
             let scripted = f64s(&output, 1);
             assert_eq!(native.len(), 14);
             for row in 0..native.len() {
-                assert_eq!(
-                    native[row].map(f64::to_bits),
-                    scripted[row].map(f64::to_bits),
-                    "{native_name} row {row}"
-                );
+                // Same finalization semantics: defined-ness must agree
+                // exactly. The values agree to the noise floor but not
+                // bitwise — the SQL window runs the incremental sweep
+                // (evaluate_frames) while the host op computes its one
+                // window directly; both are held to the compensated
+                // reference within 1e-12 by window_numerics_guard, so
+                // their mutual agreement is bounded by twice that.
+                match (native[row], scripted[row]) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => assert!(
+                        (a - b).abs() <= 2e-12 * a.abs().max(b.abs()).max(1.0),
+                        "{native_name} row {row}: {a} vs {b}"
+                    ),
+                    (a, b) => panic!("{native_name} row {row}: {a:?} vs {b:?}"),
+                }
             }
         }
     }

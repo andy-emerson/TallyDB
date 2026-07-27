@@ -66,7 +66,7 @@ pub mod exec;
 pub mod plan;
 pub mod predicate;
 
-pub use exec::{execute, execute_join, QueryOutput, Registry, WindowAggregate};
+pub use exec::{execute, execute_join, recompute_frames, QueryOutput, Registry, WindowAggregate};
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, DeletePlan, JoinPlan,
     OrderBy, Plan, PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan,
