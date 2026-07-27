@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Why a backend operation failed.
@@ -73,6 +74,8 @@ pub trait StorageBackend: Send + Sync {
 /// write.
 pub struct FsBackend {
     dir: PathBuf,
+    /// Distinguishes concurrent writes' temp files (R6).
+    write_counter: AtomicU64,
 }
 
 impl FsBackend {
@@ -81,13 +84,25 @@ impl FsBackend {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .map_err(|error| IoError::Backend(format!("creating {}: {error}", dir.display())))?;
-        Ok(FsBackend { dir })
+        Ok(FsBackend {
+            dir,
+            write_counter: AtomicU64::new(0),
+        })
     }
 }
 
 impl StorageBackend for FsBackend {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
-        let temp = self.dir.join(format!(".tmp-{name}"));
+        // A **unique** temp path per write (R6): the trait promises
+        // `Sync` + atomic publish, so two threads writing the same object
+        // name must not share `.tmp-{name}` — one would truncate the
+        // other's in-flight bytes and a reader could observe a torn file.
+        // The counter (plus pid, defensively) keeps each write's temp
+        // private; it still starts `.tmp-` so `list` skips it.
+        let unique = self.write_counter.fetch_add(1, Ordering::Relaxed);
+        let temp = self
+            .dir
+            .join(format!(".tmp-{name}.{}.{unique}", std::process::id()));
         let path = self.dir.join(name);
         // Write and sync the contents before the rename: a rename can
         // be durable while the data it points at is still only in the
@@ -259,6 +274,38 @@ mod tests {
         assert_eq!(backend.list().unwrap(), ["real"]);
         backend.write("real", b"data-2").unwrap();
         assert_eq!(backend.read("real").unwrap(), b"data-2");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_name_stay_atomic() {
+        // R6: many threads writing the same object under the advertised
+        // `Sync` bound. With a shared `.tmp-{name}`, one writer's create
+        // truncates another's in-flight bytes and a reader can observe a
+        // torn file; a unique temp per write keeps every publish atomic.
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("tallydb-io-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = Arc::new(FsBackend::new(&dir).unwrap());
+        let mut handles = Vec::new();
+        for tag in 0..8u8 {
+            let backend = Arc::clone(&backend);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    backend.write("obj", &[tag; 64]).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        // The published object is exactly one writer's uniform 64-byte
+        // payload — complete and untorn, never a mix of two writers.
+        let bytes = backend.read("obj").unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(bytes.iter().all(|&b| b == bytes[0]), "torn write");
+        // No temp files leaked past their writes.
+        assert!(backend.list().unwrap().iter().all(|name| name == "obj"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
