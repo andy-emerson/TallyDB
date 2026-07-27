@@ -92,7 +92,7 @@
 //!
 //! ## Explicitly NOT in scope for this crate
 //! No SQL, no query planning — that's `query-lite`. No schema-level
-//! type decisions — that's `engine`. No BLAS/Lua — that's the compute
+//! type decisions — that's `engine`. No linear algebra/Lua — that's the compute
 //! crates.
 
 pub mod codec;

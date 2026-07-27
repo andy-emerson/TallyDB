@@ -14,8 +14,8 @@
 //! userdata wraps the live arrow-lite buffer pointer and its accessors
 //! are implemented on the Rust side, so no bytes are copied — access is
 //! zero-copy, though each element read is a metamethod dispatch, not a
-//! compiled raw load. The ops in `compute-blas` (multiplication-class)
-//! and `compute-lapack` (curated solves/decompositions) are exposed to
+//! compiled raw load. The ops in `compute-linalg` (multiplication-class)
+//! and the engine's own curated statistics are exposed to
 //! scripts as registered functions over those same views, sharing
 //! buffers, not copying between them. Lua 5.4's integer/float number
 //! subtypes match the engine's `i64`/`f64` column pair exactly, so
@@ -33,7 +33,7 @@
 //!   layer*). Binding discipline is checked with Lua's own enforcement
 //!   and the sanitizers, both in CI on every change: `LUA_USE_APICHECK`
 //!   test builds (the `apicheck` feature) and an ASan/UBSan job with
-//!   the vendored C compiled sanitized. Still planned under #41:
+//!   the vendored C compiled sanitized. Still planned, under #69:
 //!   `ltests.c` GC/allocation torture and the official Lua test suite
 //!   over the vendored build — both need files the deliberately
 //!   embedding-set-only vendor tree does not carry, vendored with
@@ -71,7 +71,7 @@ mod values;
 
 pub use host::HostFunction;
 pub use log::LogSink;
-pub use state::LuaState;
+pub use state::{Chunk, LuaState};
 pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 
 // The batch calling convention (whole columns per call) and the F1–F4
@@ -80,7 +80,7 @@ pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 // (DESIGN.md, *The inclusion principle*): base/math/string/table in;
 // io/os/debug out; package not even linked. Host compute reaches
 // scripts through `register_host_function` (`host`) — the seam the
-// engine exposes the curated BLAS/LAPACK ops through, over the same
+// engine exposes the curated linear-algebra and statistic ops through, over the same
 // zero-copy views — and `log()` routes diagnostics to the embedder's
 // `LogSink`.
 //

@@ -2,7 +2,7 @@
 //!
 //! A [`LuaWindow`] adapts an application-registered Lua kernel to
 //! `query-lite`'s `WindowAggregate` seam — the same seam the curated
-//! LAPACK windows (`regr_slope`, `eigen_max`, …) ship through. The
+//! native windows (`regr_slope`, `eigen_max`, …) ship through. The
 //! engine drives the framing; the kernel reduces one frame to one
 //! scalar, reading its arguments as zero-copy column views and
 //! returning a number or `NULL` — the window half of the vectorized
@@ -32,9 +32,8 @@
 
 use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
-use compute_blas::{BlasBackend, NativeBlas};
-use compute_lapack::NativeLapack;
-use compute_lua::{ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
+use compute_linalg::{LinalgBackend, RustLinalg};
+use compute_lua::{Chunk, ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
@@ -57,9 +56,9 @@ pub(crate) fn is_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// `dot(x, y)` — BLAS `ddot` as a script-callable op, the cheap end of
-/// the curated spread.
-struct DotOp(NativeBlas);
+/// `dot(x, y)` — the backend dot product as a script-callable op, the
+/// cheap end of the curated spread.
+struct DotOp(RustLinalg);
 
 impl HostFunction for DotOp {
     fn arity(&self) -> usize {
@@ -89,39 +88,27 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
 }
 
 /// Installs the curated compute spread into a kernel's state: `dot`
-/// (BLAS), `regr_slope` / `regr_intercept` (least squares), and
+/// (compute-linalg), `regr_slope` / `regr_intercept` (closed-form least squares),
+/// and
 /// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
 /// implementations the SQL windows run, reading the same view buffers
 /// with no copy. This is the compute-without-copying surface inside a
 /// script: engine buffers, curated native ops, and the interpreter all
 /// share memory.
 fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
-    let lapack = NativeLapack;
-    state.register_host_function("dot", Box::new(DotOp(NativeBlas)))?;
+    state.register_host_function("dot", Box::new(DotOp(RustLinalg)))?;
     for (name, output) in [
         ("regr_slope", RegressionOutput::Slope),
         ("regr_intercept", RegressionOutput::Intercept),
     ] {
-        state.register_host_function(
-            name,
-            Box::new(CuratedOp(RollingRegression {
-                backend: lapack,
-                output,
-            })),
-        )?;
+        state.register_host_function(name, Box::new(CuratedOp(RollingRegression { output })))?;
     }
     for (name, kind) in [
         ("covar_pop", PairKind::CovarPop),
         ("corr", PairKind::Corr),
         ("eigen_max", PairKind::EigenMax),
     ] {
-        state.register_host_function(
-            name,
-            Box::new(CuratedOp(PairStatistic {
-                backend: lapack,
-                kind,
-            })),
-        )?;
+        state.register_host_function(name, Box::new(CuratedOp(PairStatistic { kind })))?;
     }
     Ok(())
 }
@@ -129,11 +116,11 @@ fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
 /// An application-registered Lua window kernel behind the
 /// `WindowAggregate` seam.
 pub(crate) struct LuaWindow {
-    /// The interpreter, serialized per the concurrency note above.
-    state: Mutex<LuaState>,
-    /// The kernel source; compiled per call, syntax-checked once at
-    /// registration.
-    chunk: String,
+    /// The interpreter and its compiled kernel, serialized per the
+    /// concurrency note above. The chunk is compiled once at
+    /// registration and called per window — parsing per frame is the
+    /// dominant cost of a script kernel, and it belongs to neither.
+    state: Mutex<(LuaState, Chunk)>,
     /// Positional argument names, bound as globals for each call.
     parameters: Vec<CString>,
     /// The declared output type (F2): `F64` or `I64`, fixed at
@@ -180,10 +167,11 @@ impl LuaWindow {
         }
         let mut state = LuaState::new()?;
         install_curated_ops(&mut state)?;
-        state.check(chunk)?; // syntax errors surface here, not mid-query
+        // Compiling here is both the loud-early syntax check and the
+        // per-window saving: queries call the compiled function.
+        let compiled = state.compile(chunk)?;
         Ok(LuaWindow {
-            state: Mutex::new(state),
-            chunk: chunk.to_owned(),
+            state: Mutex::new((state, compiled)),
             parameters: names,
             output,
         })
@@ -200,10 +188,11 @@ impl WindowAggregate for LuaWindow {
     }
 
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .map_err(|_| "lua window interpreter poisoned".to_owned())?;
+        let (state, chunk) = &mut *guard;
         let views: Vec<(&CStr, ColumnView<'_>)> = self
             .parameters
             .iter()
@@ -223,7 +212,7 @@ impl WindowAggregate for LuaWindow {
             ColumnType::I64 => ReturnType::I64,
             _ => ReturnType::F64, // Key refused at registration
         };
-        match state.eval_scalar(&self.chunk, &views, declared)? {
+        match state.eval_scalar(chunk, &views, declared)? {
             ScalarValue::F64(value) => Ok(Some(value)),
             ScalarValue::I64(value) => {
                 // The executor carries window results as f64 and casts
@@ -594,8 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn dot_from_lua_matches_the_blas_backend() {
-        use compute_blas::{BlasBackend, NativeBlas};
+    fn dot_from_lua_matches_the_linalg_backend() {
+        use compute_linalg::{LinalgBackend, RustLinalg};
         let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
         let data: Vec<f64> = (0..10).map(|i| (i as f64) * 0.75 - 3.0).collect();
         for (i, &x) in data.iter().enumerate() {
@@ -617,8 +606,8 @@ mod tests {
             )
             .unwrap();
         let results = f64s(&output, 0);
-        // The same ddot on the same window slices: identical bits.
-        let backend = NativeBlas;
+        // The same dot on the same window slices: identical bits.
+        let backend = RustLinalg;
         for (row, result) in results.iter().enumerate() {
             let window = &data[row.saturating_sub(3)..=row];
             let reference = backend.dot(window, window).unwrap();

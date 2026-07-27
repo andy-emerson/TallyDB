@@ -18,8 +18,7 @@ arrow-lite = { path = "../arrow-lite" }
 storage-lite = { path = "../storage-lite" }
 query-lite = { path = "../query-lite" }
 compute-lua = { path = "../compute-lua" }
-compute-blas = { path = "../compute-blas" }
-compute-lapack = { path = "../compute-lapack" }
+compute-linalg = { path = "../compute-linalg" }
 corpus = { path = "../corpus", optional = true }
 
 [dev-dependencies]

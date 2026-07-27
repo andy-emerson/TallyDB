@@ -44,6 +44,25 @@ use crate::log::{self, LogSink, SinkSlot};
 use crate::values::{self, ColumnView, OutputColumn, ReturnType, ScalarValue};
 use std::ffi::{CStr, CString};
 
+/// A compiled kernel, held in its interpreter's registry — the unit
+/// scripts are *run* as. Compiling is the expensive half of a call
+/// (parse, code-generate, allocate a prototype); a kernel that runs
+/// once per window must therefore be compiled once at registration and
+/// called thereafter, which is why the run methods take one of these
+/// rather than source text. Compiling is also where a syntax error
+/// surfaces, so registration fails loudly instead of the first query.
+#[derive(Debug)]
+pub struct Chunk {
+    /// Registry key holding the compiled function.
+    key: CString,
+    /// The interpreter this belongs to; a chunk is not portable between
+    /// states (their registries are separate).
+    state_id: u64,
+}
+
+/// Source of the per-state identity stamped into [`Chunk`].
+static NEXT_STATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// An embedded Lua 5.4 interpreter with the curated library set
 /// (base, math, string, table — no io, no os, no debug; the package
 /// library is not even linked, per the ANSI build), the view
@@ -62,6 +81,11 @@ pub struct LuaState {
     /// Registered host functions, one stable box each (the closures'
     /// upvalues point at them); freed in `Drop`.
     host_functions: Vec<*mut HostSlot>,
+    /// This interpreter's identity, stamped into every [`Chunk`] it
+    /// compiles so a chunk cannot be run against another state.
+    id: u64,
+    /// Serial for registry keys of compiled chunks.
+    next_chunk: u64,
 }
 
 impl LuaState {
@@ -86,14 +110,50 @@ impl LuaState {
                 generation,
                 sink,
                 host_functions: Vec::new(),
+                id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                next_chunk: 0,
+            })
+        }
+    }
+
+    /// Compiles `chunk` (text only) and keeps the compiled function in
+    /// this interpreter's registry, returning the handle the run methods
+    /// take. Compile once — at registration — and call the result per
+    /// window; recompiling per call is the dominant cost of a script
+    /// kernel, which is why source text is not a runnable input.
+    pub fn compile(&mut self, chunk: &str) -> Result<Chunk, String> {
+        unsafe {
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            let status = ffi::luaL_loadbufferx(
+                self.raw,
+                chunk.as_ptr().cast(),
+                chunk.len(),
+                c"script".as_ptr(),
+                c"t".as_ptr(), // text only: no binary chunks, ever
+            );
+            if status != ffi::LUA_OK {
+                let message = self.pop_error("load");
+                debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+                return Err(message);
+            }
+            // Park the compiled function in the registry under a key
+            // owned by the handle (built once, so calls allocate none).
+            let key = CString::new(format!("tallydb.chunk.{}", self.next_chunk))
+                .expect("generated key has no interior NUL");
+            self.next_chunk += 1;
+            ffi::lua_setfield(self.raw, ffi::LUA_REGISTRYINDEX, key.as_ptr());
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            Ok(Chunk {
+                key,
+                state_id: self.id,
             })
         }
     }
 
     /// Registers an engine-side operation as the global `name`,
     /// callable from scripts over zero-copy views — the seam the
-    /// curated `compute-blas` / `compute-lapack` ops are exposed
-    /// through. See [`HostFunction`]. A second registration under the
+    /// curated `compute-linalg` and engine ops are exposed through. See
+    /// [`HostFunction`]. A second registration under the
     /// same name replaces the first (the old function's storage is
     /// retained until the state drops).
     pub fn register_host_function(
@@ -133,7 +193,7 @@ impl LuaState {
     /// type cannot hold exactly — is a loud `Err`.
     pub fn eval_scalar(
         &mut self,
-        chunk: &str,
+        chunk: &Chunk,
         inputs: &[(&CStr, ColumnView<'_>)],
         declared: ReturnType,
     ) -> Result<ScalarValue, String> {
@@ -156,7 +216,7 @@ impl LuaState {
     /// NULL. Views are valid only inside this call.
     pub fn eval_column(
         &mut self,
-        chunk: &str,
+        chunk: &Chunk,
         inputs: &[(&CStr, ColumnView<'_>)],
         mut output: OutputColumn<'_>,
     ) -> Result<(), String> {
@@ -167,30 +227,6 @@ impl LuaState {
                 self.run(chunk, 0)
             });
             self.end_call();
-            result
-        }
-    }
-
-    /// Compiles `chunk` (text only) without running it — the loud-early
-    /// hook for registration time, so a kernel's syntax error surfaces
-    /// when it is registered, not when its first query runs.
-    pub fn check(&mut self, chunk: &str) -> Result<(), String> {
-        unsafe {
-            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
-            let status = ffi::luaL_loadbufferx(
-                self.raw,
-                chunk.as_ptr().cast(),
-                chunk.len(),
-                c"script".as_ptr(),
-                c"t".as_ptr(),
-            );
-            let result = if status == ffi::LUA_OK {
-                ffi::lua_settop(self.raw, -2); // discard the compiled chunk
-                Ok(())
-            } else {
-                Err(self.pop_error("load"))
-            };
-            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
             result
         }
     }
@@ -212,18 +248,14 @@ impl LuaState {
         }
     }
 
-    unsafe fn run(&mut self, chunk: &str, results: std::ffi::c_int) -> Result<(), String> {
+    /// Pushes the compiled function from the registry and calls it — no
+    /// parse, no code generation, no allocation on the call path.
+    unsafe fn run(&mut self, chunk: &Chunk, results: std::ffi::c_int) -> Result<(), String> {
         unsafe {
-            let status = ffi::luaL_loadbufferx(
-                self.raw,
-                chunk.as_ptr().cast(),
-                chunk.len(),
-                c"script".as_ptr(),
-                c"t".as_ptr(), // text only: no binary chunks, ever
-            );
-            if status != ffi::LUA_OK {
-                return Err(self.pop_error("load"));
+            if chunk.state_id != self.id {
+                return Err("chunk belongs to a different interpreter".to_owned());
             }
+            ffi::lua_getfield(self.raw, ffi::LUA_REGISTRYINDEX, chunk.key.as_ptr());
             if ffi::lua_pcall(self.raw, 0, results, 0) != ffi::LUA_OK {
                 return Err(self.pop_error("run"));
             }
@@ -305,6 +337,29 @@ mod tests {
     use super::*;
     use arrow_lite::{Bitmap, Dictionary};
 
+    /// Compile-and-run, for tests that exercise one chunk once. The
+    /// production path compiles at registration and calls per window.
+    fn eval(
+        state: &mut LuaState,
+        source: &str,
+        inputs: &[(&CStr, ColumnView<'_>)],
+        declared: ReturnType,
+    ) -> Result<ScalarValue, String> {
+        let chunk = state.compile(source)?;
+        state.eval_scalar(&chunk, inputs, declared)
+    }
+
+    /// As [`eval`], for the column-output shape.
+    fn eval_col(
+        state: &mut LuaState,
+        source: &str,
+        inputs: &[(&CStr, ColumnView<'_>)],
+        output: OutputColumn<'_>,
+    ) -> Result<(), String> {
+        let chunk = state.compile(source)?;
+        state.eval_column(&chunk, inputs, output)
+    }
+
     fn f64s(values: &[f64]) -> ColumnView<'_> {
         ColumnView::F64 {
             values,
@@ -318,13 +373,13 @@ mod tests {
     fn f64_view_is_zero_copy_and_reads_exactly() {
         let values: Vec<f64> = (0..1000).map(|i| f64::from(i) * 0.25 - 100.0).collect();
         let mut state = LuaState::new().unwrap();
-        let sum = state
-            .eval_scalar(
-                "local s = 0.0\nfor i = 1, #v do s = s + v[i] end\nreturn s",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap();
+        let sum = eval(
+            &mut state,
+            "local s = 0.0\nfor i = 1, #v do s = s + v[i] end\nreturn s",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap();
         // Same order, same arithmetic: bit-exact agreement, not approximate.
         let expected: f64 = values.iter().sum();
         assert_eq!(sum, ScalarValue::F64(expected));
@@ -340,19 +395,19 @@ mod tests {
         // path returns difference 1.
         let values: Vec<i64> = vec![9_007_199_254_740_993, -9_007_199_254_740_993];
         let mut state = LuaState::new().unwrap();
-        let difference = state
-            .eval_scalar(
-                "return v[1] - 9007199254740992",
-                &[(
-                    c"v",
-                    ColumnView::I64 {
-                        values: &values,
-                        validity: None,
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+        let difference = eval(
+            &mut state,
+            "return v[1] - 9007199254740992",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &values,
+                    validity: None,
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(difference, ScalarValue::I64(1));
         let pointer = state.view_data_pointer(c"v").expect("view global");
         assert_eq!(pointer, values.as_ptr().cast());
@@ -364,16 +419,16 @@ mod tests {
         let mut out = [0.0f64; 3];
         let mut validity = Bitmap::new_unset(3);
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_column(
-                "for i = 1, #v do out[i] = v[i] * 2 end",
-                &[(c"v", f64s(&values))],
-                OutputColumn::F64 {
-                    values: &mut out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap();
+        eval_col(
+            &mut state,
+            "for i = 1, #v do out[i] = v[i] * 2 end",
+            &[(c"v", f64s(&values))],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
         // The zero-copy proof for the output side: the view carried the
         // caller's buffer, and the writes are already in it.
         let pointer = state.view_data_pointer(c"out").expect("out global");
@@ -396,25 +451,25 @@ mod tests {
 
         // The naive sum does not crash and does not skip: NULL poisons
         // the whole result (soft 3VL, the SQL/pd.NA behavior).
-        let naive = state
-            .eval_scalar(
-                "local s = 0.0\nfor i = 1, #v do s = s + v[i] end\nreturn s",
-                &[(c"v", view())],
-                ReturnType::F64,
-            )
-            .unwrap();
+        let naive = eval(
+            &mut state,
+            "local s = 0.0\nfor i = 1, #v do s = s + v[i] end\nreturn s",
+            &[(c"v", view())],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(naive, ScalarValue::Null);
 
         // The guard idiom: identity comparison against the sentinel.
-        let guarded = state
-            .eval_scalar(
-                "local s = 0.0\n\
+        let guarded = eval(
+            &mut state,
+            "local s = 0.0\n\
                  for i = 1, #v do if v[i] ~= NULL then s = s + v[i] end end\n\
                  return s",
-                &[(c"v", view())],
-                ReturnType::F64,
-            )
-            .unwrap();
+            &[(c"v", view())],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(guarded, ScalarValue::F64(4.0)); // 1 + 3, null skipped
     }
 
@@ -425,24 +480,24 @@ mod tests {
         let values = [f64::NAN, 5.0];
         let validity = Bitmap::from_bools([true, false]);
         let mut state = LuaState::new().unwrap();
-        let code = state
-            .eval_scalar(
-                "local nulls, nans = 0, 0\n\
+        let code = eval(
+            &mut state,
+            "local nulls, nans = 0, 0\n\
                  for i = 1, #v do\n\
                    if v[i] == NULL then nulls = nulls + 1\n\
                    elseif v[i] ~= v[i] then nans = nans + 1 end\n\
                  end\n\
                  return nulls * 10 + nans",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(code, ScalarValue::I64(11), "one NULL and one NaN");
     }
 
@@ -452,9 +507,13 @@ mod tests {
         // integer beyond 2^53 combined with NULL yields NULL — no crash,
         // no float coercion.
         let mut state = LuaState::new().unwrap();
-        let result = state
-            .eval_scalar("return 9007199254740993 + NULL", &[], ReturnType::I64)
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "return 9007199254740993 + NULL",
+            &[],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::Null);
     }
 
@@ -466,19 +525,19 @@ mod tests {
         let values = [0.0];
         let validity = Bitmap::from_bools([false]);
         let mut state = LuaState::new().unwrap();
-        let result = state
-            .eval_scalar(
-                "if v[1] then return 1 else return 0 end",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "if v[1] then return 1 else return 0 end",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::I64(1));
     }
 
@@ -489,19 +548,19 @@ mod tests {
         let values = [0.0];
         let validity = Bitmap::from_bools([false]);
         let mut state = LuaState::new().unwrap();
-        let error = state
-            .eval_scalar(
-                "return v[1] < 5",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return v[1] < 5",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(
             error.contains("compare") || error.contains("attempt"),
             "{error}"
@@ -515,27 +574,21 @@ mod tests {
         let mut state = LuaState::new().unwrap();
         // The same chunk lands as either type when exact...
         assert_eq!(
-            state.eval_scalar("return 3", &[], ReturnType::F64).unwrap(),
+            eval(&mut state, "return 3", &[], ReturnType::F64).unwrap(),
             ScalarValue::F64(3.0)
         );
         assert_eq!(
-            state.eval_scalar("return 3", &[], ReturnType::I64).unwrap(),
+            eval(&mut state, "return 3", &[], ReturnType::I64).unwrap(),
             ScalarValue::I64(3)
         );
         // ...and is refused loudly when it cannot be exact.
-        let error = state
-            .eval_scalar("return 2.5", &[], ReturnType::I64)
-            .unwrap_err();
+        let error = eval(&mut state, "return 2.5", &[], ReturnType::I64).unwrap_err();
         assert!(error.contains("does not fit i64 exactly"), "{error}");
-        let error = state
-            .eval_scalar("return 9007199254740993", &[], ReturnType::F64)
-            .unwrap_err();
+        let error = eval(&mut state, "return 9007199254740993", &[], ReturnType::F64).unwrap_err();
         assert!(error.contains("does not fit f64 exactly"), "{error}");
         // A lossless float fills i64 (2.0 is integral), per F3.
         assert_eq!(
-            state
-                .eval_scalar("return 4.0 / 2.0", &[], ReturnType::I64)
-                .unwrap(),
+            eval(&mut state, "return 4.0 / 2.0", &[], ReturnType::I64).unwrap(),
             ScalarValue::I64(2)
         );
     }
@@ -543,9 +596,7 @@ mod tests {
     #[test]
     fn scalar_key_results_are_refused() {
         let mut state = LuaState::new().unwrap();
-        let error = state
-            .eval_scalar("return 'AAPL'", &[], ReturnType::Key)
-            .unwrap_err();
+        let error = eval(&mut state, "return 'AAPL'", &[], ReturnType::Key).unwrap_err();
         assert!(error.contains("output column"), "{error}");
     }
 
@@ -558,95 +609,95 @@ mod tests {
         let mut validity = Bitmap::new_unset(1);
 
         // Lossless float → i64 fills; boolean maps to {0, 1}.
-        state
-            .eval_column(
-                "out[1] = 2.0",
-                &[],
-                OutputColumn::I64 {
-                    values: &mut i64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap();
+        eval_col(
+            &mut state,
+            "out[1] = 2.0",
+            &[],
+            OutputColumn::I64 {
+                values: &mut i64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
         assert_eq!((i64_out[0], validity.get(0)), (2, true));
-        state
-            .eval_column(
-                "out[1] = true",
-                &[],
-                OutputColumn::I64 {
-                    values: &mut i64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap();
+        eval_col(
+            &mut state,
+            "out[1] = true",
+            &[],
+            OutputColumn::I64 {
+                values: &mut i64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
         assert_eq!((i64_out[0], validity.get(0)), (1, true));
 
         // Non-integral float → i64 is a loud error, never truncation.
-        let error = state
-            .eval_column(
-                "out[1] = 2.5",
-                &[],
-                OutputColumn::I64 {
-                    values: &mut i64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out[1] = 2.5",
+            &[],
+            OutputColumn::I64 {
+                values: &mut i64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("does not fit i64 exactly"), "{error}");
 
         let mut f64_out = [0.0f64; 1];
         // Boolean → f64 has no defined mapping: loud.
-        let error = state
-            .eval_column(
-                "out[1] = true",
-                &[],
-                OutputColumn::F64 {
-                    values: &mut f64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out[1] = true",
+            &[],
+            OutputColumn::F64 {
+                values: &mut f64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("boolean maps to i64"), "{error}");
         // Strings produce keys, nothing else: loud into f64...
-        let error = state
-            .eval_column(
-                "out[1] = 'x'",
-                &[],
-                OutputColumn::F64 {
-                    values: &mut f64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out[1] = 'x'",
+            &[],
+            OutputColumn::F64 {
+                values: &mut f64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("produces a key"), "{error}");
         // ...and an integer beyond 2^53 refuses to round into f64.
-        let error = state
-            .eval_column(
-                "out[1] = 9007199254740993",
-                &[],
-                OutputColumn::F64 {
-                    values: &mut f64_out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out[1] = 9007199254740993",
+            &[],
+            OutputColumn::F64 {
+                values: &mut f64_out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("does not fit f64 exactly"), "{error}");
 
         // Numbers never become keys — codes are per-segment, so writing
         // one through would be meaningless at best.
         let mut codes = [0u32; 1];
         let mut dictionary = Dictionary::new();
-        let error = state
-            .eval_column(
-                "out[1] = 1",
-                &[],
-                OutputColumn::Key {
-                    codes: &mut codes,
-                    validity: &mut validity,
-                    dictionary: &mut dictionary,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out[1] = 1",
+            &[],
+            OutputColumn::Key {
+                codes: &mut codes,
+                validity: &mut validity,
+                dictionary: &mut dictionary,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("only a string produces a key"), "{error}");
     }
 
@@ -655,22 +706,22 @@ mod tests {
         let mut out = [0.0f64; 4];
         let mut validity = Bitmap::new_set(4); // stale bits: must be reset
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_column(
-                // Slot 1 written; slot 2 NULLed explicitly; slot 3 via
-                // nil; slot 4 never touched. Readback: out[2] reads as
-                // NULL mid-script, so the guarded rewrite fires.
-                "out[1] = 1.5\n\
+        eval_col(
+            &mut state,
+            // Slot 1 written; slot 2 NULLed explicitly; slot 3 via
+            // nil; slot 4 never touched. Readback: out[2] reads as
+            // NULL mid-script, so the guarded rewrite fires.
+            "out[1] = 1.5\n\
                  out[2] = NULL\n\
                  out[3] = nil\n\
                  if out[2] == NULL then out[1] = out[1] + 40.5 end",
-                &[],
-                OutputColumn::F64 {
-                    values: &mut out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap();
+            &[],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
         assert_eq!(out[0], 42.0);
         assert_eq!(
             (0..4).map(|i| validity.get(i)).collect::<Vec<_>>(),
@@ -695,42 +746,46 @@ mod tests {
         let mut state = LuaState::new().unwrap();
         // The element read is the integer code (F4) — integer-cheap.
         assert_eq!(
-            state
-                .eval_scalar("return v[2]", &[(c"v", view())], ReturnType::I64)
-                .unwrap(),
+            eval(
+                &mut state,
+                "return v[2]",
+                &[(c"v", view())],
+                ReturnType::I64
+            )
+            .unwrap(),
             ScalarValue::I64(1)
         );
         // text(i) decodes on demand.
         assert_eq!(
-            state
-                .eval_scalar(
-                    "if v:text(2) == 'MSFT' then return 1 else return 0 end",
-                    &[(c"v", view())],
-                    ReturnType::I64
-                )
-                .unwrap(),
+            eval(
+                &mut state,
+                "if v:text(2) == 'MSFT' then return 1 else return 0 end",
+                &[(c"v", view())],
+                ReturnType::I64
+            )
+            .unwrap(),
             ScalarValue::I64(1)
         );
         // code_of resolves a literal once; an absent literal is nil
         // (absence, not SQL NULL), which the typed result maps to Null.
         assert_eq!(
-            state
-                .eval_scalar(
-                    "return v:code_of('MSFT')",
-                    &[(c"v", view())],
-                    ReturnType::I64
-                )
-                .unwrap(),
+            eval(
+                &mut state,
+                "return v:code_of('MSFT')",
+                &[(c"v", view())],
+                ReturnType::I64
+            )
+            .unwrap(),
             ScalarValue::I64(1)
         );
         assert_eq!(
-            state
-                .eval_scalar(
-                    "return v:code_of('TSLA')",
-                    &[(c"v", view())],
-                    ReturnType::I64
-                )
-                .unwrap(),
+            eval(
+                &mut state,
+                "return v:code_of('TSLA')",
+                &[(c"v", view())],
+                ReturnType::I64
+            )
+            .unwrap(),
             ScalarValue::Null
         );
     }
@@ -750,24 +805,24 @@ mod tests {
         let mut out_validity = Bitmap::new_unset(4);
         let mut out_dictionary = Dictionary::new();
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_column(
-                "for i = 1, #v do out[i] = v:text(i) end",
-                &[(
-                    c"v",
-                    ColumnView::Key {
-                        codes: &codes,
-                        validity: Some(&validity),
-                        dictionary: &dictionary,
-                    },
-                )],
-                OutputColumn::Key {
-                    codes: &mut out_codes,
-                    validity: &mut out_validity,
-                    dictionary: &mut out_dictionary,
+        eval_col(
+            &mut state,
+            "for i = 1, #v do out[i] = v:text(i) end",
+            &[(
+                c"v",
+                ColumnView::Key {
+                    codes: &codes,
+                    validity: Some(&validity),
+                    dictionary: &dictionary,
                 },
-            )
-            .unwrap();
+            )],
+            OutputColumn::Key {
+                codes: &mut out_codes,
+                validity: &mut out_validity,
+                dictionary: &mut out_dictionary,
+            },
+        )
+        .unwrap();
         for i in 0..4 {
             assert_eq!(out_validity.get(i), validity.get(i), "slot {i}");
             if validity.get(i) {
@@ -791,89 +846,89 @@ mod tests {
 
         let values = [10.0, 20.0, 30.0, 40.0];
         let validity = Bitmap::from_bools([true, false, true, false]);
-        let sum = state
-            .eval_scalar(
-                "return v:sum()",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::F64,
-            )
-            .unwrap();
+        let sum = eval(
+            &mut state,
+            "return v:sum()",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(sum, ScalarValue::F64(40.0)); // 10 + 30, nulls skipped
 
         // SUM over nothing is NULL, exactly as in SQL.
         let all_null = Bitmap::new_unset(4);
-        let sum = state
-            .eval_scalar(
-                "return v:sum()",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&all_null),
-                    },
-                )],
-                ReturnType::F64,
-            )
-            .unwrap();
+        let sum = eval(
+            &mut state,
+            "return v:sum()",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&all_null),
+                },
+            )],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(sum, ScalarValue::Null);
 
         // i64 sums stay exact beyond 2^53 and overflow loudly, matching
         // the engine's SUM semantics (no silent widening).
         let big = [9_007_199_254_740_993i64, 2];
-        let sum = state
-            .eval_scalar(
-                "return v:sum()",
-                &[(
-                    c"v",
-                    ColumnView::I64 {
-                        values: &big,
-                        validity: None,
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+        let sum = eval(
+            &mut state,
+            "return v:sum()",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &big,
+                    validity: None,
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(sum, ScalarValue::I64(9_007_199_254_740_995));
         let overflowing = [i64::MAX, 1];
-        let error = state
-            .eval_scalar(
-                "return v:sum()",
-                &[(
-                    c"v",
-                    ColumnView::I64 {
-                        values: &overflowing,
-                        validity: None,
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return v:sum()",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &overflowing,
+                    validity: None,
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(error.contains("overflows"), "{error}");
 
         // Keys are not arithmetic: no sum, loudly.
         let codes = [0u32];
         let mut dictionary = Dictionary::new();
         dictionary.intern("AAPL");
-        let error = state
-            .eval_scalar(
-                "return v:sum()",
-                &[(
-                    c"v",
-                    ColumnView::Key {
-                        codes: &codes,
-                        validity: None,
-                        dictionary: &dictionary,
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return v:sum()",
+            &[(
+                c"v",
+                ColumnView::Key {
+                    codes: &codes,
+                    validity: None,
+                    dictionary: &dictionary,
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(error.contains("not arithmetic"), "{error}");
     }
 
@@ -884,34 +939,34 @@ mod tests {
         let mut state = LuaState::new().unwrap();
         // Validity as its own boolean view: the value stream stays
         // purely numeric while the script counts nulls separately.
-        let count = state
-            .eval_scalar(
-                "local m = v:mask()\n\
+        let count = eval(
+            &mut state,
+            "local m = v:mask()\n\
                  local n = 0\n\
                  for i = 1, #m do if m[i] then n = n + 1 end end\n\
                  return n",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(count, ScalarValue::I64(2));
         // A column with no validity sidecar masks to all-true.
-        let count = state
-            .eval_scalar(
-                "local m = v:mask()\n\
+        let count = eval(
+            &mut state,
+            "local m = v:mask()\n\
                  local n = 0\n\
                  for i = 1, #m do if m[i] then n = n + 1 end end\n\
                  return n",
-                &[(c"v", f64s(&values))],
-                ReturnType::I64,
-            )
-            .unwrap();
+            &[(c"v", f64s(&values))],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(count, ScalarValue::I64(3));
     }
 
@@ -924,22 +979,22 @@ mod tests {
         let mut out = [0.0f64; 3];
         let mut out_validity = Bitmap::new_unset(3);
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_column(
-                "for i = 1, #v do out[i] = v[i] end",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                OutputColumn::F64 {
-                    values: &mut out,
-                    validity: &mut out_validity,
+        eval_col(
+            &mut state,
+            "for i = 1, #v do out[i] = v[i] end",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
                 },
-            )
-            .unwrap();
+            )],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut out_validity,
+            },
+        )
+        .unwrap();
         assert!(out[0].is_nan(), "NaN is a value and survives");
         assert_eq!(out[1], 1.5);
         assert!(!out_validity.get(2), "NULL survives as NULL");
@@ -953,22 +1008,22 @@ mod tests {
         let mut out = [0i64; 3];
         let mut out_validity = Bitmap::new_unset(3);
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_column(
-                "for i = 1, #v do out[i] = v[i] end",
-                &[(
-                    c"v",
-                    ColumnView::I64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                OutputColumn::I64 {
-                    values: &mut out,
-                    validity: &mut out_validity,
+        eval_col(
+            &mut state,
+            "for i = 1, #v do out[i] = v[i] end",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &values,
+                    validity: Some(&validity),
                 },
-            )
-            .unwrap();
+            )],
+            OutputColumn::I64 {
+                values: &mut out,
+                validity: &mut out_validity,
+            },
+        )
+        .unwrap();
         assert_eq!(out[..2], values[..2], "bit-exact, no float hop");
         assert!(!out_validity.get(2));
     }
@@ -980,30 +1035,26 @@ mod tests {
         let values = [1.0f64, 2.0];
         let validity = Bitmap::from_bools([true, true]);
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_scalar(
-                "stash = function() return v[1] end\n\
+        eval(
+            &mut state,
+            "stash = function() return v[1] end\n\
                  stashed_mask = v:mask()\n\
                  return 0",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap();
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap();
         // The borrows have ended; both the stashed closure and the
         // stashed mask must find poisoned views, never a dangling read.
-        let error = state
-            .eval_scalar("return stash()", &[], ReturnType::F64)
-            .unwrap_err();
+        let error = eval(&mut state, "return stash()", &[], ReturnType::F64).unwrap_err();
         assert!(error.contains("outside its call"), "{error}");
-        let error = state
-            .eval_scalar("return stashed_mask[1]", &[], ReturnType::I64)
-            .unwrap_err();
+        let error = eval(&mut state, "return stashed_mask[1]", &[], ReturnType::I64).unwrap_err();
         assert!(error.contains("outside its call"), "{error}");
     }
 
@@ -1030,14 +1081,22 @@ mod tests {
                 },
             ),
         ];
-        let error = state
-            .eval_scalar("local f = v.sum\nreturn f(k)", &inputs, ReturnType::I64)
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "local f = v.sum\nreturn f(k)",
+            &inputs,
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(error.contains("not arithmetic"), "{error}");
         // The mirror image: a key method detached and fed a numeric view.
-        let error = state
-            .eval_scalar("local f = k.text\nreturn f(v, 1)", &inputs, ReturnType::F64)
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "local f = k.text\nreturn f(v, 1)",
+            &inputs,
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("key-view methods"), "{error}");
     }
 
@@ -1047,51 +1106,50 @@ mod tests {
         let mut state = LuaState::new().unwrap();
         // Out of range — never nil, always an error.
         for chunk in ["return v[3]", "return v[0]"] {
-            let error = state
-                .eval_scalar(chunk, &[(c"v", f64s(&values))], ReturnType::F64)
-                .unwrap_err();
+            let error =
+                eval(&mut state, chunk, &[(c"v", f64s(&values))], ReturnType::F64).unwrap_err();
             assert!(error.contains("out of range"), "{error}");
         }
         // Unknown method.
-        let error = state
-            .eval_scalar(
-                "return v:median()",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return v:median()",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("no such view method"), "{error}");
         // Key methods on a numeric view.
-        let error = state
-            .eval_scalar(
-                "return v:text(1)",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return v:text(1)",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("key-view methods"), "{error}");
         // Input views are read-only.
-        let error = state
-            .eval_scalar(
-                "v[1] = 9\nreturn 0",
-                &[(c"v", f64s(&values))],
-                ReturnType::I64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "v[1] = 9\nreturn 0",
+            &[(c"v", f64s(&values))],
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(error.contains("read-only"), "{error}");
         // Output indices are integers.
         let mut out = [0.0f64; 2];
         let mut validity = Bitmap::new_unset(2);
-        let error = state
-            .eval_column(
-                "out['x'] = 1.0",
-                &[],
-                OutputColumn::F64 {
-                    values: &mut out,
-                    validity: &mut validity,
-                },
-            )
-            .unwrap_err();
+        let error = eval_col(
+            &mut state,
+            "out['x'] = 1.0",
+            &[],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("must be an integer"), "{error}");
     }
 
@@ -1100,19 +1158,19 @@ mod tests {
         let values = [1.0f64, 2.0, 3.0];
         let validity = Bitmap::from_bools([true, false]); // one bit short
         let mut state = LuaState::new().unwrap();
-        let error = state
-            .eval_scalar(
-                "return 0",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::I64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return 0",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::I64,
+        )
+        .unwrap_err();
         assert!(error.contains("2 bits for 3 values"), "{error}");
     }
 
@@ -1133,13 +1191,13 @@ mod tests {
         let mut state = LuaState::new().unwrap();
         state.set_log_sink(Box::new(Capture(messages.clone())));
         let values = [0.25f64, 0.5, 0.75];
-        let result = state
-            .eval_scalar(
-                "log('x:', 42, 1.5, nil, NULL, v, v:mask())\nreturn v:sum()",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "log('x:', 42, 1.5, nil, NULL, v, v:mask())\nreturn v:sum()",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::F64(1.5));
         let captured = messages.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -1156,27 +1214,33 @@ mod tests {
     fn log_is_a_pure_side_channel() {
         // No sink installed: log is a no-op, not an error.
         let mut state = LuaState::new().unwrap();
-        let result = state
-            .eval_scalar("log('into the void')\nreturn 7", &[], ReturnType::I64)
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "log('into the void')\nreturn 7",
+            &[],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::I64(7));
         // log returns nothing, so it cannot feed a result.
-        let result = state
-            .eval_scalar(
-                "local r = log('x')\nif r == nil then return 1 else return 0 end",
-                &[],
-                ReturnType::I64,
-            )
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "local r = log('x')\nif r == nil then return 1 else return 0 end",
+            &[],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::I64(1));
         // The answer is identical with and without a sink.
-        let quiet = state
-            .eval_scalar("return 2 + 2", &[], ReturnType::I64)
-            .unwrap();
+        let quiet = eval(&mut state, "return 2 + 2", &[], ReturnType::I64).unwrap();
         state.set_log_sink(Box::new(Capture(Default::default())));
-        let logged = state
-            .eval_scalar("log('computing')\nreturn 2 + 2", &[], ReturnType::I64)
-            .unwrap();
+        let logged = eval(
+            &mut state,
+            "log('computing')\nreturn 2 + 2",
+            &[],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(quiet, logged);
     }
 
@@ -1187,7 +1251,7 @@ mod tests {
         // kernel author at log().
         let mut state = LuaState::new().unwrap();
         for chunk in ["print(1)", "warn('w')"] {
-            let error = state.eval_scalar(chunk, &[], ReturnType::I64).unwrap_err();
+            let error = eval(&mut state, chunk, &[], ReturnType::I64).unwrap_err();
             assert!(error.contains("nil"), "{chunk}: {error}");
         }
     }
@@ -1218,9 +1282,13 @@ mod tests {
             .register_host_function("probe", Box::new(PointerProbe(seen.clone())))
             .unwrap();
         let values: Vec<f64> = (0..64).map(|i| f64::from(i) * 0.5).collect();
-        let result = state
-            .eval_scalar("return probe(v)", &[(c"v", f64s(&values))], ReturnType::F64)
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "return probe(v)",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::F64(values.iter().sum()));
         // The pointer-verified no-copy claim: the host function received
         // the bound buffer itself, through Lua, with no bytes moved.
@@ -1258,34 +1326,34 @@ mod tests {
             .register_host_function("panicking", Box::new(Moody(2)))
             .unwrap();
         // Undefined → the NULL sentinel, exactly like a SQL window.
-        let result = state
-            .eval_scalar(
-                "if undefined(v) == NULL then return 1 else return 0 end",
-                &[(c"v", f64s(&values))],
-                ReturnType::I64,
-            )
-            .unwrap();
+        let result = eval(
+            &mut state,
+            "if undefined(v) == NULL then return 1 else return 0 end",
+            &[(c"v", f64s(&values))],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(result, ScalarValue::I64(1));
         // An op error is the script's error, loudly.
-        let error = state
-            .eval_scalar(
-                "return failing(v)",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return failing(v)",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("op declined"), "{error}");
         // A panicking embedder function is contained — a loud Lua error,
         // never an unwind into C — and the state survives.
-        let error = state
-            .eval_scalar(
-                "return panicking(v)",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return panicking(v)",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("panicked"), "{error}");
-        let alive = state.eval_scalar("return 1", &[], ReturnType::I64).unwrap();
+        let alive = eval(&mut state, "return 1", &[], ReturnType::I64).unwrap();
         assert_eq!(alive, ScalarValue::I64(1));
     }
 
@@ -1298,50 +1366,48 @@ mod tests {
             .unwrap();
         let values = [1.0f64, 2.0];
         // Wrong argument count.
-        let error = state
-            .eval_scalar(
-                "return probe(v, v)",
-                &[(c"v", f64s(&values))],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return probe(v, v)",
+            &[(c"v", f64s(&values))],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("wrong number"), "{error}");
         // A plain number is not a view.
-        let error = state
-            .eval_scalar("return probe(3)", &[], ReturnType::F64)
-            .unwrap_err();
+        let error = eval(&mut state, "return probe(3)", &[], ReturnType::F64).unwrap_err();
         assert!(error.contains("column views"), "{error}");
         // An i64 view is the wrong element type for the f64 ops.
         let i64s = [1i64, 2];
-        let error = state
-            .eval_scalar(
-                "return probe(v)",
-                &[(
-                    c"v",
-                    ColumnView::I64 {
-                        values: &i64s,
-                        validity: None,
-                    },
-                )],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return probe(v)",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &i64s,
+                    validity: None,
+                },
+            )],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("f64 views"), "{error}");
         // A null-bearing view is refused: the ops take dense input.
         let validity = Bitmap::from_bools([true, false]);
-        let error = state
-            .eval_scalar(
-                "return probe(v)",
-                &[(
-                    c"v",
-                    ColumnView::F64 {
-                        values: &values,
-                        validity: Some(&validity),
-                    },
-                )],
-                ReturnType::F64,
-            )
-            .unwrap_err();
+        let error = eval(
+            &mut state,
+            "return probe(v)",
+            &[(
+                c"v",
+                ColumnView::F64 {
+                    values: &values,
+                    validity: Some(&validity),
+                },
+            )],
+            ReturnType::F64,
+        )
+        .unwrap_err();
         assert!(error.contains("NULL"), "{error}");
         // Registration bounds the arity.
         struct TooWide;
@@ -1365,12 +1431,10 @@ mod tests {
         // move. &mut discipline means one thread at a time — which is
         // exactly what std::thread::spawn's move closure proves.
         let mut state = LuaState::new().unwrap();
-        state
-            .eval_scalar("g = 7\nreturn 0", &[], ReturnType::I64)
-            .unwrap();
+        eval(&mut state, "g = 7\nreturn 0", &[], ReturnType::I64).unwrap();
         let result = std::thread::spawn(move || {
             let mut state = state;
-            state.eval_scalar("return g + 35", &[], ReturnType::I64)
+            eval(&mut state, "return g + 35", &[], ReturnType::I64)
         })
         .join()
         .unwrap()
@@ -1379,40 +1443,56 @@ mod tests {
     }
 
     #[test]
-    fn check_compiles_without_running() {
+    fn compiling_does_not_run_and_a_chunk_runs_many_times() {
         let mut state = LuaState::new().unwrap();
-        // A valid chunk checks clean — and provably did not run: its
-        // side effect never happened.
-        state.check("ran = true").unwrap();
-        let ran = state
-            .eval_scalar(
-                "if ran then return 1 else return 0 end",
-                &[],
-                ReturnType::I64,
-            )
-            .unwrap();
+        // Compiling produces a callable without executing it: the
+        // chunk's side effect has not happened yet.
+        let chunk = state.compile("ran = (ran or 0) + 1\nreturn ran").unwrap();
+        let ran = eval(
+            &mut state,
+            "if ran then return 1 else return 0 end",
+            &[],
+            ReturnType::I64,
+        )
+        .unwrap();
         assert_eq!(ran, ScalarValue::I64(0));
-        // A syntax error is loud at check time.
-        let error = state.check("return ((").unwrap_err();
+        // One compiled chunk runs repeatedly — the registration-time
+        // compile, per-window call shape the window slot uses.
+        for expected in 1..=3 {
+            assert_eq!(
+                state.eval_scalar(&chunk, &[], ReturnType::I64).unwrap(),
+                ScalarValue::I64(expected)
+            );
+        }
+        // A syntax error is loud at compile time, and the state survives.
+        let error = state.compile("return ((").unwrap_err();
         assert!(error.contains("load"), "{error}");
-        // The state survives a failed check.
         assert_eq!(
-            state.eval_scalar("return 1", &[], ReturnType::I64).unwrap(),
+            eval(&mut state, "return 1", &[], ReturnType::I64).unwrap(),
             ScalarValue::I64(1)
         );
     }
 
     #[test]
+    fn a_chunk_from_another_interpreter_is_refused() {
+        // Registries are per-state; running a chunk against the wrong
+        // one must be loud, never a silent call of some other function.
+        let mut first = LuaState::new().unwrap();
+        let mut second = LuaState::new().unwrap();
+        let chunk = first.compile("return 1").unwrap();
+        let error = second
+            .eval_scalar(&chunk, &[], ReturnType::I64)
+            .unwrap_err();
+        assert!(error.contains("different interpreter"), "{error}");
+    }
+
+    #[test]
     fn script_errors_return_as_values_and_state_survives() {
         let mut state = LuaState::new().unwrap();
-        let error = state
-            .eval_scalar("error('deliberate')", &[], ReturnType::F64)
-            .unwrap_err();
+        let error = eval(&mut state, "error('deliberate')", &[], ReturnType::F64).unwrap_err();
         assert!(error.contains("deliberate"), "{error}");
         // The same state keeps working after a script error.
-        let value = state
-            .eval_scalar("return 40 + 2", &[], ReturnType::I64)
-            .unwrap();
+        let value = eval(&mut state, "return 40 + 2", &[], ReturnType::I64).unwrap();
         assert_eq!(value, ScalarValue::I64(42));
     }
 
@@ -1441,9 +1521,7 @@ mod tests {
         let start = std::time::Instant::now();
         let mut result = ScalarValue::Null;
         for _ in 0..rounds {
-            result = state
-                .eval_scalar(chunk, &[(c"v", f64s(&values))], ReturnType::F64)
-                .unwrap();
+            result = eval(&mut state, chunk, &[(c"v", f64s(&values))], ReturnType::F64).unwrap();
         }
         let elapsed = start.elapsed();
         let ScalarValue::F64(mad) = result else {
@@ -1491,16 +1569,16 @@ mod tests {
         let mut vec_validity = Bitmap::new_unset(n);
         let start = std::time::Instant::now();
         for _ in 0..vec_rounds {
-            state
-                .eval_column(
-                    vec_chunk,
-                    &[(c"v", f64s(&values))],
-                    OutputColumn::F64 {
-                        values: &mut vec_out,
-                        validity: &mut vec_validity,
-                    },
-                )
-                .unwrap();
+            eval_col(
+                &mut state,
+                vec_chunk,
+                &[(c"v", f64s(&values))],
+                OutputColumn::F64 {
+                    values: &mut vec_out,
+                    validity: &mut vec_validity,
+                },
+            )
+            .unwrap();
         }
         let vectorized = start.elapsed() / vec_rounds;
 
@@ -1513,16 +1591,16 @@ mod tests {
             for i in 0..n {
                 let mut slot = [0.0f64];
                 let mut slot_validity = Bitmap::new_unset(1);
-                state
-                    .eval_column(
-                        row_chunk,
-                        &[(c"v", f64s(&values[i..i + 1]))],
-                        OutputColumn::F64 {
-                            values: &mut slot,
-                            validity: &mut slot_validity,
-                        },
-                    )
-                    .unwrap();
+                eval_col(
+                    &mut state,
+                    row_chunk,
+                    &[(c"v", f64s(&values[i..i + 1]))],
+                    OutputColumn::F64 {
+                        values: &mut slot,
+                        validity: &mut slot_validity,
+                    },
+                )
+                .unwrap();
                 row_out[i] = slot[0];
             }
         }

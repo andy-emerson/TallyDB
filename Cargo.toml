@@ -6,8 +6,7 @@ members = [
     "crates/query-lite",
     "crates/engine",
     "crates/compute-lua",
-    "crates/compute-blas",
-    "crates/compute-lapack",
+    "crates/compute-linalg",
     "crates/corpus",
 ]
 

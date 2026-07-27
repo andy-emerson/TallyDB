@@ -8,7 +8,7 @@ storage round trip and the cross-segment window gather. This script
 recomputes every window independently in NumPy and diffs:
 
   lua_mad     pure-Lua mean absolute deviation (interpreter arithmetic)
-  lua_wdot    a kernel calling the BLAS `dot` host function over the
+  lua_wdot    a kernel calling the native `dot` host function over the
               same zero-copy views (the curated-op spread, end to end)
   lua_npos    an I64-declared count — the declared-return-type path:
               the exported Arrow column must BE int64 (F2/B5)

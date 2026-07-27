@@ -5,7 +5,7 @@
 //!
 //! `Vec` aligns to the element type (8 bytes for `f64`/`i64`); this crate's
 //! contract promises 64-byte alignment so the same buffer is cache-line
-//! clean for BLAS/LAPACK and matches Arrow's recommended allocation
+//! clean for numeric kernels and matches Arrow's recommended allocation
 //! alignment. [`Buffer`] is the one place that owns that promise — a small
 //! `Vec` work-alike over a 64-byte-aligned allocation. All other unsafe in
 //! this crate should stay confined to this module and the C Data Interface.
@@ -326,7 +326,7 @@ impl<T: Element> FromIterator<T> for Buffer<T> {
 /// A numeric column: an aligned value buffer plus validity, present only
 /// when the schema declares the column nullable.
 ///
-/// A `NOT NULL` column has **no** bitmap — its buffer is BLAS-ready by
+/// A `NOT NULL` column has **no** bitmap — its buffer is kernel-ready by
 /// construction, with no null check on the compute path. The ordering key
 /// is always `NOT NULL`. For a nullable column, the value under a null slot
 /// is unspecified but initialized (constructors take a concrete value for

@@ -58,7 +58,7 @@
 //! workload (rolling aggregates over ordered numeric data) and deserve
 //! first-class, hand-written implementations here — not a generic,
 //! bolted-on afterthought. Where a window function's inner loop is
-//! numeric-heavy, this is exactly the shape of work `compute-blas` is
+//! numeric-heavy, this is exactly the shape of work `compute-linalg` is
 //! built to accelerate; keep that seam in mind rather than reimplementing
 //! matrix-shaped math by hand.
 

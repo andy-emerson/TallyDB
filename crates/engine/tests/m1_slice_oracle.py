@@ -3,7 +3,7 @@
 
 Drives the whole vertical slice through the `oracle-harness` hooks in
 libengine: the engine ingests its fixture row by row, runs the SQL rolling
-regression through compute-lapack, and exports both the raw inputs and the
+regression in closed form, and exports both the raw inputs and the
 computed coefficients over the Arrow C stream interface. This script then
 recomputes every window independently:
 

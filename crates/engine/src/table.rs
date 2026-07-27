@@ -4,8 +4,8 @@
 //! A [`Table`] owns the whole pipeline for its rows: schema definition
 //! (numeric-or-key and the declared `NOT NULL` ordering key, enforced at
 //! definition time), one-row-at-a-time ingest through `storage-lite`'s
-//! multi-segment [`Store`], SQL through `query-lite`, the LAPACK-backed
-//! rolling regressions registered as the window functions
+//! multi-segment [`Store`], SQL through `query-lite`, the rolling
+//! regressions and pair statistics registered as the window functions
 //! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
 //! registered Lua window kernels via [`Table::register_lua_window`]
 //! (the `script` module). Appends and queries
@@ -19,15 +19,13 @@
 //! Passthrough columns in each result batch share that segment's buffers
 //! (copy-on-write handles), and the C Data export hands those same
 //! buffers out — asserted by pointer identity in this crate's tests.
-//! Windows over a single segment feed the regression as plain sub-slices;
+//! Windows over a single segment feed the aggregates as plain sub-slices;
 //! windows that span segments and partitioned windows run over an O(rows)
 //! gather — table-proportional, not bounded by a constant (~56 B/row for
-//! a two-argument regression) — the same class of copy as the
-//! regression's `[1 | x]` design-matrix gather (the trade recorded in
-//! deferred issue #4; peak-memory accounting in #56).
+//! a two-argument window) — the copy recorded in deferred issue #4
+//! (peak-memory accounting in #56).
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
-use compute_lapack::{ColMajor, ComputeError, LapackBackend, NativeLapack, Op};
 use query_lite::{
     evaluate_predicate, execute, parse_statement, plan, DeletePlan, Number, Plan, QueryError,
     QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
@@ -218,39 +216,33 @@ impl Table {
 
     fn from_store(name: impl Into<String>, store: Store) -> Table {
         let mut registry = Registry::new();
-        let backend = NativeLapack;
         registry.register(
             "regr_slope",
             Arc::new(RollingRegression {
-                backend,
                 output: RegressionOutput::Slope,
             }),
         );
         registry.register(
             "regr_intercept",
             Arc::new(RollingRegression {
-                backend,
                 output: RegressionOutput::Intercept,
             }),
         );
         registry.register(
             "covar_pop",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::CovarPop,
             }),
         );
         registry.register(
             "corr",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::Corr,
             }),
         );
         registry.register(
             "eigen_max",
             Arc::new(PairStatistic {
-                backend,
                 kind: PairKind::EigenMax,
             }),
         );
@@ -376,7 +368,7 @@ impl Table {
     /// parameter names, a key-typed output.
     ///
     /// Kernels can call the curated native ops over the same views —
-    /// `dot(x, y)` (BLAS), `regr_slope(y, x)` / `regr_intercept(y, x)`,
+    /// `dot(x, y)` (compute-linalg), `regr_slope(y, x)` / `regr_intercept(y, x)`,
     /// `covar_pop(y, x)` / `corr(y, x)` / `eigen_max(y, x)` — the very
     /// implementations the SQL windows run, sharing buffers with no
     /// copy; each returns a number, or `NULL` where undefined.
@@ -638,12 +630,36 @@ pub(crate) enum RegressionOutput {
     Intercept,
 }
 
-/// Rolling least-squares of `y` on `x`, one solve per window through
-/// `compute-lapack` (QR via `dgels` today; decision #20 ruled
-/// QR-fast-path-plus-SVD-fallback, and the SVD side arrives with the M2
-/// work on that op).
+/// Rolling least-squares of `y` on `x`, solved in closed form.
+///
+/// A two-parameter fit has an exact solution — `slope = Sxy / Sxx` over
+/// the centered sums — so it needs no matrix factorization. It is
+/// computed by the **corrected two-pass** algorithm (Chan–Golub–LeVeque):
+/// the naive form assumes centering leaves `Σ(x − x̄)` exactly zero,
+/// which floating point does not honor, and the residual offset walks
+/// into the intercept. Measured against the SVD answer
+/// (`measure_closed_form`, release, container hardware, 2026-07-27),
+/// worst predicted-y drift over the data:
+///
+/// | design | QR (`dgels`) | corrected | naive |
+/// |---|---|---|---|
+/// | 64-row window, x offset 1e9 | 1.07e-14 | 2.84e-14 | 8.31e-7 |
+/// | 64-row window, x offset 1e12 | 1.42e-14 | 2.49e-14 | 1.01e-3 |
+/// | near-degenerate, spread 1e-10 | 2.84e-14 | 1.99e-13 | 6.75e-7 |
+///
+/// The corrected form tracks QR within a small constant factor — both at
+/// the float noise floor against `|y|` of order 10–200 — while the naive
+/// form is a real regression at timestamp-scale offsets (bug #45's
+/// regime). Worst relative slope error: 1.6e-15 at a 1e12 offset,
+/// 7.6e-10 on the pathological near-degenerate designs.
+///
+/// Why not LAPACK: a general solver's per-call overhead dwarfs a
+/// 64 × 2 problem's arithmetic — measured at roughly 2.3µs of the 2.5µs
+/// per window. Decision #20 (QR fast path, SVD fallback) still governs
+/// the `least_squares` op itself; it no longer governs this window,
+/// because this window no longer solves a general system. See DESIGN.md,
+/// *Curated compute: what the engine calls, and why*.
 pub(crate) struct RollingRegression {
-    pub(crate) backend: NativeLapack,
     pub(crate) output: RegressionOutput,
 }
 
@@ -653,54 +669,49 @@ impl WindowAggregate for RollingRegression {
     }
 
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
-        // Capability negotiation, surfaced as a clean error — on a future
-        // partial backend this is how "no LAPACK here yet" reads.
-        if !self.backend.supports(Op::LeastSquares) {
-            return Err("least-squares is unavailable on this compute backend".to_owned());
-        }
         let (y, x) = (args[0], args[1]);
         let rows = y.len();
         if rows < 2 {
             return Ok(None); // a one-point regression is undefined: NULL
         }
-        // Zero variance in x makes the regression undefined — SQL NULL,
-        // exactly regr_slope's definition. Checked here because QR
-        // without pivoting cannot be trusted to flag it: rounding leaves
-        // the triangular factor almost-but-not-exactly singular and dgels
-        // happily returns garbage coefficients (the QR weakness that
-        // decided #20: an SVD fallback joins the op at M2).
-        if x.iter().all(|&value| value == x[0]) {
+        let count = rows as f64;
+        let mean_x = x.iter().sum::<f64>() / count;
+        let mean_y = y.iter().sum::<f64>() / count;
+        // Second pass about the means. `sum_dx` and `sum_dy` are zero in
+        // exact arithmetic and merely small in floating point; carrying
+        // them is what makes this the corrected form.
+        let (mut sum_dx, mut sum_dy, mut sxy, mut sxx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&xi, &yi) in x.iter().zip(y) {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
+            sum_dx += dx;
+            sum_dy += dy;
+            sxy += dx * dy;
+            sxx += dx * dx;
+        }
+        let sxx = sxx - sum_dx * sum_dx / count;
+        let sxy = sxy - sum_dx * sum_dy / count;
+        // Zero variance in x — or negative, which rounding can produce
+        // from the correction — leaves the regression undefined: SQL
+        // NULL, exactly `regr_slope`'s definition. NaN is tested for
+        // explicitly because every comparison against it is false, so it
+        // would otherwise slip through as "not ≤ 0".
+        if sxx <= 0.0 || sxx.is_nan() {
             return Ok(None);
         }
-        // The one bounded copy (issue #4): gather the [1 | x - x̄] design
-        // matrix in the column-major layout LAPACK requires. x is centered
-        // because the raw pair (1, x) is catastrophically ill-conditioned
-        // when x carries a large offset relative to its in-window spread —
-        // a timestamp-scale regressor (unix seconds ≈ 1e9) loses the slope
-        // entirely, while centering holds ~1e-11 relative error across
-        // offsets up to 1e15 (bug #45, measured 2026-07-24). The slope is
-        // shift-invariant; the intercept is un-centered on the way out.
-        let mean_x = x.iter().sum::<f64>() / rows as f64;
-        let mut design = Vec::with_capacity(rows * 2);
-        design.resize(rows, 1.0);
-        design.extend(x.iter().map(|&value| value - mean_x));
-        match self
-            .backend
-            .least_squares(ColMajor::new(&design, rows, 2), y)
-        {
-            Ok(coefficients) => Ok(Some(match self.output {
-                RegressionOutput::Slope => coefficients[1],
-                RegressionOutput::Intercept => coefficients[0] - coefficients[1] * mean_x,
-            })),
-            // Rank-deficient window (constant x): the regression is
-            // undefined there — SQL NULL, matching regr_slope semantics.
-            Err(ComputeError::Lapack { .. }) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
+        let slope = sxy / sxx;
+        // The fit is `a + slope·(x − x̄)` with `a` correcting for the
+        // leftover offset; the reported intercept is its value at x = 0.
+        let centered_intercept = mean_y - slope * (sum_dx / count);
+        Ok(Some(match self.output {
+            RegressionOutput::Slope => slope,
+            RegressionOutput::Intercept => centered_intercept - slope * mean_x,
+        }))
     }
 }
 
 /// Which pair statistic an instance computes.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum PairKind {
     /// Population covariance of `(y, x)` — 0 for a single point,
     /// matching `covar_pop`.
@@ -709,15 +720,13 @@ pub(crate) enum PairKind {
     Corr,
     /// The largest eigenvalue of the window's 2 × 2 population
     /// covariance matrix — the first principal component's variance,
-    /// solved by `dsyev` through `compute-lapack`. `NULL` under two
-    /// rows.
+    /// solved in closed form. `NULL` under two rows.
     EigenMax,
 }
 
 /// Two-column window statistics over `(y, x)`, sharing one accumulation
 /// of the population moments.
 pub(crate) struct PairStatistic {
-    pub(crate) backend: NativeLapack,
     pub(crate) kind: PairKind,
 }
 
@@ -734,16 +743,26 @@ impl WindowAggregate for PairStatistic {
         }
         let count = n as f64;
         let (mean_y, mean_x) = (y.iter().sum::<f64>() / count, x.iter().sum::<f64>() / count);
+        // The corrected two-pass (Chan–Golub–LeVeque), same as the
+        // rolling regression: `sum_dy`/`sum_dx` are zero in exact
+        // arithmetic but only small in floating point, and dropping the
+        // correction costs ~4.9e-8 relative error at a 1e12 offset where
+        // carrying it holds the noise floor (~1e-14) — measured against
+        // the compensated reference in `window_truth`, and guarded by
+        // `window_numerics_guard` below.
+        let (mut sum_dy, mut sum_dx) = (0.0f64, 0.0f64);
         let (mut var_y, mut var_x, mut covar) = (0.0f64, 0.0f64, 0.0f64);
         for (&yi, &xi) in y.iter().zip(x) {
             let (dy, dx) = (yi - mean_y, xi - mean_x);
+            sum_dy += dy;
+            sum_dx += dx;
             var_y += dy * dy;
             var_x += dx * dx;
             covar += dy * dx;
         }
-        var_y /= count;
-        var_x /= count;
-        covar /= count;
+        var_y = (var_y - sum_dy * sum_dy / count) / count;
+        var_x = (var_x - sum_dx * sum_dx / count) / count;
+        covar = (covar - sum_dy * sum_dx / count) / count;
         match self.kind {
             PairKind::CovarPop => Ok(Some(covar)),
             PairKind::Corr => {
@@ -756,15 +775,19 @@ impl WindowAggregate for PairStatistic {
                 if n < 2 {
                     return Ok(None);
                 }
-                if !self.backend.supports(Op::SymmetricEigen) {
-                    return Err("symmetric eigen is unavailable on this compute backend".to_owned());
-                }
-                let covariance = [var_y, covar, covar, var_x];
-                let (eigenvalues, _) = self
-                    .backend
-                    .symmetric_eigen(ColMajor::new(&covariance, 2, 2))
-                    .map_err(|error| error.to_string())?;
-                Ok(Some(eigenvalues[1])) // ascending: the last is largest
+                // The largest eigenvalue of a symmetric 2 × 2 in closed
+                // form: λ_max = t + r for half-trace t = (var_y + var_x)/2
+                // and radius r = √(((var_y − var_x)/2)² + covar²). Both
+                // terms are non-negative (variances are), so the sum
+                // carries no cancellation — this is the well-conditioned
+                // half of the quadratic (λ_min, the differenced one, is
+                // not computed here). A general eigensolver on a 2 × 2 is
+                // dominated by its own call overhead; see DESIGN.md, the
+                // curated-op cost record.
+                let half_trace = (var_y + var_x) / 2.0;
+                let half_gap = (var_y - var_x) / 2.0;
+                let radius = half_gap.hypot(covar);
+                Ok(Some(half_trace + radius))
             }
         }
     }
@@ -1277,5 +1300,644 @@ mod mutation_tests {
             db.mutate("DELETE FROM nope"),
             Err(EngineError::UnknownTable(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod window_truth {
+    //! The accuracy yardstick for every window statistic: a compensated
+    //! high-precision computation, far better than plain f64, so "which
+    //! algorithm is closer to the true answer" is a measurable question
+    //! rather than an assumption. The lesson this module encodes: every
+    //! wrong accuracy conclusion this project has drawn came from judging
+    //! one f64 algorithm against another — a metric blind to the quantity
+    //! under test, or the shipped code standing in for truth. Nothing may
+    //! be judged accurate by comparison with itself.
+
+    /// The four statistics one window's moments yield.
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct Stats {
+        pub(crate) covar: f64,
+        pub(crate) corr: f64,
+        pub(crate) eigen_max: f64,
+        pub(crate) slope: f64,
+    }
+
+    /// Derives the statistics from centered moments — the shared tail of
+    /// every algorithm under test, so differences are in the moments.
+    pub(crate) fn stats_from(var_y: f64, var_x: f64, covar: f64) -> Stats {
+        let corr = if var_y > 0.0 && var_x > 0.0 {
+            covar / (var_y * var_x).sqrt()
+        } else {
+            f64::NAN
+        };
+        let half_trace = (var_y + var_x) / 2.0;
+        let radius = ((var_y - var_x) / 2.0).hypot(covar);
+        Stats {
+            covar,
+            corr,
+            eigen_max: half_trace + radius,
+            slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
+        }
+    }
+
+    /// Compensated (Neumaier) accumulation: keeps the rounding error of
+    /// every addition in a second term, so a sum of n values carries
+    /// error of order eps² rather than n·eps.
+    #[derive(Default, Clone, Copy)]
+    pub(crate) struct Compensated {
+        hi: f64,
+        lo: f64,
+    }
+
+    impl Compensated {
+        pub(crate) fn add(&mut self, value: f64) {
+            // Knuth's two-sum: `sum` plus `error` reproduces the
+            // operands exactly, whichever is larger.
+            let sum = self.hi + value;
+            let shifted = sum - self.hi;
+            self.lo += (self.hi - (sum - shifted)) + (value - shifted);
+            self.hi = sum;
+        }
+
+        /// Adds `a · b`, keeping the product's own rounding error too —
+        /// `mul_add` is a fused multiply-add, so it yields that error
+        /// exactly.
+        pub(crate) fn add_product(&mut self, a: f64, b: f64) {
+            let product = a * b;
+            self.add(product);
+            self.lo += a.mul_add(b, -product);
+        }
+
+        pub(crate) fn value(self) -> f64 {
+            self.hi + self.lo
+        }
+    }
+
+    /// The reference: per trailing window, moments about `(x[0], y[0])`
+    /// — exact shifts for offset data, removing the cancellation the
+    /// means introduce — accumulated with compensation.
+    pub(crate) fn high_precision(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        (0..y.len())
+            .map(|i| {
+                let lo = (i + 1).saturating_sub(w);
+                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
+                let n = wy.len() as f64;
+                let (x0, y0) = (wx[0], wy[0]);
+                let (mut sdx, mut sdy) = (Compensated::default(), Compensated::default());
+                let (mut sxx, mut syy, mut sxy) = (
+                    Compensated::default(),
+                    Compensated::default(),
+                    Compensated::default(),
+                );
+                for (&yi, &xi) in wy.iter().zip(wx) {
+                    let (dx, dy) = (xi - x0, yi - y0);
+                    sdx.add(dx);
+                    sdy.add(dy);
+                    sxx.add_product(dx, dx);
+                    syy.add_product(dy, dy);
+                    sxy.add_product(dx, dy);
+                }
+                let (sdx, sdy) = (sdx.value(), sdy.value());
+                let var_x = (sxx.value() - sdx * sdx / n) / n;
+                let var_y = (syy.value() - sdy * sdy / n) / n;
+                let covar = (sxy.value() - sdx * sdy / n) / n;
+                stats_from(var_y, var_x, covar)
+            })
+            .collect()
+    }
+
+    /// Deterministic pseudo-random values in [0, 1).
+    pub(crate) struct Lcg(pub(crate) u64);
+
+    impl Lcg {
+        pub(crate) fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// `(name, y, x)` corpora spanning the benign case and the offset
+    /// shapes where cancellation bites — the regime bug #45 was about.
+    /// Constructed so every statistic sits well away from zero, keeping
+    /// plain relative error meaningful.
+    pub(crate) fn corpora(rows: usize) -> Vec<(&'static str, Vec<f64>, Vec<f64>)> {
+        let mut sets = Vec::new();
+        for (name, offset) in [
+            ("benign (x ~ 0..10)", 0.0),
+            ("offset 1e6", 1e6),
+            ("offset 1e9 (unix seconds)", 1e9),
+            ("offset 1e12 (unix millis)", 1e12),
+        ] {
+            let mut rng = Lcg(0x3B_5EED_1234_5678);
+            let mut x = Vec::with_capacity(rows);
+            let mut y = Vec::with_capacity(rows);
+            for _ in 0..rows {
+                let xi = offset + rng.next() * 10.0;
+                x.push(xi);
+                y.push(2.0 * (xi - offset) + rng.next());
+            }
+            sets.push((name, y, x));
+        }
+        // A monotonic ordering key: the timestamp-regressor shape, where
+        // the data also drifts away from any fixed shift.
+        let mut rng = Lcg(0x99_5EED_8765_4321);
+        let mut x = Vec::with_capacity(rows);
+        let mut y = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let xi = 1e9 + i as f64 * 0.05;
+            x.push(xi);
+            y.push(0.5 * (i as f64 * 0.05) + rng.next());
+        }
+        sets.push(("monotonic ts (1e9 + 0.05·i)", y, x));
+        sets
+    }
+}
+
+#[cfg(test)]
+mod window_numerics_guard {
+    //! The permanent accuracy contract, run in CI on every change (not
+    //! ignored, not a measurement): every shipped window statistic must
+    //! track the compensated reference at the float noise floor over the
+    //! adversarial corpora — offsets to 1e12 and a drifting monotonic
+    //! ordering key included. This is what makes "improved performance
+    //! without sacrificing correctness" a checked property instead of a
+    //! claim: any future change to these ops that trades accuracy away
+    //! fails here, loudly, before it lands.
+    //!
+    //! The bound is 1e-12 relative — two orders above the ~1e-14 the
+    //! corrected two-pass achieves (headroom for corpus changes), four
+    //! orders below the ~4.9e-8 the uncorrected form degraded to at a
+    //! 1e12 offset (the defect this guard exists to keep out; disabling
+    //! the correction trips this test at the first 1e12 window,
+    //! verified by hand 2026-07-27).
+
+    use super::window_truth::{corpora, high_precision};
+    use super::*;
+
+    const BOUND: f64 = 1e-12;
+
+    fn relative(got: f64, reference: f64) -> f64 {
+        ((got - reference) / reference).abs()
+    }
+
+    #[test]
+    fn shipped_window_statistics_track_the_compensated_reference() {
+        let rows = 2_000;
+        let w = 64;
+        for (name, y, x) in corpora(rows) {
+            let reference = high_precision(&y, &x, w);
+            for i in (w - 1)..rows {
+                let lo = (i + 1).saturating_sub(w);
+                let window: [&[f64]; 2] = [&y[lo..=i], &x[lo..=i]];
+                let truth = reference[i];
+                // The guard guards itself: a statistic near zero would
+                // make relative error meaningless, so the corpora must
+                // keep them all well away from it.
+                assert!(
+                    truth.covar.abs() > 1e-3
+                        && truth.corr.abs() > 1e-3
+                        && truth.eigen_max.abs() > 1e-3
+                        && truth.slope.abs() > 1e-3,
+                    "{name} row {i}: corpus left a statistic near zero"
+                );
+                for (kind, expected) in [
+                    (PairKind::CovarPop, truth.covar),
+                    (PairKind::Corr, truth.corr),
+                    (PairKind::EigenMax, truth.eigen_max),
+                ] {
+                    let got = PairStatistic { kind }
+                        .evaluate(&window)
+                        .unwrap()
+                        .expect("defined on these corpora");
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} {kind:?}: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
+                }
+                let got = RollingRegression {
+                    output: RegressionOutput::Slope,
+                }
+                .evaluate(&window)
+                .unwrap()
+                .expect("defined on these corpora");
+                assert!(
+                    relative(got, truth.slope) < BOUND,
+                    "{name} row {i} slope: {got} vs {} (relative {:.2e})",
+                    truth.slope,
+                    relative(got, truth.slope)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod measure_incremental_windows {
+    //! The 3b A/B: **incremental** window moments against the shipped
+    //! **recompute-per-window** algorithm — speed *and* numerics, every
+    //! variant judged against `window_truth`'s compensated reference
+    //! (never against another f64 algorithm; see that module's note).
+    //!
+    //! The three algorithms:
+    //!
+    //! - **A — recompute** (what ships): corrected two-pass per window
+    //!   (Chan–Golub–LeVeque), matching `PairStatistic` and
+    //!   `RollingRegression`. O(n·w) work. (The earlier *uncorrected*
+    //!   two-pass shipped until 2026-07-27 and degraded to ~4.9e-8
+    //!   relative at a 1e12 offset — the defect `window_numerics_guard`
+    //!   now keeps out.)
+    //! - **B — naive incremental**: raw running `Σx, Σy, Σxx, Σyy, Σxy`,
+    //!   variance as `E[x²] − E[x]²`. O(n), fastest possible, and the
+    //!   textbook cancellation trap (bug #45's shape) — kept here as the
+    //!   permanent cautionary contrast, never to ship.
+    //! - **C — shifted incremental with re-baselining**: the same O(1)
+    //!   slide, moments kept about a shift near the data, accumulator
+    //!   rebuilt every `w` steps so rounding cannot accumulate across
+    //!   the column. One extra pass overall; still O(n).
+    //!
+    //! Run explicitly, in release:
+    //!
+    //! ```text
+    //! cargo test -p engine --release measure_3b -- --ignored --nocapture
+    //! ```
+
+    use super::window_truth::{corpora, high_precision, stats_from, Stats};
+
+    /// One algorithm under test: window statistics for a whole column.
+    type WindowAlgorithm<'a> = &'a dyn Fn(&[f64], &[f64], usize) -> Vec<Stats>;
+
+    /// A — the shipped arrangement: corrected two-pass per window.
+    fn recompute(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        (0..y.len())
+            .map(|i| {
+                let lo = (i + 1).saturating_sub(w);
+                let (wy, wx) = (&y[lo..=i], &x[lo..=i]);
+                let n = wy.len() as f64;
+                let mean_y = wy.iter().sum::<f64>() / n;
+                let mean_x = wx.iter().sum::<f64>() / n;
+                let (mut sdy, mut sdx) = (0.0f64, 0.0f64);
+                let (mut vy, mut vx, mut cxy) = (0.0f64, 0.0f64, 0.0f64);
+                for (&yi, &xi) in wy.iter().zip(wx) {
+                    let (dy, dx) = (yi - mean_y, xi - mean_x);
+                    sdy += dy;
+                    sdx += dx;
+                    vy += dy * dy;
+                    vx += dx * dx;
+                    cxy += dy * dx;
+                }
+                stats_from(
+                    (vy - sdy * sdy / n) / n,
+                    (vx - sdx * sdx / n) / n,
+                    (cxy - sdy * sdx / n) / n,
+                )
+            })
+            .collect()
+    }
+
+    /// Running raw moments; `ky`/`kx` are subtracted from every value as
+    /// it enters (zero for the naive variant).
+    #[derive(Default, Clone, Copy)]
+    struct Moments {
+        n: f64,
+        sy: f64,
+        sx: f64,
+        syy: f64,
+        sxx: f64,
+        sxy: f64,
+        ky: f64,
+        kx: f64,
+    }
+
+    impl Moments {
+        fn add(&mut self, yi: f64, xi: f64) {
+            let (dy, dx) = (yi - self.ky, xi - self.kx);
+            self.n += 1.0;
+            self.sy += dy;
+            self.sx += dx;
+            self.syy += dy * dy;
+            self.sxx += dx * dx;
+            self.sxy += dy * dx;
+        }
+
+        fn remove(&mut self, yi: f64, xi: f64) {
+            let (dy, dx) = (yi - self.ky, xi - self.kx);
+            self.n -= 1.0;
+            self.sy -= dy;
+            self.sx -= dx;
+            self.syy -= dy * dy;
+            self.sxx -= dx * dx;
+            self.sxy -= dy * dx;
+        }
+
+        fn stats(&self) -> Stats {
+            let (my, mx) = (self.sy / self.n, self.sx / self.n);
+            stats_from(
+                self.syy / self.n - my * my,
+                self.sxx / self.n - mx * mx,
+                self.sxy / self.n - my * mx,
+            )
+        }
+    }
+
+    /// B — naive incremental: raw moments, no shift, never rebuilt.
+    fn incremental_naive(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        let mut moments = Moments::default();
+        (0..y.len())
+            .map(|i| {
+                moments.add(y[i], x[i]);
+                if i >= w {
+                    moments.remove(y[i - w], x[i - w]);
+                }
+                moments.stats()
+            })
+            .collect()
+    }
+
+    /// C — shifted incremental, rebuilt every `w` steps about a shift
+    /// taken from the current window.
+    fn incremental_shifted(y: &[f64], x: &[f64], w: usize) -> Vec<Stats> {
+        let mut moments = Moments::default();
+        let mut since_rebuild = usize::MAX; // force a build on the first row
+        (0..y.len())
+            .map(|i| {
+                if since_rebuild >= w {
+                    let lo = (i + 1).saturating_sub(w);
+                    moments = Moments {
+                        ky: y[i],
+                        kx: x[i],
+                        ..Moments::default()
+                    };
+                    for j in lo..=i {
+                        moments.add(y[j], x[j]);
+                    }
+                    since_rebuild = 0;
+                } else {
+                    moments.add(y[i], x[i]);
+                    if i >= w {
+                        moments.remove(y[i - w], x[i - w]);
+                    }
+                    since_rebuild += 1;
+                }
+                moments.stats()
+            })
+            .collect()
+    }
+
+    /// Worst relative difference against the high-precision reference,
+    /// over full windows only (short leading windows are a different
+    /// regime).
+    fn worst_relative_error(got: &[Stats], reference: &[Stats], w: usize) -> Stats {
+        let mut worst = Stats::default();
+        let relative = |a: f64, b: f64| {
+            if b == 0.0 || !b.is_finite() || !a.is_finite() {
+                if a == b || (a.is_nan() && b.is_nan()) {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            } else {
+                ((a - b) / b).abs()
+            }
+        };
+        for i in w..got.len() {
+            worst.covar = worst.covar.max(relative(got[i].covar, reference[i].covar));
+            worst.corr = worst.corr.max(relative(got[i].corr, reference[i].corr));
+            worst.eigen_max = worst
+                .eigen_max
+                .max(relative(got[i].eigen_max, reference[i].eigen_max));
+            worst.slope = worst.slope.max(relative(got[i].slope, reference[i].slope));
+        }
+        worst
+    }
+
+    #[test]
+    #[ignore = "measurement — run explicitly in release mode"]
+    fn measure_3b_incremental_vs_recompute() {
+        let rows = 20_000;
+        let w = 64;
+        println!(
+            "3b A/B: {rows} rows, window {w}; A = corrected recompute (shipped), \
+             B = naive incremental, C = shifted incremental rebuilt every {w}.\n\
+             Errors are worst relative deviation from the compensated \
+             high-precision reference."
+        );
+        for (name, y, x) in corpora(rows) {
+            // Timing: best of a few passes, black-boxed against DCE.
+            let time = |f: WindowAlgorithm<'_>| {
+                let mut best = f64::INFINITY;
+                let mut last = Vec::new();
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    last = f(&y, &x, w);
+                    best = best.min(start.elapsed().as_secs_f64());
+                    std::hint::black_box(&last);
+                }
+                (best, last)
+            };
+            let (time_a, recomputed) = time(&recompute);
+            let (time_b, naive) = time(&incremental_naive);
+            let (time_c, shifted) = time(&incremental_shifted);
+            let reference = high_precision(&y, &x, w);
+            let error_a = worst_relative_error(&recomputed, &reference, w);
+            let error_b = worst_relative_error(&naive, &reference, w);
+            let error_c = worst_relative_error(&shifted, &reference, w);
+            println!("\n  {name}");
+            println!(
+                "    time    A {:>8.2}ms   B {:>8.2}ms ({:>5.1}x)   C {:>8.2}ms ({:>5.1}x)",
+                time_a * 1e3,
+                time_b * 1e3,
+                time_a / time_b,
+                time_c * 1e3,
+                time_a / time_c
+            );
+            for (label, error) in [
+                ("A recompute (shipped)", error_a),
+                ("B naive incremental  ", error_b),
+                ("C shifted incremental", error_c),
+            ] {
+                println!(
+                    "    {label}  covar {:.2e}  corr {:.2e}  eigen {:.2e}  slope {:.2e}",
+                    error.covar, error.corr, error.eigen_max, error.slope
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod regression_numerics {
+    //! Guards for the closed-form rolling regression — specifically the
+    //! part of it that is easy to "simplify" away.
+    //!
+    //! `RollingRegression` uses the **corrected** two-pass form: it
+    //! carries `Σ(x − x̄)` and `Σ(y − ȳ)` rather than assuming the
+    //! centering left them exactly zero. The correction looks redundant —
+    //! both sums are zero in exact arithmetic — and deleting it is the
+    //! obvious cleanup. These tests exist so that cleanup fails loudly.
+    //!
+    //! The reference is an independent, more accurate computation of the
+    //! same statistic: moments taken about `x[0]` and `y[0]` rather than
+    //! about the means. For offset data those shifts are exact (the
+    //! values share an exponent, so the subtraction is), which removes
+    //! the cancellation the means introduce.
+
+    use super::*;
+
+    /// Slope and the fitted value at the last row, computed about
+    /// `(x[0], y[0])` — no cancellation, so this is the reference.
+    fn reference(x: &[f64], y: &[f64]) -> (f64, f64) {
+        let n = x.len() as f64;
+        let (x0, y0) = (x[0], y[0]);
+        let (mut sdx, mut sdy, mut sxy, mut sxx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&xi, &yi) in x.iter().zip(y) {
+            let (dx, dy) = (xi - x0, yi - y0);
+            sdx += dx;
+            sdy += dy;
+            sxy += dx * dy;
+            sxx += dx * dx;
+        }
+        let slope = (sxy - sdx * sdy / n) / (sxx - sdx * sdx / n);
+        // Fit at the last row, expressed relative to (x0, y0) so no huge
+        // intercept is ever formed.
+        let mean_dx = sdx / n;
+        let mean_dy = sdy / n;
+        let last = x[x.len() - 1] - x0;
+        (slope, y0 + mean_dy + slope * (last - mean_dx))
+    }
+
+    /// A 64-row window on an offset ordering key, `y = 3·(x − offset) + 7`
+    /// so the slope is 3 with respect to x.
+    ///
+    /// The x values are deliberately **irregular**. An evenly spaced ramp
+    /// lands on exactly-representable values at any offset, which makes
+    /// the mean exact, `Σ(x − x̄)` exactly zero, and the correction under
+    /// test a no-op — the fixture would pass whether or not the code is
+    /// right. Irregular values do not divide evenly into the offset's
+    /// ulp, so the centering is inexact and the correction matters.
+    fn offset_window(offset: f64) -> (Vec<f64>, Vec<f64>) {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let x: Vec<f64> = (0..64)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                offset + (state >> 11) as f64 / (1u64 << 53) as f64 * 10.0
+            })
+            .collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 3.0 * (xi - offset) + 7.0).collect();
+        (x, y)
+    }
+
+    fn slope_of(y: &[f64], x: &[f64]) -> Option<f64> {
+        RollingRegression {
+            output: RegressionOutput::Slope,
+        }
+        .evaluate(&[y, x])
+        .unwrap()
+    }
+
+    #[test]
+    fn slope_survives_timestamp_scale_offsets() {
+        // Bug #45's property, now guarded without LAPACK: a regressor
+        // carrying a unix-timestamp-scale offset must not lose the slope.
+        for offset in [0.0, 1e6, 1e9, 1e12, 1e15] {
+            let (x, y) = offset_window(offset);
+            let slope = slope_of(&y, &x).expect("a 64-row window with spread is defined");
+            let (expected, _) = reference(&x, &y);
+            assert!(
+                ((slope - expected) / expected).abs() < 1e-12,
+                "offset {offset:e}: slope {slope} vs reference {expected}"
+            );
+            // The data is exactly linear, so the true slope is known.
+            assert!(
+                (slope - 3.0).abs() < 1e-9,
+                "offset {offset:e}: slope {slope} is not 3"
+            );
+        }
+    }
+
+    #[test]
+    fn the_centering_correction_is_load_bearing() {
+        // The naive form — `a = ȳ`, no `Σ(x − x̄)` correction — against
+        // the shipped one, both judged by the fitted value at the last
+        // row (predictions, not the x = 0 intercept, which is
+        // intrinsically imprecise for offset data whatever the method).
+        fn naive_fit_at_last(x: &[f64], y: &[f64]) -> f64 {
+            let n = x.len() as f64;
+            let mean_x = x.iter().sum::<f64>() / n;
+            let mean_y = y.iter().sum::<f64>() / n;
+            let (mut sxy, mut sxx) = (0.0f64, 0.0f64);
+            for (&xi, &yi) in x.iter().zip(y) {
+                let dx = xi - mean_x;
+                sxy += dx * (yi - mean_y);
+                sxx += dx * dx;
+            }
+            let slope = sxy / sxx;
+            // Naive: intercept taken as ȳ, then un-centered.
+            let intercept = mean_y - slope * mean_x;
+            intercept + slope * x[x.len() - 1]
+        }
+
+        fn shipped_fit_at_last(x: &[f64], y: &[f64]) -> f64 {
+            let slope = slope_of(y, x).expect("defined");
+            let intercept = RollingRegression {
+                output: RegressionOutput::Intercept,
+            }
+            .evaluate(&[y, x])
+            .unwrap()
+            .expect("defined");
+            intercept + slope * x[x.len() - 1]
+        }
+
+        // At a 1e12 offset the naive form's fitted value drifts further
+        // than the shipped one. Both are compared to the
+        // cancellation-free reference.
+        let (x, y) = offset_window(1e12);
+        let (slope, expected) = reference(&x, &y);
+        let naive_error = (naive_fit_at_last(&x, &y) - expected).abs();
+        let shipped_error = (shipped_fit_at_last(&x, &y) - expected).abs();
+        assert!(
+            shipped_error < naive_error,
+            "the correction bought nothing: shipped {shipped_error:e}, naive {naive_error:e}"
+        );
+        // How close the shipped form can possibly get: reconstructing a
+        // fit of order 100 through an x = 0 intercept of order 3e12 is
+        // bounded by that intercept's own resolution, whatever the
+        // estimator. The bound is the representation floor, not a
+        // tolerance chosen to pass.
+        let intercept_scale = slope * x[0];
+        let floor = f64::EPSILON * intercept_scale.abs();
+        assert!(
+            shipped_error <= floor,
+            "shipped fit drifted {shipped_error:e}, past the {floor:e} representation floor"
+        );
+
+        // Where the intercept *is* well resolved, the fit is tight in
+        // absolute terms too.
+        let (x, y) = offset_window(1e6);
+        let (_, expected) = reference(&x, &y);
+        let shipped_error = (shipped_fit_at_last(&x, &y) - expected).abs();
+        assert!(
+            shipped_error < 1e-8,
+            "at a 1e6 offset the shipped fit drifted {shipped_error:e}"
+        );
+    }
+
+    #[test]
+    fn degenerate_windows_are_null_not_wrong() {
+        // Constant x: no slope exists. One row: undefined. NaN: the
+        // regression is undefined rather than silently NaN-valued.
+        let constant = vec![5.0f64; 16];
+        let y: Vec<f64> = (0..16).map(f64::from).collect();
+        assert_eq!(slope_of(&y, &constant), None);
+        assert_eq!(slope_of(&[1.0], &[1.0]), None);
+        let with_nan = [1.0f64, 2.0, f64::NAN, 4.0];
+        let plain = [1.0f64, 2.0, 3.0, 4.0];
+        assert_eq!(slope_of(&plain, &with_nan), None);
     }
 }

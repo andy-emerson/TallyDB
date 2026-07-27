@@ -28,7 +28,7 @@
 //! A view is an offset + length over a column — Arrow-native slicing. The
 //! window `rows[o .. o + n]` of an `f64` column is `&values[o .. o + n]`:
 //! the same bytes the column owns, no copy. This is what lets window
-//! functions feed BLAS/LAPACK with pointer arithmetic instead of a copy
+//! functions feed numeric kernels with pointer arithmetic instead of a copy
 //! per window.
 
 use crate::bitmap::Bitmap;

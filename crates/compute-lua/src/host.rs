@@ -1,8 +1,8 @@
 //! Host functions: engine-side compute callable from scripts over the
 //! same zero-copy views.
 //!
-//! This is the seam the curated `compute-blas` / `compute-lapack` ops
-//! reach scripts through (the engine registers them into every kernel
+//! This is the seam the curated `compute-linalg` and engine ops reach
+//! scripts through (the engine registers them into every kernel
 //! state): a [`HostFunction`] receives its column arguments as plain
 //! `&[f64]` slices pointing **directly at the engine buffers the views
 //! wrap** — sharing buffers, not copying between them — and returns one

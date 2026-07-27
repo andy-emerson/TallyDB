@@ -4,7 +4,7 @@
 //!
 //! Window-aggregate *implementations* are not defined here. The embedder
 //! (`engine`) registers them in a [`Registry`] — that is how compute
-//! (BLAS/LAPACK-backed regressions) reaches SQL while `query-lite` itself
+//! (regressions, pair statistics, Lua kernels) reaches SQL while this crate
 //! stays compute-free. An implementation sees plain `&[f64]` window
 //! slices and returns one value per window (`None` for windows where the
 //! aggregate is undefined — too few rows, degenerate inputs — which

@@ -7,7 +7,7 @@
 > and PyArrow; on top of it, a working vertical slice appends rows one at a
 > time into persistent, crash-safe, multi-segment storage and serves a real
 > SQL subset — `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, small-table
-> joins, window functions, and `UPDATE`/`DELETE` — with BLAS/LAPACK compute
+> joins, window functions, and `UPDATE`/`DELETE` — with numeric compute
 > (regression, covariance, PCA) exposed as SQL. Every query family is born
 > cross-checked against DuckDB and NumPy in CI, over data that has
 > round-tripped through storage. M2's final increment — M2.7, embedded Lua
@@ -21,7 +21,7 @@
 TallyDB is an HTAP-shaped store: fast, append-heavy ingest (the
 write-optimized half) feeding directly into ordered, columnar, analytical
 reads (the read-optimized half), with no ETL step between them — and with
-BLAS/LAPACK and Lua compute that runs *on the engine's own buffers,
+curated native and Lua compute that runs *on the engine's own buffers,
 in-process, with no copy*. It is being built around three assumptions about
 the data it stores:
 
@@ -131,7 +131,7 @@ boundary, not our own foresight.
   Lua — called directly from SQL, operating on the same numeric buffers the
   query engine already has in memory. Nothing is copied out to a separate
   scripting process or serialized across a boundary; the script, the query
-  engine, and the curated BLAS/LAPACK ops all read and write the same
+  engine, and the curated native ops all read and write the same
   buffers in place. This **compute-without-copying** property is the thing
   TallyDB is actually built around, not a bolted-on extra.
 - Runs natively (Linux/Mac/Windows) for production and research pipelines.
@@ -144,7 +144,7 @@ storage, dictionary-encoded keys, in-database compute — each exists
 somewhere. The differentiator is the *combination and packaging*: numeric
 compute (regression, covariance, factor math) running inside an
 **embeddable, SQL-native** engine, over **off-the-shelf** numeric libraries
-(canonical Lua, BLAS/LAPACK) on **zero-copy shared buffers** — rather than a
+(canonical Lua, pure-Rust linear algebra) on **zero-copy shared buffers** — rather than a
 bespoke array language (kdb+'s q) or a serialization hop (DuckDB ↔ Python).
 The honest one-line framing is *"an open, SQL-native, embeddable kdb+ for
 teams below kdb+ scale"*: the workload kdb+ proved over 25 years, minus the
@@ -208,44 +208,77 @@ per segment with per-segment key dictionaries remapped at query time
 where grouping or partitioning needs them, and a generated
 differential harness diffs query families against DuckDB over the
 corpus in CI;
-`compute-lapack` links system
-LAPACK and solves least squares through `dgels` behind a
-capability-negotiating trait; and `engine` ties them together behind a
-multi-table `Database` handle, registering `regr_slope` / `regr_intercept`, `covar_pop` / `corr`,
-and `eigen_max` (the window's first principal-component variance, via
-`dsyev`) as SQL window functions — every window re-derived
-independently by NumPy and DuckDB in CI, over a fixture that spans
-several segments and a storage round trip. Passthrough results share the stored buffers
+`engine` ties them together behind a
+multi-table `Database` handle, registering `regr_slope` / `regr_intercept`,
+`covar_pop` / `corr`, and `eigen_max` (the window's first
+principal-component variance) as SQL window functions — every window
+re-derived independently by NumPy and DuckDB in CI, over a fixture that
+spans several segments and a storage round trip. **These are solved in
+closed form, and the engine links no LAPACK at all**: a two-parameter
+regression and a 2 × 2 eigenvalue have exact solutions, while a general
+solver is dominated by its own per-call overhead at window scale
+(measured: ~2.3µs of `regr_slope`'s 2.5µs per 64-row window). Removing it
+moved `regr_slope` from 5× behind DuckDB's equivalent window to 3.3×
+ahead, dropped the system-LAPACK build dependency, and took a
+LAPACK-in-WASM layer off the WASM build's critical path. A LAPACK-class
+backend returns only when an op needs more than two parameters or
+dimensions, where no closed form exists — see `DESIGN.md`, *Curated
+compute: what the engine calls, and why*. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
-are the bounded copies, as recorded in the crate docs. `compute-blas`
-links system BLAS behind the same capability-negotiating trait shape
-(`dot`, matrix–vector, matrix–matrix — checked against hand
-computations; not yet called from query inner loops, which stays
-profiling-gated). `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
+are the bounded copies, as recorded in the crate docs. `compute-linalg`
+provides the multiplication-class kernels behind the same
+capability-negotiating trait shape (`dot`, matrix–vector, matrix–matrix
+— checked against hand computations; not yet called from query inner
+loops, which stays profiling-gated), and it is pure Rust: `dot` is a
+source-fixed loop, bit-identical on every CPU and target and measured
+fastest at window scale, while the matrix products use faer, measured
+3.7–10× ahead of a naive loop (and ahead of reference BLAS) at the Gram
+shapes a future multi-parameter op would need. The engine links no
+system math library at all — no BLAS, no LAPACK — and the compute stack
+compiles for wasm32 as-is. `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
 unmodified) behind the frozen value-map contract: nullable columns
 cross as zero-copy views (NULL is the `NULL` sentinel, three-valued
 through arithmetic; keys read as codes with `text()`/`code_of()`),
 results coerce exact-or-loud to a type declared at registration, and
 application kernels run as SQL window functions
-(`Table::register_lua_window`) with the curated BLAS/LAPACK ops
+(`Table::register_lua_window`) with the curated native ops
 callable from scripts over the same buffers — every kernel family
 re-derived by NumPy in CI over a multi-segment storage round trip, the
 C boundary additionally run under `LUA_USE_APICHECK` and ASan/UBSan in
 CI, and `log()` routing script diagnostics to an embedder-installed
 sink (`print` is gone; stdout is not an embedded library's to own). One
-honest number to hold beside the design: the first in-engine-vs-round-trip
-latency benchmark (`m2_compute_latency_bench.py`, run 2026-07-27,
-container hardware) came out **against** the in-engine path at the
-shapes tried — exporting over Arrow and computing in vectorized NumPy
-or DuckDB won by 2–100×, because the Arrow hop is nearly free
-in-process while per-window interpreter and solver costs are not. The
-zero-copy property itself is pointer-verified and stands; the
-wall-clock win is open optimization work, not an earned claim.
-`blas.wasm` and `lua.wasm` (the WASM
-compute dependencies, for later) are real, working, MIT-licensed projects
-already in progress by the same author, with LAPACK-in-WASM as their next
-planned milestone — tracked as future dependencies, not part of the current
-native-first build.
+honest set of numbers to hold beside the design: the latency benchmark
+(`m2_compute_latency_bench.py`, run 2026-07-27, container hardware, 20k
+rows, window 64) now measures **two peers** — vectorized NumPy riding
+TallyDB's own ~0.1ms Arrow export (the *marginal* question: given data
+in TallyDB, is in-engine compute worth it?) and the competitor stack
+entire, the same rows stored in DuckDB with NumPy pulling from DuckDB
+(the *product* question: TallyDB, or DuckDB + NumPy?). Against the
+competitor stack, in-engine wins `regr_slope` by **2.4×**, holds parity
+on the pair statistics (`covar_pop`, `corr`, `eigen_max`: 0.84–1.08),
+and wins the live-query shape — the newest window, now — by **7–9×**,
+because pulling even 64 rows out of DuckDB costs ~1ms before any math
+happens, while the append-ordered engine serves the whole query in
+~120µs. Against the marginal peer the pair statistics still lose ~2.5×
+and the Lua kernels ~14×: the Arrow hop is nearly free in-process, and
+the engine recomputes each window from scratch where the vectorized
+peer sweeps the column once. Three rounds of overhead have come off
+already (kernels compile once rather than per window; the 2×2
+eigenvalue and the two-parameter regression are solved in closed form
+rather than by a general solver), and the remaining gap is measured and
+understood: it is the O(n·w) recompute, not the arithmetic. Incremental
+windows would close it — a 7× algorithmic win, measured, with the
+numerics settled — and need an executor change that is not built. The
+zero-copy property itself is pointer-verified and stands; the earned
+wall-clock claim is bulk parity and a decisive latency win against the
+stack a user would actually deploy, not a blanket win in every shape.
+`lua.wasm` (the one WASM compute
+dependency still to come, for later) is a real, working, MIT-licensed
+project already in progress by the same author — tracked as a future
+dependency, not part of the current native-first build. (Its sibling
+`blas.wasm` is no longer needed: with LAPACK removed and system BLAS
+replaced by pure Rust, TallyDB's linear algebra compiles for wasm32
+directly.)
 
 ## How we work
 
