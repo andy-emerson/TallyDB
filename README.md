@@ -233,14 +233,20 @@ re-derived by NumPy in CI over a multi-segment storage round trip, the
 C boundary additionally run under `LUA_USE_APICHECK` and ASan/UBSan in
 CI, and `log()` routing script diagnostics to an embedder-installed
 sink (`print` is gone; stdout is not an embedded library's to own). One
-honest number to hold beside the design: the first in-engine-vs-round-trip
+honest number to hold beside the design: the in-engine-vs-round-trip
 latency benchmark (`m2_compute_latency_bench.py`, run 2026-07-27,
-container hardware) came out **against** the in-engine path at the
+container hardware) comes out **against** the in-engine path at the
 shapes tried — exporting over Arrow and computing in vectorized NumPy
-or DuckDB won by 2–100×, because the Arrow hop is nearly free
-in-process while per-window interpreter and solver costs are not. The
-zero-copy property itself is pointer-verified and stands; the
-wall-clock win is open optimization work, not an earned claim.
+or DuckDB wins by roughly 3–24× on a 20k-row rolling sweep and 1.1–1.8×
+on a single window, because the Arrow hop is nearly free in-process
+while per-window interpreter and solver costs are not. Two rounds of
+that overhead are already gone (kernels compile once rather than per
+window; the 2×2 eigenvalue is solved in closed form rather than by a
+general eigensolver), and the largest remaining term is measured and
+understood: a general LAPACK solve costs far more in per-call overhead
+than in arithmetic at window scale. The zero-copy property itself is
+pointer-verified and stands; the wall-clock win is open optimization
+work, not an earned claim.
 `blas.wasm` and `lua.wasm` (the WASM
 compute dependencies, for later) are real, working, MIT-licensed projects
 already in progress by the same author, with LAPACK-in-WASM as their next
