@@ -5,7 +5,7 @@
 //! TallyDB's numeric-or-key invariant means every value column is a flat,
 //! fixed-width buffer. If that layout matches Apache Arrow's columnar spec,
 //! the *same bytes* serve three consumers with zero copying: compute (raw
-//! pointers into BLAS/Lua/curated ops), storage (serialize/mmap into segments),
+//! pointers into compute kernels/Lua/curated ops), storage (serialize/mmap into segments),
 //! and the outside world (query results handed to NumPy/Polars/DuckDB via
 //! the Arrow C Data Interface with no conversion step). That third boundary
 //! is the reason to be *Arrow*-shaped specifically — the first two only need
@@ -33,7 +33,7 @@
 //!   format migration.
 //! - **Validity:** an optional side `Bitmap`, present only for columns the
 //!   schema declares nullable. A `NOT NULL` column has no bitmap and is
-//!   BLAS-ready by construction. The ordering key is always `NOT NULL`.
+//!   kernel-ready by construction. The ordering key is always `NOT NULL`.
 //! - **`Bitmap` as a first-class shared type:** LSB-ordered per Arrow, with
 //!   and/or/not, popcount, and set-bit iteration. Used for validity here,
 //!   for row selections in `query-lite` (WHERE, dictionary-LIKE bitmaps),

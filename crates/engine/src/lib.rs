@@ -25,16 +25,16 @@
 //! ## What this crate is
 //! The public entry point: schema definition/validation, wiring
 //! `storage-lite` + `query-lite` together, and exposing the compute
-//! backends (`compute-lua`, `compute-blas`) to SQL as callable
+//! backends (`compute-lua`, `compute-linalg`) to SQL as callable
 //! functions. Application code depends on this crate, not on the
 //! lower-level crates directly.
 //!
 //! ## Compute backend selection
-//! `compute-blas` is consumed here through its trait interface (see that
+//! `compute-linalg` is consumed here through its trait interface (see that
 //! crate), not through a concrete type; `compute-lua` is currently
 //! consumed as its concrete native state (its backend trait is extracted
 //! when the WASM backend starts — see that crate's docs). Right now the
-//! native implementations (vendored Lua 5.4, native BLAS) are the only
+//! implementations (vendored Lua 5.4, pure-Rust linear algebra) are the only
 //! ones that exist — but this crate should never hardcode that
 //! assumption. Select the concrete implementation with
 //! `cfg(target_arch = "wasm32")` / a Cargo feature at the point where a
@@ -79,7 +79,7 @@ pub use table::{EngineError, Table};
 // curated ops — dot, regr_slope/intercept, covar_pop/corr/eigen_max —
 // over the same views, no copy.
 //
-// TODO: expose the remaining compute-blas (multiplication-class) ops as
+// TODO: expose the remaining compute-linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced
 //       cleanly (not panics)
 // TODO: the scalar-projection Lua slot (deferred: PlanItem is

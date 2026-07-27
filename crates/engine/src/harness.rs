@@ -273,7 +273,7 @@ pub extern "C" fn tallydb_lua_window_preceding() -> u64 {
 }
 
 /// The Lua-window oracle family (M2.7): four application-registered
-/// kernels — a pure-Lua MAD, a kernel calling the BLAS `dot` host
+/// kernels — a pure-Lua MAD, a kernel calling the `dot` host
 /// function, an `I64`-declared count, and a kernel that returns `NULL`
 /// on short windows — run as partitioned SQL windows over the M1
 /// fixture (persistent, reopened from disk, multi-segment), exporting
@@ -369,7 +369,7 @@ const BENCH_MAD: &str = "local n = #x\n\
 /// Builds the benchmark table — `rows` rows, 8 symbols, strictly
 /// increasing `ts`, non-null LCG-generated `x`/`y` — and registers the
 /// Lua kernels the benchmark queries: `lua_dot(y, x)` (a kernel calling
-/// the BLAS `dot` host function) and `lua_mad(x)` (pure interpreter).
+/// the `dot` host function) and `lua_mad(x)` (pure interpreter).
 /// Returns an owned context; release it with [`tallydb_bench_close`].
 #[no_mangle]
 pub extern "C" fn tallydb_bench_open(rows: u64) -> *mut BenchContext {

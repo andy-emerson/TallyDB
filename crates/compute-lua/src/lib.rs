@@ -14,7 +14,7 @@
 //! userdata wraps the live arrow-lite buffer pointer and its accessors
 //! are implemented on the Rust side, so no bytes are copied — access is
 //! zero-copy, though each element read is a metamethod dispatch, not a
-//! compiled raw load. The ops in `compute-blas` (multiplication-class)
+//! compiled raw load. The ops in `compute-linalg` (multiplication-class)
 //! and the engine's own curated statistics are exposed to
 //! scripts as registered functions over those same views, sharing
 //! buffers, not copying between them. Lua 5.4's integer/float number
@@ -80,7 +80,7 @@ pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 // (DESIGN.md, *The inclusion principle*): base/math/string/table in;
 // io/os/debug out; package not even linked. Host compute reaches
 // scripts through `register_host_function` (`host`) — the seam the
-// engine exposes the curated BLAS and statistic ops through, over the same
+// engine exposes the curated linear-algebra and statistic ops through, over the same
 // zero-copy views — and `log()` routes diagnostics to the embedder's
 // `LogSink`.
 //

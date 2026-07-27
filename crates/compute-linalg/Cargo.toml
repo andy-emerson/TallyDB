@@ -1,0 +1,15 @@
+[package]
+name = "compute-linalg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow-lite = { path = "../arrow-lite" }
+# The matrix kernels. Pure Rust, so one implementation serves native and
+# (later) WASM; slim features drop the thread pool, RNG, and file-format
+# extras an embedded engine has no business carrying. `dot` deliberately
+# does NOT go through faer — see src/backend.rs.
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+
+[dev-dependencies]

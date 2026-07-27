@@ -368,7 +368,7 @@ impl Table {
     /// parameter names, a key-typed output.
     ///
     /// Kernels can call the curated native ops over the same views —
-    /// `dot(x, y)` (BLAS), `regr_slope(y, x)` / `regr_intercept(y, x)`,
+    /// `dot(x, y)` (compute-linalg), `regr_slope(y, x)` / `regr_intercept(y, x)`,
     /// `covar_pop(y, x)` / `corr(y, x)` / `eigen_max(y, x)` — the very
     /// implementations the SQL windows run, sharing buffers with no
     /// copy; each returns a number, or `NULL` where undefined.

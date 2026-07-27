@@ -32,7 +32,7 @@
 
 use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
-use compute_blas::{BlasBackend, NativeBlas};
+use compute_linalg::{LinalgBackend, RustLinalg};
 use compute_lua::{Chunk, ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
@@ -56,9 +56,9 @@ pub(crate) fn is_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// `dot(x, y)` — BLAS `ddot` as a script-callable op, the cheap end of
-/// the curated spread.
-struct DotOp(NativeBlas);
+/// `dot(x, y)` — the backend dot product as a script-callable op, the
+/// cheap end of the curated spread.
+struct DotOp(RustLinalg);
 
 impl HostFunction for DotOp {
     fn arity(&self) -> usize {
@@ -88,7 +88,7 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
 }
 
 /// Installs the curated compute spread into a kernel's state: `dot`
-/// (BLAS), `regr_slope` / `regr_intercept` (closed-form least squares),
+/// (compute-linalg), `regr_slope` / `regr_intercept` (closed-form least squares),
 /// and
 /// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
 /// implementations the SQL windows run, reading the same view buffers
@@ -96,7 +96,7 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
 /// script: engine buffers, curated native ops, and the interpreter all
 /// share memory.
 fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
-    state.register_host_function("dot", Box::new(DotOp(NativeBlas)))?;
+    state.register_host_function("dot", Box::new(DotOp(RustLinalg)))?;
     for (name, output) in [
         ("regr_slope", RegressionOutput::Slope),
         ("regr_intercept", RegressionOutput::Intercept),
@@ -583,8 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn dot_from_lua_matches_the_blas_backend() {
-        use compute_blas::{BlasBackend, NativeBlas};
+    fn dot_from_lua_matches_the_linalg_backend() {
+        use compute_linalg::{LinalgBackend, RustLinalg};
         let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
         let data: Vec<f64> = (0..10).map(|i| (i as f64) * 0.75 - 3.0).collect();
         for (i, &x) in data.iter().enumerate() {
@@ -606,8 +606,8 @@ mod tests {
             )
             .unwrap();
         let results = f64s(&output, 0);
-        // The same ddot on the same window slices: identical bits.
-        let backend = NativeBlas;
+        // The same dot on the same window slices: identical bits.
+        let backend = RustLinalg;
         for (row, result) in results.iter().enumerate() {
             let window = &data[row.saturating_sub(3)..=row];
             let reference = backend.dot(window, window).unwrap();

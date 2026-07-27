@@ -152,7 +152,7 @@ impl LuaState {
 
     /// Registers an engine-side operation as the global `name`,
     /// callable from scripts over zero-copy views — the seam the
-    /// curated `compute-blas` and engine ops are exposed through. See
+    /// curated `compute-linalg` and engine ops are exposed through. See
     /// [`HostFunction`]. A second registration under the
     /// same name replaces the first (the old function's storage is
     /// retained until the state drops).

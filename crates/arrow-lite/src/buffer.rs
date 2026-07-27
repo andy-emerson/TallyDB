@@ -326,7 +326,7 @@ impl<T: Element> FromIterator<T> for Buffer<T> {
 /// A numeric column: an aligned value buffer plus validity, present only
 /// when the schema declares the column nullable.
 ///
-/// A `NOT NULL` column has **no** bitmap — its buffer is BLAS-ready by
+/// A `NOT NULL` column has **no** bitmap — its buffer is kernel-ready by
 /// construction, with no null check on the compute path. The ordering key
 /// is always `NOT NULL`. For a nullable column, the value under a null slot
 /// is unspecified but initialized (constructors take a concrete value for
