@@ -375,6 +375,10 @@ pub enum Statement {
     /// A `SELECT`. Boxed: a `Plan` (with its projection expressions)
     /// dwarfs the mutation variants, and statements are moved around.
     Select(Box<Plan>),
+    /// A `CREATE TABLE`.
+    CreateTable(CreateTablePlan),
+    /// An `INSERT INTO ... VALUES ...`.
+    Insert(InsertPlan),
     /// An `UPDATE ... SET ... [WHERE ...]`.
     Update(UpdatePlan),
     /// A `DELETE FROM ... [WHERE ...]`.
@@ -382,7 +386,280 @@ pub enum Statement {
 }
 
 /// Parses and lowers one SQL statement.
+/// One column of a `CREATE TABLE` plan.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ColumnSpec {
+    /// The column name.
+    pub name: String,
+    /// `"BIGINT"`, `"DOUBLE"`, or `"KEY"` — resolved to the engine's
+    /// column types by the embedder (query-lite stays schema-agnostic).
+    pub type_name: String,
+    /// `NOT NULL` present (the ordering key implies it).
+    pub not_null: bool,
+    /// `ORDERING KEY` present.
+    pub ordering_key: bool,
+}
+
+/// A lowered `CREATE TABLE`: the DDL surface of the stdlib table (#49,
+/// ruled 2026-07-27) — standard names where standard exists (`BIGINT`,
+/// `DOUBLE`), the coined `KEY` for dictionary keys, the ordering key
+/// declared like a constraint. `VARCHAR`/`TEXT` are refused with a
+/// teaching error: keys are interned labels, not text values.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateTablePlan {
+    /// The table name.
+    pub table: String,
+    /// The columns, in declared order.
+    pub columns: Vec<ColumnSpec>,
+}
+
+/// A cell literal of an `INSERT ... VALUES` row.
+#[derive(Clone, PartialEq, Debug)]
+pub enum InsertValue {
+    /// A numeric literal.
+    Number(Number),
+    /// A string literal (a key value).
+    String(String),
+    /// `NULL`.
+    Null,
+}
+
+/// A lowered `INSERT INTO ... [(columns)] VALUES (...), (...)`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct InsertPlan {
+    /// The table name.
+    pub table: String,
+    /// The named column order, if the statement gave one; `None`
+    /// means the schema's declared order.
+    pub columns: Option<Vec<String>>,
+    /// The literal rows.
+    pub rows: Vec<Vec<InsertValue>>,
+}
+
+fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, QueryError> {
+    let table = object_name(&create.name)?;
+    if create.if_not_exists || create.or_replace {
+        return Err(QueryError::Unsupported(
+            "IF NOT EXISTS / OR REPLACE".to_owned(),
+        ));
+    }
+    let mut columns = Vec::with_capacity(create.columns.len());
+    for column in &create.columns {
+        let type_name = match &column.data_type {
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => "BIGINT",
+            ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => {
+                "DOUBLE"
+            }
+            ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("key") => {
+                "KEY"
+            }
+            ast::DataType::Varchar(_)
+            | ast::DataType::Text
+            | ast::DataType::Char(_)
+            | ast::DataType::String(_) => {
+                return Err(QueryError::Unsupported(format!(
+                    "column '{}': strings are not a column type here — keys are \
+                     interned labels used for filtering, grouping, and joining; \
+                     declare it KEY",
+                    ident(&column.name)
+                )))
+            }
+            other => {
+                return Err(QueryError::Unsupported(format!(
+                    "column type '{other}' (BIGINT, DOUBLE, or KEY)"
+                )))
+            }
+        };
+        let mut not_null = false;
+        let mut ordering_key = false;
+        for option in &column.options {
+            match &option.option {
+                ast::ColumnOption::NotNull => not_null = true,
+                ast::ColumnOption::Null => {}
+                // The rewrite carries ORDERING KEY through the parser as
+                // PRIMARY KEY (user-typed PRIMARY KEY was refused at the
+                // door); map the carrier back.
+                ast::ColumnOption::PrimaryKey(_) => {
+                    ordering_key = true;
+                    not_null = true; // the ordering key is NOT NULL
+                }
+                other => {
+                    return Err(QueryError::Unsupported(format!("column option '{other}'")));
+                }
+            }
+        }
+        columns.push(ColumnSpec {
+            name: ident(&column.name),
+            type_name: type_name.to_owned(),
+            not_null,
+            ordering_key,
+        });
+    }
+    match columns.iter().filter(|column| column.ordering_key).count() {
+        1 => Ok(CreateTablePlan { table, columns }),
+        0 => Err(QueryError::Unsupported(
+            "declare exactly one ORDERING KEY column (the BIGINT column \
+             ingest arrives roughly sorted on)"
+                .to_owned(),
+        )),
+        _ => Err(QueryError::Unsupported(
+            "more than one ORDERING KEY column".to_owned(),
+        )),
+    }
+}
+
+fn lower_insert(insert: &ast::Insert) -> Result<InsertPlan, QueryError> {
+    let ast::TableObject::TableName(name) = &insert.table else {
+        return Err(QueryError::Unsupported(
+            "INSERT into something other than a table".to_owned(),
+        ));
+    };
+    let table = object_name(name)?;
+    let columns = if insert.columns.is_empty() {
+        None
+    } else {
+        Some(
+            insert
+                .columns
+                .iter()
+                .map(object_name)
+                .collect::<Result<Vec<String>, QueryError>>()?,
+        )
+    };
+    let Some(source) = &insert.source else {
+        return Err(QueryError::Unsupported("INSERT without VALUES".to_owned()));
+    };
+    let ast::SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(QueryError::Unsupported(
+            "INSERT ... SELECT (VALUES only)".to_owned(),
+        ));
+    };
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let mut cells = Vec::with_capacity(row.content.len());
+        for cell in &row.content {
+            cells.push(lower_insert_value(cell)?);
+        }
+        rows.push(cells);
+    }
+    if rows.is_empty() {
+        return Err(QueryError::Unsupported("INSERT of zero rows".to_owned()));
+    }
+    Ok(InsertPlan {
+        table,
+        columns,
+        rows,
+    })
+}
+
+fn lower_insert_value(expr: &ast::Expr) -> Result<InsertValue, QueryError> {
+    match expr {
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Number(text, _) => {
+                Ok(InsertValue::Number(crate::predicate::parse_number(text)?))
+            }
+            ast::Value::SingleQuotedString(text) => Ok(InsertValue::String(text.clone())),
+            ast::Value::Null => Ok(InsertValue::Null),
+            other => Err(QueryError::Unsupported(format!("INSERT literal '{other}'"))),
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => match lower_insert_value(expr)? {
+            InsertValue::Number(Number::Int(value)) => Ok(InsertValue::Number(Number::Int(-value))),
+            InsertValue::Number(Number::Float(value)) => {
+                Ok(InsertValue::Number(Number::Float(-value)))
+            }
+            _ => Err(QueryError::Unsupported(
+                "negation of a non-number".to_owned(),
+            )),
+        },
+        other => Err(QueryError::Unsupported(format!(
+            "INSERT expression '{other}' (literals only)"
+        ))),
+    }
+}
+
+/// Carries the ruled `ORDERING KEY` syntax through a parser that does
+/// not know the phrase: outside quotes, user-typed `PRIMARY KEY` is
+/// refused with a teaching error (the ordering key is *not* a
+/// uniqueness constraint — duplicate ordering-key values are
+/// first-class here), then `ORDERING KEY` rewrites to `PRIMARY KEY`
+/// as the internal carrier the parser accepts; the lowering maps the
+/// carrier back. Only `CREATE TABLE` statements are rewritten.
+fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut index = 0;
+    let phrase_at = |index: usize, word_a: &str, word_b: &str| -> Option<usize> {
+        let rest: String = chars[index..].iter().collect();
+        let lower = rest.to_lowercase();
+        if !lower.starts_with(word_a) {
+            return None;
+        }
+        let after = &lower[word_a.len()..];
+        let spaces = after.len() - after.trim_start().len();
+        if spaces == 0 || !after.trim_start().starts_with(word_b) {
+            return None;
+        }
+        // Both words must end at word boundaries.
+        let end = word_a.len() + spaces + word_b.len();
+        let boundary = |position: usize| {
+            chars
+                .get(index + position)
+                .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
+        };
+        let start_ok = index == 0 || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_';
+        (start_ok && boundary(end)).then_some(end)
+    };
+    while index < chars.len() {
+        let c = chars[index];
+        match quote {
+            Some(open) => {
+                if c == open {
+                    quote = None;
+                }
+                out.push(c);
+                index += 1;
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push(c);
+                    index += 1;
+                } else if phrase_at(index, "primary", "key").is_some() {
+                    return Err(QueryError::Unsupported(
+                        "PRIMARY KEY: TallyDB's ordering key is not a uniqueness \
+                         constraint (duplicate ordering-key values are first-class) — \
+                         declare the ingest-order column with ORDERING KEY"
+                            .to_owned(),
+                    ));
+                } else if let Some(end) = phrase_at(index, "ordering", "key") {
+                    out.push_str("PRIMARY KEY");
+                    index += end;
+                } else {
+                    out.push(c);
+                    index += 1;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    let rewritten;
+    let sql = if sql
+        .trim_start()
+        .get(..12)
+        .is_some_and(|start| start.eq_ignore_ascii_case("create table"))
+    {
+        rewritten = rewrite_ordering_key(sql)?;
+        &rewritten
+    } else {
+        sql
+    };
     let statements =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| QueryError::Parse(e.to_string()))?;
     let [statement] = statements.as_slice() else {
@@ -395,8 +672,12 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
         ast::Statement::Query(query) => Ok(Statement::Select(Box::new(lower_query(query)?))),
         ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
         ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
+        ast::Statement::CreateTable(create) => {
+            Ok(Statement::CreateTable(lower_create_table(create)?))
+        }
+        ast::Statement::Insert(insert) => Ok(Statement::Insert(lower_insert(insert)?)),
         _ => Err(QueryError::Unsupported(
-            "only SELECT, UPDATE, and DELETE statements are supported".to_owned(),
+            "only SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE are supported".to_owned(),
         )),
     }
 }
@@ -406,8 +687,11 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
 pub fn plan(sql: &str) -> Result<Plan, QueryError> {
     match parse_statement(sql)? {
         Statement::Select(plan) => Ok(*plan),
-        Statement::Update(_) | Statement::Delete(_) => Err(QueryError::Unsupported(
-            "mutations run through the mutation entry point, not query".to_owned(),
+        Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::CreateTable(_)
+        | Statement::Insert(_) => Err(QueryError::Unsupported(
+            "mutations and DDL run through their entry points, not query".to_owned(),
         )),
     }
 }
@@ -1380,7 +1664,7 @@ mod tests {
                 "ROWS only",
             ),
             ("SELECT sum(x) OVER (ORDER BY ts) FROM t", "without a frame"),
-            ("INSERT INTO t VALUES (1)", "SELECT"),
+            ("INSERT INTO t VALUES (1)", "entry points"), // supported, elsewhere
         ] {
             let error = plan(sql).expect_err(sql);
             let message = error.to_string();

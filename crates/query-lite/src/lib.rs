@@ -68,8 +68,9 @@ pub mod predicate;
 
 pub use exec::{execute, execute_join, recompute_frames, QueryOutput, Registry, WindowAggregate};
 pub use plan::{
-    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, DeletePlan, JoinPlan,
-    OrderBy, Plan, PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan,
+    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,
+    DeletePlan, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem, Projection, QueryError,
+    SetValue, Statement, UpdatePlan,
 };
 pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 

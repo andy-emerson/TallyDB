@@ -125,6 +125,14 @@ impl Database {
         let table = match parse_statement(sql)? {
             Statement::Update(update) => update.table,
             Statement::Delete(delete) => delete.table,
+            Statement::Insert(insert) => insert.table,
+            Statement::CreateTable(_) => {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "CREATE TABLE runs through execute (it makes a table, \
+                     it doesn't mutate one)"
+                        .to_owned(),
+                )))
+            }
             Statement::Select(_) => {
                 return Err(EngineError::Query(QueryError::Unsupported(
                     "SELECT runs through query, not mutate".to_owned(),

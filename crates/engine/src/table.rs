@@ -25,7 +25,7 @@
 //! a two-argument window) — the copy recorded in deferred issue #4
 //! (peak-memory accounting in #56).
 
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
+use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 use query_lite::{
     evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
     QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
@@ -209,6 +209,21 @@ impl Table {
         Ok(Table::from_store(
             name,
             Store::persistent_with(backend, schema, index, options)?,
+        ))
+    }
+
+    /// Opens an existing persistent table, taking schema and ordering
+    /// key from its manifest — the shell's doorway to a table it did
+    /// not create in this process.
+    pub fn open(
+        name: impl Into<String>,
+        dir: impl AsRef<std::path::Path>,
+        options: StoreOptions,
+    ) -> Result<Table, EngineError> {
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::open_existing(backend, options)?,
         ))
     }
 
@@ -405,6 +420,87 @@ impl Table {
         Ok(arrow_lite::export_stream(schema, batches.into_iter()))
     }
 
+    /// Applies an `INSERT ... VALUES` plan: rows validate and append
+    /// through the ordinary append path (WAL included), literals
+    /// coercing exactly or loudly — an integer literal fits an `f64`
+    /// column exactly or is refused; a float literal never silently
+    /// truncates into a `BIGINT` column; strings go to key columns
+    /// only. Returns the rows inserted.
+    pub(crate) fn insert(&mut self, plan: &query_lite::InsertPlan) -> Result<u64, EngineError> {
+        let schema = self.store.schema().clone();
+        let order: Vec<usize> = match &plan.columns {
+            None => (0..schema.fields().len()).collect(),
+            Some(names) => {
+                let mut order = Vec::with_capacity(names.len());
+                for name in names {
+                    let position = schema
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| {
+                            EngineError::Query(QueryError::UnknownColumn(name.clone()))
+                        })?;
+                    order.push(position);
+                }
+                order
+            }
+        };
+        let mut inserted = 0u64;
+        for row in &plan.rows {
+            if row.len() != order.len() {
+                return Err(EngineError::Query(QueryError::Unsupported(format!(
+                    "INSERT row has {} values for {} columns",
+                    row.len(),
+                    order.len()
+                ))));
+            }
+            let mut cells: Vec<RowValue<'_>> = vec![RowValue::Null; schema.fields().len()];
+            for (value, &position) in row.iter().zip(&order) {
+                let field = &schema.fields()[position];
+                cells[position] = match value {
+                    query_lite::InsertValue::Null => RowValue::Null,
+                    query_lite::InsertValue::String(text) => RowValue::Key(text),
+                    query_lite::InsertValue::Number(number) => match field.column_type() {
+                        ColumnType::F64 => match number {
+                            Number::Float(value) => RowValue::F64(*value),
+                            Number::Int(value) => {
+                                let as_f64 = *value as f64;
+                                if as_f64 as i64 != *value {
+                                    return Err(EngineError::Query(QueryError::TypeError(
+                                        format!(
+                                            "integer {value} does not fit an f64 exactly \
+                                             (column '{}')",
+                                            field.name()
+                                        ),
+                                    )));
+                                }
+                                RowValue::F64(as_f64)
+                            }
+                        },
+                        ColumnType::I64 => match number {
+                            Number::Int(value) => RowValue::I64(*value),
+                            Number::Float(value) => {
+                                return Err(EngineError::Query(QueryError::TypeError(format!(
+                                    "float {value} into BIGINT column '{}' would truncate",
+                                    field.name()
+                                ))))
+                            }
+                        },
+                        ColumnType::Key => {
+                            return Err(EngineError::Query(QueryError::TypeError(format!(
+                                "number into KEY column '{}' (keys take strings)",
+                                field.name()
+                            ))))
+                        }
+                    },
+                };
+            }
+            self.append(&cells)?;
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
     /// Runs one SQL mutation (`UPDATE` or `DELETE`), returning the rows
     /// affected. Both are the design's one mutation mechanism: `DELETE`
     /// tombstones the matched rows; `UPDATE` tombstones them and
@@ -421,6 +517,13 @@ impl Table {
             Statement::Select(_) => Err(EngineError::Query(QueryError::Unsupported(
                 "SELECT runs through query, not mutate".to_owned(),
             ))),
+            Statement::CreateTable(_) => Err(EngineError::Query(QueryError::Unsupported(
+                "CREATE TABLE runs through the database handle".to_owned(),
+            ))),
+            Statement::Insert(insert) => {
+                self.check_table(&insert.table)?;
+                self.insert(&insert)
+            }
             Statement::Delete(delete) => self.delete(delete),
             Statement::Update(update) => self.update(update),
         }
@@ -700,6 +803,43 @@ fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineEr
 fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend>, EngineError> {
     let backend = FsBackend::new(dir.as_ref()).map_err(StorageError::from)?;
     Ok(Arc::new(backend))
+}
+
+/// Maps a lowered `CREATE TABLE` (the #49 DDL grammar: `BIGINT`,
+/// `DOUBLE`, the coined `KEY`, one `ORDERING KEY` column) onto the
+/// engine's schema types. Returns the schema and the ordering-key
+/// column name. Shared by every SQL surface — shell, and later the
+/// server and workbench — so the mapping cannot fork.
+pub fn schema_from_create(
+    plan: &query_lite::CreateTablePlan,
+) -> Result<(Schema, String), EngineError> {
+    let mut fields = Vec::with_capacity(plan.columns.len());
+    let mut ordering = None;
+    for column in &plan.columns {
+        let column_type = match column.type_name.as_str() {
+            "BIGINT" => ColumnType::I64,
+            "DOUBLE" => ColumnType::F64,
+            "KEY" => ColumnType::Key,
+            other => {
+                return Err(EngineError::Query(QueryError::Unsupported(format!(
+                    "column type '{other}'"
+                ))))
+            }
+        };
+        if column.ordering_key {
+            if column_type != ColumnType::I64 {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "the ORDERING KEY column must be BIGINT (a timestamp, sequence, \
+                     or offset — the monotonic-on-ingest key)"
+                        .to_owned(),
+                )));
+            }
+            ordering = Some(column.name.clone());
+        }
+        fields.push(Field::new(&column.name, column_type, !column.not_null));
+    }
+    let ordering = ordering.expect("the planner requires exactly one ORDERING KEY");
+    Ok((Schema::new(fields), ordering))
 }
 
 /// A cheap, cloneable, `Send` handle a reader thread holds to mint
@@ -1429,6 +1569,122 @@ mod tests {
             Table::new("t", m1_schema(), "x"),
             Err(EngineError::Storage(StorageError::BadOrderingKey { .. }))
         ));
+    }
+}
+
+#[cfg(test)]
+mod ddl_and_insert {
+    //! M3.5's engine half: `INSERT ... VALUES` through the mutation
+    //! entry (WAL included, exact-or-loud literal coercion) and the
+    //! #49 DDL grammar mapped onto engine types.
+
+    use super::tests::m1_schema;
+    use super::*;
+
+    #[test]
+    fn insert_appends_through_the_ordinary_path() {
+        // As m1_schema, but with y nullable so NULL literals land.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 4).unwrap();
+        let n = table
+            .mutate("INSERT INTO t VALUES (1, 'A', 1.5, 2.5), (2, 'B', -3, NULL)")
+            .unwrap();
+        assert_eq!(n, 2);
+        let output = table.query("SELECT ts, x, y FROM t ORDER BY ts").unwrap();
+        assert_eq!(output.num_rows(), 2);
+        // Integer literal -3 landed exactly in the f64 column.
+        let batch = &output.batches[0];
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(x)) = &batch.columns()[1]
+        else {
+            panic!("x is f64")
+        };
+        assert_eq!(x.values().as_slice()[1], -3.0);
+    }
+
+    #[test]
+    fn insert_honors_a_named_column_order() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        table
+            .mutate("INSERT INTO t (x, ts, sym, y) VALUES (9.0, 7, 'C', 1.0)")
+            .unwrap();
+        let output = table.query("SELECT ts, x FROM t").unwrap();
+        let batch = &output.batches[0];
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(ts)) = &batch.columns()[0]
+        else {
+            panic!("ts is i64")
+        };
+        assert_eq!(ts.values().as_slice()[0], 7);
+    }
+
+    #[test]
+    fn insert_coercions_are_exact_or_loud() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        // Float into BIGINT would truncate: loud.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1.5, 'A', 1.0, 1.0)")
+            .is_err());
+        // Number into KEY: loud.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 7, 1.0, 1.0)")
+            .is_err());
+        // String into numeric: loud (storage's own validation).
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 'A', 'oops', 1.0)")
+            .is_err());
+        // Wrong arity: loud.
+        assert!(table.mutate("INSERT INTO t VALUES (1, 'A', 1.0)").is_err());
+        // Nothing partial landed from the failures... the first row of a
+        // multi-row INSERT that fails midway HAS landed (documented
+        // non-atomicity is #56/#40 territory); here every statement
+        // failed on its only row, so the table is empty.
+        assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 0);
+    }
+
+    #[test]
+    fn the_ddl_grammar_maps_onto_engine_types() {
+        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym KEY NOT NULL, px DOUBLE)";
+        let Statement::CreateTable(plan) = parse_statement(sql).unwrap() else {
+            panic!("parses as CREATE TABLE")
+        };
+        let (schema, ordering) = schema_from_create(&plan).unwrap();
+        assert_eq!(ordering, "ts");
+        let fields = schema.fields();
+        assert_eq!(fields[0].column_type(), ColumnType::I64);
+        assert!(!fields[0].nullable(), "ordering key implies NOT NULL");
+        assert_eq!(fields[1].column_type(), ColumnType::Key);
+        assert!(!fields[1].nullable());
+        assert_eq!(fields[2].column_type(), ColumnType::F64);
+        assert!(fields[2].nullable());
+        // And the whole thing actually builds a working table.
+        let mut table = Table::new("ticks", schema, &ordering).unwrap();
+        table
+            .mutate("INSERT INTO ticks VALUES (1, 'ES', 5432.25)")
+            .unwrap();
+        assert_eq!(table.query("SELECT px FROM ticks").unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn varchar_is_refused_with_a_teaching_error() {
+        let error =
+            parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, name VARCHAR)").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("interned labels"), "{message}");
+        assert!(message.contains("KEY"), "{message}");
+        // No ordering key: loud, with guidance.
+        let error = parse_statement("CREATE TABLE t (a BIGINT, b DOUBLE)").unwrap_err();
+        assert!(error.to_string().contains("ORDERING KEY"), "{}", error);
+        // A DOUBLE ordering key: loud.
+        let Statement::CreateTable(plan) =
+            parse_statement("CREATE TABLE t (a DOUBLE ORDERING KEY)").unwrap()
+        else {
+            panic!()
+        };
+        assert!(schema_from_create(&plan).is_err());
     }
 }
 

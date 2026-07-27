@@ -380,6 +380,20 @@ impl Store {
         )
     }
 
+    /// Reopens an existing persistent store, taking the schema and
+    /// ordering key from its manifest — the doorway a shell or server
+    /// uses to open a table it did not create. Errors if the backend
+    /// holds no manifest.
+    pub fn open_existing(
+        backend: Arc<dyn StorageBackend>,
+        options: StoreOptions,
+    ) -> Result<Store, StorageError> {
+        let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
+        let schema = manifest.schema.clone();
+        let ordering_key = manifest.ordering_key;
+        Store::persistent_with(backend, schema, ordering_key, options)
+    }
+
     /// As [`Store::persistent`], with explicit [`StoreOptions`] — the
     /// segment threshold and the durability level (#43).
     pub fn persistent_with(
