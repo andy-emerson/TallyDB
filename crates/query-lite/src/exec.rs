@@ -57,6 +57,29 @@ pub trait WindowAggregate: Send + Sync {
     /// `Err` aborts the query.
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String>;
 
+    /// Evaluates every trailing frame over one contiguous run of rows —
+    /// position `i`'s frame is rows `i.saturating_sub(preceding) ..= i`
+    /// (all rows from the run's start when `preceding` is `None`), the
+    /// executor's one frame shape. `columns` holds one slice per
+    /// argument (at least one — every aggregate takes arguments), all
+    /// the same length; the result holds one entry per position, in
+    /// order. The executor always calls this, once per contiguous run
+    /// (the whole snapshot, or one partition).
+    ///
+    /// The default recomputes each frame through [`Self::evaluate`] —
+    /// correct for any aggregate, `O(run · window)`. An aggregate whose
+    /// consecutive frames share work (running moments) overrides this
+    /// with an incremental form; because the executor only ever calls
+    /// through here, the override is a pure implementation swap with no
+    /// caller change.
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        recompute_frames(self, columns, preceding)
+    }
+
     /// The Arrow type of this window's output column. Computed in `f64`
     /// internally, but a function whose result is logically integral (e.g.
     /// `COUNT`) declares `I64` so its output column matches SQL — the
@@ -550,6 +573,48 @@ fn passthrough(
 /// The window slice for row `position` in a run of rows: `preceding`
 /// rows back (`None` = from the start of the run) through the current
 /// row, ragged at the start of the run.
+/// Frame-by-frame recomputation over one contiguous run — the
+/// [`WindowAggregate::evaluate_frames`] default, exposed so an
+/// incremental override can fall back to it for frame shapes it does
+/// not accelerate.
+pub fn recompute_frames<A: WindowAggregate + ?Sized>(
+    aggregate: &A,
+    columns: &[&[f64]],
+    preceding: Option<usize>,
+) -> Result<Vec<Option<f64>>, String> {
+    let rows = columns.first().map_or(0, |column| column.len());
+    let mut results = Vec::with_capacity(rows);
+    let mut frame: Vec<&[f64]> = Vec::with_capacity(columns.len());
+    for position in 0..rows {
+        let (start, end) = window_bounds(position, preceding);
+        frame.clear();
+        frame.extend(columns.iter().map(|column| &column[start..end]));
+        results.push(aggregate.evaluate(&frame)?);
+    }
+    Ok(results)
+}
+
+/// Calls the aggregate's frame-sequence evaluation and holds it to the
+/// executor's contract: one result per row of the run.
+fn evaluate_run(
+    aggregate: &dyn WindowAggregate,
+    columns: &[&[f64]],
+    rows: usize,
+    preceding: Option<usize>,
+) -> Result<Vec<Option<f64>>, QueryError> {
+    debug_assert!(columns.iter().all(|column| column.len() == rows));
+    let results = aggregate
+        .evaluate_frames(columns, preceding)
+        .map_err(QueryError::Compute)?;
+    if results.len() != rows {
+        return Err(QueryError::Compute(format!(
+            "window aggregate returned {} results for {rows} frames",
+            results.len()
+        )));
+    }
+    Ok(results)
+}
+
 fn window_bounds(position: usize, preceding: Option<usize>) -> (usize, usize) {
     let start = match preceding {
         Some(preceding) => position.saturating_sub(preceding),
@@ -754,15 +819,11 @@ fn unpartitioned(
             .collect();
         gathered.iter().map(Vec::as_slice).collect()
     };
-    let mut windows: Vec<&[f64]> = Vec::with_capacity(arg_slices.len());
-    let mut global = 0usize;
+    let rows: usize = results.iter().map(Vec::len).sum();
+    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, preceding)?.into_iter();
     for result in results.iter_mut() {
         for slot in result.iter_mut() {
-            let (start, end) = window_bounds(global, preceding);
-            windows.clear();
-            windows.extend(arg_slices.iter().map(|values| &values[start..end]));
-            *slot = aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
-            global += 1;
+            *slot = outputs.next().expect("length checked by evaluate_run");
         }
     }
     Ok(())
@@ -831,14 +892,11 @@ fn partitioned(
             origins[partition].push((view_index, live_position));
         }
     }
-    let mut windows: Vec<&[f64]> = Vec::with_capacity(args.len());
     for (values, rows) in scratch.iter().zip(&origins) {
-        for (position, &(view_index, live_position)) in rows.iter().enumerate() {
-            let (start, end) = window_bounds(position, preceding);
-            windows.clear();
-            windows.extend(values.iter().map(|argument| &argument[start..end]));
-            results[view_index][live_position] =
-                aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
+        let columns: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
+        let outputs = evaluate_run(aggregate, &columns, rows.len(), preceding)?;
+        for (output, &(view_index, live_position)) in outputs.into_iter().zip(rows) {
+            results[view_index][live_position] = output;
         }
     }
     Ok(())
@@ -2178,6 +2236,107 @@ mod query1_tests {
         .unwrap();
         // DuckDB's default (our oracle): nulls last under DESC too.
         assert_eq!(flatten(&descending, 0), [Some(3.0), Some(2.0), None]);
+    }
+
+    #[test]
+    fn executor_routes_windows_through_the_frame_sequence() {
+        // An aggregate that only answers through evaluate_frames: if the
+        // executor ever took the per-frame path, the query would error.
+        // Proves the sequence seam is the one road in.
+        struct SequenceOnly;
+        impl WindowAggregate for SequenceOnly {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Err("per-frame path used".to_owned())
+            }
+            fn evaluate_frames(
+                &self,
+                columns: &[&[f64]],
+                preceding: Option<usize>,
+            ) -> Result<Vec<Option<f64>>, String> {
+                // Frame sums, carried incrementally: enough state to
+                // prove the whole run arrives in one call.
+                let column = columns[0];
+                let mut sum = 0.0f64;
+                Ok((0..column.len())
+                    .map(|position| {
+                        sum += column[position];
+                        if let Some(preceding) = preceding {
+                            if position > preceding {
+                                sum -= column[position - preceding - 1];
+                            }
+                        }
+                        Some(sum)
+                    })
+                    .collect())
+            }
+        }
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 4.0)]);
+        let mut registry = Registry::new();
+        registry.register("runsum", Arc::new(SequenceOnly));
+        let sql = "SELECT runsum(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND \
+                   CURRENT ROW) AS w FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(
+            flatten(&output.unwrap(), 0),
+            [Some(1.0), Some(3.0), Some(6.0)]
+        );
+        // Partitioned: each key's rows form their own run.
+        let sql = "SELECT runsum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 1 \
+                   PRECEDING AND CURRENT ROW) AS w FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(
+            flatten(&output.unwrap(), 0),
+            [Some(1.0), Some(2.0), Some(5.0)]
+        );
+    }
+
+    #[test]
+    fn a_wrong_length_frame_sequence_is_an_error_not_a_panic() {
+        struct ShortChanger;
+        impl WindowAggregate for ShortChanger {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(0.0))
+            }
+            fn evaluate_frames(
+                &self,
+                _: &[&[f64]],
+                _: Option<usize>,
+            ) -> Result<Vec<Option<f64>>, String> {
+                Ok(vec![Some(0.0)]) // one result, however many frames
+            }
+        }
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 4.0)]);
+        let mut registry = Registry::new();
+        registry.register("short", Arc::new(ShortChanger));
+        let sql = "SELECT short(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND \
+                   CURRENT ROW) AS w FROM t";
+        let error = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, QueryError::Compute(message) if message.contains("1 results for 3 frames")),
+            "{error:?}"
+        );
     }
 
     #[test]
