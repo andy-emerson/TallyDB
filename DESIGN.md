@@ -416,26 +416,53 @@ directory; table names stay identifiers (they become directory names).
 extension model before the desk: the 2026-07-28 review rulings touched
 M0–M3 design, and the back-end must settle before anything user-facing
 is built on it).** M3 ships *embed in your application* plus the
-console. **M4 (the extension model)** makes the 2026-07-28 rulings
-real and small: the `WindowAggregate` trait and `register_window`
-become public engine surface (the primary extension path); compute-lua
-becomes a non-default feature the console enables; Lua becomes a thin
-front-end over compiled ops, on the architecture NumPy proved (a slow
-interpreter is fine when the loops live in compiled code and scripts
-only compose): the vocabulary invariant (anything SQL can call, Lua
-can call), the vectorized whole-column kernel slot wired
-(`eval_column`, built in M2.7 and never connected), the
-compose-don't-loop idiom documented, and promotion made mechanical
-(one registry name, Lua implementation swappable for a trait
-implementation with no query change); the vendored interpreter is finally validated against the
-upstream Lua test suite (#69); plus the accumulated low-hanging
-correctness work (#73 atomic mutations, #63 Miri in CI, the review
-pass's noted redundancies). **M5 (desk adoption)** then builds what
-the target user needs, chosen by the moat test: multi-factor curated
-compute (K > 2 — the recorded LAPACK-class-returns trigger firing,
-served by faer), the ordered-axis dividends (cross-sectional
-partitioning, time bucketing pending F1, `LAG`/`LEAD`, `RANGE` frames,
-`ASOF` #65, corrections pending F2), segment-lazy open (F3),
+console. **M4 (the extension model + corrections)** makes the
+2026-07-28 rulings real — the back-end settles before anything
+user-facing builds on it. The plan of record, approved 2026-07-28:
+
+- **M4.0 Trait exposure** — `WindowAggregate` and `Registry`
+  re-exported, `Table::register_window` + `Database::register_window`
+  public, the ~20-line embedder kernel as a doctest.
+- **M4.1 The feature gate** — compute-lua becomes a non-default
+  feature the console enables; CI builds and tests both legs;
+  sanitizer/apicheck jobs run in the on-leg only.
+- **M4.2 The Lua front-end** — Lua as a thin front-end over compiled
+  ops, on the architecture NumPy proved (a slow interpreter is fine
+  when the loops live in compiled code and scripts only compose): the
+  vocabulary invariant (anything SQL can call, Lua can call —
+  registry-driven, so future natives flow in for free), the vectorized
+  whole-column kernel slot wired (`eval_column`, built in M2.7 and
+  never connected; likely closes #53), the compose-don't-loop idiom
+  documented, promotion made mechanical (one registry name, Lua
+  implementation swappable for a trait implementation with no query
+  change).
+- **M4.3 The corrections design cycle** — F2 ruled **(a) whole**
+  (2026-07-28): the sub-decisions (column default-on vs opt-in — the
+  virtual-until-divergence option makes default-on nearly free;
+  retention horizon semantics; the `AS OF` spelling, standard
+  `FOR SYSTEM_TIME AS OF` available) are ruled here, on paper, while
+  M4.0–M4.2 build.
+- **M4.4 The corrections build** — the hidden ingest-sequence column
+  (the permanent knowledge axis; delta-coded to almost nothing while
+  uncorrected), retaining compaction (history segments), the knowledge
+  mask (the live mask's analog), the `AS OF` predicate. Oracle: DuckDB
+  re-deriving as-of answers over an explicit history table — emulation
+  in the referee only, never in the product. Format additions ride the
+  one manifest revision shared with F3's zone-map lift (sections
+  reserved now, filled by whichever lands first).
+- **M4.5 The correctness batch** — #73 (the atomic mutation commit
+  record: old-or-new for crashes and readers, recovery
+  auto-completes), #63 (Miri in CI), #69 (the upstream Lua test
+  suite), the review-noted redundancies.
+- **The Lua trial** — the sunset clause's verdict (see *The Lua
+  layer*): the Agent brings the evidence brief, the Human alone rules.
+- **M4.6 SQL-in-Lua (#70)** — built and tested only on a pass.
+
+**M5 (desk adoption)** then builds what the target user needs, chosen
+by the moat test: multi-factor curated compute (K > 2 — the recorded
+LAPACK-class-returns trigger firing, served by faer), the ordered-axis
+dividends (cross-sectional partitioning, time bucketing pending F1,
+`LAG`/`LEAD`, `RANGE` frames, `ASOF` #65), segment-lazy open (F3),
 cross-process readers (F4), and reach (bulk Arrow ingest, a Python
 binding with host-callback NumPy kernels — distribution method open: a
 wheel is one form, not the ruling). **M6 (WASM parity)** adds *embed
