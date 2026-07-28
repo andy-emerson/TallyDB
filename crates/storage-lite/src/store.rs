@@ -236,8 +236,9 @@ pub enum WalSync {
     /// steady append stream, a crash loses at most this window of
     /// appends. Precisely: the sync rides the next append after the
     /// interval elapses, so a tail written and then left idle stays
-    /// unsynced (OS-buffered — it survives a process crash, not power
-    /// loss) until the next append or flush. The default is 100 ms.
+    /// unsynced (OS-buffered — surviving a process crash but not power
+    /// loss) until the next append, a flush, or the store's drop — a
+    /// clean close syncs the tail. The default is 100 ms.
     Group(std::time::Duration),
     /// Sync every append: zero loss window, measured ~670× slower per
     /// append on ordinary disks. For the caller who insists.
@@ -596,44 +597,49 @@ impl Store {
             }
             return Ok(());
         }
-        // Fresh log first, so the recovered rows go back in and stay
-        // durable across a crash during recovery itself.
-        let mut wal = backend.create_log(WAL)?;
-        wal.append(&crate::format::encode_wal_header(
-            self.generation,
-            self.rows,
-        ))?;
-        for row in &recovered {
-            let cells: Vec<RowValue<'_>> = row
-                .iter()
-                .map(crate::format::WalCell::as_row_value)
-                .collect();
-            wal.append(&crate::format::encode_wal_record(&cells))?;
+        // Assemble the replacement log whole — header plus every
+        // recovered record — and publish it atomically *over* the old
+        // one. The old log stays the durable copy until the publishing
+        // rename commits, so a crash at any instant of recovery leaves
+        // exactly one complete log to recover from; truncate-then-
+        // rewrite would destroy the only copy first.
+        let mut bytes = crate::format::encode_wal_header(self.generation, self.rows);
+        let rows: Vec<Vec<RowValue<'_>>> = recovered
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(crate::format::WalCell::as_row_value)
+                    .collect()
+            })
+            .collect();
+        for cells in &rows {
+            bytes.extend_from_slice(&crate::format::encode_wal_record(cells));
+        }
+        backend.write(WAL, &bytes)?;
+        for cells in &rows {
             let mut shared = lock(&self.shared);
-            shared.buffer.append(&cells)?;
+            shared.buffer.append(cells)?;
             self.rows += 1;
         }
-        wal.sync()?;
-        self.wal = Some(wal);
+        self.wal = Some(backend.open_log(WAL)?);
         self.last_wal_sync = std::time::Instant::now();
         Ok(())
     }
 
-    /// Recreates the log empty at the current row watermark — the
-    /// truncation that follows a flush or compaction, once every row
-    /// the old log guarded is segment-durable.
+    /// Replaces the log with an empty one at the current row watermark
+    /// — the truncation that follows a flush or compaction, once every
+    /// row the old log guarded is segment-durable. Atomic publish, so
+    /// no crash instant sees a headerless log.
     fn reset_wal(&mut self) -> Result<(), StorageError> {
         if self.wal.is_none() {
             return Ok(());
         }
         let backend = self.backend.as_ref().expect("a WAL implies a backend");
-        let mut wal = backend.create_log(WAL)?;
-        wal.append(&crate::format::encode_wal_header(
-            self.generation,
-            self.rows,
-        ))?;
-        wal.sync()?;
-        self.wal = Some(wal);
+        backend.write(
+            WAL,
+            &crate::format::encode_wal_header(self.generation, self.rows),
+        )?;
+        self.wal = Some(backend.open_log(WAL)?);
         self.last_wal_sync = std::time::Instant::now();
         Ok(())
     }
@@ -921,6 +927,19 @@ impl Store {
     /// after the call don't affect the returned views.
     pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
         snapshot_of(&lock(&self.shared))
+    }
+}
+
+impl Drop for Store {
+    /// A clean close syncs the log's tail (best-effort): the last
+    /// group-commit window must not depend on a next append that never
+    /// comes. Power loss while idle can still take the OS-buffered
+    /// tail — tests that model power loss leak the store
+    /// (`std::mem::forget`) instead of dropping it.
+    fn drop(&mut self) {
+        if let Some(wal) = self.wal.as_mut() {
+            let _ = wal.sync();
+        }
     }
 }
 

@@ -75,7 +75,9 @@ fn full_sync_survives_power_loss_exactly() {
 #[test]
 fn group_sync_loses_at_most_the_window() {
     // A one-hour group interval: no sync ever fires during the test,
-    // so power loss takes every unflushed row — the window's worst case.
+    // so power loss takes every unflushed row — the window's worst
+    // case. Power loss means drop never runs (a drop syncs — see the
+    // clean-close test below), so the store is leaked, not dropped.
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     {
         let mut store = open(
@@ -83,16 +85,37 @@ fn group_sync_loses_at_most_the_window() {
             WalSync::Group(std::time::Duration::from_secs(3600)),
         );
         append_n(&mut store, 0..7);
+        std::mem::forget(store);
     }
     let store = open(backend.clone(), WalSync::Full);
     assert_eq!(store.len(), 0, "unsynced tail lost, as the window allows");
-    // A zero interval syncs every append: nothing lost.
+    // A zero interval syncs every append: nothing lost even at power
+    // loss.
     {
         let mut store = open(backend.clone(), WalSync::Group(std::time::Duration::ZERO));
         append_n(&mut store, 0..7);
+        std::mem::forget(store);
     }
     let store = open(backend, WalSync::Full);
     assert_eq!(store.len(), 7);
+}
+
+#[test]
+fn a_clean_close_syncs_the_group_tail() {
+    // The idle-writer case: rows appended, interval never elapsed, and
+    // the process exits cleanly. Drop syncs the tail — durability must
+    // not depend on a next append that never comes.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(
+            backend.clone(),
+            WalSync::Group(std::time::Duration::from_secs(3600)),
+        );
+        append_n(&mut store, 0..7);
+    } // dropped cleanly
+    let store = open(backend, WalSync::Full);
+    assert_eq!(store.len(), 7);
+    assert_eq!(ts_values(&store), (0..7).collect::<Vec<_>>());
 }
 
 #[test]
@@ -123,10 +146,10 @@ fn a_corrupt_record_ends_the_clean_prefix() {
         let mut store = open(backend.clone(), WalSync::Full);
         append_n(&mut store, 0..5);
     }
-    // Flip a byte inside the third record's payload (past the 26-byte
+    // Flip a byte inside the third record's payload (past the 30-byte
     // header and two records; each record here is 4 + 26 + 4 bytes).
     let mut bytes = backend.read("wal.tlyw").unwrap();
-    let offset = 26 + 2 * 34 + 8;
+    let offset = 30 + 2 * 34 + 8;
     bytes[offset] ^= 0xFF;
     backend.write("wal.tlyw", &bytes).unwrap();
     let store = open(backend, WalSync::Full);
@@ -210,11 +233,12 @@ fn a_rejected_append_leaves_no_phantom_record() {
 }
 
 #[test]
-fn a_crash_during_log_creation_recovers() {
-    // The window between log creation (truncate-in-place) and the
-    // header sync leaves a log shorter than one header. Nothing was
-    // ever acknowledged under it, so reopen must treat it as empty —
-    // not as corruption that bricks a store whose segments are intact.
+fn a_short_or_empty_log_reads_as_empty_not_corrupt() {
+    // The log is born and rotated by atomic publish, so our own writes
+    // never leave a sub-header file — but a filesystem that truncates
+    // on power loss can. No record can be acknowledged under an
+    // unsynced header, so reopen must treat a short log as empty — not
+    // as corruption that bricks a store whose segments are intact.
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     {
         let mut store = open(backend.clone(), WalSync::Full);
@@ -228,6 +252,38 @@ fn a_crash_during_log_creation_recovers() {
         assert_eq!(ts_values(&store), (0..5).collect::<Vec<_>>());
         drop(store);
     }
+}
+
+#[test]
+fn a_corrupt_header_is_loud_not_silent() {
+    // A full-length header whose checksum fails is real corruption —
+    // the CRC-everything rule covers the header too — and recovery
+    // refuses loudly instead of guessing at the generation.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(backend.clone(), WalSync::Full);
+        append_n(&mut store, 0..3);
+        std::mem::forget(store); // keep the log; a drop-sync is fine too
+    }
+    let mut bytes = backend.read("wal.tlyw").unwrap();
+    bytes[12] ^= 0xFF; // inside the generation field
+    backend.write("wal.tlyw", &bytes).unwrap();
+    let Err(error) = Store::persistent_with(
+        backend,
+        schema(),
+        0,
+        StoreOptions {
+            segment_rows: Some(1000),
+            wal_sync: WalSync::Full,
+            ..StoreOptions::default()
+        },
+    ) else {
+        panic!("corrupt header must be refused");
+    };
+    assert!(
+        error.to_string().contains("checksum"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

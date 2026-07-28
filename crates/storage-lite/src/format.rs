@@ -732,10 +732,11 @@ pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
 /// WAL format version.
 pub const WAL_VERSION: u16 = 1;
 /// The header's encoded size: magic (8) + version (2) + generation (8)
-/// plus base row id (8). A log file shorter than this never had its
-/// header synced — the create-crash window — and holds no acknowledged
-/// record.
-pub const WAL_HEADER_LEN: usize = 26;
+/// plus base row id (8) plus their CRC-32C (4) — the header carries a
+/// checksum like every other structure in the format. A log file
+/// shorter than this holds no acknowledged record (records follow the
+/// header in the same file) and reads as an empty log, not corruption.
+pub const WAL_HEADER_LEN: usize = 30;
 
 /// Encodes the WAL header: magic, version, generation, and the row id
 /// of the first record — replay skips records already covered by
@@ -749,6 +750,8 @@ pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
     out.extend_from_slice(&WAL_VERSION.to_le_bytes());
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&base_row_id.to_le_bytes());
+    let crc = crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
@@ -829,6 +832,12 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
     }
     let generation = reader.u64()?;
     let base_row_id = reader.u64()?;
+    let stored_crc = reader.u32()?;
+    if crc32c(&bytes[..WAL_HEADER_LEN - 4]) != stored_crc {
+        return Err(FormatError::Corrupt(
+            "WAL header checksum mismatch".to_owned(),
+        ));
+    }
     let mut rows = Vec::new();
     loop {
         let record_start = reader.position;

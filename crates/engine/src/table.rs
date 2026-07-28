@@ -1050,8 +1050,16 @@ impl WindowAggregate for RollingRegression {
         };
         let (y, x) = (columns[0], columns[1]);
         let mut results = Vec::with_capacity(y.len());
-        shifted_sweep(y, x, preceding + 1, |moments| {
-            results.push(self.value_from_shifted(moments));
+        shifted_sweep(y, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => self.value_from_shifted(moments),
+                // A frame containing NaN/±Inf runs the reference
+                // arithmetic directly, so the two paths agree exactly
+                // where running sums cannot be trusted.
+                None => self
+                    .evaluate(&[&y[lo..=i], &x[lo..=i]])
+                    .expect("the closed-form regression does not error"),
+            });
         });
         Ok(results)
     }
@@ -1146,9 +1154,18 @@ impl WindowAggregate for PairStatistic {
         };
         let (y, x) = (columns[0], columns[1]);
         let mut results = Vec::with_capacity(y.len());
-        shifted_sweep(y, x, preceding + 1, |moments| {
-            let (var_y, var_x, covar) = moments.population();
-            results.push(self.value_from_moments(moments.rows(), var_y, var_x, covar));
+        shifted_sweep(y, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => {
+                    let (var_y, var_x, covar) = moments.population();
+                    self.value_from_moments(moments.rows(), var_y, var_x, covar)
+                }
+                // Non-finite frame: the reference arithmetic, exactly
+                // as the recompute path would run it.
+                None => self
+                    .evaluate(&[&y[lo..=i], &x[lo..=i]])
+                    .expect("the pair statistics do not error"),
+            });
         });
         Ok(results)
     }
@@ -1254,20 +1271,48 @@ impl ShiftedMoments {
 }
 
 /// Sweeps one contiguous run with trailing frames of up to `w` rows,
-/// calling `emit` once per position with that frame's moments. O(run):
-/// each step slides by one `add` and one `remove`, and the accumulator
-/// is rebuilt about a fresh shift every `w` steps so rounding cannot
-/// accumulate across the column. Measured (`measure_3b`, 2026-07-27):
-/// ~7× the per-window recompute at 20k rows / window 64, worst relative
-/// error 5e-15–1.1e-14 against the compensated reference — held to
-/// 1e-12 in CI by `window_numerics_guard`, which runs this exact path.
-fn shifted_sweep(y: &[f64], x: &[f64], w: usize, mut emit: impl FnMut(&ShiftedMoments)) {
+/// calling `emit` once per position with the frame's bounds and — for
+/// frames of finite values — that frame's moments. O(run): each step
+/// slides by one `add` and one `remove`, and the accumulator is rebuilt
+/// about a fresh shift every `w` steps so rounding cannot accumulate
+/// across the column. Measured (`measure_3b`, 2026-07-27): ~7× the
+/// per-window recompute at 20k rows / window 64, worst relative error
+/// 5e-15–1.1e-14 against the compensated reference — held to 1e-12 in
+/// CI by `window_numerics_guard`, which runs this exact path.
+///
+/// **Non-finite values break the sliding identity**: `NaN − NaN = NaN`,
+/// so once a NaN (or ±Inf, whose differences produce NaN) enters the
+/// running sums they stay poisoned even after the row leaves the frame
+/// — the incremental path would return NaN for windows whose true
+/// frames are clean. So the sweep counts the frame's non-finite rows:
+/// while any is present it emits `None` (the caller runs the per-frame
+/// reference arithmetic — bit-identical to the recompute path), and the
+/// first clean frame afterwards rebuilds the accumulator from scratch.
+fn shifted_sweep(
+    y: &[f64],
+    x: &[f64],
+    w: usize,
+    mut emit: impl FnMut(usize, usize, Option<&ShiftedMoments>),
+) {
     debug_assert!(w >= 1 && y.len() == x.len());
+    let finite = |j: usize| y[j].is_finite() && x[j].is_finite();
     let mut moments = ShiftedMoments::default();
+    let mut dirty = 0usize; // non-finite rows in the current frame
     let mut since_rebuild = usize::MAX; // force a build on the first row
     for i in 0..y.len() {
+        let lo = (i + 1).saturating_sub(w);
+        if !finite(i) {
+            dirty += 1;
+        }
+        if i >= w && !finite(i - w) {
+            dirty -= 1;
+        }
+        if dirty > 0 {
+            since_rebuild = usize::MAX; // rebuild when the frame comes clean
+            emit(lo, i, None);
+            continue;
+        }
         if since_rebuild >= w {
-            let lo = (i + 1).saturating_sub(w);
             moments = ShiftedMoments {
                 ky: y[i],
                 kx: x[i],
@@ -1284,7 +1329,7 @@ fn shifted_sweep(y: &[f64], x: &[f64], w: usize, mut emit: impl FnMut(&ShiftedMo
             }
             since_rebuild += 1;
         }
-        emit(&moments);
+        emit(lo, i, Some(&moments));
     }
 }
 
@@ -1603,6 +1648,9 @@ mod tests {
         // And the reopened table keeps ingesting where it left off.
         let mut reopened = reopened;
         assert_eq!(reopened.append(&linear_row(30)).unwrap(), 30);
+        // Release the directory lock so the next open reaches the
+        // schema check (a held lock refuses first, by design).
+        drop(reopened);
         // Schema disagreement at open is refused loudly.
         let wrong = Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
@@ -2317,6 +2365,87 @@ mod window_numerics_guard {
                         "{name} row {i} regression: {got} vs {expected} (relative {:.2e})",
                         relative(got, expected)
                     );
+                }
+            }
+        }
+    }
+
+    /// NaN and ±Inf are first-class values here, and they break the
+    /// sliding identity (`NaN − NaN = NaN` outlives the row): without
+    /// the dirty-frame handling in `shifted_sweep`, the incremental
+    /// path returns NaN for windows whose true frames are clean, for up
+    /// to a full window after the non-finite row leaves. The oracle
+    /// corpus contains no NaN, so only this test sees it: the two paths
+    /// must agree at every position — same NULLs, same NaNs, and
+    /// near-identical finite values.
+    #[test]
+    fn incremental_and_recompute_paths_agree_on_nan_and_inf() {
+        let rows = 60;
+        let mut y: Vec<f64> = (0..rows).map(|i| 0.7 * i as f64 + 3.0).collect();
+        let mut x: Vec<f64> = (0..rows).map(|i| 1e9 + 1.3 * i as f64).collect();
+        y[7] = f64::NAN;
+        x[19] = f64::INFINITY;
+        y[20] = f64::NEG_INFINITY;
+        y[21] = f64::NAN; // adjacent dirty rows: the counter, not a flag
+        let columns: [&[f64]; 2] = [&y, &x];
+        let aggregates: Vec<(&str, Box<dyn WindowAggregate>)> = vec![
+            (
+                "regr_slope",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::Slope,
+                }),
+            ),
+            (
+                "regr_intercept",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::Intercept,
+                }),
+            ),
+            (
+                "covar_pop",
+                Box::new(PairStatistic {
+                    kind: PairKind::CovarPop,
+                }),
+            ),
+            (
+                "corr",
+                Box::new(PairStatistic {
+                    kind: PairKind::Corr,
+                }),
+            ),
+            (
+                "eigen_max",
+                Box::new(PairStatistic {
+                    kind: PairKind::EigenMax,
+                }),
+            ),
+        ];
+        for preceding in [1usize, 3, 7] {
+            for (name, aggregate) in &aggregates {
+                let incremental = aggregate
+                    .evaluate_frames(&columns, Some(preceding))
+                    .unwrap();
+                let reference =
+                    query_lite::recompute_frames(aggregate.as_ref(), &columns, Some(preceding))
+                        .unwrap();
+                assert_eq!(incremental.len(), reference.len());
+                for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
+                    match (got, want) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) if a.is_nan() && b.is_nan() => {}
+                        // Dirty frames run the same arithmetic on both
+                        // paths — ±Inf results are bit-equal.
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => assert!(
+                            ((a - b) / b).abs() < 1e-9,
+                            "{name} w={} row {i}: {a} vs {b}",
+                            preceding + 1
+                        ),
+                        other => panic!(
+                            "{name} w={} row {i}: paths disagree on definedness: {other:?}",
+                            preceding + 1
+                        ),
+                    }
                 }
             }
         }

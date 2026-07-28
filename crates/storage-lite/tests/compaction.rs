@@ -27,8 +27,8 @@ impl FailingRemoves {
 }
 
 impl StorageBackend for FailingRemoves {
-    fn create_log(&self, name: &str) -> Result<Box<dyn storage_lite::LogWriter>, IoError> {
-        self.inner.create_log(name)
+    fn open_log(&self, name: &str) -> Result<Box<dyn storage_lite::LogWriter>, IoError> {
+        self.inner.open_log(name)
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {

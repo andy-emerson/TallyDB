@@ -43,7 +43,9 @@ impl std::error::Error for IoError {}
 /// Contract: `write` publishes atomically — a reader (including a
 /// process that crashed mid-write and reopened) sees either the whole
 /// object or no object, never a torn one. `list` returns every published
-/// name, in unspecified order.
+/// name, in unspecified order. Names beginning with `.` are reserved
+/// for a backend's own bookkeeping (temporaries, locks) and are not
+/// part of the namespace.
 pub trait StorageBackend: Send + Sync {
     /// Publishes `bytes` under `name`, replacing any previous object.
     /// **Durability contract:** when `write` returns, the object is
@@ -65,13 +67,17 @@ pub trait StorageBackend: Send + Sync {
     /// Removes the object named `name` (an error if absent).
     fn remove(&self, name: &str) -> Result<(), IoError>;
 
-    /// Creates (or truncates) the append-only log named `name` and
-    /// returns its writer. The log lists and reads back like any
-    /// object, but its durability is governed by [`LogWriter::sync`] —
-    /// not `write`'s atomic-publish contract — because a log's whole
-    /// point is accumulating small appends between syncs (the WAL,
-    /// decision #43).
-    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError>;
+    /// Opens the *existing* object named `name` as an append-only log
+    /// and returns its writer (an error if absent). A log is born and
+    /// reborn through `write` — atomic, durable publish of its initial
+    /// contents — and only *appended* through this writer, so there is
+    /// never an instant where the old log is destroyed and its
+    /// replacement not yet durable. The log lists and reads back like
+    /// any object, but appended bytes' durability is governed by
+    /// [`LogWriter::sync`] — not `write`'s contract — because a log's
+    /// whole point is accumulating small appends between syncs (the
+    /// WAL, decision #43).
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError>;
 }
 
 /// An open append-only log. Bytes accumulate with `append`; `sync`
@@ -92,21 +98,48 @@ pub trait LogWriter: Send {
 /// *and durable* publish on POSIX filesystems; leftover temporaries
 /// from a crash are invisible to `list` and overwritten by the next
 /// write.
+///
+/// Opening the backend takes an **exclusive OS file lock** on the
+/// directory (`.tallydb.lock`), held for the backend's life and
+/// released by the OS even if the process dies — so two processes
+/// linking the library cannot silently clobber one store (the same
+/// protection the console's own lock gives its whole database
+/// directory, now enforced where the files are actually written).
 pub struct FsBackend {
     dir: PathBuf,
     /// Distinguishes concurrent writes' temp files (R6).
     write_counter: AtomicU64,
+    /// The advisory process lock; released when the backend drops (or
+    /// the process dies — no stale-lock cleanup ever needed).
+    _lock: std::fs::File,
 }
 
 impl FsBackend {
-    /// A backend over `dir`, created if absent.
+    /// A backend over `dir`, created if absent; fails if another
+    /// process (or another backend in this one) holds the directory.
     pub fn new(dir: impl Into<PathBuf>) -> Result<FsBackend, IoError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .map_err(|error| IoError::Backend(format!("creating {}: {error}", dir.display())))?;
+        let lock_path = dir.join(".tallydb.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                IoError::Backend(format!("opening lock {}: {error}", lock_path.display()))
+            })?;
+        if let Err(error) = lock.try_lock() {
+            return Err(IoError::Backend(format!(
+                "another process holds {} ({error}); one accessor per store directory",
+                dir.display()
+            )));
+        }
         Ok(FsBackend {
             dir,
             write_counter: AtomicU64::new(0),
+            _lock: lock,
         })
     }
 }
@@ -193,8 +226,11 @@ impl StorageBackend for FsBackend {
             let Ok(name) = entry.file_name().into_string() else {
                 continue; // not a name this backend ever wrote
             };
-            if name.starts_with(".tmp-") {
-                continue; // unpublished leftovers are invisible
+            if name.starts_with('.') {
+                // The backend's own bookkeeping — unpublished `.tmp-`
+                // leftovers, the `.tallydb.lock` file — is not part of
+                // the namespace (dot-prefixed names are reserved).
+                continue;
             }
             if entry.path().is_file() {
                 names.push(name);
@@ -203,16 +239,20 @@ impl StorageBackend for FsBackend {
         Ok(names)
     }
 
-    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
         let path = self.dir.join(name);
-        let file = std::fs::File::create(&path)
-            .map_err(|error| IoError::Backend(format!("creating {}: {error}", path.display())))?;
-        // Sync the directory so the log's existence survives power loss.
-        std::fs::File::open(&self.dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|error| {
-                IoError::Backend(format!("syncing {}: {error}", self.dir.display()))
-            })?;
+        let file = match std::fs::OpenOptions::new().append(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(IoError::NotFound(name.to_owned()))
+            }
+            Err(error) => {
+                return Err(IoError::Backend(format!(
+                    "opening {}: {error}",
+                    path.display()
+                )))
+            }
+        };
         Ok(Box::new(FsLogWriter { file, path }))
     }
 
@@ -304,13 +344,18 @@ impl StorageBackend for MemBackend {
             .collect())
     }
 
-    fn create_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
-        // Creation is immediate (models the synced directory entry);
-        // record bytes arrive only at sync.
-        self.objects
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        // The log must already exist (born through `write`'s atomic
+        // publish); appended bytes arrive in the shared map only at
+        // sync — which is what models power loss honestly.
+        if !self
+            .objects
             .lock()
             .expect("no poisoned locks")
-            .insert(name.to_owned(), Vec::new());
+            .contains_key(name)
+        {
+            return Err(IoError::NotFound(name.to_owned()));
+        }
         Ok(Box::new(MemLogWriter {
             objects: Arc::clone(&self.objects),
             name: name.to_owned(),
@@ -373,6 +418,27 @@ mod tests {
         assert_eq!(backend.list().unwrap(), ["real"]);
         backend.write("real", b"data-2").unwrap();
         assert_eq!(backend.read("real").unwrap(), b"data-2");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_directory_lock_admits_one_backend() {
+        // Two library embedders opening one store directory would
+        // silently clobber each other's segments; the lock makes the
+        // second open loud instead. Released with the file handle — by
+        // the OS even on a crash, so no stale-lock cleanup exists.
+        let dir = std::env::temp_dir().join(format!("tallydb-io-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = FsBackend::new(&dir).unwrap();
+        let Err(error) = FsBackend::new(&dir) else {
+            panic!("second accessor must be refused");
+        };
+        assert!(
+            error.to_string().contains("one accessor"),
+            "unexpected error: {error}"
+        );
+        drop(first);
+        drop(FsBackend::new(&dir).unwrap()); // released with the handle
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

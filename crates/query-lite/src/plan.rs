@@ -504,6 +504,19 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
             ordering_key,
         });
     }
+    for (index, column) in columns.iter().enumerate() {
+        // A duplicated name would make the later column silently
+        // unreachable (every resolver takes the first match).
+        if columns[..index]
+            .iter()
+            .any(|other| other.name == column.name)
+        {
+            return Err(QueryError::Unsupported(format!(
+                "column '{}' is declared twice",
+                column.name
+            )));
+        }
+    }
     match columns.iter().filter(|column| column.ordering_key).count() {
         1 => Ok(CreateTablePlan { table, columns }),
         0 => Err(QueryError::Unsupported(
@@ -1773,6 +1786,16 @@ mod tests {
         assert_eq!(plan.columns[1].type_name, "KEY");
         assert!(!plan.columns[1].ordering_key);
         assert!(plan.columns[0].ordering_key);
+    }
+
+    #[test]
+    fn duplicate_column_names_are_refused_not_shadowed() {
+        // Two columns named `x`: every resolver takes the first match,
+        // so the second would be silently unreachable forever.
+        let error = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE, x DOUBLE)")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("declared twice"), "{error}");
     }
 
     #[test]
