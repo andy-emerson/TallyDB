@@ -1060,7 +1060,11 @@ hosts that have no language of their own:
 **The sunset clause.** ~32k lines (vendored C + bindings) is not yet
 justified by that niche. Lua must demonstrate value before release
 1.0 — real console/browser kernel use, or the latency niche exercised
-in practice — or it is removed and tier 3 becomes query-only. The
+in practice — or it is removed and tier 3 becomes query-only. If the
+sunset executes, the **no-coined-SQL-names principle reopens by its
+recorded trigger** (ruled 2026-07-28): with no scripting layer to
+carry novel compute names, SQL becomes their only home, and
+`eigen_max`-class naming must be re-decided there. The
 runaway-kernel guard (#61) is scoped by the same ruling: required
 before Lua ships in any surface serving untrusted input (the M6
 served product), optional for a local console.
