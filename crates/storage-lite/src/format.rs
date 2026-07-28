@@ -417,8 +417,40 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
 
 /// First bytes of every manifest file.
 pub const MANIFEST_MAGIC: [u8; 8] = *b"TALLYMFT";
-/// The manifest format version this module writes.
+/// The manifest format version this module writes for tables with no
+/// section content — byte-identical to the original format, so
+/// untouched tables never see a version bump.
 pub const MANIFEST_VERSION: u16 = 1;
+/// The sectioned manifest version (M4.4): v1's exact layout, then
+/// `section_count: u16` followed by `tag: u16, length: u32, payload`
+/// per section. Readers skip unknown tags, so sections fill in over
+/// time without another version bump. Assigned tags: 1 = per-segment
+/// zone maps (reserved for the segment-lazy work, never yet written),
+/// 2 = knowledge state, 3 = history segments.
+pub const MANIFEST_VERSION_SECTIONED: u16 = 2;
+
+/// Manifest section content beyond the v1 core. `Default` is the
+/// empty state, which encodes as plain v1.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ManifestSections {
+    /// Whether this table has ever diverged — run a retaining
+    /// compaction that broke sequence == row id. Once true, segments
+    /// written by compaction carry materialized sequence trailers.
+    pub diverged: bool,
+    /// Segments holding superseded row versions: excluded from
+    /// latest-knowledge scans, entered only under `ASOF`.
+    pub history: Vec<String>,
+}
+
+impl ManifestSections {
+    /// Whether encoding needs the sectioned version at all.
+    pub fn is_empty(&self) -> bool {
+        !self.diverged && self.history.is_empty()
+    }
+}
+
+const SECTION_KNOWLEDGE: u16 = 2;
+const SECTION_HISTORY: u16 = 3;
 
 /// A decoded table manifest: what reopen verifies against and the
 /// generation the backend is committed to.
@@ -430,13 +462,27 @@ pub struct Manifest {
     pub ordering_key: usize,
     /// The committed compaction generation.
     pub generation: u64,
+    /// Section content (v2); empty for v1 manifests.
+    pub sections: ManifestSections,
 }
 
-/// Encodes a manifest into its v1 bytes.
-pub fn encode_manifest(schema: &Schema, ordering_key: usize, generation: u64) -> Vec<u8> {
+/// Encodes a manifest: byte-identical v1 while `sections` is empty
+/// (the golden-locked layout untouched tables keep forever), the
+/// sectioned v2 once any section has content.
+pub fn encode_manifest(
+    schema: &Schema,
+    ordering_key: usize,
+    generation: u64,
+    sections: &ManifestSections,
+) -> Vec<u8> {
+    let version = if sections.is_empty() {
+        MANIFEST_VERSION
+    } else {
+        MANIFEST_VERSION_SECTIONED
+    };
     let mut out = Vec::new();
     out.extend_from_slice(&MANIFEST_MAGIC);
-    out.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
     out.extend_from_slice(&generation.to_le_bytes());
@@ -458,6 +504,27 @@ pub fn encode_manifest(schema: &Schema, ordering_key: usize, generation: u64) ->
             }
         }
     }
+    if version == MANIFEST_VERSION_SECTIONED {
+        let mut section_bytes: Vec<(u16, Vec<u8>)> = Vec::new();
+        if sections.diverged {
+            section_bytes.push((SECTION_KNOWLEDGE, vec![1u8]));
+        }
+        if !sections.history.is_empty() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(sections.history.len() as u32).to_le_bytes());
+            for name in &sections.history {
+                payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+            }
+            section_bytes.push((SECTION_HISTORY, payload));
+        }
+        out.extend_from_slice(&(section_bytes.len() as u16).to_le_bytes());
+        for (tag, payload) in section_bytes {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
+    }
     let crc = crc32c(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out
@@ -470,7 +537,7 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
         return Err(FormatError::BadMagic);
     }
     let version = reader.u16()?;
-    if version != MANIFEST_VERSION {
+    if version != MANIFEST_VERSION && version != MANIFEST_VERSION_SECTIONED {
         return Err(FormatError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -512,16 +579,66 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
         }
         fields.push(field);
     }
+    let mut sections = ManifestSections::default();
+    if version == MANIFEST_VERSION_SECTIONED {
+        let section_count = reader.u16()? as usize;
+        for _ in 0..section_count {
+            let tag = reader.u16()?;
+            let length = reader.u32()? as usize;
+            let payload = reader.take(length)?;
+            match tag {
+                SECTION_KNOWLEDGE => {
+                    if payload.len() != 1 {
+                        return Err(FormatError::Corrupt(
+                            "knowledge section is one byte".to_owned(),
+                        ));
+                    }
+                    sections.diverged = payload[0] != 0;
+                }
+                SECTION_HISTORY => {
+                    let mut inner = Reader {
+                        bytes: payload,
+                        position: 0,
+                    };
+                    let count = inner.u32()? as usize;
+                    for _ in 0..count {
+                        let len = inner.u16()? as usize;
+                        let name = std::str::from_utf8(inner.take(len)?)
+                            .map_err(|_| {
+                                FormatError::Corrupt("history segment name is not UTF-8".to_owned())
+                            })?
+                            .to_owned();
+                        sections.history.push(name);
+                    }
+                    if inner.position != payload.len() {
+                        return Err(FormatError::Corrupt(
+                            "trailing bytes in the history section".to_owned(),
+                        ));
+                    }
+                }
+                // Unknown tags (zone maps to come, and anything newer
+                // than this reader) are skipped whole — that is the
+                // sectioned format's forward-compatibility contract.
+                _ => {}
+            }
+        }
+    }
     if reader.position != bytes.len() {
         return Err(FormatError::Corrupt(format!(
-            "{} bytes remain after the last column",
-            bytes.len() - reader.position
+            "{} bytes remain after the last {}",
+            bytes.len() - reader.position,
+            if version == MANIFEST_VERSION_SECTIONED {
+                "section"
+            } else {
+                "column"
+            }
         )));
     }
     Ok(Manifest {
         schema: Schema::new(fields),
         ordering_key,
         generation,
+        sections,
     })
 }
 

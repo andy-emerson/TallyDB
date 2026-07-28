@@ -168,6 +168,9 @@ pub struct Store {
     delete_log_sequence: u64,
     /// The current storage generation (bumped by each compaction).
     generation: u64,
+    /// Section content the manifest carries (knowledge state, history
+    /// segments) — empty until the table first diverges (M4.4).
+    manifest_sections: crate::format::ManifestSections,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
     /// The open write-ahead log, when `wal_sync` is not `Off` and the
@@ -333,6 +336,7 @@ impl Store {
             rows: 0,
             delete_log_sequence: 0,
             generation: 0,
+            manifest_sections: crate::format::ManifestSections::default(),
             backend: None,
             wal: None,
             wal_sync: WalSync::Off,
@@ -435,10 +439,19 @@ impl Store {
                         ),
                     });
                 }
+                store.manifest_sections = manifest.sections.clone();
                 manifest.generation
             }
             Err(IoError::NotFound(_)) => {
-                backend.write(MANIFEST, &encode_manifest(&store.schema, ordering_key, 0))?;
+                backend.write(
+                    MANIFEST,
+                    &encode_manifest(
+                        &store.schema,
+                        ordering_key,
+                        0,
+                        &crate::format::ManifestSections::default(),
+                    ),
+                )?;
                 0
             }
             Err(error) => return Err(error.into()),
@@ -893,7 +906,12 @@ impl Store {
             // The manifest write is the commit point.
             backend.write(
                 MANIFEST,
-                &encode_manifest(&self.schema, self.ordering_key, next),
+                &encode_manifest(
+                    &self.schema,
+                    self.ordering_key,
+                    next,
+                    &self.manifest_sections,
+                ),
             )?;
             self.generation = next;
         }

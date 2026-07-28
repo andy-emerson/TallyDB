@@ -9,8 +9,8 @@
 
 use arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
 use storage_lite::{
-    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, RowValue,
-    Segment, WriteBuffer,
+    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError,
+    ManifestSections, RowValue, Segment, WriteBuffer,
 };
 
 /// A fixture exercising every format feature: all three column types, a
@@ -144,7 +144,12 @@ fn fixture_manifest() -> (Schema, usize, u64) {
 #[test]
 fn manifest_round_trips_exactly() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     let manifest = decode_manifest(&bytes).unwrap();
     assert_eq!(manifest.schema, schema);
     assert_eq!(manifest.ordering_key, ordering_key);
@@ -154,7 +159,12 @@ fn manifest_round_trips_exactly() {
 #[test]
 fn every_manifest_truncation_is_an_error_never_a_panic() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     for len in 0..bytes.len() {
         assert!(
             decode_manifest(&bytes[..len]).is_err(),
@@ -166,7 +176,12 @@ fn every_manifest_truncation_is_an_error_never_a_panic() {
 #[test]
 fn every_manifest_single_byte_corruption_is_caught() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     for position in 0..bytes.len() {
         let mut corrupt = bytes.clone();
         corrupt[position] ^= 0x40;
@@ -185,7 +200,12 @@ fn manifest_rejects_segment_bytes_and_vice_versa() {
         Err(FormatError::BadMagic)
     ));
     assert!(matches!(
-        decode_segment(&encode_manifest(&schema, ordering_key, generation)),
+        decode_segment(&encode_manifest(
+            &schema,
+            ordering_key,
+            generation,
+            &ManifestSections::default()
+        )),
         Err(FormatError::BadMagic)
     ));
 }
@@ -198,7 +218,12 @@ fn manifest_golden_bytes_are_locked() {
         .join("golden")
         .join("manifest_v1.bin");
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     if !path.exists() && std::env::var_os("TALLYDB_BLESS_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &bytes).unwrap();
@@ -331,4 +356,73 @@ fn decoded_columns_read_correctly() {
         batch.schema().fields()[0].logical(),
         Some(LogicalType::TimestampNs)
     );
+}
+
+#[test]
+fn sectioned_manifest_round_trips_and_v1_stays_byte_identical() {
+    // M4.4: empty sections encode plain v1 (the golden above already
+    // locks those bytes); content switches to v2, round-trips, and a
+    // v1 reader's world is untouched until a table actually diverges.
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("x", ColumnType::F64, true),
+    ]);
+    let empty = ManifestSections::default();
+    let v1 = encode_manifest(&schema, 0, 3, &empty);
+    assert_eq!(&v1[8..10], &1u16.to_le_bytes(), "empty sections stay v1");
+    let sections = ManifestSections {
+        diverged: true,
+        history: vec!["seg-g0000000001-00000000000000000000.tlyseg".to_owned()],
+    };
+    let v2 = encode_manifest(&schema, 0, 3, &sections);
+    assert_eq!(&v2[8..10], &2u16.to_le_bytes(), "content is v2");
+    let decoded = decode_manifest(&v2).unwrap();
+    assert_eq!(decoded.generation, 3);
+    assert_eq!(decoded.sections, sections);
+    // A v1 manifest decodes with empty sections.
+    assert_eq!(decode_manifest(&v1).unwrap().sections, empty);
+}
+
+#[test]
+fn unknown_manifest_sections_are_skipped_whole() {
+    // The forward-compatibility contract: a reader ignores tags it
+    // does not know (zone maps arrive later under tag 1), so sections
+    // fill in over time without a version bump.
+    let schema = Schema::new(vec![Field::new("ts", ColumnType::I64, false)]);
+    let sections = ManifestSections {
+        diverged: true,
+        history: Vec::new(),
+    };
+    let mut bytes = encode_manifest(&schema, 0, 0, &sections);
+    // Append one unknown section (tag 999, 4-byte payload) by hand,
+    // bump the count, and re-stamp the checksum the way the encoder
+    // lays it out: crc32c over everything past the 16-byte header.
+    let count_offset = bytes.len() - (2 + 2 + 4 + 1); // count + known section
+    let count = u16::from_le_bytes([bytes[count_offset], bytes[count_offset + 1]]);
+    bytes[count_offset..count_offset + 2].copy_from_slice(&(count + 1).to_le_bytes());
+    bytes.extend_from_slice(&999u16.to_le_bytes());
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&[0xAA; 4]);
+    let crc = crc32c_reference(&bytes[16..]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+    let decoded = decode_manifest(&bytes).unwrap();
+    assert!(decoded.sections.diverged, "known section still read");
+}
+
+/// An independent CRC-32C (Castagnoli, reflected 0x82F63B78) so the
+/// unknown-section test re-stamps checksums without borrowing the
+/// implementation under test.
+fn crc32c_reference(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
