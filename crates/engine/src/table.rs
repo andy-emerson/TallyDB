@@ -367,13 +367,27 @@ impl Table {
     /// Runs an already-planned query (the database handle plans once to
     /// route by table name, then calls this).
     pub(crate) fn execute_plan(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
-        let segments = self.store.snapshot()?;
+        let segments = match plan.as_of {
+            // Knowledge-time travel: the same executor over an as-of
+            // snapshot — the knowledge mask is just a live mask.
+            Some(cut) => self.store.knowledge_snapshot()?.as_of(cut),
+            None => self.store.snapshot()?,
+        };
         Ok(execute(
             self.store.schema(),
             &segments,
             plan,
             &self.current_registry(),
         )?)
+    }
+
+    /// The table's ingest-sequence watermark: the sequence the next
+    /// appended row will receive — one past the newest knowledge the
+    /// table holds, so `ASOF next_sequence() - 1` (on a non-empty
+    /// table) reads the latest state. Record it before a correction to
+    /// keep a queryable before/after boundary.
+    pub fn next_sequence(&self) -> u64 {
+        self.store.next_sequence()
     }
 
     /// Runs a join plan with `self` as the fact table (the database
@@ -1081,11 +1095,11 @@ impl TableReader {
     /// exactly as of this call. Appends, mutations, compactions, and
     /// registrations after it never affect the returned snapshot.
     pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
-        let views = self.store.snapshot()?;
+        let knowledge = self.store.knowledge_snapshot()?;
         Ok(TableSnapshot {
             name: self.name.clone(),
             schema: self.schema.clone(),
-            views,
+            knowledge,
             registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
         })
     }
@@ -1105,12 +1119,16 @@ impl TableReader {
 pub struct TableSnapshot {
     name: String,
     schema: Schema,
-    views: Vec<SegmentView>,
+    /// The latest-knowledge views plus what an `AS OF` query needs —
+    /// history and pending kill stamps — captured at the same instant.
+    knowledge: storage_lite::KnowledgeSnapshot,
     registry: Arc<Registry>,
 }
 
 impl TableSnapshot {
-    /// Runs one SQL `SELECT` over this frozen view.
+    /// Runs one SQL `SELECT` over this frozen view. `ASOF n` works
+    /// here too: the snapshot carries the knowledge state of its
+    /// moment, so time travel is relative to what was known then.
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
         if plan.table != self.name {
@@ -1119,7 +1137,15 @@ impl TableSnapshot {
                 got: plan.table,
             });
         }
-        Ok(execute(&self.schema, &self.views, &plan, &self.registry)?)
+        let views;
+        let segments = match plan.as_of {
+            Some(cut) => {
+                views = self.knowledge.as_of(cut);
+                &views
+            }
+            None => &self.knowledge.views,
+        };
+        Ok(execute(&self.schema, segments, &plan, &self.registry)?)
     }
 
     /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
@@ -1602,6 +1628,63 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn as_of_reads_the_table_as_it_was_known() {
+        // The corrections model end to end: correct a row, then read
+        // both the corrected present and the uncorrected past — before
+        // and after compaction moves the superseded version to history.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::new("t", schema, "ts").unwrap();
+        for i in 0..4i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        // The correction: UPDATE appends the replacement (sequence 4),
+        // then tombstones the original (stamped at 5).
+        table.mutate("UPDATE t SET x = 100.0 WHERE ts = 1").unwrap();
+        assert_eq!(table.next_sequence(), 5);
+        let latest = "SELECT ts, x FROM t ORDER BY ts";
+        let past = "SELECT ts, x FROM t ASOF 3 ORDER BY ts";
+        let corrected = [Some(0.0), Some(100.0), Some(2.0), Some(3.0)];
+        let original = [Some(0.0), Some(1.0), Some(2.0), Some(3.0)];
+        assert_eq!(flatten(&table.query(latest).unwrap(), 1), corrected);
+        assert_eq!(flatten(&table.query(past).unwrap(), 1), original);
+        // The SQL:2011 spelling reads identically.
+        assert_eq!(
+            flatten(
+                &table
+                    .query("SELECT ts, x FROM t FOR SYSTEM_TIME AS OF 3 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            original
+        );
+        // ASOF 0: only the first row was known.
+        assert_eq!(table.query("SELECT x FROM t ASOF 0").unwrap().num_rows(), 1);
+        // Compaction retains the superseded version in history — the
+        // past answer does not move, and neither does the present.
+        table.compact().unwrap();
+        assert_eq!(flatten(&table.query(past).unwrap(), 1), original);
+        assert_eq!(flatten(&table.query(latest).unwrap(), 1), corrected);
+        // A detached snapshot carries its knowledge state with it.
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(flatten(&snapshot.query(past).unwrap(), 1), original);
+        assert_eq!(flatten(&snapshot.query(latest).unwrap(), 1), corrected);
+        // Aggregation over the past runs through the same executor.
+        assert_eq!(
+            flatten(&table.query("SELECT SUM(x) AS s FROM t ASOF 3").unwrap(), 0),
+            [Some(6.0)]
+        );
+        assert_eq!(
+            flatten(&table.query("SELECT SUM(x) AS s FROM t").unwrap(), 0),
+            [Some(105.0)]
+        );
     }
 
     const REGRESSION_SQL: &str = "SELECT sym, regr_slope(y, x) OVER (PARTITION BY sym ORDER BY ts \

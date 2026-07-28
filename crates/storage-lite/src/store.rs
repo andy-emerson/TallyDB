@@ -237,6 +237,87 @@ impl StoreReader {
     pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
         snapshot_of(&lock(&self.shared))
     }
+
+    /// As [`Store::knowledge_snapshot`], from any thread.
+    pub fn knowledge_snapshot(&self) -> Result<KnowledgeSnapshot, StorageError> {
+        knowledge_snapshot_of(&lock(&self.shared))
+    }
+}
+
+/// A point-in-time capture of everything an `AS OF` read needs, taken
+/// under one lock so the three parts can never be torn against each
+/// other: the latest-knowledge views, the history segments, and the
+/// pending (uncompacted) tombstones' kill stamps.
+pub struct KnowledgeSnapshot {
+    /// The latest-knowledge views, exactly as [`Store::snapshot`].
+    pub views: Vec<SegmentView>,
+    /// History segments (see [`Store::history`]).
+    pub history: Vec<Arc<Segment>>,
+    /// Pending tombstones: row id → the sequence its kill landed at.
+    pub stamps: BTreeMap<u64, u64>,
+}
+
+impl KnowledgeSnapshot {
+    /// The table as it was known at ingest-sequence `cut`: rows born at
+    /// or before the cut and not superseded by it. Live segments keep
+    /// rows whose pending tombstone (if any) landed after the cut;
+    /// history rows return where their kill came later. The result runs
+    /// through the ordinary executor — the knowledge mask is just a
+    /// live mask.
+    pub fn as_of(&self, cut: u64) -> Vec<SegmentView> {
+        let mut out = Vec::with_capacity(self.views.len() + self.history.len());
+        for view in &self.views {
+            let segment = Arc::clone(&view.segment);
+            let base = segment.base_row_id();
+            let rows = segment.batch().num_rows();
+            let mut mask = Vec::with_capacity(rows);
+            let mut all_live = true;
+            for row in 0..rows {
+                let born = segment.sequence_at(row) <= cut;
+                let killed = self
+                    .stamps
+                    .get(&(base + row as u64))
+                    .is_some_and(|&kill| kill <= cut);
+                let live = born && !killed;
+                all_live &= live;
+                mask.push(live);
+            }
+            out.push(if all_live {
+                SegmentView::all_live(segment)
+            } else {
+                SegmentView {
+                    segment,
+                    live: Some(Bitmap::from_bools(mask.into_iter())),
+                }
+            });
+        }
+        for segment in &self.history {
+            let rows = segment.batch().num_rows();
+            let kills = segment.superseded();
+            let mask = (0..rows).map(|row| {
+                // A history row without a kill array (which the engine
+                // never writes) reads as killed-at-unknown: never
+                // visible — the same conservative reading as a v1
+                // delete log.
+                let kill = kills.map_or(0, |kills| kills[row]);
+                segment.sequence_at(row) <= cut && kill > cut
+            });
+            out.push(SegmentView {
+                segment: Arc::clone(segment),
+                live: Some(Bitmap::from_bools(mask)),
+            });
+        }
+        out
+    }
+}
+
+/// The [`KnowledgeSnapshot`] algorithm over locked state.
+fn knowledge_snapshot_of(shared: &Shared) -> Result<KnowledgeSnapshot, StorageError> {
+    Ok(KnowledgeSnapshot {
+        views: snapshot_of(shared)?,
+        history: shared.history.clone(),
+        stamps: shared.tombstones.clone(),
+    })
 }
 
 /// Takes the shared-state lock. A poisoned lock means a writer panicked
@@ -623,6 +704,24 @@ impl Store {
     /// for them; `AS OF` reads walk them explicitly.
     pub fn history(&self) -> Vec<Arc<Segment>> {
         lock(&self.shared).history.clone()
+    }
+
+    /// The ingest-sequence watermark: the sequence the next appended
+    /// row will receive — also one past the newest knowledge the table
+    /// holds, so `AS OF next_sequence() - 1` (on a non-empty table) is
+    /// the latest state. Equal to [`Store::len`] until the table
+    /// diverges.
+    pub fn next_sequence(&self) -> u64 {
+        let shared = lock(&self.shared);
+        shared
+            .buffer_sequence_base
+            .map_or(self.rows, |base| base + shared.buffer.len() as u64)
+    }
+
+    /// Everything an `AS OF` read needs, captured atomically — see
+    /// [`KnowledgeSnapshot`].
+    pub fn knowledge_snapshot(&self) -> Result<KnowledgeSnapshot, StorageError> {
+        knowledge_snapshot_of(&lock(&self.shared))
     }
 
     /// A cheap, cloneable reader handle: mints point-in-time snapshots

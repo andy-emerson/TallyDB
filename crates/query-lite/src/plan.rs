@@ -338,6 +338,11 @@ pub struct Plan {
     pub limit: Option<usize>,
     /// `OFFSET`.
     pub offset: Option<usize>,
+    /// Knowledge-time travel: `ASOF n` / `FOR SYSTEM_TIME AS OF n` —
+    /// read the table as it was known at ingest sequence `n`. The
+    /// embedder resolves it to an as-of snapshot instead of the latest
+    /// one; the executor itself never looks at this field.
+    pub as_of: Option<u64>,
 }
 
 /// A value the right side of `SET column = ...` may hold.
@@ -712,7 +717,139 @@ fn is_create_table(sql: &str) -> bool {
     )
 }
 
+/// Splits the knowledge-time clause out of the SQL text before parsing:
+/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
+/// keyword followed by `JOIN` and is left alone) and the SQL:2011
+/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
+/// as known at ingest sequence n". Returns the SQL with the clause
+/// removed (`None` when the text held no clause — untouched input never
+/// pays reassembly) and the cut it named. The two-word near-miss
+/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
+/// alias named OF), so it gets a teaching error instead of a puzzle.
+fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
+    // Shallow tokenization: quoted runs ('…' with '' escapes, "…") stay
+    // single tokens so nothing inside a string literal can look like a
+    // clause; hugging punctuation splits off so `ASOF 5,` scans.
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut chars = sql.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            let mut end = sql.len();
+            while let Some((i, c)) = chars.next() {
+                if c == ch {
+                    if ch == '\'' && chars.peek().is_some_and(|&(_, next)| next == '\'') {
+                        chars.next();
+                        continue;
+                    }
+                    end = i + c.len_utf8();
+                    break;
+                }
+            }
+            tokens.push(&sql[start..end]);
+            continue;
+        }
+        if "(),;".contains(ch) {
+            tokens.push(&sql[start..start + ch.len_utf8()]);
+            continue;
+        }
+        let mut end = sql.len();
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_whitespace() || c == '\'' || c == '"' || "(),;".contains(c) {
+                end = i;
+                break;
+            }
+            chars.next();
+        }
+        tokens.push(&sql[start..end]);
+    }
+    let lower: Vec<String> = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    let parse_cut = |token: &str| -> Result<u64, QueryError> {
+        token.parse::<u64>().map_err(|_| {
+            QueryError::Unsupported(format!(
+                "ASOF expects a non-negative integer ingest-sequence literal, got '{token}'"
+            ))
+        })
+    };
+    let mut cut: Option<u64> = None;
+    let mut keep = vec![true; tokens.len()];
+    let mut index = 0;
+    while index < tokens.len() {
+        let matched = if index + 4 < tokens.len()
+            && lower[index] == "for"
+            && lower[index + 1] == "system_time"
+            && lower[index + 2] == "as"
+            && lower[index + 3] == "of"
+        {
+            Some((parse_cut(tokens[index + 4])?, 5))
+        } else if lower[index] == "asof" && lower.get(index + 1).map(String::as_str) != Some("join")
+        {
+            let Some(argument) = tokens.get(index + 1) else {
+                return Err(QueryError::Unsupported(
+                    "ASOF at the end of the statement — it takes an \
+                     ingest-sequence literal: ASOF <n>"
+                        .to_owned(),
+                ));
+            };
+            Some((parse_cut(argument)?, 2))
+        } else {
+            if index + 2 < tokens.len()
+                && lower[index] == "as"
+                && lower[index + 1] == "of"
+                && tokens[index + 2].parse::<u64>().is_ok()
+                && (index == 0 || lower[index - 1] != "system_time")
+            {
+                return Err(QueryError::Unsupported(
+                    "AS OF <n> — SQL's alias grammar claims the two-word form; \
+                     write ASOF <n> (one word), or the standard \
+                     FOR SYSTEM_TIME AS OF <n>"
+                        .to_owned(),
+                ));
+            }
+            None
+        };
+        match matched {
+            Some((value, width)) => {
+                if cut.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "one AS OF per statement".to_owned(),
+                    ));
+                }
+                cut = Some(value);
+                for kept in &mut keep[index..index + width] {
+                    *kept = false;
+                }
+                index += width;
+            }
+            None => index += 1,
+        }
+    }
+    if cut.is_none() {
+        return Ok((None, None));
+    }
+    let kept: Vec<&str> = tokens
+        .iter()
+        .zip(&keep)
+        .filter(|&(_, &kept)| kept)
+        .map(|(&token, _)| token)
+        .collect();
+    Ok((Some(kept.join(" ")), cut))
+}
+
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    let stripped;
+    let (sql, as_of) = match extract_as_of(sql)? {
+        (Some(cleaned), cut) => {
+            stripped = cleaned;
+            (stripped.as_str(), cut)
+        }
+        (None, cut) => (sql, cut),
+    };
     let rewritten;
     let sql = if is_create_table(sql) {
         rewritten = rewrite_ordering_key(sql)?;
@@ -728,8 +865,26 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
             statements.len()
         )));
     };
+    if as_of.is_some() && !matches!(statement, ast::Statement::Query(_)) {
+        return Err(QueryError::Unsupported(
+            "AS OF applies to SELECT — mutations and DDL always act on latest knowledge".to_owned(),
+        ));
+    }
     match statement {
-        ast::Statement::Query(query) => Ok(Statement::Select(Box::new(lower_query(query)?))),
+        ast::Statement::Query(query) => {
+            let mut plan = lower_query(query)?;
+            if as_of.is_some() {
+                if plan.join.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "AS OF with JOIN — the clause binds to one table's sequence \
+                         space and the join lowering does not carry it yet"
+                            .to_owned(),
+                    ));
+                }
+                plan.as_of = as_of;
+            }
+            Ok(Statement::Select(Box::new(plan)))
+        }
         ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
         ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
         ast::Statement::CreateTable(create) => {
@@ -1065,6 +1220,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
         order_by: None,
         limit: None,
         offset: None,
+        as_of: None,
     })
 }
 
@@ -1717,6 +1873,42 @@ mod tests {
                 alias: None,
             }])
         );
+    }
+
+    #[test]
+    fn the_knowledge_time_clause_is_extracted_in_both_spellings() {
+        // One-word ASOF — the engine's spelling.
+        let plan_asof = plan("SELECT x FROM t ASOF 41520 WHERE x > 1").expect("plans");
+        assert_eq!(plan_asof.as_of, Some(41_520));
+        assert!(plan_asof.predicate.is_some(), "the rest of the query holds");
+        // The SQL:2011 carrier, same meaning.
+        let standard = plan("SELECT x FROM t FOR SYSTEM_TIME AS OF 41520 WHERE x > 1").unwrap();
+        assert_eq!(standard.as_of, Some(41_520));
+        // Without a clause, nothing is touched.
+        assert_eq!(plan("SELECT x FROM t WHERE x > 1").unwrap().as_of, None);
+        // Inside a string literal the words are inert.
+        let inert = plan("SELECT x FROM t WHERE sym = 'ASOF 5'").unwrap();
+        assert_eq!(inert.as_of, None);
+    }
+
+    #[test]
+    fn knowledge_time_misuses_are_taught() {
+        for (sql, needle) in [
+            // The two-word form collides with SQL's alias grammar.
+            ("SELECT x FROM t AS OF 3", "ASOF <n> (one word)"),
+            ("SELECT x FROM t ASOF now", "ingest-sequence literal"),
+            ("SELECT x FROM t ASOF", "takes an ingest-sequence"),
+            ("SELECT x FROM t ASOF 1 WHERE x > 0 ASOF 2", "one AS OF"),
+            (
+                "SELECT t.x FROM t ASOF 1 JOIN d ON t.k = d.k",
+                "AS OF with JOIN",
+            ),
+            ("DELETE FROM t ASOF 1 WHERE x > 0", "latest knowledge"),
+            ("UPDATE t ASOF 1 SET x = 0", "latest knowledge"),
+        ] {
+            let error = format!("{}", parse_statement(sql).unwrap_err());
+            assert!(error.contains(needle), "{sql}: {error}");
+        }
     }
 
     #[test]
