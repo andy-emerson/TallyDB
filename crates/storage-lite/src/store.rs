@@ -764,6 +764,25 @@ impl Store {
         if self.backend.is_some() && newly.iter().any(|&id| id >= buffer_base) {
             self.flush()?;
         }
+        // The companion rule: no delete log may commit ahead of the
+        // rows that *supersede* its victims. UPDATE appends its
+        // replacements before tombstoning the originals, and the delete
+        // log below is synced immediately — so if the replacements were
+        // still riding an unsynced WAL tail (or, under `Off`, the
+        // buffer), a crash here would recover the deletion without the
+        // replacements: the one middle state that loses data forever.
+        // Sync the log (cheap) — or without one, flush — first.
+        if self.backend.is_some() {
+            if let Some(wal) = self.wal.as_mut() {
+                wal.sync().map_err(StorageError::from)?;
+                self.last_wal_sync = std::time::Instant::now();
+            } else {
+                let buffered = !lock(&self.shared).buffer.is_empty();
+                if buffered {
+                    self.flush()?;
+                }
+            }
+        }
         if let Some(backend) = &self.backend {
             backend.write(
                 &delete_log_name(self.generation, self.delete_log_sequence),

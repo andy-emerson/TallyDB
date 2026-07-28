@@ -759,12 +759,13 @@ impl Table {
         }
         // Reappend the replacements first, then tombstone the originals
         // — the one mutation mechanism, ordered for crash safety. The
-        // tombstone durably flushes the buffer before writing its delete
-        // log, so on a persistent store the replacements are on disk
-        // before the delete that supersedes the originals. A crash
-        // between the two leaves originals and replacements both live
-        // (recoverable duplicates under the row-id identity rule), never
-        // the replacements lost.
+        // tombstone makes every superseding row durable (a WAL sync, or
+        // a flush without one) before committing its delete log, so on
+        // a persistent store the replacements always outlive the delete
+        // that supersedes the originals. A crash anywhere in between
+        // leaves originals and replacements both live (recoverable
+        // duplicates under the row-id identity rule), never the
+        // replacements lost.
         for cells in &corrected {
             let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
             self.store.append(&row)?;

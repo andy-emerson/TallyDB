@@ -287,6 +287,52 @@ fn a_corrupt_header_is_loud_not_silent() {
 }
 
 #[test]
+fn a_delete_log_never_commits_ahead_of_superseding_rows() {
+    // UPDATE's shape at the storage layer: replacements appended first,
+    // then the originals tombstoned. The delete log is synced the
+    // moment it is written — so the replacements must be made durable
+    // *before* it commits, or a crash in the group window recovers the
+    // deletion without the replacements: originals gone, replacements
+    // gone, the one middle state that loses data forever.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(
+            backend.clone(),
+            WalSync::Group(std::time::Duration::from_secs(3600)),
+        );
+        append_n(&mut store, 0..4);
+        store.flush().unwrap(); // originals segment-durable
+        append_n(&mut store, 100..104); // replacements: logged, unsynced
+        store.tombstone(&[0, 1, 2, 3]).unwrap(); // must sync the WAL first
+        std::mem::forget(store); // power loss
+    }
+    let store = open(backend, WalSync::Full);
+    // Eight ids in the row-id space (originals stay until compaction);
+    // the four live rows are the replacements.
+    assert_eq!(store.len(), 8);
+    assert_eq!(ts_values(&store), vec![100, 101, 102, 103]);
+}
+
+#[test]
+fn a_delete_log_never_commits_ahead_of_buffered_rows_under_off() {
+    // The same invariant without a WAL: under `Off` the replacements
+    // live only in the write buffer, so the tombstone must flush them
+    // into a segment before its delete log commits.
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(backend.clone(), WalSync::Off);
+        append_n(&mut store, 0..4);
+        store.flush().unwrap();
+        append_n(&mut store, 100..104);
+        store.tombstone(&[0, 1, 2, 3]).unwrap(); // must flush first
+        std::mem::forget(store); // power loss
+    }
+    let store = open(backend, WalSync::Off);
+    assert_eq!(store.len(), 8);
+    assert_eq!(ts_values(&store), vec![100, 101, 102, 103]);
+}
+
+#[test]
 fn off_means_no_log_at_all() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     let mut store = open(backend.clone(), WalSync::Off);
