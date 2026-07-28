@@ -443,16 +443,24 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
   ready-at-hand stable id; the virtual-until-divergence design makes
   it nearly free — store nothing while sequence == row id, materialize
   delta-coded from the first divergence); the retention horizon is
-  **unbounded by default** with a per-table bound available; and the
-  knowledge-time clause is **bare `AS OF n` as the user-facing form,
-  carried on standard `FOR SYSTEM_TIME AS OF`** (which sqlparser
-  parses natively — the bare form is a small pre-parse rewrite onto
-  it, and both spellings are accepted). `ASOF JOIN` stays one word
-  (the DuckDB/ClickHouse/QuestDB/Snowflake convention; Snowflake
-  proves the coexistence), lexically distinct from the two-word
-  clause, with teaching errors in both directions for the human
-  near-miss (`ASOF 41520` → "did you mean AS OF"; `AS OF JOIN` →
-  "did you mean ASOF JOIN").
+  **unbounded by default** with a per-table bound available; and **one
+  keyword — `ASOF` — with structure dispatching** (amended by ruling,
+  2026-07-28): followed by `JOIN` it is the event-time nearest-match
+  join (the DuckDB/ClickHouse/QuestDB/Snowflake spelling, unchanged);
+  followed by a sequence it is knowledge-time travel
+  (`FROM trades ASOF 41520`). Why one word: the join side has a
+  universal convention worth honoring while the travel side has none
+  (Oracle `AS OF SCN`, Delta `VERSION AS OF`, Snowflake `AT` — no
+  consensus to diverge from), and two-word `AS OF` collides with
+  SQL's alias grammar (`trades AS OF` = "trades renamed OF"). Riders:
+  the SQL:2011 long form `FOR SYSTEM_TIME AS OF n` stays accepted
+  (sqlparser parses it natively; it is the internal carrier), and a
+  textual teaching error catches two-word `AS OF <n>` before the
+  parser garbles it — the error message itself teaches the two axes
+  (join = event time on the ordering key; travel = knowledge time on
+  the ingest sequence). Mix-ups cannot yield wrong semantics: the two
+  uses need different surrounding syntax, so confusion is a loud
+  error, never a silently wrong answer.
 - **M4.4 The corrections build** — the hidden ingest-sequence column
   (the permanent knowledge axis; delta-coded to almost nothing while
   uncorrected), retaining compaction (history segments), the knowledge
