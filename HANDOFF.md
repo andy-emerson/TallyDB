@@ -58,15 +58,23 @@ constraints change only when the Human says so.
   KnowledgeSnapshot::as_of masks, snapshot time travel, teaching
   errors, Table::next_sequence), and the DuckDB explicit-history-table
   oracle (sixth CI suite; 253 cuts swept twice across a reopen).
-  NEXT: **M4.5 correctness batch** (#73 atomic mutation commit record,
-  #63 Miri CI, #69 upstream Lua suite, review-noted redundancies) →
-  **the Lua trial** (Agent brings the evidence brief; the Human alone
-  rules) → M4.6 SQL-in-Lua (#70) only on a pass.
-- **Loose end to surface at the M4.4 wrap:** the sequence column is
-  reachable as `ASOF`'s coordinate and via `Table::next_sequence()`,
-  but not yet projectable from SQL (`SELECT _seq ...`); the M4.3
-  ruling said its exposure surface is designed in M4.4 — propose the
-  design (standard system-column precedent) before M4 closes.
+  **M4.5 correctness batch — done except #69** (2026-07-28): #73
+  closed (atomic supersession — `Store::supersede`, one commit record
+  and ONE knowledge coordinate per mutation, so no `ASOF` cut is ever
+  torn; WAL v2 supersession bracket, delete-log commit evidence,
+  injected-failure crash test recovers old-then-new; note: an UPDATE
+  now diverges a virtual table at the mutation itself); #63 closed
+  (Miri job in CI over arrow-lite's unit suite); review-noted
+  redundancies factored (shared field codec, one assemble core,
+  single manifest decode, WAL surface pub(crate)); #69 still blocked
+  on network policy (lua.org 403; unblock paths recorded on the
+  issue — Human-side fetch or policy change). NEXT: **the Lua trial**
+  (Agent brings the evidence brief; the Human alone rules) → M4.6
+  SQL-in-Lua (#70) only on a pass.
+- **Open decision (Human closes):** the sequence column's SQL
+  exposure surface — design brief with options and recommendation
+  (pseudocolumn `_seq`) posted to #75, 2026-07-28. Nothing in flight
+  entrenches an answer.
 - **Open rulings pending:** F1 (time bucketing, an M5 concern); the
   Human's noted-but-unstated reservation about how `KEY` was coined.
   Issue #75 tracks the corrections build; #73/#63/#69 are M4's
