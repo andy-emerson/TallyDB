@@ -12,7 +12,8 @@
 //!
 //! ```text
 //! magic        8B  "TALLYSEG"
-//! version      u16 (this module writes 1)
+//! version      u16 (1, or 2 when a trailer follows the columns — see
+//!                  [`VERSION_TRAILERED`])
 //! reserved     u16 (zero)
 //! crc32c       u32 — CRC-32C (Castagnoli) of every byte after this
 //!                  field; chosen over IEEE CRC-32 because it is the
@@ -73,7 +74,7 @@
 //! ```
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
-use crate::mem::{RowValue, Segment, ZoneMap};
+use crate::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
     NumericData, RecordBatch, Schema,
@@ -82,8 +83,24 @@ use std::fmt;
 
 /// First bytes of every segment file.
 pub const MAGIC: [u8; 8] = *b"TALLYSEG";
-/// The format version this module writes.
+/// The format version this module writes for segments whose sequences
+/// are virtual (`sequence == row id` — every segment of a never-diverged
+/// table). Byte-identical to the original golden-locked format, so
+/// tables that never retain history never see a version bump.
 pub const VERSION: u16 = 1;
+/// The trailered segment version (M4.4, issue #75): v1's exact layout,
+/// then — after the last column — the same section scheme the manifest
+/// uses: `section_count: u16`, then per section `tag: u16, length: u32,
+/// payload`. Readers skip unknown tags. Only diverged tables ever write
+/// v2 segments. Assigned trailer tags (a registry separate from the
+/// manifest's): 1 = birth sequences (see [`crate::mem::SequenceInfo`]) —
+/// a state byte (1 contiguous, 2 explicit), then for contiguous the
+/// `u64` base, for explicit the delta-of-delta-coded per-row array.
+pub const VERSION_TRAILERED: u16 = 2;
+
+const TRAILER_SEQUENCE: u16 = 1;
+const SEQUENCE_CONTIGUOUS: u8 = 1;
+const SEQUENCE_EXPLICIT: u8 = 2;
 
 /// Why segment bytes could not be decoded.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -160,12 +177,18 @@ fn crc32c(bytes: &[u8]) -> u32 {
 const CRC_OFFSET: usize = 12;
 const PAYLOAD_OFFSET: usize = 16;
 
-/// Encodes a segment into its v1 bytes.
+/// Encodes a segment: byte-identical v1 while its sequences are virtual
+/// (the golden-locked layout every never-diverged table keeps forever),
+/// the trailered v2 once sequence data must be carried.
 pub fn encode_segment(segment: &Segment) -> Vec<u8> {
+    let version = match segment.sequence_info() {
+        SequenceInfo::RowIds => VERSION,
+        _ => VERSION_TRAILERED,
+    };
     let batch = segment.batch();
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
     out.extend_from_slice(&segment.base_row_id().to_le_bytes());
@@ -189,6 +212,30 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
             is_ordering_key,
             segment.zone_map(index),
         );
+    }
+    if version == VERSION_TRAILERED {
+        let payload = match segment.sequence_info() {
+            SequenceInfo::RowIds => unreachable!("virtual segments encode as v1"),
+            SequenceInfo::Contiguous { base } => {
+                let mut payload = Vec::with_capacity(9);
+                payload.push(SEQUENCE_CONTIGUOUS);
+                payload.extend_from_slice(&base.to_le_bytes());
+                payload
+            }
+            SequenceInfo::Explicit(values) => {
+                // Sequences are u64; the codec is i64 with wrapping
+                // arithmetic throughout, so the bit-preserving cast
+                // round-trips every value exactly.
+                let signed: Vec<i64> = values.iter().map(|&value| value as i64).collect();
+                let mut payload = encode_delta_of_delta(&signed);
+                payload.insert(0, SEQUENCE_EXPLICIT);
+                payload
+            }
+        };
+        out.extend_from_slice(&1u16.to_le_bytes()); // section count
+        out.extend_from_slice(&TRAILER_SEQUENCE.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&payload);
     }
     let crc = crc32c(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -358,14 +405,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decodes v1 segment bytes, verifying magic, version, and checksum.
+/// Decodes segment bytes (v1 or trailered v2), verifying magic,
+/// version, and checksum.
 pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != MAGIC {
         return Err(FormatError::BadMagic);
     }
     let version = reader.u16()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_TRAILERED {
         return Err(FormatError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -399,10 +447,29 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         columns.push(column);
         zone_maps.push(zone_map);
     }
+    let mut sequence = SequenceInfo::RowIds;
+    if version == VERSION_TRAILERED {
+        let section_count = reader.u16()?;
+        for _ in 0..section_count {
+            let tag = reader.u16()?;
+            let length = reader.u32()? as usize;
+            let payload = reader.take(length)?;
+            // Unknown trailer tags are skipped whole — the same
+            // forward-compatibility contract as manifest sections.
+            if tag == TRAILER_SEQUENCE {
+                sequence = decode_sequence_section(payload, row_count)?;
+            }
+        }
+    }
     if reader.position != bytes.len() {
         return Err(FormatError::Corrupt(format!(
-            "{} bytes remain after the last column",
-            bytes.len() - reader.position
+            "{} bytes remain after the last {}",
+            bytes.len() - reader.position,
+            if version == VERSION_TRAILERED {
+                "trailer section"
+            } else {
+                "column"
+            }
         )));
     }
     let batch = RecordBatch::new(Schema::new(fields), columns);
@@ -412,7 +479,32 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         ordered,
         base_row_id,
         zone_maps,
+        sequence,
     ))
+}
+
+/// Decodes a v2 segment's sequence trailer section.
+fn decode_sequence_section(payload: &[u8], rows: usize) -> Result<SequenceInfo, FormatError> {
+    match payload.first() {
+        Some(&SEQUENCE_CONTIGUOUS) => {
+            let base: [u8; 8] = payload[1..]
+                .try_into()
+                .map_err(|_| FormatError::Corrupt("contiguous sequence base is 8 bytes".into()))?;
+            Ok(SequenceInfo::Contiguous {
+                base: u64::from_le_bytes(base),
+            })
+        }
+        Some(&SEQUENCE_EXPLICIT) => {
+            let signed = decode_delta_of_delta(&payload[1..], rows)?;
+            Ok(SequenceInfo::Explicit(
+                signed.into_iter().map(|value| value as u64).collect(),
+            ))
+        }
+        Some(&state) => Err(FormatError::Corrupt(format!(
+            "unknown sequence state byte {state}"
+        ))),
+        None => Err(FormatError::Corrupt("empty sequence section".into())),
+    }
 }
 
 /// First bytes of every manifest file.
@@ -426,17 +518,22 @@ pub const MANIFEST_VERSION: u16 = 1;
 /// per section. Readers skip unknown tags, so sections fill in over
 /// time without another version bump. Assigned tags: 1 = per-segment
 /// zone maps (reserved for the segment-lazy work, never yet written),
-/// 2 = knowledge state, 3 = history segments.
+/// 2 = knowledge state (the `u64` ingest-sequence watermark — see
+/// [`ManifestSections::next_sequence`]), 3 = history segments.
 pub const MANIFEST_VERSION_SECTIONED: u16 = 2;
 
 /// Manifest section content beyond the v1 core. `Default` is the
 /// empty state, which encodes as plain v1.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ManifestSections {
-    /// Whether this table has ever diverged — run a retaining
-    /// compaction that broke sequence == row id. Once true, segments
-    /// written by compaction carry materialized sequence trailers.
-    pub diverged: bool,
+    /// The ingest-sequence watermark: the sequence the next appended
+    /// row will receive. `Some` exactly when the table has diverged —
+    /// run a retaining compaction that broke sequence == row id — and
+    /// the counter must advance independently of reassigned row ids
+    /// (ids compact downward; birth sequences never reuse). `None`
+    /// while virtual: the next sequence *is* the next row id, derived,
+    /// nothing stored.
+    pub next_sequence: Option<u64>,
     /// Segments holding superseded row versions: excluded from
     /// latest-knowledge scans, entered only under `ASOF`.
     pub history: Vec<String>,
@@ -445,7 +542,12 @@ pub struct ManifestSections {
 impl ManifestSections {
     /// Whether encoding needs the sectioned version at all.
     pub fn is_empty(&self) -> bool {
-        !self.diverged && self.history.is_empty()
+        self.next_sequence.is_none() && self.history.is_empty()
+    }
+
+    /// Whether the table has ever diverged (sequence != row id).
+    pub fn diverged(&self) -> bool {
+        self.next_sequence.is_some()
     }
 }
 
@@ -506,8 +608,8 @@ pub fn encode_manifest(
     }
     if version == MANIFEST_VERSION_SECTIONED {
         let mut section_bytes: Vec<(u16, Vec<u8>)> = Vec::new();
-        if sections.diverged {
-            section_bytes.push((SECTION_KNOWLEDGE, vec![1u8]));
+        if let Some(next_sequence) = sections.next_sequence {
+            section_bytes.push((SECTION_KNOWLEDGE, next_sequence.to_le_bytes().to_vec()));
         }
         if !sections.history.is_empty() {
             let mut payload = Vec::new();
@@ -588,12 +690,10 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
             let payload = reader.take(length)?;
             match tag {
                 SECTION_KNOWLEDGE => {
-                    if payload.len() != 1 {
-                        return Err(FormatError::Corrupt(
-                            "knowledge section is one byte".to_owned(),
-                        ));
-                    }
-                    sections.diverged = payload[0] != 0;
+                    let watermark: [u8; 8] = payload.try_into().map_err(|_| {
+                        FormatError::Corrupt("knowledge section is 8 bytes".to_owned())
+                    })?;
+                    sections.next_sequence = Some(u64::from_le_bytes(watermark));
                 }
                 SECTION_HISTORY => {
                     let mut inner = Reader {

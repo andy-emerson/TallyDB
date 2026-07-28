@@ -311,6 +311,7 @@ impl WriteBuffer {
             ordered: self.ordered,
             base_row_id,
             zone_maps,
+            sequence: SequenceInfo::RowIds,
         })
     }
 
@@ -487,6 +488,34 @@ pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
     }
 }
 
+/// Where a segment's rows' ingest sequences live (the corrections
+/// design, issue #75). Every row has a **birth sequence** — the value of
+/// the table's ingest counter when it arrived, the coordinate `AS OF`
+/// queries address. The three states are the three lives of a segment:
+///
+/// - [`SequenceInfo::RowIds`] — the virtual state: sequence == row id
+///   for every row, so nothing is stored. Every segment of a table that
+///   has never diverged (run a retaining compaction) is here.
+/// - [`SequenceInfo::Contiguous`] — post-divergence fresh segments:
+///   appends still receive consecutive sequences, so one base suffices,
+///   but row ids no longer match (compaction reassigned them downward).
+/// - [`SequenceInfo::Explicit`] — compacted or history segments, where
+///   the (ordering-key, sequence) merge order makes sequences
+///   non-contiguous: one value per row.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum SequenceInfo {
+    /// Sequence == row id; zero bytes stored (the virtual state).
+    #[default]
+    RowIds,
+    /// Row `i` carries sequence `base + i`.
+    Contiguous {
+        /// The first row's sequence.
+        base: u64,
+    },
+    /// One birth sequence per row (delta-of-delta coded on disk).
+    Explicit(Vec<u64>),
+}
+
 /// An immutable, in-memory segment: a record batch plus what storage knows
 /// about it.
 pub struct Segment {
@@ -495,6 +524,7 @@ pub struct Segment {
     ordered: bool,
     base_row_id: u64,
     zone_maps: Vec<Option<ZoneMap>>,
+    sequence: SequenceInfo,
 }
 
 impl Segment {
@@ -506,6 +536,7 @@ impl Segment {
         ordered: bool,
         base_row_id: u64,
         zone_maps: Vec<Option<ZoneMap>>,
+        sequence: SequenceInfo,
     ) -> Segment {
         Segment {
             batch,
@@ -513,6 +544,7 @@ impl Segment {
             ordered,
             base_row_id,
             zone_maps,
+            sequence,
         }
     }
 
@@ -535,6 +567,7 @@ impl Segment {
             ordered,
             base_row_id: 0,
             zone_maps,
+            sequence: SequenceInfo::RowIds,
         }
     }
 
@@ -561,6 +594,37 @@ impl Segment {
     /// wins" resolution address rows by these ids, never by key tuples.
     pub fn base_row_id(&self) -> u64 {
         self.base_row_id
+    }
+
+    /// Where this segment's birth sequences live (see [`SequenceInfo`]).
+    /// Freshly frozen segments are virtual ([`SequenceInfo::RowIds`]);
+    /// anything else is attached by [`Segment::with_sequence`].
+    pub fn sequence_info(&self) -> &SequenceInfo {
+        &self.sequence
+    }
+
+    /// The birth sequence of the row at `offset` within this segment.
+    pub fn sequence_at(&self, offset: usize) -> u64 {
+        match &self.sequence {
+            SequenceInfo::RowIds => self.base_row_id + offset as u64,
+            SequenceInfo::Contiguous { base } => base + offset as u64,
+            SequenceInfo::Explicit(values) => values[offset],
+        }
+    }
+
+    /// Attaches sequence data — the doorway a retaining compaction (and
+    /// post-divergence appends) use to record where sequences diverged
+    /// from row ids. An explicit array must carry one value per row.
+    pub fn with_sequence(mut self, sequence: SequenceInfo) -> Segment {
+        if let SequenceInfo::Explicit(values) = &sequence {
+            assert_eq!(
+                values.len(),
+                self.batch.num_rows(),
+                "an explicit sequence array carries one value per row"
+            );
+        }
+        self.sequence = sequence;
+        self
     }
 
     /// First and last values of the ordering key, or `None` if the
