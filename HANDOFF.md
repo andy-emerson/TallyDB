@@ -66,9 +66,13 @@ constraints change only when the Human says so.
   now diverges a virtual table at the mutation itself); #63 closed
   (Miri job in CI over arrow-lite's unit suite); review-noted
   redundancies factored (shared field codec, one assemble core,
-  single manifest decode, WAL surface pub(crate)); #69 still blocked
-  on network policy (lua.org 403; unblock paths recorded on the
-  issue — Human-side fetch or policy change). NEXT: **the Lua trial**
+  single manifest decode, WAL surface pub(crate)); #69 closed — the
+  official Lua 5.4.7 suite vendored with provenance (via the Go
+  module proxy, checksum-database-verified, vendored sources proven
+  byte-identical to the tagged tree) and running in CI with ltests
+  torture instrumentation (`lua-suite` job; full suite passes). The
+  Human's fork andy-emerson/lua served as an attempt vehicle and is
+  no longer needed. NEXT: **the Lua trial**
   (Agent brings the evidence brief; the Human alone rules) → M4.6
   SQL-in-Lua (#70) only on a pass.
 - **Open decision (Human closes):** the sequence column's SQL
