@@ -30,9 +30,11 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
-use arrow_lite::ColumnType;
+use arrow_lite::{Bitmap, ColumnType};
 use compute_linalg::{LinalgBackend, RustLinalg};
-use compute_lua::{Chunk, ColumnView, HostFunction, LogSink, LuaState, ReturnType, ScalarValue};
+use compute_lua::{
+    Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
+};
 use query_lite::{Registry, WindowAggregate};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -230,6 +232,121 @@ impl WindowAggregate for LuaWindow {
     }
 }
 
+/// An application-registered Lua *column* kernel behind the
+/// [`query_lite::ColumnFunction`] seam — the vectorized whole-column
+/// shape (#53): the arguments bind as whole-column views, the script
+/// fills the preallocated `out` column, and the interpreter is entered
+/// **once per view**, never per row. This is what makes a scripted
+/// per-row function viable in bulk: the loops the script writes run
+/// over columns already in memory, and the boundary is crossed once.
+pub(crate) struct LuaColumn {
+    /// The interpreter and its compiled kernel, serialized exactly as
+    /// [`LuaWindow`]'s (see the module's concurrency note).
+    state: Mutex<(LuaState, Chunk)>,
+    /// Positional argument names, bound as globals for each call.
+    parameters: Vec<CString>,
+}
+
+impl LuaColumn {
+    /// Builds the adapter with [`LuaWindow::new`]'s validation posture:
+    /// everything that can fail confusingly at query time fails loudly
+    /// here instead. The output is nullable `f64` (slots the script
+    /// never writes come back NULL); exact-`i64` and key outputs are
+    /// deferred surface.
+    pub(crate) fn new(
+        parameters: &[&str],
+        chunk: &str,
+        log_sink: Option<Arc<dyn LogSink + Sync>>,
+        ops: &Registry,
+    ) -> Result<LuaColumn, String> {
+        if parameters.is_empty() {
+            return Err("a lua column function takes at least one column argument".to_owned());
+        }
+        let mut names: Vec<CString> = Vec::with_capacity(parameters.len());
+        for &parameter in parameters {
+            if !is_identifier(parameter) {
+                return Err(format!(
+                    "parameter '{parameter}' is not a usable Lua identifier"
+                ));
+            }
+            if RESERVED.contains(&parameter) || parameter == "out" {
+                return Err(format!(
+                    "parameter '{parameter}' is reserved in Lua kernels"
+                ));
+            }
+            let name = CString::new(parameter).expect("identifier has no interior NUL");
+            if names.contains(&name) {
+                return Err(format!("parameter '{parameter}' appears twice"));
+            }
+            names.push(name);
+        }
+        let mut state = LuaState::new()?;
+        install_vocabulary(&mut state, ops)?;
+        if let Some(sink) = log_sink {
+            state.set_log_sink(Box::new(SharedSink(sink)));
+        }
+        let compiled = state.compile(chunk)?;
+        Ok(LuaColumn {
+            state: Mutex::new((state, compiled)),
+            parameters: names,
+        })
+    }
+}
+
+impl query_lite::ColumnFunction for LuaColumn {
+    fn arity(&self) -> usize {
+        self.parameters.len()
+    }
+
+    fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "lua column interpreter poisoned".to_owned())?;
+        let (state, chunk) = &mut *guard;
+        let rows = args.first().map_or(0, |(values, _)| values.len());
+        // NULL crosses as the sentinel (F1), carried by a validity
+        // bitmap built only where nulls actually exist.
+        let bitmaps: Vec<Option<Bitmap>> = args
+            .iter()
+            .map(|(_, validity)| {
+                if validity.iter().all(|&valid| valid) {
+                    None
+                } else {
+                    Some(Bitmap::from_bools(validity.iter().copied()))
+                }
+            })
+            .collect();
+        let inputs: Vec<(&CStr, ColumnView<'_>)> = self
+            .parameters
+            .iter()
+            .zip(args.iter().zip(&bitmaps))
+            .map(|(name, (&(values, _), bitmap))| {
+                (
+                    name.as_c_str(),
+                    ColumnView::F64 {
+                        values,
+                        validity: bitmap.as_ref(),
+                    },
+                )
+            })
+            .collect();
+        let mut values = vec![0.0f64; rows];
+        let mut validity = Bitmap::from_bools(std::iter::repeat_n(false, rows));
+        state.eval_column(
+            chunk,
+            &inputs,
+            OutputColumn::F64 {
+                values: &mut values,
+                validity: &mut validity,
+            },
+        )?;
+        Ok((0..rows)
+            .map(|row| validity.get(row).then(|| values[row]))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The B evidence: a Lua kernel run end-to-end through SQL matches a
@@ -313,6 +430,63 @@ mod tests {
         assert_eq!(messages.len(), 3, "one log per window");
         assert_eq!(messages[0], "rows\t1");
         assert_eq!(messages[1], "rows\t2");
+    }
+
+    #[test]
+    fn a_lua_scalar_kernel_runs_whole_columns_per_call() {
+        // The vectorized shape (#53): one interpreter entry per view,
+        // NULL in as the sentinel, NULL out by never writing the slot.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 3).unwrap();
+        for i in 0..7i64 {
+            let x = if i == 2 {
+                RowValue::Null
+            } else {
+                RowValue::F64(i as f64)
+            };
+            table.append(&[RowValue::I64(i), x]).unwrap();
+        }
+        table
+            .register_lua_scalar(
+                "double_or_skip",
+                &["x"],
+                "for i = 1, #x do\n\
+                 if x[i] ~= NULL then out[i] = 2 * x[i] end\n\
+                 end",
+            )
+            .unwrap();
+        let output = table.query("SELECT double_or_skip(x) AS d FROM t").unwrap();
+        let results: Vec<Option<f64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::F64(column)) = &batch.columns()[0] else {
+                    panic!("expected f64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                Some(0.0),
+                Some(2.0),
+                None, // NULL in, slot never written, NULL out
+                Some(6.0),
+                Some(8.0),
+                Some(10.0),
+                Some(12.0),
+            ]
+        );
     }
 
     #[test]

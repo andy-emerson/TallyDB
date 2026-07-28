@@ -236,6 +236,22 @@ impl Console {
                     "window function '{name}' registered"
                 )))
             }
+            "luascalar" => {
+                let (name, parameters, chunk) = parse_lua_command(argument)?;
+                let parameters: Vec<&str> = parameters.iter().map(String::as_str).collect();
+                let tables = self.tables();
+                if tables.is_empty() {
+                    return Err("no tables to register on yet".to_owned());
+                }
+                for table in &tables {
+                    self.database
+                        .register_lua_scalar(table, &name, &parameters, &chunk)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(Outcome::Note(format!(
+                    "scalar function '{name}' registered"
+                )))
+            }
             other => Err(format!("unknown command '.{other}' (try .help)")),
         }
     }
@@ -498,6 +514,10 @@ Commands:
   .lua NAME(PARAMS) CHUNK   register a Lua window function (f64 result)
                             on every open table; re-run it after
                             CREATE TABLE to cover the new table
+  .luascalar NAME(PARAMS) CHUNK
+                            register a Lua per-row function: whole
+                            columns bind to PARAMS, the script fills
+                            out[i] (unwritten slots return NULL)
   .quit                     leave";
 
 #[cfg(test)]

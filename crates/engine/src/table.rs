@@ -29,8 +29,9 @@ use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schem
 #[cfg(feature = "lua")]
 use compute_lua::LogSink;
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
-    QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
+    evaluate_predicate, execute, parse_statement, plan, recompute_frames, ColumnFunction,
+    DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan,
+    WindowAggregate,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -729,6 +730,71 @@ impl Table {
         kernel: impl WindowAggregate + 'static,
     ) -> Result<(), EngineError> {
         self.register_kernel(name, Arc::new(kernel))
+    }
+
+    /// Registers a native **column function** — SQL's per-row (scalar)
+    /// extension slot, evaluated a whole column at a time: implement
+    /// [`ColumnFunction`], register it, and `SELECT f(x, y) FROM t`
+    /// calls it once per view over dense argument columns. Same naming
+    /// and replacement rules as [`Table::register_window`]; the output
+    /// is a nullable `f64` column.
+    pub fn register_column_function(
+        &mut self,
+        name: &str,
+        function: impl ColumnFunction + 'static,
+    ) -> Result<(), EngineError> {
+        self.register_column_kernel(name, Arc::new(function))
+    }
+
+    #[cfg(feature = "lua")]
+    /// Registers a Lua **column** kernel as a SQL scalar function —
+    /// the vectorized whole-column shape (#53). The parameters bind as
+    /// whole-column views (NULL is the `NULL` sentinel), the script
+    /// fills the preallocated `out` column (`out[i] = ...`; slots never
+    /// written come back NULL), and the interpreter is entered **once
+    /// per view**, never per row — which is what makes a scripted
+    /// per-row function viable in bulk. The compose-don't-loop idiom
+    /// still applies inside: prefer the registered vocabulary over
+    /// element loops where one fits.
+    ///
+    /// ```text
+    /// .luascalar spread(hi, lo) for i = 1, #hi do out[i] = hi[i] - lo[i] end
+    /// SELECT spread(hi, lo) FROM quotes
+    /// ```
+    pub fn register_lua_scalar(
+        &mut self,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+    ) -> Result<(), EngineError> {
+        if !is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let ops = self.current_registry();
+        let column =
+            crate::script::LuaColumn::new(parameters, chunk, self.lua_log_sink.clone(), &ops)
+                .map_err(EngineError::Script)?;
+        self.register_column_kernel(name, Arc::new(column))
+    }
+
+    /// [`Table::register_kernel`]'s column-function twin.
+    fn register_column_kernel(
+        &mut self,
+        name: &str,
+        function: Arc<dyn ColumnFunction>,
+    ) -> Result<(), EngineError> {
+        if !is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let mut guard = self.registry.lock().expect("registry lock poisoned");
+        let mut next = (**guard).clone();
+        next.register_column(name, function);
+        *guard = Arc::new(next);
+        Ok(())
     }
 
     /// The one registration mechanism both extension paths share: an
@@ -1948,7 +2014,7 @@ mod snapshot_concurrency {
     //! the generation swap — unchanged); one races freely as a smoke
     //! test; one pins the Send/Sync story at compile time.
 
-    use super::tests::{linear_row, m1_schema};
+    use super::tests::{flatten, linear_row, m1_schema};
     use super::*;
 
     /// COUNT over the snapshot — one number summarizing what it sees.
@@ -2033,6 +2099,50 @@ mod snapshot_concurrency {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TableReader>();
         assert_send_sync::<TableSnapshot>();
+    }
+
+    #[test]
+    fn a_registered_column_function_runs_in_projection() {
+        // The native half of the vectorized scalar slot (#53): one
+        // call per view, dense arguments, NULL decided by the kernel.
+        struct SpreadPct;
+        impl ColumnFunction for SpreadPct {
+            fn arity(&self) -> usize {
+                2
+            }
+            fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+                let (x, xv) = args[0];
+                let (y, yv) = args[1];
+                Ok((0..x.len())
+                    .map(|i| (xv[i] && yv[i] && y[i] != 0.0).then(|| (x[i] - y[i]) / y[i]))
+                    .collect())
+            }
+        }
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        for i in 0..6i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        table
+            .register_column_function("spread_pct", SpreadPct)
+            .unwrap();
+        // Composes with expression arguments through the same machinery.
+        let output = table
+            .query("SELECT spread_pct(x + 1.0, x + 1.0) AS s FROM t WHERE ts >= 1")
+            .unwrap();
+        let values = flatten(&output, 0);
+        assert_eq!(values, vec![Some(0.0); 5]);
+        // Unknown names stay loud, at execution, by name.
+        let error = table
+            .query("SELECT nope(x) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nope"), "{error}");
+        // Wrong arity is loud too.
+        let error = table
+            .query("SELECT spread_pct(x) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("argument"), "{error}");
     }
 
     #[test]

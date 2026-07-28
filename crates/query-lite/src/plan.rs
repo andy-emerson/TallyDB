@@ -193,6 +193,16 @@ pub enum ScalarExpr {
         /// The ELSE arm.
         otherwise: Option<Box<ScalarExpr>>,
     },
+    /// A call to an embedder-registered column function (the vectorized
+    /// per-row extension slot, #53). The name resolves against the
+    /// registry at execution — a name registered on one table is loudly
+    /// unknown on another — so plan time carries it verbatim.
+    Registered {
+        /// The registered name, lower-cased.
+        name: String,
+        /// Arguments, in call order — any scalar expressions.
+        args: Vec<ScalarExpr>,
+    },
 }
 
 /// A standard SQL aggregate function.
@@ -1442,9 +1452,6 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                     "a window call inside a scalar expression".to_owned(),
                 ));
             }
-            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
-                return Err(QueryError::Unsupported(format!("scalar function '{name}'")));
-            };
             let ast::FunctionArguments::List(list) = &function.args else {
                 return Err(QueryError::Unsupported(format!(
                     "{name} without an argument list"
@@ -1459,6 +1466,18 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                 };
                 args.push(lower_scalar_expr(expr)?);
             }
+            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
+                if AggFunction::from_name(&name).is_some() {
+                    return Err(QueryError::Unsupported(format!(
+                        "aggregate {name} inside a scalar expression"
+                    )));
+                }
+                // Not a built-in: an embedder-registered column
+                // function, resolved against the registry at execution
+                // (which is where the registry lives) — unknown names
+                // stay loud, just later.
+                return Ok(ScalarExpr::Registered { name, args });
+            };
             if args.len() != arity {
                 return Err(QueryError::Unsupported(format!(
                     "{name} takes {arity} argument(s), got {}",
@@ -1726,7 +1745,9 @@ mod tests {
                 "plain key columns",
             ),
             ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
-            ("SELECT nope_agg(x) FROM t", "nope_agg"),
+            // (an unknown plain call like nope_agg(x) now lowers to a
+            // Registered column function and is refused by name at
+            // execution, where the registry lives — tested in engine)
             ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
             (
                 "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",

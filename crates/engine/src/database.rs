@@ -183,6 +183,22 @@ impl Database {
             .register_lua_window(name, parameters, chunk, output)
     }
 
+    /// Registers a Lua column kernel as a SQL scalar function on the
+    /// named table (see [`Table::register_lua_scalar`]).
+    #[cfg(feature = "lua")]
+    pub fn register_lua_scalar(
+        &mut self,
+        table: &str,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+    ) -> Result<(), EngineError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
+            .register_lua_scalar(name, parameters, chunk)
+    }
+
     /// Compacts the named table (see [`Table::compact`]).
     pub fn compact(&mut self, table: &str) -> Result<(), EngineError> {
         self.tables

@@ -94,10 +94,31 @@ pub trait WindowAggregate: Send + Sync {
     }
 }
 
-/// The window-aggregate registry: SQL name → implementation.
+/// An embedder-registered per-row function (SQL calls these *scalar*
+/// functions), evaluated a whole column at a time — one call per view,
+/// vectorized, so an interpreter-backed implementation pays its entry
+/// cost once per batch instead of once per row. Appears in projection
+/// as an ordinary call: `SELECT f(x, y) FROM t`.
+pub trait ColumnFunction: Send + Sync {
+    /// How many arguments a call must pass.
+    fn arity(&self) -> usize;
+    /// One call per view: each argument arrives dense over the live
+    /// rows as `(values, validity)` (a `false` slot is SQL NULL; its
+    /// value is unspecified). Returns one result per row — `None` is
+    /// NULL. The output column is nullable `f64`; exact-`i64` and key
+    /// outputs are deferred surface (#40's exactness rules would bind
+    /// them).
+    fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String>;
+}
+
+/// The function registry: SQL name → implementation, window aggregates
+/// and column functions in separate namespaces (SQL resolves them from
+/// different positions — `OVER` calls the first, plain projection
+/// calls the second).
 #[derive(Clone, Default)]
 pub struct Registry {
     aggregates: HashMap<String, Arc<dyn WindowAggregate>>,
+    columns: HashMap<String, Arc<dyn ColumnFunction>>,
 }
 
 impl Registry {
@@ -111,6 +132,12 @@ impl Registry {
         self.aggregates.insert(name.to_lowercase(), aggregate);
     }
 
+    /// Registers `function` as a column function under `name`
+    /// (lower-cased; last one wins — the promotion path).
+    pub fn register_column(&mut self, name: &str, function: Arc<dyn ColumnFunction>) {
+        self.columns.insert(name.to_lowercase(), function);
+    }
+
     /// Every registered name and its implementation, in no particular
     /// order — what lets an embedding expose the whole vocabulary to a
     /// scripting layer (anything SQL can call, a script can call).
@@ -118,6 +145,10 @@ impl Registry {
         self.aggregates
             .iter()
             .map(|(name, aggregate)| (name.as_str(), aggregate))
+    }
+
+    fn column(&self, name: &str) -> Option<&Arc<dyn ColumnFunction>> {
+        self.columns.get(name)
     }
 
     fn get(&self, name: &str) -> Option<&Arc<dyn WindowAggregate>> {
@@ -548,7 +579,9 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
-            PlanItem::Computed { expr, name } => computed_column(schema, views, expr, name)?,
+            PlanItem::Computed { expr, name } => {
+                computed_column(schema, views, expr, name, registry)?
+            }
             PlanItem::WindowAgg {
                 function,
                 args,
@@ -619,10 +652,11 @@ fn computed_column(
     views: &[&SegmentView],
     expr: &ScalarExpr,
     name: &str,
+    registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
     let mut columns = Vec::with_capacity(views.len());
     for view in views {
-        let (values, validity) = evaluate_scalar(expr, schema, view)?;
+        let (values, validity) = evaluate_scalar(expr, schema, view, registry)?;
         columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
             values, validity,
         ))));
@@ -636,6 +670,7 @@ fn evaluate_scalar(
     expr: &ScalarExpr,
     schema: &Schema,
     view: &SegmentView,
+    registry: &Registry,
 ) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
     let rows = view.live_rows();
     match expr {
@@ -664,15 +699,15 @@ fn evaluate_scalar(
         }
         ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
         ScalarExpr::Negate(inner) => {
-            let (mut values, validity) = evaluate_scalar(inner, schema, view)?;
+            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry)?;
             for value in &mut values {
                 *value = -*value;
             }
             Ok((values, validity))
         }
         ScalarExpr::Binary { op, left, right } => {
-            let (lv, lval) = evaluate_scalar(left, schema, view)?;
-            let (rv, rval) = evaluate_scalar(right, schema, view)?;
+            let (lv, lval) = evaluate_scalar(left, schema, view, registry)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view, registry)?;
             let values = lv
                 .iter()
                 .zip(&rv)
@@ -690,7 +725,7 @@ fn evaluate_scalar(
         ScalarExpr::Call { function, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
             }
             let mut values = Vec::with_capacity(rows);
             let mut validity = Vec::with_capacity(rows);
@@ -719,11 +754,11 @@ fn evaluate_scalar(
             let mut arms = Vec::with_capacity(whens.len());
             for (predicate, arm) in whens {
                 conditions.push(evaluate_predicate(predicate, schema, view)?);
-                arms.push(evaluate_scalar(arm, schema, view)?);
+                arms.push(evaluate_scalar(arm, schema, view, registry)?);
             }
             let fallback = otherwise
                 .as_ref()
-                .map(|expr| evaluate_scalar(expr, schema, view))
+                .map(|expr| evaluate_scalar(expr, schema, view, registry))
                 .transpose()?;
             let mut values = vec![0.0f64; rows];
             let mut validity = vec![false; rows];
@@ -741,6 +776,47 @@ fn evaluate_scalar(
                 });
                 values[out] = value;
                 validity[out] = valid;
+            }
+            Ok((values, validity))
+        }
+        ScalarExpr::Registered { name, args } => {
+            let Some(function) = registry.column(name) else {
+                return Err(QueryError::Unsupported(format!(
+                    "no registered column function '{name}' on this table \
+                     (a window function needs OVER; register column \
+                     functions through the table handle)"
+                )));
+            };
+            if args.len() != function.arity() {
+                return Err(QueryError::TypeError(format!(
+                    "{name} takes {} argument(s), got {}",
+                    function.arity(),
+                    args.len()
+                )));
+            }
+            // Arguments evaluate through this same machinery, so any
+            // scalar expression composes into a registered call; the
+            // kernel then runs once for the whole view.
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+            }
+            let dense: Vec<(&[f64], &[bool])> = evaluated
+                .iter()
+                .map(|(values, validity)| (values.as_slice(), validity.as_slice()))
+                .collect();
+            let results = function.evaluate(&dense).map_err(QueryError::Compute)?;
+            if results.len() != rows {
+                return Err(QueryError::Compute(format!(
+                    "{name} returned {} results for {rows} rows",
+                    results.len()
+                )));
+            }
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for result in results {
+                values.push(result.unwrap_or(0.0));
+                validity.push(result.is_some());
             }
             Ok((values, validity))
         }
