@@ -157,6 +157,18 @@ surprises the people who built the tool. The invariants are the boundary,
 not our imagination. The two surfaces share this *method* and differ only
 in *which* invariants apply.
 
+**The moat test (adopted from external review, ruled 2026-07-28).** The
+inclusion principle is a negative filter: it says what is *admissible*.
+It cannot order the backlog. The companion positive filter does: **build
+first the things the three assumptions make cheaper for this engine than
+for a general database.** Of each admissible-but-unbuilt candidate, ask
+*"does DuckDB have to work harder than us here?"* If yes, building it
+cashes a dividend the cuts already paid for — ordered ingest turning a
+hash aggregate into a streaming sweep, contiguity turning a partition
+into a slice. If no, it is generality wearing a feature's clothes, and
+it spends the very thing the cuts purchased. The inclusion principle
+decides *in or out*; the moat test decides *what's next*.
+
 **SQL is bounded by** (a) numeric-or-key — no non-numeric, non-key column
 type — and (b) no general-purpose cost-based optimizer.
 
@@ -399,22 +411,30 @@ threat model, not before. Local security posture: an OS file lock
 (released by the OS on death — no stale locks) admits one process per
 directory; table names stay identifiers (they become directory names).
 
-**The roadmap beyond native GA (recorded 2026-07-27; three deployment
-models, one engine).** M3 ships *embed in your application* plus the
-console. M4 (WASM parity) adds *embed in a browser*: the compute stack
-already compiles for wasm32; the remaining work is a browser
-`StorageBackend` (OPFS/IndexedDB behind the existing trait — written
-knowing an HTTP-fetch sibling comes later), the JS bindings, and
-`lua.wasm`. M5 adds *embed in a server*: a Servette-shaped served
-product and a workbench UI, both **separate artifacts embedding the
-engine** (the never-a-server guardrail's sanctioned form), the console
-module reused as the server's shell. The load-bearing observation for
-M5's sync story: **segments are immutable, self-describing, CRC'd
-objects committed by a generation manifest — the storage format is
-already the replication format.** A read-only browser or client
-replica fetches the manifest and pulls segments lazily (zone maps
-prune the fetch), verified by the same checks reopen runs; the single
-writer stays wherever the WAL is. Nothing in M4 may foreclose this.
+**The roadmap beyond native GA (recorded 2026-07-27; reordered by
+ruling 2026-07-28 — the desk before the browser).** M3 ships *embed in
+your application* plus the console. **M4 (desk adoption)** builds what
+the target user needs before any new deployment shape matters, chosen
+by the moat test: multi-factor curated compute (K > 2 — the recorded
+LAPACK-class-returns trigger firing, served by faer), the ordered-axis
+dividends (cross-sectional partitioning, time bucketing, `LAG`/`LEAD`,
+`RANGE` frames, `ASOF` #65), and reach (bulk Arrow ingest, a Python
+binding — distribution method open: a wheel is one form, not the
+ruling). **M5 (WASM parity)** then adds *embed in a browser*: the
+compute stack already compiles for wasm32; the remaining work is a
+browser `StorageBackend` (OPFS/IndexedDB behind the existing trait —
+written knowing an HTTP-fetch sibling comes later), the JS bindings,
+and `lua.wasm`. **M6** adds *embed in a server*: a Servette-shaped
+served product and a workbench UI, both **separate artifacts embedding
+the engine** (the never-a-server guardrail's sanctioned form), the
+console module reused as the server's shell. The load-bearing
+observation for M6's sync story: **segments are immutable,
+self-describing, CRC'd objects committed by a generation manifest —
+the storage format is already the replication format.** A read-only
+browser or client replica fetches the manifest and pulls segments
+lazily (zone maps prune the fetch), verified by the same checks reopen
+runs; the single writer stays wherever the WAL is. Nothing earlier may
+foreclose this.
 
 ## Current milestone: native only
 
