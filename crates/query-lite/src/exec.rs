@@ -753,7 +753,7 @@ fn computed_column_whole(
         ))));
     }
     let batch = RecordBatch::new(Schema::new(fields), gathered);
-    let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch(batch, 0, false)));
+    let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(batch, 0, false)));
     let reduced = synthetic.segment.batch().schema().clone();
     let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry)?;
     let mut columns = Vec::with_capacity(views.len());
@@ -784,6 +784,16 @@ fn evaluate_scalar(
             match &view.segment.batch().columns()[index] {
                 Column::Numeric(NumericData::F64(numeric)) => {
                     let raw = numeric.values().as_slice();
+                    // Bulk path: no tombstone mask means every row is
+                    // live in stored order — one memcpy, no per-row
+                    // filter loop.
+                    if view.live.is_none() {
+                        let validity = match numeric.validity() {
+                            None => vec![true; rows],
+                            Some(bitmap) => (0..rows).map(|row| bitmap.get(row)).collect(),
+                        };
+                        return Ok((raw.to_vec(), validity));
+                    }
                     let mut values = Vec::with_capacity(rows);
                     let mut validity = Vec::with_capacity(rows);
                     for row in live_rows(view) {

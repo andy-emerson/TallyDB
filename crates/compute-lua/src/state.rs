@@ -300,8 +300,52 @@ fn write_column_result(
     column: crate::vector::ColumnResult,
     output: &mut OutputColumn<'_>,
 ) -> Result<(), String> {
-    let crate::vector::ColumnResult::Elements(elements) = column else {
-        return Ok(());
+    let elements = match column {
+        crate::vector::ColumnResult::None => return Ok(()),
+        crate::vector::ColumnResult::Dense(dense) => {
+            // The bulk path: a NULL-free column copies straight in.
+            return match output {
+                OutputColumn::F64 { values, validity } => {
+                    if dense.len() != values.len() {
+                        return Err(format!(
+                            "result: returned column has {} elements for {} output rows",
+                            dense.len(),
+                            values.len()
+                        ));
+                    }
+                    values.copy_from_slice(&dense);
+                    (0..dense.len()).for_each(|offset| validity.set(offset, true));
+                    Ok(())
+                }
+                OutputColumn::I64 { values, validity } => {
+                    if dense.len() != values.len() {
+                        return Err(format!(
+                            "result: returned column has {} elements for {} output rows",
+                            dense.len(),
+                            values.len()
+                        ));
+                    }
+                    for (offset, value) in dense.into_iter().enumerate() {
+                        match crate::values::float_as_i64_exact(value) {
+                            Some(integer) => {
+                                values[offset] = integer;
+                                validity.set(offset, true);
+                            }
+                            None => {
+                                return Err(
+                                    "result: float element does not fit i64 exactly".to_owned()
+                                )
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                OutputColumn::Key { .. } => {
+                    Err("result: a returned column cannot fill a key output".to_owned())
+                }
+            };
+        }
+        crate::vector::ColumnResult::Elements(elements) => elements,
     };
     match output {
         OutputColumn::F64 { values, validity } => {
@@ -1711,6 +1755,47 @@ mod tests {
         for i in 0..500 {
             assert!(validity.get(i));
             assert_eq!(out[i].to_bits(), ((a[i] - b[i]) / b[i]).to_bits());
+        }
+    }
+
+    /// The dense fast path and the general path are the same function:
+    /// integer-valued data fed as f64 views (fast) and as i64 views
+    /// (general — the per-element exactness check keeps it off the
+    /// fast path) produces bit-identical composed and rolling results.
+    #[test]
+    fn dense_fast_path_agrees_with_the_general_path() {
+        let ints: Vec<i64> = (0..300).map(|i| (i * 7 % 250) - 125).collect();
+        let floats: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
+        let offset: Vec<f64> = (0..300).map(|i| f64::from(i) + 0.5).collect();
+        let mut state = LuaState::new().unwrap();
+        for source in [
+            "return (x + y) * x - y / (x + 200)",
+            "return rolling_sum(x, 7) + rolling_dot(x, y, 13)",
+        ] {
+            let mut run = |x: ColumnView<'_>| -> Vec<f64> {
+                let mut out = vec![0.0f64; 300];
+                let mut validity = Bitmap::new_unset(300);
+                eval_col(
+                    &mut state,
+                    source,
+                    &[(c"x", x), (c"y", f64s(&offset))],
+                    OutputColumn::F64 {
+                        values: &mut out,
+                        validity: &mut validity,
+                    },
+                )
+                .unwrap();
+                assert_eq!(validity.count_set(), 300);
+                out
+            };
+            let fast = run(f64s(&floats));
+            let general = run(ColumnView::I64 {
+                values: &ints,
+                validity: None,
+            });
+            for (a, b) in fast.iter().zip(&general) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
         }
     }
 

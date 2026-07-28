@@ -262,6 +262,49 @@ unsafe fn common_length(
     }
 }
 
+/// A dense `f64` source: a raw slice or a broadcast scalar. The fast
+/// paths dispatch on this — no per-element validity or exactness
+/// machinery, so the loops carry no raise points and auto-vectorize.
+#[derive(Clone, Copy)]
+enum DenseF64 {
+    Slice(*const f64),
+    Scalar(f64),
+}
+
+impl DenseF64 {
+    /// # Safety
+    /// For `Slice`, `offset` must be in bounds of the source.
+    unsafe fn at(self, offset: usize) -> f64 {
+        match self {
+            DenseF64::Slice(values) => unsafe { *values.add(offset) },
+            DenseF64::Scalar(value) => value,
+        }
+    }
+}
+
+/// Resolves an operand as a dense `f64` source if it is one: a plain
+/// number, an `f64` view with no NULLs, or an all-valid vector. `i64`
+/// views never qualify — their per-element exactness check can raise,
+/// which the fast paths must not.
+unsafe fn dense_f64(operand: Operand) -> Option<DenseF64> {
+    unsafe {
+        match operand {
+            Operand::Number(value) => Some(DenseF64::Scalar(value)),
+            Operand::F64View {
+                values,
+                validity,
+                len,
+            } => (validity.is_null() || (*validity).count_set() == len)
+                .then_some(DenseF64::Slice(values)),
+            Operand::Vector(vector) => std::slice::from_raw_parts(vector.validity, vector.len)
+                .iter()
+                .all(|&valid| valid != 0)
+                .then_some(DenseF64::Slice(vector.values)),
+            Operand::I64View { .. } | Operand::Null => None,
+        }
+    }
+}
+
 const OP_ADD: i64 = 1;
 const OP_SUB: i64 = 2;
 const OP_MUL: i64 = 3;
@@ -277,6 +320,18 @@ unsafe extern "C" fn vector_binary(state: *mut ffi::lua_State) -> c_int {
         let Ok(len) = common_length(state, lhs, rhs) else {
             return 0;
         };
+        // The dense fast path: both operands dense f64 — one tight,
+        // raise-free loop per operator.
+        if let (Some(a), Some(b)) = (dense_f64(lhs), dense_f64(rhs)) {
+            let out = push_vector(state, len);
+            match op {
+                OP_ADD => (0..len).for_each(|i| *out.values.add(i) = a.at(i) + b.at(i)),
+                OP_SUB => (0..len).for_each(|i| *out.values.add(i) = a.at(i) - b.at(i)),
+                OP_MUL => (0..len).for_each(|i| *out.values.add(i) = a.at(i) * b.at(i)),
+                _ => (0..len).for_each(|i| *out.values.add(i) = a.at(i) / b.at(i)),
+            }
+            return 1;
+        }
         let out = push_vector(state, len);
         for offset in 0..len {
             let Ok(a) = element(state, lhs, offset) else {
@@ -458,9 +513,19 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
         let Ok(window) = window_argument(state, window_idx) else {
             return 0;
         };
-        // Dense elements: NULLs were refused, and i64 exactness raises
-        // per element inside `term`.
-        let term = |state: *mut ffi::lua_State, offset: usize| -> Result<f64, ()> {
+        let out = push_vector(state, len);
+        // The dense fast path: raw slices, no raise points in the sweep.
+        if let (Some(xs), Some(ys)) = (dense_f64(x), dense_f64(y)) {
+            let term = |offset: usize| -> Result<f64, ()> {
+                let a = xs.at(offset);
+                Ok(if op == ROLL_DOT { a * ys.at(offset) } else { a })
+            };
+            let _ = rolling_sweep(op, out, len, window, term);
+            return 1;
+        }
+        // The general path — i64 exactness raises per element inside
+        // `term` (NULLs were already refused).
+        let term = |offset: usize| -> Result<f64, ()> {
             let a = element(state, x, offset)?.expect("dense operand");
             if op == ROLL_DOT {
                 let b = element(state, y, offset)?.expect("dense operand");
@@ -469,18 +534,29 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
                 Ok(a)
             }
         };
-        let out = push_vector(state, len);
+        match rolling_sweep(op, out, len, window, term) {
+            Ok(()) => 1,
+            Err(()) => 0,
+        }
+    }
+}
+
+/// The rolling sweep body, shared by the fast and general term
+/// sources. `term` may raise (longjmp) on the general path, so this
+/// frame holds only `Copy` state.
+unsafe fn rolling_sweep<F: Fn(usize) -> Result<f64, ()> + Copy>(
+    op: i64,
+    out: VectorParts,
+    len: usize,
+    window: usize,
+    term: F,
+) -> Result<(), ()> {
+    unsafe {
         let mut sum = Compensated::default();
         for offset in 0..len {
-            let Ok(new) = term(state, offset) else {
-                return 0;
-            };
-            sum.add(new);
+            sum.add(term(offset)?);
             if offset >= window {
-                let Ok(old) = term(state, offset - window) else {
-                    return 0;
-                };
-                sum.add(-old);
+                sum.add(-term(offset - window)?);
             }
             // Re-anchor: recompute the live window from scratch so the
             // add/subtract drift is bounded by one period.
@@ -488,10 +564,7 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
                 let mut fresh = Compensated::default();
                 let start = (offset + 1).saturating_sub(window);
                 for inner in start..=offset {
-                    let Ok(value) = term(state, inner) else {
-                        return 0;
-                    };
-                    fresh.add(value);
+                    fresh.add(term(inner)?);
                 }
                 sum = fresh;
             }
@@ -501,7 +574,7 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
                 _ => sum.value(),
             };
         }
-        1
+        Ok(())
     }
 }
 
@@ -517,6 +590,8 @@ pub(crate) enum ColumnResult {
     None,
     /// One element of the returned column per call — `None` is NULL.
     Elements(Vec<Option<f64>>),
+    /// A column with no NULLs, read in bulk.
+    Dense(Vec<f64>),
 }
 
 /// Reads the value at the top of the stack as a column result. Runs
@@ -534,6 +609,11 @@ pub(crate) unsafe fn read_column_result(raw: *mut ffi::lua_State) -> Result<Colu
         let vector = ffi::luaL_testudata(raw, -1, META_VECTOR.as_ptr());
         if !vector.is_null() {
             let vector = parts(vector.cast::<VectorHeader>());
+            if let Some(DenseF64::Slice(values)) = dense_f64(Operand::Vector(vector)) {
+                return Ok(ColumnResult::Dense(
+                    std::slice::from_raw_parts(values, vector.len).to_vec(),
+                ));
+            }
             let mut elements = Vec::with_capacity(vector.len);
             for offset in 0..vector.len {
                 elements
@@ -546,6 +626,13 @@ pub(crate) unsafe fn read_column_result(raw: *mut ffi::lua_State) -> Result<Colu
             let view = *payload;
             if *view.generation != view.born {
                 return Err("result: view used outside its call".to_owned());
+            }
+            if view.tag == TAG_F64
+                && (view.validity.is_null() || (*view.validity).count_set() == view.len)
+            {
+                return Ok(ColumnResult::Dense(
+                    std::slice::from_raw_parts(view.data.cast::<f64>(), view.len).to_vec(),
+                ));
             }
             let mut elements = Vec::with_capacity(view.len);
             for offset in 0..view.len {

@@ -580,6 +580,22 @@ impl Segment {
         }
     }
 
+    /// As [`Segment::from_batch`], but with no zone maps — for
+    /// query-lifetime scratch segments that are never zone-pruned
+    /// (absent maps disable pruning, never falsify it).
+    pub fn from_batch_unpruned(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {
+        let zone_maps = batch.columns().iter().map(|_| None).collect();
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id: 0,
+            zone_maps,
+            sequence: SequenceInfo::RowIds,
+            superseded: None,
+        }
+    }
+
     /// The segment's data.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
