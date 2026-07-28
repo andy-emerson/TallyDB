@@ -7,7 +7,8 @@
 //! multi-segment [`Store`], SQL through `query-lite`, the rolling
 //! regressions and pair statistics registered as the window functions
 //! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
-//! registered Lua window kernels via [`Table::register_lua_window`]
+//! registered Lua window kernels via `Table::register_lua_window`
+//! (behind the `lua` feature)
 //! (the `script` module). Appends and queries
 //! interleave freely: a query runs over a point-in-time snapshot of the
 //! store, and appends after it never disturb the result. Results leave as

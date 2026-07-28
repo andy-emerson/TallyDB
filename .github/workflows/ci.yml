@@ -35,6 +35,7 @@ jobs:
         run: |
           cargo clippy -p engine --all-targets -- -D warnings
           cargo test -p engine
+          RUSTDOCFLAGS="-D warnings" cargo doc -p engine --no-deps
       - name: Docs
         run: cargo doc --workspace --no-deps
       - name: PyArrow oracle (issue #15)
