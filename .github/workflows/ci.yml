@@ -77,14 +77,27 @@ jobs:
           PROPTEST_CASES: "4"
         run: cargo +nightly miri test -p arrow-lite --lib
 
+  # The official Lua 5.4.7 test suite over the vendored interpreter
+  # (issue #69): the release's own ltests instrumentation compiled in
+  # (tracing allocator with failure injection, stack/GC consistency
+  # asserts, the T library), built from the exact sources the engine
+  # embeds — byte-identical to the upstream v5.4.7 tag; see
+  # crates/compute-lua/upstream-tests/PROVENANCE.md.
+  lua-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: readline headers (main.lua's transcripts assume readline)
+        run: sudo apt-get update && sudo apt-get install -y libreadline-dev
+      - name: Build the instrumented interpreter, run all.lua
+        run: crates/compute-lua/upstream-tests/run.sh
+
   # The C boundary under the sanitizers: the vendored interpreter and the
   # binding's C accessors compiled with ASan (leaks included — the
   # longjmp-over-destructor discipline is exactly a leak generator when
   # violated) and UBSan in trap mode. Nightly because sanitizers are -Z
-  # flags. The remaining hardening (#69) — ltests.c torture and the official
-  # Lua suite over the vendored build — needs files this repo does not
-  # carry (the vendor tree is deliberately the embedding set, no lua.c);
-  # they land when the suite can be vendored with provenance.
+  # flags. The ltests torture and official suite (#69) run in the
+  # lua-suite job above.
   sanitize:
     runs-on: ubuntu-latest
     steps:
