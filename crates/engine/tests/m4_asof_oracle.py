@@ -19,11 +19,10 @@ the answers must not move. The emulation lives in the referee only.
 Interval model (must match the engine's knowledge axis):
 - an appended row's birth is the watermark at its append (the fixture's
   row i has birth i);
-- an UPDATE appends its replacements first — births w0, w0+1, ... in
-  the matched rows' storage order (the script only issues multi-row
-  updates where storage order is ts order: after a compaction, against
-  rows no prior mutation touched) — then kills the originals at the
-  post-append watermark w0+k;
+- an UPDATE is ONE knowledge event (issue #73): every replacement is
+  born at the pre-mutation watermark w0 and every victim killed at w0,
+  and the mutation consumes exactly one sequence — no cut can see both
+  versions;
 - a DELETE kills its matches at the current watermark without consuming
   a sequence.
 
@@ -41,9 +40,7 @@ import pyarrow as pa
 from pyarrow.cffi import ffi
 
 # The scripted history: ("delete", predicate) | ("update", predicate,
-# column, value) | ("compact",) | ("reopen",). Multi-row updates only
-# where the matched set sits in compacted, previously-untouched storage
-# (see the interval model above).
+# column, value) | ("compact",) | ("reopen",).
 SCRIPT = [
     ("delete", "sym = 'TSLA'"),
     ("update", "ts = 40", "y", "0"),
@@ -239,20 +236,19 @@ def main() -> None:
                     f"FAIL update '{predicate}': engine changed {changed}, "
                     f"oracle matched {len(matched)}"
                 )
-            for rank, (ts, sym, x, y) in enumerate(matched):
+            for ts, sym, x, y in matched:
                 new = dict(ts=ts, sym=sym, x=x, y=y)
                 new[column] = float(value)
                 connection.execute(
                     "INSERT INTO versions VALUES (?, ?, ?, ?, ?, NULL)",
-                    [new["ts"], new["sym"], new["x"], new["y"], w0 + rank],
+                    [new["ts"], new["sym"], new["x"], new["y"], w0],
                 )
-            kill = w0 + len(matched)
             connection.execute(
-                f"UPDATE versions SET kill = {kill} "
+                f"UPDATE versions SET kill = {w0} "
                 f"WHERE kill IS NULL AND ({predicate}) AND birth < {w0}"
             )
-            if lib.tallydb_asof_next_sequence(context) != kill:
-                sys.exit("FAIL update's watermark does not match its appends")
+            if matched and lib.tallydb_asof_next_sequence(context) != w0 + 1:
+                sys.exit("FAIL update did not consume exactly one sequence")
         # After every step, the engine's latest state must equal the
         # open versions — the same invariant the M2.3 oracle proves,
         # here holding at every point of the history.

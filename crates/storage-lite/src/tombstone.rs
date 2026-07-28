@@ -35,19 +35,25 @@ pub struct DeleteLog {
     pub ids: BTreeSet<u64>,
     /// The sequence at which the kill was known (0 = unknown, v1).
     pub stamped_at: u64,
+    /// Nonzero when this log commits a supersession (issue #73): the
+    /// shared birth coordinate of the mutation's replacement rows —
+    /// the WAL bracket carrying the same value is committed by this
+    /// log's existence. 0 for plain deletes (and v1 logs).
+    pub superseding: u64,
 }
 
 /// Encodes one delete log (version 2): the header discipline of the
 /// segment format (magic, version, CRC over the payload), the stamp,
 /// then the sorted row ids delta-of-delta packed (sorted ids are
 /// exactly the ascending-integer shape that codec compresses best).
-pub fn encode_tombstones(ids: &BTreeSet<u64>, stamped_at: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ids.len() + 40);
+pub fn encode_tombstones(ids: &BTreeSet<u64>, stamped_at: u64, superseding: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ids.len() + 48);
     out.extend_from_slice(&TOMBSTONE_MAGIC);
     out.extend_from_slice(&2u16.to_le_bytes()); // version
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
     out.extend_from_slice(&stamped_at.to_le_bytes());
+    out.extend_from_slice(&superseding.to_le_bytes());
     out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
     let signed: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
     out.extend_from_slice(&encode_delta_of_delta(&signed));
@@ -79,13 +85,17 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<DeleteLog, FormatError> {
     if stored != computed {
         return Err(FormatError::ChecksumMismatch { stored, computed });
     }
-    let (stamped_at, mut position) = if version == 2 {
-        if bytes.len() < 32 {
+    let (stamped_at, superseding, mut position) = if version == 2 {
+        if bytes.len() < 40 {
             return Err(FormatError::Corrupt("delete log too short".to_owned()));
         }
-        (u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 24)
+        (
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            32,
+        )
     } else {
-        (0, 16)
+        (0, 0, 16)
     };
     let count = usize::try_from(u64::from_le_bytes(
         bytes[position..position + 8].try_into().unwrap(),
@@ -105,7 +115,11 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<DeleteLog, FormatError> {
         previous = Some(id);
         ids.insert(id);
     }
-    Ok(DeleteLog { ids, stamped_at })
+    Ok(DeleteLog {
+        ids,
+        stamped_at,
+        superseding,
+    })
 }
 
 /// IEEE CRC-32 (polynomial `0xEDB8_8320`). Note this is *not* the
@@ -152,14 +166,15 @@ mod tests {
             BTreeSet::from([5, 6, 7, 8, 1000, u64::from(u32::MAX)]),
             (0u64..10_000).collect::<BTreeSet<u64>>(),
         ] {
-            let bytes = encode_tombstones(&ids, 41_520);
+            let bytes = encode_tombstones(&ids, 41_520, 7);
             let decoded = decode_tombstones(&bytes).unwrap();
             assert_eq!(decoded.ids, ids);
             assert_eq!(decoded.stamped_at, 41_520);
+            assert_eq!(decoded.superseding, 7);
         }
         // A dense run of ids costs about a byte each, not eight.
         let dense: BTreeSet<u64> = (0u64..10_000).collect();
-        assert!(encode_tombstones(&dense, 0).len() < 11_000);
+        assert!(encode_tombstones(&dense, 0, 0).len() < 11_000);
     }
 
     #[test]
@@ -180,12 +195,13 @@ mod tests {
         let decoded = decode_tombstones(&bytes).unwrap();
         assert_eq!(decoded.ids, ids);
         assert_eq!(decoded.stamped_at, 0);
+        assert_eq!(decoded.superseding, 0);
     }
 
     #[test]
     fn corruption_is_loud() {
         let ids: BTreeSet<u64> = (0u64..100).step_by(3).collect();
-        let bytes = encode_tombstones(&ids, 7);
+        let bytes = encode_tombstones(&ids, 7, 0);
         for position in 0..bytes.len() {
             let mut corrupt = bytes.clone();
             corrupt[position] ^= 0x10;

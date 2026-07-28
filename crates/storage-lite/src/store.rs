@@ -104,6 +104,33 @@ fn delete_log_prefix(generation: u64) -> String {
     format!("del-g{generation:010}-")
 }
 
+/// A recovered WAL unit after supersession brackets resolve (see
+/// [`Store::replay_wal`]).
+enum Replayed {
+    Row(Vec<crate::format::WalCell>),
+    Supersession {
+        sequence: u64,
+        rows: Vec<Vec<crate::format::WalCell>>,
+    },
+}
+
+impl Replayed {
+    fn row_count(&self) -> usize {
+        match self {
+            Replayed::Row(_) => 1,
+            Replayed::Supersession { rows, .. } => rows.len(),
+        }
+    }
+}
+
+/// Owned WAL cells as the borrowed row the append path takes.
+fn owned_cells(cells: &[crate::format::WalCell]) -> Vec<RowValue<'_>> {
+    cells
+        .iter()
+        .map(crate::format::WalCell::as_row_value)
+        .collect()
+}
+
 /// History segments live outside the generation protocol: their names
 /// are recorded in the manifest (which is what makes them real — a
 /// crash can strand unlisted `hist-` files, pre-cleaned by the next
@@ -203,12 +230,11 @@ struct Shared {
     buffer: WriteBuffer,
     /// Row id of the buffer's first row.
     buffer_base: u64,
-    /// Birth sequence of the buffer's first row, once the table has
-    /// diverged (sequence != row id — see [`crate::SequenceInfo`]);
-    /// `None` while virtual. Lives here, not on [`Store`], because
-    /// reader snapshots stamp the buffer's segment with it. The
-    /// ingest-sequence watermark is derived: `base + buffer.len()`.
-    buffer_sequence_base: Option<u64>,
+    /// The diverged half of the knowledge axis; `None` while virtual
+    /// (sequence == row id and the watermark is the row count). Lives
+    /// here, not on [`Store`], because reader snapshots stamp the
+    /// buffer's segment from it.
+    knowledge: Option<Knowledge>,
     /// Row ids the table has tombstoned (decision #1: ids, never keys),
     /// each mapped to the sequence its kill landed at (0 = unknown,
     /// from a v1 delete log) — what compaction moves into history
@@ -218,6 +244,86 @@ struct Shared {
     /// preserved. Never in a latest-knowledge snapshot; entered only
     /// under `AS OF`.
     history: Vec<Arc<Segment>>,
+}
+
+/// A diverged table's live knowledge state: where the ingest-sequence
+/// watermark stands and where the buffered rows were born.
+struct Knowledge {
+    /// The sequence the next ordinary append receives.
+    next: u64,
+    /// The buffer's first row's birth sequence; with `explicit` absent,
+    /// buffered row `i` was born at `buffer_base + i`.
+    buffer_base: u64,
+    /// Per-row births, materialized once a supersession (issue #73)
+    /// landed rows in the buffer at a shared coordinate — the one thing
+    /// that breaks the buffer's contiguity.
+    explicit: Option<Vec<u64>>,
+}
+
+impl Shared {
+    /// The ingest-sequence watermark; `rows` is the store's row count,
+    /// which IS the watermark while virtual.
+    fn watermark(&self, rows: u64) -> u64 {
+        self.knowledge
+            .as_ref()
+            .map_or(rows, |knowledge| knowledge.next)
+    }
+
+    /// Appends one ordinary row, advancing the knowledge axis with it.
+    fn append_row(&mut self, row: &[RowValue<'_>]) -> Result<(), StorageError> {
+        self.buffer.append(row)?;
+        if let Some(knowledge) = &mut self.knowledge {
+            if let Some(explicit) = &mut knowledge.explicit {
+                explicit.push(knowledge.next);
+            }
+            knowledge.next += 1;
+        }
+        Ok(())
+    }
+
+    /// Appends one row born at `shared_sequence` — a supersession's
+    /// replacement (live or replayed). Diverges a virtual table (the
+    /// shared coordinate is what breaks sequence == row id) and
+    /// materializes the buffer's explicit births.
+    fn append_superseding(
+        &mut self,
+        row: &[RowValue<'_>],
+        shared_sequence: u64,
+        virtual_watermark: u64,
+    ) -> Result<(), StorageError> {
+        let buffered = self.buffer.len() as u64;
+        let knowledge = self.knowledge.get_or_insert_with(|| Knowledge {
+            next: virtual_watermark,
+            buffer_base: virtual_watermark - buffered,
+            explicit: None,
+        });
+        if knowledge.explicit.is_none() {
+            let base = knowledge.buffer_base;
+            knowledge.explicit = Some((0..buffered).map(|offset| base + offset).collect());
+        }
+        self.buffer.append(row)?;
+        let knowledge = self.knowledge.as_mut().expect("diverged above");
+        knowledge
+            .explicit
+            .as_mut()
+            .expect("materialized above")
+            .push(shared_sequence);
+        knowledge.next = knowledge.next.max(shared_sequence + 1);
+        Ok(())
+    }
+
+    /// The buffer's sequence stamp for snapshots and flushes; `None`
+    /// while virtual.
+    fn buffer_sequence(&self) -> Option<SequenceInfo> {
+        self.knowledge
+            .as_ref()
+            .map(|knowledge| match &knowledge.explicit {
+                Some(explicit) => SequenceInfo::Explicit(explicit.clone()),
+                None => SequenceInfo::Contiguous {
+                    base: knowledge.buffer_base,
+                },
+            })
+    }
 }
 
 /// A cheap, cloneable handle that mints point-in-time snapshots while
@@ -400,8 +506,8 @@ fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
         // Post-divergence, the buffer's rows carry sequences from the
         // watermark, not their row ids; stamp the snapshot so readers
         // (and flush, which reuses this path's shape) see them.
-        if let Some(base) = shared.buffer_sequence_base {
-            segment = segment.with_sequence(SequenceInfo::Contiguous { base });
+        if let Some(sequence) = shared.buffer_sequence() {
+            segment = segment.with_sequence(sequence);
         }
         segments.push(Arc::new(segment));
     }
@@ -456,7 +562,7 @@ impl Store {
                 segments: Vec::new(),
                 buffer,
                 buffer_base: 0,
-                buffer_sequence_base: None,
+                knowledge: None,
                 tombstones: BTreeMap::new(),
                 history: Vec::new(),
             })),
@@ -571,6 +677,7 @@ impl Store {
         };
         let mut segments = Vec::new();
         let mut tombstones = BTreeMap::new();
+        let mut committed_supersessions: BTreeSet<u64> = BTreeSet::new();
         let mut next_sequence = 0u64;
         for name in backend.list()? {
             // Objects from other generations are a crashed compaction's
@@ -584,6 +691,9 @@ impl Store {
                 })?;
                 let log = decode_tombstones(&backend.read(&name)?)?;
                 tombstones.extend(log.ids.iter().map(|&id| (id, log.stamped_at)));
+                if log.superseding != 0 {
+                    committed_supersessions.insert(log.superseding);
+                }
                 next_sequence = next_sequence.max(sequence + 1);
                 continue;
             }
@@ -635,23 +745,36 @@ impl Store {
             history.push(Arc::new(segment));
         }
         // A diverged table's watermark: the manifest records it at each
-        // compaction, but flushes advance sequences without rewriting
-        // the manifest, so fold the stored segments' ends on top. Rows
-        // the WAL replays below then take sequences from here — the
-        // same values they had before the crash, since assignment is
-        // deterministic in append order. (History needs no fold: it
-        // only changes at compaction, where the manifest catches up.)
-        let watermark = store.manifest_sections.next_sequence.map(|recorded| {
+        // compaction, but flushes — and supersessions, which diverge a
+        // table without a compaction — advance sequences without
+        // rewriting the manifest. So divergence is detected from the
+        // manifest OR from any stored segment carrying sequence data,
+        // and the watermark folds the segments' ends over whatever the
+        // manifest recorded. Rows the WAL replays below then take
+        // sequences from here — the same values they had before the
+        // crash, since assignment is deterministic in append order.
+        // (History needs no fold: it only changes at compaction, where
+        // the manifest catches up.)
+        let recorded = store.manifest_sections.next_sequence;
+        let diverged = recorded.is_some()
+            || segments
+                .iter()
+                .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
+        let watermark = diverged.then(|| {
             segments
                 .iter()
                 .map(|segment| segment.sequence_end())
-                .fold(recorded, u64::max)
+                .fold(recorded.unwrap_or(0), u64::max)
         });
         {
             let mut shared = lock(&store.shared);
             shared.segments = segments;
             shared.buffer_base = expected_base;
-            shared.buffer_sequence_base = watermark;
+            shared.knowledge = watermark.map(|next| Knowledge {
+                next,
+                buffer_base: next,
+                explicit: None,
+            });
             shared.tombstones = tombstones;
             shared.history = history;
         }
@@ -659,7 +782,7 @@ impl Store {
         store.delete_log_sequence = next_sequence;
         store.generation = generation;
         store.backend = Some(backend);
-        store.replay_wal()?;
+        store.replay_wal(&committed_supersessions)?;
         Ok(store)
     }
 
@@ -712,10 +835,7 @@ impl Store {
     /// the latest state. Equal to [`Store::len`] until the table
     /// diverges.
     pub fn next_sequence(&self) -> u64 {
-        let shared = lock(&self.shared);
-        shared
-            .buffer_sequence_base
-            .map_or(self.rows, |base| base + shared.buffer.len() as u64)
+        lock(&self.shared).watermark(self.rows)
     }
 
     /// Everything an `AS OF` read needs, captured atomically — see
@@ -738,43 +858,93 @@ impl Store {
     /// crash left as a torn tail end the clean prefix silently, and a
     /// log stranded by a crashed compaction (wrong generation) is
     /// ignored — its rows are already in the new generation's segments.
-    /// Ends with the log in steady state for the configured level:
-    /// recreated and synced under `Group`/`Full`, removed under `Off`.
-    fn replay_wal(&mut self) -> Result<(), StorageError> {
+    /// Supersession brackets (issue #73) resolve to old-or-new: a
+    /// bracket whose delete log committed replays with its shared
+    /// coordinate; an uncommitted bracket at the log's tail — the
+    /// crashed-mutation window — is dropped whole. Ends with the log in
+    /// steady state for the configured level: recreated and synced
+    /// under `Group`/`Full`, removed under `Off`.
+    fn replay_wal(&mut self, committed: &BTreeSet<u64>) -> Result<(), StorageError> {
         let backend = self.backend.as_ref().expect("replay is a reopen step");
-        let recovered = match backend.read(WAL) {
+        let (base_row_id, entries) = match backend.read(WAL) {
             // Shorter than one header is the crash window between log
             // creation (which truncates in place) and the header sync:
             // no record was ever synced under this log — records follow
             // the header in the same file — so there is nothing to
             // recover, and treating it as corruption would leave the
             // store permanently unopenable over intact segments.
-            Ok(bytes) if bytes.len() < crate::format::WAL_HEADER_LEN => Vec::new(),
+            Ok(bytes) if bytes.len() < crate::format::WAL_HEADER_LEN => (self.rows, Vec::new()),
             Ok(bytes) => {
                 let wal = crate::format::decode_wal(&bytes, self.schema.fields().len())?;
                 if wal.generation == self.generation {
-                    let skip = usize::try_from(self.rows.saturating_sub(wal.base_row_id))
-                        .expect("row counts fit usize");
-                    wal.rows.into_iter().skip(skip).collect()
+                    (wal.base_row_id, wal.entries)
                 } else {
-                    Vec::new()
+                    (self.rows, Vec::new())
                 }
             }
-            Err(IoError::NotFound(_)) => Vec::new(),
+            Err(IoError::NotFound(_)) => (self.rows, Vec::new()),
             Err(error) => return Err(error.into()),
         };
+        // Resolve brackets into replayable units (old-or-new).
+        let mut units: Vec<Replayed> = Vec::new();
+        let mut iter = entries.into_iter().peekable();
+        while let Some(entry) = iter.next() {
+            match entry {
+                crate::format::WalEntry::Row(cells) => units.push(Replayed::Row(cells)),
+                crate::format::WalEntry::Supersession {
+                    sequence,
+                    replacements,
+                } => {
+                    let mut rows = Vec::new();
+                    while (rows.len() as u64) < replacements {
+                        match iter.next() {
+                            Some(crate::format::WalEntry::Row(cells)) => rows.push(cells),
+                            // Truncated mid-bracket: the crash window.
+                            _ => break,
+                        }
+                    }
+                    let complete = rows.len() as u64 == replacements;
+                    let at_tail = iter.peek().is_none();
+                    // A complete bracket replays if its delete log
+                    // committed, or if records follow it (the process
+                    // outlived a failed commit and the rows were
+                    // visible). A complete uncommitted bracket at the
+                    // tail is a crashed mutation — dropped whole, so
+                    // the originals stand: old, never torn.
+                    if complete && (committed.contains(&sequence) || !at_tail) {
+                        units.push(Replayed::Supersession { sequence, rows });
+                    }
+                    if !complete {
+                        break; // nothing after a torn bracket replays
+                    }
+                }
+            }
+        }
+        // Skip the prefix already covered by flushed segments (a crash
+        // between segment publish and WAL truncate leaves one). Flushes
+        // take the whole buffer, so the boundary never splits a bracket.
+        let mut skip =
+            usize::try_from(self.rows.saturating_sub(base_row_id)).expect("row counts fit usize");
+        let mut replay: Vec<Replayed> = Vec::new();
+        for unit in units {
+            let rows = unit.row_count();
+            if skip == 0 {
+                replay.push(unit);
+            } else if rows <= skip {
+                skip -= rows;
+            } else {
+                // Unreachable by construction; drop the split unit
+                // rather than replay half a mutation.
+                skip = 0;
+            }
+        }
         if self.wal_sync == WalSync::Off {
             // Recovered rows re-enter the buffer under the flush-boundary
             // contract; the log itself goes away.
-            for row in &recovered {
-                let cells: Vec<RowValue<'_>> = row
-                    .iter()
-                    .map(crate::format::WalCell::as_row_value)
-                    .collect();
-                let mut shared = lock(&self.shared);
-                shared.buffer.append(&cells)?;
-                self.rows += 1;
+            for unit in replay {
+                self.apply_replayed(unit)?;
             }
+            let backend = self.backend.as_ref().expect("replay is a reopen step");
             match backend.remove(WAL) {
                 Ok(()) | Err(IoError::NotFound(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -782,31 +952,59 @@ impl Store {
             return Ok(());
         }
         // Assemble the replacement log whole — header plus every
-        // recovered record — and publish it atomically *over* the old
-        // one. The old log stays the durable copy until the publishing
-        // rename commits, so a crash at any instant of recovery leaves
-        // exactly one complete log to recover from; truncate-then-
-        // rewrite would destroy the only copy first.
+        // recovered record, brackets preserved so a second crash still
+        // resolves old-or-new — and publish it atomically *over* the
+        // old one. The old log stays the durable copy until the
+        // publishing rename commits, so a crash at any instant of
+        // recovery leaves exactly one complete log to recover from;
+        // truncate-then-rewrite would destroy the only copy first.
         let mut bytes = crate::format::encode_wal_header(self.generation, self.rows);
-        let rows: Vec<Vec<RowValue<'_>>> = recovered
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(crate::format::WalCell::as_row_value)
-                    .collect()
-            })
-            .collect();
-        for cells in &rows {
-            bytes.extend_from_slice(&crate::format::encode_wal_record(cells));
+        for unit in &replay {
+            match unit {
+                Replayed::Row(cells) => {
+                    bytes.extend_from_slice(&crate::format::encode_wal_record(&owned_cells(cells)));
+                }
+                Replayed::Supersession { sequence, rows } => {
+                    bytes.extend_from_slice(&crate::format::encode_wal_supersession(
+                        *sequence,
+                        rows.len() as u64,
+                    ));
+                    for cells in rows {
+                        bytes.extend_from_slice(&crate::format::encode_wal_record(&owned_cells(
+                            cells,
+                        )));
+                    }
+                }
+            }
         }
+        let backend = self.backend.as_ref().expect("replay is a reopen step");
         backend.write(WAL, &bytes)?;
-        for cells in &rows {
-            let mut shared = lock(&self.shared);
-            shared.buffer.append(cells)?;
-            self.rows += 1;
+        for unit in replay {
+            self.apply_replayed(unit)?;
         }
+        let backend = self.backend.as_ref().expect("replay is a reopen step");
         self.wal = Some(backend.open_log(WAL)?);
         self.last_wal_sync = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Applies one recovered WAL unit to the buffer and row counter.
+    fn apply_replayed(&mut self, unit: Replayed) -> Result<(), StorageError> {
+        match unit {
+            Replayed::Row(cells) => {
+                let row = owned_cells(&cells);
+                lock(&self.shared).append_row(&row)?;
+                self.rows += 1;
+            }
+            Replayed::Supersession { sequence, rows } => {
+                for cells in &rows {
+                    let row = owned_cells(cells);
+                    let virtual_watermark = self.rows;
+                    lock(&self.shared).append_superseding(&row, sequence, virtual_watermark)?;
+                    self.rows += 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -865,7 +1063,7 @@ impl Store {
         self.wal_append(row)?;
         let must_flush = {
             let mut shared = lock(&self.shared);
-            shared.buffer.append(row)?;
+            shared.append_row(row)?;
             shared.buffer.len() >= self.segment_rows
         };
         let id = self.rows;
@@ -892,10 +1090,10 @@ impl Store {
                 return Ok(());
             }
             let segment = shared.buffer.snapshot_at(shared.buffer_base)?;
-            match shared.buffer_sequence_base {
+            match shared.buffer_sequence() {
                 // Diverged: the frozen segment records where in the
                 // sequence space its rows were born.
-                Some(base) => segment.with_sequence(SequenceInfo::Contiguous { base }),
+                Some(sequence) => segment.with_sequence(sequence),
                 None => segment,
             }
         };
@@ -913,9 +1111,11 @@ impl Store {
             shared.segments.push(Arc::new(segment));
             shared.buffer = fresh;
             shared.buffer_base = self.rows;
-            // The next buffered row's sequence follows the flushed rows.
-            if let Some(base) = shared.buffer_sequence_base {
-                shared.buffer_sequence_base = Some(base + flushed);
+            let _ = flushed;
+            // The empty buffer restarts contiguous at the watermark.
+            if let Some(knowledge) = &mut shared.knowledge {
+                knowledge.buffer_base = knowledge.next;
+                knowledge.explicit = None;
             }
         }
         // Every row the log guarded is now segment-durable: truncate.
@@ -947,9 +1147,7 @@ impl Store {
             // takes the same sequence, and `AS OF n` applies both ("all
             // knowledge with coordinate <= n"); a flush below moves the
             // buffer without moving the watermark, so the stamp holds.
-            let stamp = shared
-                .buffer_sequence_base
-                .map_or(self.rows, |base| base + shared.buffer.len() as u64);
+            let stamp = shared.watermark(self.rows);
             (newly, shared.buffer_base, stamp)
         };
         if newly.is_empty() {
@@ -989,7 +1187,7 @@ impl Store {
         if let Some(backend) = &self.backend {
             backend.write(
                 &delete_log_name(self.generation, self.delete_log_sequence),
-                &encode_tombstones(&newly, stamp),
+                &encode_tombstones(&newly, stamp, 0),
             )?;
             self.delete_log_sequence += 1;
         }
@@ -997,6 +1195,103 @@ impl Store {
         lock(&self.shared)
             .tombstones
             .extend(newly.into_iter().map(|id| (id, stamp)));
+        Ok(count)
+    }
+
+    /// Supersedes rows as **one knowledge event** (issue #73): appends
+    /// `replacements` and tombstones `victims`, all at a single ingest
+    /// sequence — the mutation's coordinate, consumed exactly once.
+    /// `AS OF` that coordinate sees every replacement and no victim;
+    /// the cut before it sees the originals untouched — old-or-new on
+    /// the knowledge axis, with no cut in between. The same property
+    /// holds across a crash: the WAL brackets the replacements, and
+    /// the delete log — written last, carrying the coordinate — is the
+    /// commit record; replay finding the bracket without it drops the
+    /// replacements whole. (Under [`WalSync::Off`] the flush boundary
+    /// remains the durability contract: a crash between the mutation's
+    /// flush and its delete log can leave both versions live, exactly
+    /// as that mode already trades.)
+    ///
+    /// The shared coordinate is precisely `sequence != row id`, so a
+    /// supersession diverges a virtual table on the spot.
+    pub fn supersede(
+        &mut self,
+        replacements: &[Vec<RowValue<'_>>],
+        victims: &[u64],
+    ) -> Result<u64, StorageError> {
+        // Validate everything up front: a refused mutation changes
+        // nothing anywhere.
+        {
+            let shared = lock(&self.shared);
+            for row in replacements {
+                shared.buffer.validate(row)?;
+            }
+        }
+        if let Some(&bad) = victims.iter().find(|&&id| id >= self.rows) {
+            return Err(StorageError::TombstoneOutOfRange { id: bad });
+        }
+        let (newly, buffer_base) = {
+            let shared = lock(&self.shared);
+            let newly: BTreeSet<u64> = victims
+                .iter()
+                .copied()
+                .filter(|id| !shared.tombstones.contains_key(id))
+                .collect();
+            (newly, shared.buffer_base)
+        };
+        if newly.is_empty() && replacements.is_empty() {
+            return Ok(0);
+        }
+        // Buffered victims must be segment-durable before the bracket
+        // opens: any later flush would truncate the bracket out of the
+        // WAL mid-mutation, which is also why the threshold flush is
+        // deferred to the very end.
+        if self.backend.is_some() && newly.iter().any(|&id| id >= buffer_base) {
+            self.flush()?;
+        }
+        // The mutation's coordinate (the pre-flush above never moves it).
+        let sequence = lock(&self.shared).watermark(self.rows);
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(&crate::format::encode_wal_supersession(
+                sequence,
+                replacements.len() as u64,
+            ))?;
+        }
+        for row in replacements {
+            self.wal_append(row)?;
+            let virtual_watermark = self.rows;
+            lock(&self.shared).append_superseding(row, sequence, virtual_watermark)?;
+            self.rows += 1;
+        }
+        // Superseding rows must be durable before the delete log
+        // commits — the same rule [`Store::tombstone`] enforces: sync
+        // the WAL, or without one, flush.
+        if self.backend.is_some() {
+            if let Some(wal) = self.wal.as_mut() {
+                wal.sync().map_err(StorageError::from)?;
+                self.last_wal_sync = std::time::Instant::now();
+            } else if !lock(&self.shared).buffer.is_empty() {
+                self.flush()?;
+            }
+        }
+        // The commit record: the delete log carrying the bracket's
+        // coordinate — written even when every victim was already dead,
+        // because the bracket's replacements need the evidence.
+        if let Some(backend) = &self.backend {
+            backend.write(
+                &delete_log_name(self.generation, self.delete_log_sequence),
+                &encode_tombstones(&newly, sequence, sequence),
+            )?;
+            self.delete_log_sequence += 1;
+        }
+        let count = newly.len() as u64;
+        lock(&self.shared)
+            .tombstones
+            .extend(newly.into_iter().map(|id| (id, sequence)));
+        // The threshold flush deferred while the bracket was open.
+        if lock(&self.shared).buffer.len() >= self.segment_rows {
+            self.flush()?;
+        }
         Ok(count)
     }
 
@@ -1037,9 +1332,7 @@ impl Store {
         let (recorded_watermark, stamps, old_history) = {
             let shared = lock(&self.shared);
             (
-                shared
-                    .buffer_sequence_base
-                    .map(|base| base + shared.buffer.len() as u64),
+                shared.knowledge.as_ref().map(|knowledge| knowledge.next),
                 shared.tombstones.clone(),
                 shared.history.clone(),
             )
@@ -1237,7 +1530,11 @@ impl Store {
             shared.segments = new_segments.into_iter().map(Arc::new).collect();
             shared.buffer = fresh_buffer;
             shared.buffer_base = base;
-            shared.buffer_sequence_base = watermark;
+            shared.knowledge = watermark.map(|next| Knowledge {
+                next,
+                buffer_base: next,
+                explicit: None,
+            });
             shared.tombstones.clear();
             shared.history = old_history
                 .into_iter()
@@ -1279,7 +1576,11 @@ impl Store {
     #[cfg(test)]
     fn diverge(&mut self, watermark: u64) -> Result<(), StorageError> {
         self.manifest_sections.next_sequence = Some(watermark);
-        lock(&self.shared).buffer_sequence_base = Some(watermark);
+        lock(&self.shared).knowledge = Some(Knowledge {
+            next: watermark,
+            buffer_base: watermark,
+            explicit: None,
+        });
         if let Some(backend) = &self.backend {
             backend.write(
                 MANIFEST,
@@ -1542,6 +1843,146 @@ mod tests {
             views[1].segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 13 }
         );
+    }
+
+    #[test]
+    fn a_supersession_is_one_knowledge_event() {
+        let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..3);
+        let replacement = vec![vec![
+            RowValue::I64(1),
+            RowValue::Key("A"),
+            RowValue::F64(9.0),
+        ]];
+        // The mutation lands whole at coordinate 3 and consumes it.
+        assert_eq!(store.supersede(&replacement, &[1]).unwrap(), 1);
+        assert_eq!(store.next_sequence(), 4);
+        let knowledge = store.knowledge_snapshot().unwrap();
+        let xs_at = |cut: u64| -> Vec<f64> {
+            let mut xs: Vec<f64> = knowledge
+                .as_of(cut)
+                .iter()
+                .flat_map(|view| {
+                    let Column::Numeric(NumericData::F64(x)) = &view.segment.batch().columns()[2]
+                    else {
+                        panic!("x type")
+                    };
+                    (0..view.segment.batch().num_rows())
+                        .filter(|&row| view.is_live(row))
+                        .map(|row| x.values().as_slice()[row])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            xs.sort_by(f64::total_cmp);
+            xs
+        };
+        // The cut before the mutation is all-old, the cut at it is
+        // all-new; no cut sees both versions.
+        assert_eq!(xs_at(2), [0.0, 1.0, 2.0]);
+        assert_eq!(xs_at(3), [0.0, 2.0, 9.0]);
+        assert_eq!(xs_at(4), [0.0, 2.0, 9.0]);
+    }
+
+    /// A backend that, once armed, fails delete-log writes — the crash
+    /// window between a supersession's appends and its commit record.
+    struct FailingDeleteLogs {
+        inner: crate::MemBackend,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::StorageBackend for FailingDeleteLogs {
+        fn open_log(&self, name: &str) -> Result<Box<dyn crate::LogWriter>, crate::IoError> {
+            self.inner.open_log(name)
+        }
+        fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::IoError> {
+            if name.starts_with("del-") && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::IoError::Backend("injected log failure".to_owned()));
+            }
+            self.inner.write(name, bytes)
+        }
+        fn read(&self, name: &str) -> Result<Vec<u8>, crate::IoError> {
+            self.inner.read(name)
+        }
+        fn list(&self) -> Result<Vec<String>, crate::IoError> {
+            self.inner.list()
+        }
+        fn remove(&self, name: &str) -> Result<(), crate::IoError> {
+            self.inner.remove(name)
+        }
+    }
+
+    #[test]
+    fn a_crashed_supersession_recovers_old_never_torn() {
+        let backend = Arc::new(FailingDeleteLogs {
+            inner: crate::MemBackend::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut store =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..3);
+        let replacement = vec![vec![
+            RowValue::I64(1),
+            RowValue::Key("A"),
+            RowValue::F64(9.0),
+        ]];
+        // The commit record fails: the mutation errors, and a crash at
+        // this instant (no clean close) must recover the OLD state —
+        // the WAL bracket at the tail has no commit evidence.
+        backend
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(store.supersede(&replacement, &[1]).is_err());
+        std::mem::forget(store);
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        assert_eq!(store.live_len(), 3);
+        assert_eq!(store.next_sequence(), 3, "old state, still virtual");
+        // The same mutation committed replays as NEW — bracket plus
+        // commit record — across the same crash-shaped close.
+        backend
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut store = store;
+        assert_eq!(store.supersede(&replacement, &[1]).unwrap(), 1);
+        std::mem::forget(store);
+        let store = Store::persistent_with_segment_rows(backend, schema(), 0, 100).unwrap();
+        assert_eq!(store.live_len(), 3);
+        assert_eq!(store.next_sequence(), 4);
+        let views = store.snapshot().unwrap();
+        let total_live: usize = views.iter().map(SegmentView::live_rows).sum();
+        assert_eq!(total_live, 3, "replacement in, victim out — never both");
+    }
+
+    #[test]
+    fn a_supersession_diverges_durably_through_flushed_segments() {
+        // A supersession diverges without a compaction, so no manifest
+        // records it; reopen must detect divergence from the flushed
+        // segment's sequence data alone.
+        let backend: Arc<dyn crate::StorageBackend> = Arc::new(crate::MemBackend::new());
+        let mut store =
+            Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..3);
+        let replacement = vec![vec![
+            RowValue::I64(1),
+            RowValue::Key("A"),
+            RowValue::F64(9.0),
+        ]];
+        store.supersede(&replacement, &[1]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        let store = Store::persistent_with_segment_rows(backend, schema(), 0, 100).unwrap();
+        assert_eq!(store.next_sequence(), 4);
+        assert_eq!(store.live_len(), 3);
+        // The mutation pre-flushed its buffered victims as a still-
+        // virtual segment; the replacement then landed in an explicit
+        // one — and that second segment alone is what tells reopen the
+        // table diverged.
+        let views = store.snapshot().unwrap();
+        assert_eq!(views[0].segment.sequence_info(), &SequenceInfo::RowIds);
+        assert_eq!(
+            views[1].segment.sequence_info(),
+            &SequenceInfo::Explicit(vec![3]),
+        );
+        assert!(!views[0].is_live(1), "the victim stays masked");
     }
 
     #[test]

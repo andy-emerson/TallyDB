@@ -942,20 +942,15 @@ impl Table {
                 corrected.push(cells);
             }
         }
-        // Reappend the replacements first, then tombstone the originals
-        // — the one mutation mechanism, ordered for crash safety. The
-        // tombstone makes every superseding row durable (a WAL sync, or
-        // a flush without one) before committing its delete log, so on
-        // a persistent store the replacements always outlive the delete
-        // that supersedes the originals. A crash anywhere in between
-        // leaves originals and replacements both live (recoverable
-        // duplicates under the row-id identity rule), never the
-        // replacements lost.
-        for cells in &corrected {
-            let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
-            self.store.append(&row)?;
-        }
-        let affected = self.store.tombstone(&matched_ids)?;
+        // One knowledge event (issue #73): the replacements and the
+        // tombstones land together at a single ingest sequence —
+        // old-or-new under `AS OF` and across a crash alike, never a
+        // cut that sees both versions or a recovery that keeps half.
+        let rows: Vec<Vec<RowValue<'_>>> = corrected
+            .iter()
+            .map(|cells| cells.iter().map(OwnedValue::as_row_value).collect())
+            .collect();
+        let affected = self.store.supersede(&rows, &matched_ids)?;
         Ok(affected)
     }
 }
@@ -1645,8 +1640,10 @@ mod tests {
                 .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
                 .unwrap();
         }
-        // The correction: UPDATE appends the replacement (sequence 4),
-        // then tombstones the original (stamped at 5).
+        // The correction: one knowledge event (issue #73) — the
+        // replacement is born and the original killed at the same
+        // coordinate, 4, and the mutation consumes exactly one
+        // sequence.
         table.mutate("UPDATE t SET x = 100.0 WHERE ts = 1").unwrap();
         assert_eq!(table.next_sequence(), 5);
         let latest = "SELECT ts, x FROM t ORDER BY ts";
@@ -1667,6 +1664,25 @@ mod tests {
         );
         // ASOF 0: only the first row was known.
         assert_eq!(table.query("SELECT x FROM t ASOF 0").unwrap().num_rows(), 1);
+        // Old-or-new on the knowledge axis: the cut at the mutation's
+        // coordinate is already the corrected state, and no cut
+        // anywhere sees both versions at once.
+        assert_eq!(
+            flatten(
+                &table
+                    .query("SELECT ts, x FROM t ASOF 4 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            corrected
+        );
+        for cut in 0..=5 {
+            let rows = table
+                .query(&format!("SELECT x FROM t ASOF {cut}"))
+                .unwrap()
+                .num_rows();
+            assert!(rows <= 4, "cut {cut} saw {rows} rows");
+        }
         // Compaction retains the superseded version in history — the
         // past answer does not move, and neither does the present.
         table.compact().unwrap();

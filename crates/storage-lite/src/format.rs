@@ -975,8 +975,10 @@ fn decode_dictionary(reader: &mut Reader<'_>, name: &str) -> Result<Dictionary, 
 /// golden), and it exists only between flushes — truncated whenever the
 /// rows it guards become segment-durable.
 pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
-/// WAL format version.
-pub const WAL_VERSION: u16 = 1;
+/// WAL format version. Version 2 (M4.5, issue #73) added one control
+/// record — the supersession bracket — to the record grammar; v1 logs
+/// (which cannot contain control records) still replay.
+pub const WAL_VERSION: u16 = 2;
 /// The header's encoded size: magic (8) + version (2) + generation (8)
 /// plus base row id (8) plus their CRC-32C (4) — the header carries a
 /// checksum like every other structure in the format. A log file
@@ -1005,6 +1007,9 @@ pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
 /// presence-tagged cell per schema column), `u32` CRC-32C of the
 /// payload. A record whose length, payload, or CRC cannot be read
 /// whole is a torn tail — the crash boundary — never an error.
+///
+/// Cell presence tags are 0..=3; a payload whose first byte is `0xFF`
+/// is a **control record** instead (see [`encode_wal_supersession`]).
 pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16 * row.len());
     for cell in row {
@@ -1025,6 +1030,27 @@ pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
             }
         }
     }
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc32c(&payload).to_le_bytes());
+    out
+}
+
+/// The supersession bracket (issue #73): announces that the next
+/// `replacements` row records belong to one mutation whose every row is
+/// born at `sequence` — the single knowledge coordinate at which the
+/// mutation's victims also die. The bracket's *commit evidence* is the
+/// delete log carrying `superseding == sequence`; replay finding the
+/// bracket at the log's clean tail without that evidence drops the
+/// bracketed rows whole, which is what makes a crashed `UPDATE`
+/// old-or-new instead of torn.
+pub fn encode_wal_supersession(sequence: u64, replacements: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18);
+    payload.push(0xFF);
+    payload.push(1); // control tag: begin supersession
+    payload.extend_from_slice(&sequence.to_le_bytes());
+    payload.extend_from_slice(&replacements.to_le_bytes());
     let mut out = Vec::with_capacity(payload.len() + 8);
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&payload);
@@ -1053,12 +1079,22 @@ impl WalCell {
     }
 }
 
+/// One replayable WAL entry.
+#[derive(Debug, PartialEq)]
+pub enum WalEntry {
+    /// An ordinary appended row.
+    Row(Vec<WalCell>),
+    /// A supersession bracket: the next `replacements` rows share the
+    /// birth coordinate `sequence` (see [`encode_wal_supersession`]).
+    Supersession { sequence: u64, replacements: u64 },
+}
+
 /// A decoded WAL: where its records start in the row-id space, and the
-/// clean-prefix rows that survived.
+/// clean-prefix entries that survived.
 pub struct WalContents {
     pub generation: u64,
     pub base_row_id: u64,
-    pub rows: Vec<Vec<WalCell>>,
+    pub entries: Vec<WalEntry>,
 }
 
 /// Decodes a WAL file. Header corruption is an error (the file is not a
@@ -1071,9 +1107,9 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
         return Err(FormatError::Corrupt("not a WAL file".to_owned()));
     }
     let version = reader.u16()?;
-    if version != WAL_VERSION {
+    if version != 1 && version != WAL_VERSION {
         return Err(FormatError::Corrupt(format!(
-            "WAL version {version} is not {WAL_VERSION}"
+            "WAL version {version} is not readable (this build reads 1 and {WAL_VERSION})"
         )));
     }
     let generation = reader.u64()?;
@@ -1084,7 +1120,7 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
             "WAL header checksum mismatch".to_owned(),
         ));
     }
-    let mut rows = Vec::new();
+    let mut entries = Vec::new();
     loop {
         let record_start = reader.position;
         let Ok(length) = reader.u32() else { break };
@@ -1096,6 +1132,18 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
         let Ok(stored_crc) = reader.u32() else { break };
         if crc32c(payload) != stored_crc {
             break; // torn or corrupt record: the clean prefix ends here
+        }
+        if payload.first() == Some(&0xFF) {
+            // A control record. Unknown control tags or malformed
+            // payloads end the clean prefix like any other damage.
+            if payload.len() != 18 || payload[1] != 1 {
+                break;
+            }
+            entries.push(WalEntry::Supersession {
+                sequence: u64::from_le_bytes(payload[2..10].try_into().unwrap()),
+                replacements: u64::from_le_bytes(payload[10..18].try_into().unwrap()),
+            });
+            continue;
         }
         let mut cells = Reader {
             bytes: payload,
@@ -1147,11 +1195,11 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
         if !clean || row.len() != columns {
             break; // CRC passed but shape is wrong: stop, don't guess
         }
-        rows.push(row);
+        entries.push(WalEntry::Row(row));
     }
     Ok(WalContents {
         generation,
         base_row_id,
-        rows,
+        entries,
     })
 }
