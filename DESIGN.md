@@ -1021,6 +1021,56 @@ shape.
 
 ## The Lua layer
 
+**Decision record — the extension model (ruled 2026-07-28, from
+external review).** User compute reaches the engine through **one
+mechanism per host**, and the embedded interpreter serves only the
+hosts that have no language of their own:
+
+1. **Rust host → the trait.** `WindowAggregate` is the extension API:
+   an embedder implements it (~20 lines) and registers the kernel on
+   the table — native speed, full type safety, no interpreter. This is
+   the *primary* extension path; the trait and a `register_window`
+   entry are public engine surface (correcting the M2.7 state, which
+   shipped only the interpreter path publicly).
+2. **Python host → callbacks through the binding (M4).** Python is
+   **never embedded in the engine** — ruled out on structure, not
+   taste: NumPy (the thing users actually know — the familiarity is
+   the library, not the syntax) is welded to CPython; CPython brings
+   the process-global GIL, no viable sandbox, tens of megabytes, and —
+   decisive — *circularity*, since the primary host process already is
+   Python, and a library importing a second interpreter into it fights
+   the first. (RustPython/MicroPython rejected: no NumPy, so the
+   familiarity argument evaporates.) Instead the binding registers a
+   host-side callable as a window kernel: the engine calls back into
+   the host's own interpreter through the `evaluate_frames` seam —
+   whole columns per call, zero-copy views in, vectorized NumPy
+   inside, an array out. In-query compute in real NumPy, with no
+   interpreter shipped.
+3. **No host language (console; browser at M5) → embedded Lua.** The
+   one territory where an embedded interpreter is non-substitutable —
+   a console user cannot compile Rust at a prompt. Lua becomes a
+   **non-default feature** the console (and later the browser bundle)
+   turns on; library embedders opt in or never carry the C boundary,
+   its sanitizer CI, or the interpreter at all. Its honest value:
+   interactive kernel registration, and the measured low-latency
+   niche (parity with NumPy-on-export at the newest-window shape,
+   where fixed costs dominate). It is **not** the extensibility story;
+   the trait is.
+
+**The sunset clause.** ~32k lines (vendored C + bindings) is not yet
+justified by that niche. Lua must demonstrate value before release
+1.0 — real console/browser kernel use, or the latency niche exercised
+in practice — or it is removed and tier 3 becomes query-only. The
+runaway-kernel guard (#61) is scoped by the same ruling: required
+before Lua ships in any surface serving untrusted input (the M6
+served product), optional for a local console.
+
+**A history correction (same review).** The four curated statistics
+were *not* produced by promoting Lua prototypes — the regressions
+predate the Lua layer by two milestones. The promotion ladder is the
+intended path for future kernels, not the origin story of the shipped
+ones; documentation must not claim otherwise.
+
 The embedded interpreter is **canonical PUC Lua 5.4**, compiled into the
 engine from the unmodified upstream sources — the embedding model Lua is
 designed around. Scripts reach the engine's buffers through zero-copy

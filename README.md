@@ -287,10 +287,19 @@ answers exactly where the ordering key lives. That accuracy contract is
 enforced in CI on every change by a compensated-reference guard over
 adversarial corpora, covering both the per-window and incremental
 paths. The Lua kernels remain interpreter-bound (~12–14× behind
-vectorized NumPy in bulk) — they are the correctness playground of the
-promotion ladder, not the fast path, and the four statistics above are
-what promotion produces. The zero-copy property itself is
-pointer-verified and stands.
+vectorized NumPy in bulk) — their measured value is interactive
+kernel registration at the console and the newest-window latency
+shape, where fixed costs dominate and they reach parity with NumPy
+over the engine's own export. The four statistics above are native
+implementations; the promotion ladder (prototype a kernel, then
+graduate it to native) is the intended path for future statistics,
+not how these four arrived. The extension model is ruled
+(2026-07-28): the Rust `WindowAggregate` trait is the primary
+extension path, Python composes from outside over the same Arrow
+buffers (never embedded), and Lua becomes an opt-in feature owned by
+the console — kept under a sunset clause, to prove its value before
+1.0 or leave. The zero-copy property itself is pointer-verified and
+stands.
 `lua.wasm` (the one WASM compute
 dependency still to come, for later) is a real, working, MIT-licensed
 project already in progress by the same author — tracked as a future
