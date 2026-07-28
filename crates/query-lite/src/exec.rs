@@ -823,14 +823,23 @@ fn evaluate_scalar(
     }
 }
 
-/// Builds a nullable `f64` column from parallel values/validity.
-fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
-    let buffer = Buffer::from_slice(&values);
+/// Builds a numeric column from parallel values/validity — the one
+/// values-plus-bitmap assembly every output path shares. The bitmap
+/// exists only if some value is actually absent, same as storage.
+fn assemble_numeric<T: arrow_lite::Element>(
+    values: Buffer<T>,
+    validity: Vec<bool>,
+) -> NumericColumn<T> {
     if validity.iter().all(|&valid| valid) {
-        NumericColumn::new_non_null(buffer)
+        NumericColumn::new_non_null(values)
     } else {
-        NumericColumn::new_nullable(buffer, Bitmap::from_bools(validity))
+        NumericColumn::new_nullable(values, Bitmap::from_bools(validity))
     }
+}
+
+/// As [`assemble_numeric`], from a plain vector.
+fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
+    assemble_numeric(Buffer::from_slice(&values), validity)
 }
 
 /// Looks up a column by name in the table schema.
@@ -1876,52 +1885,31 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
 }
 
 fn assemble_numeric_f64(values: Buffer<f64>, validity: Vec<bool>) -> Column {
-    let column = if validity.iter().any(|&valid| !valid) {
-        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::F64(column))
+    Column::Numeric(NumericData::F64(assemble_numeric(values, validity)))
 }
 
 fn assemble_numeric_i64(values: Buffer<i64>, validity: Vec<bool>) -> Column {
-    let column = if validity.iter().any(|&valid| !valid) {
-        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::I64(column))
+    Column::Numeric(NumericData::I64(assemble_numeric(values, validity)))
 }
 
 /// One view's output column: nullable f64, bitmap only if a window
 /// actually came back undefined.
 fn assemble_f64(results: Vec<Option<f64>>) -> Column {
-    let values = results.iter().map(|v| v.unwrap_or(0.0)).collect();
-    let column = if results.iter().any(Option::is_none) {
-        NumericColumn::new_nullable(
-            values,
-            Bitmap::from_bools(results.iter().map(Option::is_some)),
-        )
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::F64(column))
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<f64> = results.into_iter().map(|v| v.unwrap_or(0.0)).collect();
+    assemble_numeric_f64(values, validity)
 }
 
 /// Materializes an `i64` output column from integral `f64` results — the
 /// `COUNT`-window path (B5). Each present value is an exact integer count,
 /// so the cast is lossless.
 fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
-    let values = results.iter().map(|v| v.map_or(0, |x| x as i64)).collect();
-    let column = if results.iter().any(Option::is_none) {
-        NumericColumn::new_nullable(
-            values,
-            Bitmap::from_bools(results.iter().map(Option::is_some)),
-        )
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::I64(column))
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<i64> = results
+        .into_iter()
+        .map(|v| v.map_or(0, |x| x as i64))
+        .collect();
+    assemble_numeric_i64(values, validity)
 }
 
 #[cfg(test)]

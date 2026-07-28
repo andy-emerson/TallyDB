@@ -619,7 +619,7 @@ impl Store {
         let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
         let schema = manifest.schema.clone();
         let ordering_key = manifest.ordering_key;
-        Store::persistent_with(backend, schema, ordering_key, options)
+        Store::persistent_inner(backend, schema, ordering_key, options, Some(manifest))
     }
 
     /// As [`Store::persistent`], with explicit [`StoreOptions`] — the
@@ -629,6 +629,19 @@ impl Store {
         schema: Schema,
         ordering_key: usize,
         options: StoreOptions,
+    ) -> Result<Store, StorageError> {
+        Store::persistent_inner(backend, schema, ordering_key, options, None)
+    }
+
+    /// The one persistent-open path; `preloaded` carries the manifest a
+    /// caller already decoded ([`Store::open_existing`]) so nothing is
+    /// read twice.
+    fn persistent_inner(
+        backend: Arc<dyn StorageBackend>,
+        schema: Schema,
+        ordering_key: usize,
+        options: StoreOptions,
+        preloaded: Option<crate::format::Manifest>,
     ) -> Result<Store, StorageError> {
         let segment_rows = match (options.segment_rows, options.segment_bytes) {
             (Some(_), Some(_)) => {
@@ -642,9 +655,16 @@ impl Store {
         };
         let mut store = Store::with_segment_rows(schema, ordering_key, segment_rows)?;
         store.wal_sync = options.wal_sync;
-        let generation = match backend.read(MANIFEST) {
-            Ok(bytes) => {
-                let manifest = decode_manifest(&bytes)?;
+        let stored_manifest = match preloaded {
+            Some(manifest) => Some(manifest),
+            None => match backend.read(MANIFEST) {
+                Ok(bytes) => Some(decode_manifest(&bytes)?),
+                Err(IoError::NotFound(_)) => None,
+                Err(error) => return Err(error.into()),
+            },
+        };
+        let generation = match stored_manifest {
+            Some(manifest) => {
                 if manifest.schema != store.schema {
                     return Err(StorageError::SchemaMismatch {
                         reason: "manifest schema differs from the schema given".to_owned(),
@@ -658,10 +678,10 @@ impl Store {
                         ),
                     });
                 }
-                store.manifest_sections = manifest.sections.clone();
+                store.manifest_sections = manifest.sections;
                 manifest.generation
             }
-            Err(IoError::NotFound(_)) => {
+            None => {
                 backend.write(
                     MANIFEST,
                     &encode_manifest(
@@ -673,7 +693,6 @@ impl Store {
                 )?;
                 0
             }
-            Err(error) => return Err(error.into()),
         };
         let mut segments = Vec::new();
         let mut tombstones = BTreeMap::new();

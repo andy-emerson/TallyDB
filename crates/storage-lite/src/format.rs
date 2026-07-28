@@ -270,14 +270,10 @@ fn writer_codec(segment: &Segment, column: &Column, is_ordering_key: bool) -> Co
     }
 }
 
-fn encode_column(
-    out: &mut Vec<u8>,
-    segment: &Segment,
-    field: &Field,
-    column: &Column,
-    is_ordering_key: bool,
-    zone_map: Option<&ZoneMap>,
-) {
+/// The field prefix both containers share — name, type, nullability,
+/// logical annotation — written identically by segments (per column)
+/// and manifests (per schema field).
+fn encode_field(out: &mut Vec<u8>, field: &Field) {
     out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
     out.extend_from_slice(field.name().as_bytes());
     out.push(field.column_type() as u8);
@@ -292,6 +288,39 @@ fn encode_column(
             out.extend_from_slice(&[logical.tag(), payload]);
         }
     }
+}
+
+/// Decodes the shared field prefix (the inverse of [`encode_field`]).
+fn decode_field(reader: &mut Reader<'_>) -> Result<Field, FormatError> {
+    let name_len = reader.u16()? as usize;
+    let name = std::str::from_utf8(reader.take(name_len)?)
+        .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
+        .to_owned();
+    let column_type = ColumnType::from_tag(reader.u8()?)
+        .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
+    let nullable = reader.u8()? != 0;
+    let logical_tag = reader.u8()?;
+    let logical_payload = reader.u8()?;
+    let mut field = Field::new(name.clone(), column_type, nullable);
+    if logical_tag != 0 {
+        field = field.with_logical(
+            LogicalType::from_parts(logical_tag, logical_payload).ok_or_else(|| {
+                FormatError::Corrupt(format!("unknown logical type {logical_tag} for '{name}'"))
+            })?,
+        );
+    }
+    Ok(field)
+}
+
+fn encode_column(
+    out: &mut Vec<u8>,
+    segment: &Segment,
+    field: &Field,
+    column: &Column,
+    is_ordering_key: bool,
+    zone_map: Option<&ZoneMap>,
+) {
+    encode_field(out, field);
     let codec = writer_codec(segment, column, is_ordering_key);
     out.push(codec.tag());
     encode_zone_map(out, zone_map);
@@ -620,20 +649,7 @@ pub fn encode_manifest(
     out.extend_from_slice(&(ordering_key as u32).to_le_bytes());
     out.extend_from_slice(&(schema.fields().len() as u32).to_le_bytes());
     for field in schema.fields() {
-        out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
-        out.extend_from_slice(field.name().as_bytes());
-        out.push(field.column_type() as u8);
-        out.push(u8::from(field.nullable()));
-        match field.logical() {
-            None => out.extend_from_slice(&[0, 0]),
-            Some(logical) => {
-                let payload = match logical {
-                    LogicalType::Decimal64 { scale } => scale,
-                    LogicalType::TimestampNs => 0,
-                };
-                out.extend_from_slice(&[logical.tag(), payload]);
-            }
-        }
+        encode_field(&mut out, field);
     }
     if version == MANIFEST_VERSION_SECTIONED {
         let mut section_bytes: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -691,24 +707,7 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
     }
     let mut fields = Vec::with_capacity(column_count);
     for _ in 0..column_count {
-        let name_len = reader.u16()? as usize;
-        let name = std::str::from_utf8(reader.take(name_len)?)
-            .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
-            .to_owned();
-        let column_type = ColumnType::from_tag(reader.u8()?)
-            .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
-        let nullable = reader.u8()? != 0;
-        let logical_tag = reader.u8()?;
-        let logical_payload = reader.u8()?;
-        let mut field = Field::new(name.clone(), column_type, nullable);
-        if logical_tag != 0 {
-            field = field.with_logical(
-                LogicalType::from_parts(logical_tag, logical_payload).ok_or_else(|| {
-                    FormatError::Corrupt(format!("unknown logical type {logical_tag} for '{name}'"))
-                })?,
-            );
-        }
-        fields.push(field);
+        fields.push(decode_field(&mut reader)?);
     }
     let mut sections = ManifestSections::default();
     if version == MANIFEST_VERSION_SECTIONED {
@@ -775,23 +774,9 @@ fn decode_column(
     reader: &mut Reader<'_>,
     rows: usize,
 ) -> Result<(Field, Column, Option<ZoneMap>), FormatError> {
-    let name_len = reader.u16()? as usize;
-    let name = std::str::from_utf8(reader.take(name_len)?)
-        .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
-        .to_owned();
-    let column_type = ColumnType::from_tag(reader.u8()?)
-        .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
-    let nullable = reader.u8()? != 0;
-    let logical_tag = reader.u8()?;
-    let logical_payload = reader.u8()?;
-    let logical = match logical_tag {
-        0 => None,
-        tag => Some(
-            LogicalType::from_parts(tag, logical_payload).ok_or_else(|| {
-                FormatError::Corrupt(format!("unknown logical type {tag} for '{name}'"))
-            })?,
-        ),
-    };
+    let field = decode_field(reader)?;
+    let name = field.name().to_owned();
+    let column_type = field.column_type();
     let codec = Codec::from_tag(reader.u8()?)
         .ok_or_else(|| FormatError::Corrupt(format!("unknown codec for '{name}'")))?;
     let presence = reader.u8()?;
@@ -901,10 +886,6 @@ fn decode_column(
             })
         }
     };
-    let mut field = Field::new(name, column_type, nullable);
-    if let Some(logical) = logical {
-        field = field.with_logical(logical);
-    }
     Ok((field, column, zone_map))
 }
 
@@ -974,17 +955,17 @@ fn decode_dictionary(reader: &mut Reader<'_>, name: &str) -> Result<Dictionary, 
 /// the segment format (whose bytes stay locked by the committed
 /// golden), and it exists only between flushes — truncated whenever the
 /// rows it guards become segment-durable.
-pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
+pub(crate) const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
 /// WAL format version. Version 2 (M4.5, issue #73) added one control
 /// record — the supersession bracket — to the record grammar; v1 logs
 /// (which cannot contain control records) still replay.
-pub const WAL_VERSION: u16 = 2;
+pub(crate) const WAL_VERSION: u16 = 2;
 /// The header's encoded size: magic (8) + version (2) + generation (8)
 /// plus base row id (8) plus their CRC-32C (4) — the header carries a
 /// checksum like every other structure in the format. A log file
 /// shorter than this holds no acknowledged record (records follow the
 /// header in the same file) and reads as an empty log, not corruption.
-pub const WAL_HEADER_LEN: usize = 30;
+pub(crate) const WAL_HEADER_LEN: usize = 30;
 
 /// Encodes the WAL header: magic, version, generation, and the row id
 /// of the first record — replay skips records already covered by
@@ -992,7 +973,7 @@ pub const WAL_HEADER_LEN: usize = 30;
 /// leaves such a prefix) and refuses logs from another generation
 /// (compaction reassigns row ids, so cross-generation replay would be
 /// in the wrong id space).
-pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
+pub(crate) fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(WAL_HEADER_LEN);
     out.extend_from_slice(&WAL_MAGIC);
     out.extend_from_slice(&WAL_VERSION.to_le_bytes());
@@ -1010,7 +991,7 @@ pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
 ///
 /// Cell presence tags are 0..=3; a payload whose first byte is `0xFF`
 /// is a **control record** instead (see [`encode_wal_supersession`]).
-pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
+pub(crate) fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16 * row.len());
     for cell in row {
         match cell {
@@ -1045,7 +1026,7 @@ pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
 /// bracket at the log's clean tail without that evidence drops the
 /// bracketed rows whole, which is what makes a crashed `UPDATE`
 /// old-or-new instead of torn.
-pub fn encode_wal_supersession(sequence: u64, replacements: u64) -> Vec<u8> {
+pub(crate) fn encode_wal_supersession(sequence: u64, replacements: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(18);
     payload.push(0xFF);
     payload.push(1); // control tag: begin supersession
@@ -1060,7 +1041,7 @@ pub fn encode_wal_supersession(sequence: u64, replacements: u64) -> Vec<u8> {
 
 /// A WAL row, owned (`RowValue` borrows; replay needs owned cells).
 #[derive(Debug, PartialEq)]
-pub enum WalCell {
+pub(crate) enum WalCell {
     Null,
     I64(i64),
     F64(f64),
@@ -1081,7 +1062,7 @@ impl WalCell {
 
 /// One replayable WAL entry.
 #[derive(Debug, PartialEq)]
-pub enum WalEntry {
+pub(crate) enum WalEntry {
     /// An ordinary appended row.
     Row(Vec<WalCell>),
     /// A supersession bracket: the next `replacements` rows share the
@@ -1091,7 +1072,7 @@ pub enum WalEntry {
 
 /// A decoded WAL: where its records start in the row-id space, and the
 /// clean-prefix entries that survived.
-pub struct WalContents {
+pub(crate) struct WalContents {
     pub generation: u64,
     pub base_row_id: u64,
     pub entries: Vec<WalEntry>,
@@ -1101,7 +1082,7 @@ pub struct WalContents {
 /// WAL); a torn or corrupt *record* ends the clean prefix silently —
 /// that is the crash boundary working as designed, and everything
 /// before it is intact (each record carries its own CRC).
-pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatError> {
+pub(crate) fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != WAL_MAGIC {
         return Err(FormatError::Corrupt("not a WAL file".to_owned()));

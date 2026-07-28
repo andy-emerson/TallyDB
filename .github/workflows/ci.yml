@@ -59,6 +59,24 @@ jobs:
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
         run: cargo test -p compute-lua --features apicheck
 
+  # The unsafe core under Miri (issue #63): arrow-lite concentrates the
+  # workspace's unsafe (aligned buffers, bitmaps, the C Data Interface),
+  # and Miri checks it for undefined behavior on every change instead of
+  # by hand. Isolation is disabled because proptest touches the
+  # filesystem; the case count is trimmed to keep the interpreter's
+  # ~50x cost inside a few minutes.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - name: Miri over arrow-lite
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: "4"
+        run: cargo +nightly miri test -p arrow-lite --lib
+
   # The C boundary under the sanitizers: the vendored interpreter and the
   # binding's C accessors compiled with ASan (leaks included — the
   # longjmp-over-destructor discipline is exactly a leak generator when
