@@ -85,7 +85,10 @@ pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 // scripts through `register_host_function` (`host`) — the seam the
 // engine exposes the curated linear-algebra and statistic ops through, over the same
 // zero-copy views — and `log()` routes diagnostics to the embedder's
-// `LogSink`.
+// `LogSink`. The opposite direction is `driver` (SQL-in-Lua, #70):
+// `LuaState::run_driver` runs a script whose `query`/`append` reach
+// the embedder's `ScriptHost` — live for exactly that call, refused
+// everywhere else, so kernels never re-enter the engine.
 //
 // TODO: Lua backend trait, extracted when the WASM backend starts —
 //       nothing above this crate should need to know which is active
