@@ -612,6 +612,18 @@ impl Segment {
         }
     }
 
+    /// One past the largest birth sequence in this segment — what
+    /// reopen folds over to recover the ingest-sequence watermark,
+    /// since flushes advance sequences without rewriting the manifest.
+    pub fn sequence_end(&self) -> u64 {
+        let rows = self.batch.num_rows() as u64;
+        match &self.sequence {
+            SequenceInfo::RowIds => self.base_row_id + rows,
+            SequenceInfo::Contiguous { base } => base + rows,
+            SequenceInfo::Explicit(values) => values.iter().max().map_or(0, |largest| largest + 1),
+        }
+    }
+
     /// Attaches sequence data — the doorway a retaining compaction (and
     /// post-divergence appends) use to record where sequences diverged
     /// from row ids. An explicit array must carry one value per row.

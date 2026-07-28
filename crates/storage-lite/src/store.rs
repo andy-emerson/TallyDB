@@ -34,7 +34,7 @@
 
 use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_segment};
 use crate::io::{IoError, StorageBackend};
-use crate::mem::{RowValue, Segment, StorageError, WriteBuffer};
+use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::BTreeSet;
@@ -193,6 +193,12 @@ struct Shared {
     buffer: WriteBuffer,
     /// Row id of the buffer's first row.
     buffer_base: u64,
+    /// Birth sequence of the buffer's first row, once the table has
+    /// diverged (sequence != row id — see [`crate::SequenceInfo`]);
+    /// `None` while virtual. Lives here, not on [`Store`], because
+    /// reader snapshots stamp the buffer's segment with it. The
+    /// ingest-sequence watermark is derived: `base + buffer.len()`.
+    buffer_sequence_base: Option<u64>,
     /// Row ids the table has tombstoned (decision #1: ids, never keys).
     tombstones: BTreeSet<u64>,
 }
@@ -292,7 +298,14 @@ fn row_width(schema: &Schema) -> usize {
 fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
     let mut segments = shared.segments.clone();
     if !shared.buffer.is_empty() {
-        segments.push(Arc::new(shared.buffer.snapshot_at(shared.buffer_base)?));
+        let mut segment = shared.buffer.snapshot_at(shared.buffer_base)?;
+        // Post-divergence, the buffer's rows carry sequences from the
+        // watermark, not their row ids; stamp the snapshot so readers
+        // (and flush, which reuses this path's shape) see them.
+        if let Some(base) = shared.buffer_sequence_base {
+            segment = segment.with_sequence(SequenceInfo::Contiguous { base });
+        }
+        segments.push(Arc::new(segment));
     }
     Ok(segments
         .into_iter()
@@ -345,6 +358,7 @@ impl Store {
                 segments: Vec::new(),
                 buffer,
                 buffer_base: 0,
+                buffer_sequence_base: None,
                 tombstones: BTreeSet::new(),
             })),
         })
@@ -504,10 +518,23 @@ impl Store {
         if let Some(&bad) = tombstones.iter().find(|&&id| id >= expected_base) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
+        // A diverged table's watermark: the manifest records it at each
+        // compaction, but flushes advance sequences without rewriting
+        // the manifest, so fold the stored segments' ends on top. Rows
+        // the WAL replays below then take sequences from here — the
+        // same values they had before the crash, since assignment is
+        // deterministic in append order.
+        let watermark = store.manifest_sections.next_sequence.map(|recorded| {
+            segments
+                .iter()
+                .map(|segment| segment.sequence_end())
+                .fold(recorded, u64::max)
+        });
         {
             let mut shared = lock(&store.shared);
             shared.segments = segments;
             shared.buffer_base = expected_base;
+            shared.buffer_sequence_base = watermark;
             shared.tombstones = tombstones;
         }
         store.rows = expected_base;
@@ -720,7 +747,13 @@ impl Store {
             if shared.buffer.is_empty() {
                 return Ok(());
             }
-            shared.buffer.snapshot_at(shared.buffer_base)?
+            let segment = shared.buffer.snapshot_at(shared.buffer_base)?;
+            match shared.buffer_sequence_base {
+                // Diverged: the frozen segment records where in the
+                // sequence space its rows were born.
+                Some(base) => segment.with_sequence(SequenceInfo::Contiguous { base }),
+                None => segment,
+            }
         };
         if let Some(backend) = &self.backend {
             backend.write(
@@ -732,9 +765,14 @@ impl Store {
         let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
         {
             let mut shared = lock(&self.shared);
+            let flushed = segment.batch().num_rows() as u64;
             shared.segments.push(Arc::new(segment));
             shared.buffer = fresh;
             shared.buffer_base = self.rows;
+            // The next buffered row's sequence follows the flushed rows.
+            if let Some(base) = shared.buffer_sequence_base {
+                shared.buffer_sequence_base = Some(base + flushed);
+            }
         }
         // Every row the log guarded is now segment-durable: truncate.
         // A crash before this point replays a prefix the segments
@@ -832,6 +870,15 @@ impl Store {
     /// release `UPDATE`/`DELETE` debt, so it runs precisely when the table
     /// is already inflated (interacts with #43/#44, #56).
     pub fn compact(&mut self) -> Result<(), StorageError> {
+        // The ingest-sequence watermark, captured before the merge: a
+        // diverged table's compaction must carry it through unchanged —
+        // row ids reassign below, birth sequences never do.
+        let watermark = {
+            let shared = lock(&self.shared);
+            shared
+                .buffer_sequence_base
+                .map(|base| base + shared.buffer.len() as u64)
+        };
         // Collect every live row's (ordering value, row id, location),
         // buffer included via an ephemeral snapshot.
         let views = self.snapshot()?;
@@ -851,36 +898,59 @@ impl Store {
             }
         }
         order.sort_by_key(|&(value, id, _, _)| (value, id));
-        // Rebuild into fresh segments of the configured size.
+        // Rebuild into fresh segments of the configured size. A
+        // diverged table's rows keep their birth sequences through the
+        // merge — gathered in merge order, so the new segments carry
+        // them explicitly (the merge follows the ordering key, not
+        // ingest, making sequences non-contiguous).
         let mut new_segments: Vec<Segment> = Vec::new();
         let mut buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        let mut sequences: Vec<u64> = Vec::new();
         let mut base = 0u64;
         for &(_, _, view_index, row) in &order {
-            let batch = views[view_index].segment.batch();
-            let cells: Vec<RowValue<'_>> = batch
+            let view_segment = &views[view_index].segment;
+            let cells: Vec<RowValue<'_>> = view_segment
+                .batch()
                 .columns()
                 .iter()
                 .map(|column| cell_value(column, row))
                 .collect();
             buffer.append(&cells)?;
+            if watermark.is_some() {
+                sequences.push(view_segment.sequence_at(row));
+            }
             if buffer.len() >= self.segment_rows {
                 let rows = buffer.len() as u64;
                 let full = std::mem::replace(
                     &mut buffer,
                     WriteBuffer::new(self.schema.clone(), self.ordering_key)?,
                 );
-                new_segments.push(full.freeze_at(base)?);
+                let mut segment = full.freeze_at(base)?;
+                if watermark.is_some() {
+                    segment = segment
+                        .with_sequence(SequenceInfo::Explicit(std::mem::take(&mut sequences)));
+                }
+                new_segments.push(segment);
                 base += rows;
             }
         }
         if !buffer.is_empty() {
             let rows = buffer.len() as u64;
-            new_segments.push(buffer.freeze_at(base)?);
+            let mut segment = buffer.freeze_at(base)?;
+            if watermark.is_some() {
+                segment = segment.with_sequence(SequenceInfo::Explicit(sequences));
+            }
+            new_segments.push(segment);
             base += rows;
         }
         // Built now, before the commit point, so adopting the new
         // generation in memory below cannot fail partway.
         let fresh_buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+        // The manifest the commit writes carries the current watermark:
+        // the one durable record that sequences run ahead of row ids.
+        if watermark.is_some() {
+            self.manifest_sections.next_sequence = watermark;
+        }
 
         // Persist the next generation and commit it atomically.
         if let Some(backend) = &self.backend {
@@ -928,6 +998,7 @@ impl Store {
             shared.segments = new_segments.into_iter().map(Arc::new).collect();
             shared.buffer = fresh_buffer;
             shared.buffer_base = base;
+            shared.buffer_sequence_base = watermark;
             shared.tombstones.clear();
         }
         self.rows = base;
@@ -953,6 +1024,30 @@ impl Store {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Marks the table diverged at `watermark`: from here on, appended
+    /// rows take birth sequences from the watermark instead of their
+    /// row ids, and the manifest records it. This is what a retaining
+    /// compaction does the first time it breaks sequence == row id;
+    /// until that compaction lands (M4.4 step 4), only tests walk this
+    /// path, which is why it is test-gated.
+    #[cfg(test)]
+    fn diverge(&mut self, watermark: u64) -> Result<(), StorageError> {
+        self.manifest_sections.next_sequence = Some(watermark);
+        lock(&self.shared).buffer_sequence_base = Some(watermark);
+        if let Some(backend) = &self.backend {
+            backend.write(
+                MANIFEST,
+                &encode_manifest(
+                    &self.schema,
+                    self.ordering_key,
+                    self.generation,
+                    &self.manifest_sections,
+                ),
+            )?;
         }
         Ok(())
     }
@@ -1131,6 +1226,126 @@ mod tests {
         assert_eq!(
             store.append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)]),
             Ok(2)
+        );
+    }
+
+    #[test]
+    fn a_diverged_table_stamps_sequences_along_the_watermark() {
+        // M4.4 step 3: the two axes come apart at divergence — row ids
+        // keep numbering storage positions, birth sequences continue
+        // from the watermark — and every snapshot and flush carries the
+        // sequence data readers will need under `AS OF`.
+        let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
+        append_n(&mut store, 0..2);
+        let views = store.snapshot().unwrap();
+        assert_eq!(views[0].segment.sequence_info(), &SequenceInfo::RowIds);
+        assert_eq!(views[0].segment.sequence_at(1), 1);
+        store.flush().unwrap();
+        store.diverge(100).unwrap();
+        append_n(&mut store, 2..4);
+        let views = store.snapshot().unwrap();
+        // The buffer snapshot is stamped; row ids stay their own axis.
+        assert_eq!(
+            views[1].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 100 }
+        );
+        assert_eq!(views[1].segment.base_row_id(), 2);
+        assert_eq!(views[1].segment.sequence_at(1), 101);
+        // The flushed segment carries the same stamp, and the next
+        // buffer picks up where the flush left the sequence space.
+        store.flush().unwrap();
+        append_n(&mut store, 4..5);
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views[1].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 100 }
+        );
+        assert_eq!(
+            views[2].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 102 }
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_birth_sequences_and_the_watermark() {
+        // Compaction reassigns row ids downward and reorders rows on
+        // the ordering key; a diverged table's birth sequences must
+        // survive both, and the watermark must never rewind (sequences
+        // are permanent even when their rows die).
+        let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+        store.diverge(10).unwrap();
+        for ts in [5, 1, 3] {
+            store
+                .append(&[RowValue::I64(ts), RowValue::Key("A"), RowValue::F64(0.0)])
+                .unwrap();
+        }
+        // Kill ts=1 (row id 1, sequence 11).
+        store.tombstone(&[1]).unwrap();
+        store.compact().unwrap();
+        let views = store.snapshot().unwrap();
+        // Merge order is ts 3, 5 — sequences 12, 10, explicit because
+        // the merge follows the ordering key, not ingest.
+        assert_eq!(
+            views[0].segment.sequence_info(),
+            &SequenceInfo::Explicit(vec![12, 10])
+        );
+        assert_eq!(views[0].segment.base_row_id(), 0);
+        // The next append's sequence follows the dead row's, not the
+        // compacted row count: 13, never 12 again.
+        store
+            .append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)])
+            .unwrap();
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views[1].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 13 }
+        );
+    }
+
+    #[test]
+    fn a_diverged_reopen_recovers_the_watermark_past_the_manifest() {
+        // Flushes advance sequences without rewriting the manifest, so
+        // reopen folds segment ends over the recorded watermark — and
+        // WAL replay hands the buffered rows the same sequences they
+        // had before the close.
+        let backend: Arc<dyn crate::StorageBackend> = Arc::new(crate::MemBackend::new());
+        let mut store =
+            Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
+        store.diverge(50).unwrap(); // manifest records 50
+        append_n(&mut store, 0..6); // auto-flush at 4; two rows stay buffered
+        drop(store);
+        let store =
+            Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views[0].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 50 }
+        );
+        // The replayed buffer continues at 54 — past the stale
+        // manifest's 50, because the flushed segment's end wins.
+        assert_eq!(
+            views[1].segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 54 }
+        );
+        // And a compaction commits the full state durably: explicit
+        // sequences in the segments, the watermark in the manifest.
+        let mut store = store;
+        store.compact().unwrap();
+        drop(store);
+        let mut store =
+            Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views[0].segment.sequence_info(),
+            &SequenceInfo::Explicit(vec![50, 51, 52, 53])
+        );
+        store
+            .append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)])
+            .unwrap();
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views.last().unwrap().segment.sequence_info(),
+            &SequenceInfo::Contiguous { base: 56 }
         );
     }
 }
