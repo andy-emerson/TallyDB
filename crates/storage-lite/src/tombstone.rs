@@ -10,8 +10,11 @@
 //! Persistence is an append-only log of delete files beside the
 //! segments: each mutation writes one `del-…` object holding the row
 //! ids it killed (sorted, delta-varint, CRC-checked, same header
-//! discipline as segments). Reopen unions the logs; compaction rewrites
-//! storage and removes them. Nothing is ever edited in place.
+//! discipline as segments) and — since v2, the corrections build — the
+//! ingest-sequence coordinate the mutation landed at, which is what
+//! lets `AS OF` un-apply tombstones newer than its cut. Reopen unions
+//! the logs; compaction resolves them into history segments. Nothing
+//! is ever edited in place.
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta};
 use crate::format::FormatError;
@@ -20,16 +23,31 @@ use std::collections::BTreeSet;
 /// First bytes of every delete-log file.
 pub const TOMBSTONE_MAGIC: [u8; 8] = *b"TALLYDEL";
 
-/// Encodes one delete log: the header discipline of the segment format
-/// (magic, version, CRC over the payload), then the sorted row ids
-/// delta-of-delta packed (sorted ids are exactly the ascending-integer
-/// shape that codec compresses best).
-pub fn encode_tombstones(ids: &BTreeSet<u64>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ids.len() + 32);
+/// One decoded delete log: the row ids one mutation killed, and the
+/// ingest-sequence coordinate the mutation landed at — one stamp per
+/// log, because one log is one knowledge event (a `DELETE` statement,
+/// an `UPDATE`'s supersession). A v1 log (written before the corrections
+/// build) decodes with stamp 0: killed-at-unknown, which every `AS OF`
+/// treats as always applied — the conservative reading for tombstones
+/// whose history was never recorded.
+pub struct DeleteLog {
+    /// The killed row ids.
+    pub ids: BTreeSet<u64>,
+    /// The sequence at which the kill was known (0 = unknown, v1).
+    pub stamped_at: u64,
+}
+
+/// Encodes one delete log (version 2): the header discipline of the
+/// segment format (magic, version, CRC over the payload), the stamp,
+/// then the sorted row ids delta-of-delta packed (sorted ids are
+/// exactly the ascending-integer shape that codec compresses best).
+pub fn encode_tombstones(ids: &BTreeSet<u64>, stamped_at: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ids.len() + 40);
     out.extend_from_slice(&TOMBSTONE_MAGIC);
-    out.extend_from_slice(&1u16.to_le_bytes()); // version
+    out.extend_from_slice(&2u16.to_le_bytes()); // version
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+    out.extend_from_slice(&stamped_at.to_le_bytes());
     out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
     let signed: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
     out.extend_from_slice(&encode_delta_of_delta(&signed));
@@ -38,8 +56,9 @@ pub fn encode_tombstones(ids: &BTreeSet<u64>) -> Vec<u8> {
     out
 }
 
-/// Decodes one delete log, verifying magic, version, and checksum.
-pub fn decode_tombstones(bytes: &[u8]) -> Result<BTreeSet<u64>, FormatError> {
+/// Decodes one delete log (v1 or v2), verifying magic, version, and
+/// checksum.
+pub fn decode_tombstones(bytes: &[u8]) -> Result<DeleteLog, FormatError> {
     if bytes.len() < 24 {
         return Err(FormatError::Corrupt("delete log too short".to_owned()));
     }
@@ -47,7 +66,7 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<BTreeSet<u64>, FormatError> {
         return Err(FormatError::BadMagic);
     }
     let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(FormatError::UnsupportedVersion(version));
     }
     if bytes[10..12] != [0, 0] {
@@ -60,9 +79,20 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<BTreeSet<u64>, FormatError> {
     if stored != computed {
         return Err(FormatError::ChecksumMismatch { stored, computed });
     }
-    let count = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
-        .map_err(|_| FormatError::Corrupt("row-id count exceeds this platform".to_owned()))?;
-    let signed = decode_delta_of_delta(&bytes[24..], count)?;
+    let (stamped_at, mut position) = if version == 2 {
+        if bytes.len() < 32 {
+            return Err(FormatError::Corrupt("delete log too short".to_owned()));
+        }
+        (u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 24)
+    } else {
+        (0, 16)
+    };
+    let count = usize::try_from(u64::from_le_bytes(
+        bytes[position..position + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| FormatError::Corrupt("row-id count exceeds this platform".to_owned()))?;
+    position += 8;
+    let signed = decode_delta_of_delta(&bytes[position..], count)?;
     let mut ids = BTreeSet::new();
     let mut previous: Option<u64> = None;
     for value in signed {
@@ -75,7 +105,7 @@ pub fn decode_tombstones(bytes: &[u8]) -> Result<BTreeSet<u64>, FormatError> {
         previous = Some(id);
         ids.insert(id);
     }
-    Ok(ids)
+    Ok(DeleteLog { ids, stamped_at })
 }
 
 /// IEEE CRC-32 (polynomial `0xEDB8_8320`). Note this is *not* the
@@ -122,18 +152,40 @@ mod tests {
             BTreeSet::from([5, 6, 7, 8, 1000, u64::from(u32::MAX)]),
             (0u64..10_000).collect::<BTreeSet<u64>>(),
         ] {
-            let bytes = encode_tombstones(&ids);
-            assert_eq!(decode_tombstones(&bytes).unwrap(), ids);
+            let bytes = encode_tombstones(&ids, 41_520);
+            let decoded = decode_tombstones(&bytes).unwrap();
+            assert_eq!(decoded.ids, ids);
+            assert_eq!(decoded.stamped_at, 41_520);
         }
         // A dense run of ids costs about a byte each, not eight.
         let dense: BTreeSet<u64> = (0u64..10_000).collect();
-        assert!(encode_tombstones(&dense).len() < 11_000);
+        assert!(encode_tombstones(&dense, 0).len() < 11_000);
+    }
+
+    #[test]
+    fn a_v1_log_reads_as_stamped_at_unknown() {
+        // The pre-corrections layout, byte for byte: no stamp field.
+        // Its tombstones decode with stamp 0 — applied at every AS OF.
+        let ids: BTreeSet<u64> = BTreeSet::from([3u64, 9]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TOMBSTONE_MAGIC);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        let signed: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+        bytes.extend_from_slice(&encode_delta_of_delta(&signed));
+        let crc = crc32(&bytes[16..]);
+        bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+        let decoded = decode_tombstones(&bytes).unwrap();
+        assert_eq!(decoded.ids, ids);
+        assert_eq!(decoded.stamped_at, 0);
     }
 
     #[test]
     fn corruption_is_loud() {
         let ids: BTreeSet<u64> = (0u64..100).step_by(3).collect();
-        let bytes = encode_tombstones(&ids);
+        let bytes = encode_tombstones(&ids, 7);
         for position in 0..bytes.len() {
             let mut corrupt = bytes.clone();
             corrupt[position] ^= 0x10;

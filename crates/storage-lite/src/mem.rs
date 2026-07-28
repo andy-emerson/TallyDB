@@ -312,6 +312,7 @@ impl WriteBuffer {
             base_row_id,
             zone_maps,
             sequence: SequenceInfo::RowIds,
+            superseded: None,
         })
     }
 
@@ -525,6 +526,11 @@ pub struct Segment {
     base_row_id: u64,
     zone_maps: Vec<Option<ZoneMap>>,
     sequence: SequenceInfo,
+    /// Per-row kill coordinates — `Some` only on history segments,
+    /// whose every row is a superseded version: the sequence at which
+    /// the row's tombstone was known (0 = unknown, from a v1 delete
+    /// log — treated as superseded before any `AS OF` cut).
+    superseded: Option<Vec<u64>>,
 }
 
 impl Segment {
@@ -537,6 +543,7 @@ impl Segment {
         base_row_id: u64,
         zone_maps: Vec<Option<ZoneMap>>,
         sequence: SequenceInfo,
+        superseded: Option<Vec<u64>>,
     ) -> Segment {
         Segment {
             batch,
@@ -545,6 +552,7 @@ impl Segment {
             base_row_id,
             zone_maps,
             sequence,
+            superseded,
         }
     }
 
@@ -568,6 +576,7 @@ impl Segment {
             base_row_id: 0,
             zone_maps,
             sequence: SequenceInfo::RowIds,
+            superseded: None,
         }
     }
 
@@ -636,6 +645,26 @@ impl Segment {
             );
         }
         self.sequence = sequence;
+        self
+    }
+
+    /// Per-row kill coordinates, present only on history segments: the
+    /// sequence at which each row's tombstone was known (0 = unknown,
+    /// from a v1 delete log — superseded before any `AS OF` cut).
+    pub fn superseded(&self) -> Option<&[u64]> {
+        self.superseded.as_deref()
+    }
+
+    /// Marks this segment as history: every row a superseded version,
+    /// `superseded[i]` the sequence its tombstone landed at. One value
+    /// per row.
+    pub fn with_superseded(mut self, superseded: Vec<u64>) -> Segment {
+        assert_eq!(
+            superseded.len(),
+            self.batch.num_rows(),
+            "a superseded array carries one value per row"
+        );
+        self.superseded = Some(superseded);
         self
     }
 

@@ -19,8 +19,9 @@
 //! Tombstones address rows by these ids ([`Store::tombstone`]), and
 //! [`Store::compact`] resolves them: live rows merge into fresh
 //! segments sorted by (ordering key, ingest sequence) with contiguous
-//! new ids, crash-safely on a persistent store (see the generation
-//! protocol below).
+//! new ids, while superseded rows are retained as history segments
+//! addressed by ingest sequence alone — crash-safely on a persistent
+//! store (see the generation protocol below).
 //!
 //! ## What a snapshot promises
 //!
@@ -37,7 +38,7 @@ use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer};
 use crate::tombstone::{decode_tombstones, encode_tombstones};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// Rows per segment before an automatic flush. Large enough that segment
@@ -101,6 +102,15 @@ fn cell_value(column: &Column, row: usize) -> RowValue<'_> {
 
 fn delete_log_prefix(generation: u64) -> String {
     format!("del-g{generation:010}-")
+}
+
+/// History segments live outside the generation protocol: their names
+/// are recorded in the manifest (which is what makes them real — a
+/// crash can strand unlisted `hist-` files, pre-cleaned by the next
+/// compaction), and they are never rewritten once listed, so history
+/// accumulates without write amplification.
+fn history_name(index: usize) -> String {
+    format!("hist-{index:010}.tlyseg")
 }
 
 /// One segment as a reader sees it: the immutable segment plus the live
@@ -199,8 +209,15 @@ struct Shared {
     /// reader snapshots stamp the buffer's segment with it. The
     /// ingest-sequence watermark is derived: `base + buffer.len()`.
     buffer_sequence_base: Option<u64>,
-    /// Row ids the table has tombstoned (decision #1: ids, never keys).
-    tombstones: BTreeSet<u64>,
+    /// Row ids the table has tombstoned (decision #1: ids, never keys),
+    /// each mapped to the sequence its kill landed at (0 = unknown,
+    /// from a v1 delete log) — what compaction moves into history
+    /// segments' kill coordinates.
+    tombstones: BTreeMap<u64, u64>,
+    /// History segments: superseded row versions a retaining compaction
+    /// preserved. Never in a latest-knowledge snapshot; entered only
+    /// under `AS OF`.
+    history: Vec<Arc<Segment>>,
 }
 
 /// A cheap, cloneable handle that mints point-in-time snapshots while
@@ -316,7 +333,7 @@ fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
                 SegmentView::all_live(segment)
             } else {
                 let live =
-                    Bitmap::from_bools((base..end).map(|id| !shared.tombstones.contains(&id)));
+                    Bitmap::from_bools((base..end).map(|id| !shared.tombstones.contains_key(&id)));
                 SegmentView {
                     segment,
                     live: Some(live),
@@ -359,7 +376,8 @@ impl Store {
                 buffer,
                 buffer_base: 0,
                 buffer_sequence_base: None,
-                tombstones: BTreeSet::new(),
+                tombstones: BTreeMap::new(),
+                history: Vec::new(),
             })),
         })
     }
@@ -471,7 +489,7 @@ impl Store {
             Err(error) => return Err(error.into()),
         };
         let mut segments = Vec::new();
-        let mut tombstones = BTreeSet::new();
+        let mut tombstones = BTreeMap::new();
         let mut next_sequence = 0u64;
         for name in backend.list()? {
             // Objects from other generations are a crashed compaction's
@@ -483,7 +501,8 @@ impl Store {
                 let sequence: u64 = sequence.parse().map_err(|_| StorageError::SchemaMismatch {
                     reason: format!("delete log '{name}' has a malformed name"),
                 })?;
-                tombstones.extend(decode_tombstones(&backend.read(&name)?)?);
+                let log = decode_tombstones(&backend.read(&name)?)?;
+                tombstones.extend(log.ids.iter().map(|&id| (id, log.stamped_at)));
                 next_sequence = next_sequence.max(sequence + 1);
                 continue;
             }
@@ -515,15 +534,32 @@ impl Store {
         // fingerprint of a torn mutation written by a pre-fix build (or a
         // corrupt log). Reject it loudly rather than carrying it: left in
         // place it underflows live_len and shadow-kills reissued ids.
-        if let Some(&bad) = tombstones.iter().find(|&&id| id >= expected_base) {
+        if let Some(&bad) = tombstones.keys().find(|&&id| id >= expected_base) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
+        }
+        // History segments are exactly the ones the manifest names — a
+        // `hist-` file the manifest does not know is a crashed
+        // compaction's stray, invisible here and pre-cleaned by the
+        // next compaction.
+        let mut history = Vec::with_capacity(store.manifest_sections.history.len());
+        for name in &store.manifest_sections.history {
+            let segment = decode_segment(&backend.read(name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!(
+                        "history segment '{name}' was written under a different schema"
+                    ),
+                });
+            }
+            history.push(Arc::new(segment));
         }
         // A diverged table's watermark: the manifest records it at each
         // compaction, but flushes advance sequences without rewriting
         // the manifest, so fold the stored segments' ends on top. Rows
         // the WAL replays below then take sequences from here — the
         // same values they had before the crash, since assignment is
-        // deterministic in append order.
+        // deterministic in append order. (History needs no fold: it
+        // only changes at compaction, where the manifest catches up.)
         let watermark = store.manifest_sections.next_sequence.map(|recorded| {
             segments
                 .iter()
@@ -536,6 +572,7 @@ impl Store {
             shared.buffer_base = expected_base;
             shared.buffer_sequence_base = watermark;
             shared.tombstones = tombstones;
+            shared.history = history;
         }
         store.rows = expected_base;
         store.delete_log_sequence = next_sequence;
@@ -578,6 +615,14 @@ impl Store {
     /// Frozen segments so far (not counting the live buffer).
     pub fn segment_count(&self) -> usize {
         lock(&self.shared).segments.len()
+    }
+
+    /// The history segments: superseded row versions preserved by
+    /// retaining compactions, in the order they were retained. Never
+    /// part of [`Store::snapshot`] — latest-knowledge reads pay nothing
+    /// for them; `AS OF` reads walk them explicitly.
+    pub fn history(&self) -> Vec<Arc<Segment>> {
+        lock(&self.shared).history.clone()
     }
 
     /// A cheap, cloneable reader handle: mints point-in-time snapshots
@@ -791,14 +836,22 @@ impl Store {
         if let Some(&bad) = ids.iter().find(|&&id| id >= self.rows) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
-        let (newly, buffer_base) = {
+        let (newly, buffer_base, stamp) = {
             let shared = lock(&self.shared);
             let newly: BTreeSet<u64> = ids
                 .iter()
                 .copied()
-                .filter(|id| !shared.tombstones.contains(id))
+                .filter(|id| !shared.tombstones.contains_key(id))
                 .collect();
-            (newly, shared.buffer_base)
+            // The kill's coordinate on the knowledge axis: the current
+            // watermark. It is not consumed — the next appended row
+            // takes the same sequence, and `AS OF n` applies both ("all
+            // knowledge with coordinate <= n"); a flush below moves the
+            // buffer without moving the watermark, so the stamp holds.
+            let stamp = shared
+                .buffer_sequence_base
+                .map_or(self.rows, |base| base + shared.buffer.len() as u64);
+            (newly, shared.buffer_base, stamp)
         };
         if newly.is_empty() {
             return Ok(0);
@@ -837,12 +890,14 @@ impl Store {
         if let Some(backend) = &self.backend {
             backend.write(
                 &delete_log_name(self.generation, self.delete_log_sequence),
-                &encode_tombstones(&newly),
+                &encode_tombstones(&newly, stamp),
             )?;
             self.delete_log_sequence += 1;
         }
         let count = newly.len() as u64;
-        lock(&self.shared).tombstones.extend(newly);
+        lock(&self.shared)
+            .tombstones
+            .extend(newly.into_iter().map(|id| (id, stamp)));
         Ok(count)
     }
 
@@ -850,12 +905,18 @@ impl Store {
     /// into fresh segments **sorted by (ordering key, ingest sequence)**,
     /// resolves all tombstones, and reassigns contiguous internal row
     /// ids in the new order. This is where "resolved at the next
-    /// compaction" happens: deleted rows physically disappear, and the
-    /// disorder left by late arrivals or `UPDATE`'s reappends is sorted
-    /// away, so a store is always globally ordered right after
-    /// compaction. Ties on the ordering key keep ingest order (stable
-    /// sort by row id), so duplicates stay first-class and "newest
-    /// version wins" stays meaningful.
+    /// compaction" happens: deleted rows leave the live set — **retained
+    /// as history segments** with their birth and kill coordinates
+    /// (the corrections model, #75; latest-knowledge reads never touch
+    /// them) — and the disorder left by late arrivals or `UPDATE`'s
+    /// reappends is sorted away, so a store is always globally ordered
+    /// right after compaction. Ties on the ordering key keep ingest
+    /// order (stable sort by row id), so duplicates stay first-class
+    /// and "newest version wins" stays meaningful. A compaction that
+    /// retains rows or moves any row id **diverges** the table: birth
+    /// sequences freeze as they were, row ids renumber freely, and the
+    /// two axes never rejoin (an ordered, untombstoned table compacts
+    /// to itself and stays virtual).
     ///
     /// On a persistent store the rewrite is crash-safe: the entire next
     /// generation is written first, one atomic manifest write commits
@@ -870,20 +931,27 @@ impl Store {
     /// release `UPDATE`/`DELETE` debt, so it runs precisely when the table
     /// is already inflated (interacts with #43/#44, #56).
     pub fn compact(&mut self) -> Result<(), StorageError> {
-        // The ingest-sequence watermark, captured before the merge: a
-        // diverged table's compaction must carry it through unchanged —
-        // row ids reassign below, birth sequences never do.
-        let watermark = {
+        // The ingest-sequence watermark as recorded so far, plus the
+        // kill stamps and prior history, captured before the merge: a
+        // diverged table's compaction must carry all three through —
+        // row ids reassign below, knowledge coordinates never do.
+        let (recorded_watermark, stamps, old_history) = {
             let shared = lock(&self.shared);
-            shared
-                .buffer_sequence_base
-                .map(|base| base + shared.buffer.len() as u64)
+            (
+                shared
+                    .buffer_sequence_base
+                    .map(|base| base + shared.buffer.len() as u64),
+                shared.tombstones.clone(),
+                shared.history.clone(),
+            )
         };
-        // Collect every live row's (ordering value, row id, location),
-        // buffer included via an ephemeral snapshot.
+        // Collect every row's (ordering value, row id, location),
+        // buffer included via an ephemeral snapshot — live rows headed
+        // for the new generation, dead rows for history.
         let views = self.snapshot()?;
         let capacity = views.iter().map(SegmentView::live_rows).sum();
         let mut order: Vec<(i64, u64, usize, usize)> = Vec::with_capacity(capacity);
+        let mut dead_order: Vec<(i64, u64, usize, usize)> = Vec::new();
         for (view_index, view) in views.iter().enumerate() {
             let Column::Numeric(NumericData::I64(ordering)) =
                 &view.segment.batch().columns()[self.ordering_key]
@@ -892,12 +960,33 @@ impl Store {
             };
             let base = view.segment.base_row_id();
             for (row, &value) in ordering.values().as_slice().iter().enumerate() {
+                let entry = (value, base + row as u64, view_index, row);
                 if view.is_live(row) {
-                    order.push((value, base + row as u64, view_index, row));
+                    order.push(entry);
+                } else {
+                    dead_order.push(entry);
                 }
             }
         }
         order.sort_by_key(|&(value, id, _, _)| (value, id));
+        dead_order.sort_by_key(|&(value, id, _, _)| (value, id));
+        // Does this compaction break sequence == row id? Yes if it
+        // already broke (diverged), if anything is retained (a dead
+        // row's sequence outlives its id, so future ids must not reuse
+        // it), or if the merge moves any live row to a new id. A
+        // compaction of an ordered, untombstoned table changes nothing
+        // and the table stays virtual.
+        let diverging = recorded_watermark.is_some()
+            || !dead_order.is_empty()
+            || order
+                .iter()
+                .enumerate()
+                .any(|(new_id, &(_, id, _, _))| id != new_id as u64);
+        let watermark = if diverging {
+            Some(recorded_watermark.unwrap_or(self.rows))
+        } else {
+            None
+        };
         // Rebuild into fresh segments of the configured size. A
         // diverged table's rows keep their birth sequences through the
         // merge — gathered in merge order, so the new segments carry
@@ -943,29 +1032,84 @@ impl Store {
             new_segments.push(segment);
             base += rows;
         }
+        // Dead rows become history segments: same merge order, same
+        // chunking, each row carrying its birth and kill coordinates.
+        // Their base row id is 0 — history rows have no live identity;
+        // they are addressed by sequence alone.
+        let mut new_history: Vec<Segment> = Vec::new();
+        if !dead_order.is_empty() {
+            let mut buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
+            let mut births: Vec<u64> = Vec::new();
+            let mut kills: Vec<u64> = Vec::new();
+            for &(_, id, view_index, row) in &dead_order {
+                let view_segment = &views[view_index].segment;
+                let cells: Vec<RowValue<'_>> = view_segment
+                    .batch()
+                    .columns()
+                    .iter()
+                    .map(|column| cell_value(column, row))
+                    .collect();
+                buffer.append(&cells)?;
+                births.push(view_segment.sequence_at(row));
+                kills.push(*stamps.get(&id).expect("a dead row has a tombstone"));
+                if buffer.len() >= self.segment_rows {
+                    let full = std::mem::replace(
+                        &mut buffer,
+                        WriteBuffer::new(self.schema.clone(), self.ordering_key)?,
+                    );
+                    new_history.push(
+                        full.freeze()?
+                            .with_sequence(SequenceInfo::Explicit(std::mem::take(&mut births)))
+                            .with_superseded(std::mem::take(&mut kills)),
+                    );
+                }
+            }
+            if !buffer.is_empty() {
+                new_history.push(
+                    buffer
+                        .freeze()?
+                        .with_sequence(SequenceInfo::Explicit(births))
+                        .with_superseded(kills),
+                );
+            }
+        }
         // Built now, before the commit point, so adopting the new
         // generation in memory below cannot fail partway.
         let fresh_buffer = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
-        // The manifest the commit writes carries the current watermark:
-        // the one durable record that sequences run ahead of row ids.
+        // The manifest the commit will write: the current watermark (the
+        // one durable record that sequences run ahead of row ids) and
+        // the accumulated history names. Built as a local and adopted
+        // only at the commit point, so a failed compaction never leaves
+        // memory claiming history the backend does not hold.
+        let mut sections = self.manifest_sections.clone();
         if watermark.is_some() {
-            self.manifest_sections.next_sequence = watermark;
+            sections.next_sequence = watermark;
         }
+        let new_history_names: Vec<String> = (0..new_history.len())
+            .map(|index| history_name(sections.history.len() + index))
+            .collect();
+        sections.history.extend(new_history_names.iter().cloned());
 
         // Persist the next generation and commit it atomically.
         if let Some(backend) = &self.backend {
             let next = self.generation + 1;
             // Pre-clean: a compaction that crashed after writing some
             // next-generation objects left strays under exactly this
-            // generation. They must go before we write, or a stray whose
-            // base the new layout doesn't overwrite would be loaded as
-            // real data after the commit.
+            // generation — and possibly `hist-` files the manifest never
+            // came to name. They must go before we write, or a stray
+            // whose base the new layout doesn't overwrite would be
+            // loaded as real data after the commit.
             for name in backend.list()? {
-                if name.starts_with(&segment_prefix(next))
-                    || name.starts_with(&delete_log_prefix(next))
-                {
+                let stray_generation = name.starts_with(&segment_prefix(next))
+                    || name.starts_with(&delete_log_prefix(next));
+                let stray_history =
+                    name.starts_with("hist-") && !self.manifest_sections.history.contains(&name);
+                if stray_generation || stray_history {
                     backend.remove(&name)?;
                 }
+            }
+            for (name, segment) in new_history_names.iter().zip(&new_history) {
+                backend.write(name, &encode_segment(segment))?;
             }
             for segment in &new_segments {
                 backend.write(
@@ -976,15 +1120,11 @@ impl Store {
             // The manifest write is the commit point.
             backend.write(
                 MANIFEST,
-                &encode_manifest(
-                    &self.schema,
-                    self.ordering_key,
-                    next,
-                    &self.manifest_sections,
-                ),
+                &encode_manifest(&self.schema, self.ordering_key, next, &sections),
             )?;
             self.generation = next;
         }
+        self.manifest_sections = sections;
 
         // In-memory commit: adopt the new generation. Infallible, taken
         // under one brief lock, and run immediately after the durable
@@ -1000,6 +1140,10 @@ impl Store {
             shared.buffer_base = base;
             shared.buffer_sequence_base = watermark;
             shared.tombstones.clear();
+            shared.history = old_history
+                .into_iter()
+                .chain(new_history.into_iter().map(Arc::new))
+                .collect();
         }
         self.rows = base;
         self.delete_log_sequence = 0;
@@ -1030,10 +1174,9 @@ impl Store {
 
     /// Marks the table diverged at `watermark`: from here on, appended
     /// rows take birth sequences from the watermark instead of their
-    /// row ids, and the manifest records it. This is what a retaining
-    /// compaction does the first time it breaks sequence == row id;
-    /// until that compaction lands (M4.4 step 4), only tests walk this
-    /// path, which is why it is test-gated.
+    /// row ids, and the manifest records it. [`Store::compact`] crosses
+    /// this seam itself the first time it retains or renumbers; tests
+    /// drive it directly to pin the plumbing at chosen watermarks.
     #[cfg(test)]
     fn diverge(&mut self, watermark: u64) -> Result<(), StorageError> {
         self.manifest_sections.next_sequence = Some(watermark);

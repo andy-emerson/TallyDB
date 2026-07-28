@@ -95,10 +95,14 @@ pub const VERSION: u16 = 1;
 /// v2 segments. Assigned trailer tags (a registry separate from the
 /// manifest's): 1 = birth sequences (see [`crate::mem::SequenceInfo`]) —
 /// a state byte (1 contiguous, 2 explicit), then for contiguous the
-/// `u64` base, for explicit the delta-of-delta-coded per-row array.
+/// `u64` base, for explicit the delta-of-delta-coded per-row array;
+/// 2 = kill coordinates (history segments only) — the delta-of-delta-
+/// coded per-row array of sequences at which each row's tombstone
+/// landed (see [`crate::mem::Segment::superseded`]).
 pub const VERSION_TRAILERED: u16 = 2;
 
 const TRAILER_SEQUENCE: u16 = 1;
+const TRAILER_SUPERSEDED: u16 = 2;
 const SEQUENCE_CONTIGUOUS: u8 = 1;
 const SEQUENCE_EXPLICIT: u8 = 2;
 
@@ -181,8 +185,8 @@ const PAYLOAD_OFFSET: usize = 16;
 /// (the golden-locked layout every never-diverged table keeps forever),
 /// the trailered v2 once sequence data must be carried.
 pub fn encode_segment(segment: &Segment) -> Vec<u8> {
-    let version = match segment.sequence_info() {
-        SequenceInfo::RowIds => VERSION,
+    let version = match (segment.sequence_info(), segment.superseded()) {
+        (SequenceInfo::RowIds, None) => VERSION,
         _ => VERSION_TRAILERED,
     };
     let batch = segment.batch();
@@ -214,13 +218,18 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
         );
     }
     if version == VERSION_TRAILERED {
-        let payload = match segment.sequence_info() {
-            SequenceInfo::RowIds => unreachable!("virtual segments encode as v1"),
+        let mut sections: Vec<(u16, Vec<u8>)> = Vec::new();
+        match segment.sequence_info() {
+            // A history segment can carry kill coordinates while its
+            // births are virtual only in principle; in practice every
+            // trailered segment of a diverged table has sequence data,
+            // and a RowIds state simply writes no sequence section.
+            SequenceInfo::RowIds => {}
             SequenceInfo::Contiguous { base } => {
                 let mut payload = Vec::with_capacity(9);
                 payload.push(SEQUENCE_CONTIGUOUS);
                 payload.extend_from_slice(&base.to_le_bytes());
-                payload
+                sections.push((TRAILER_SEQUENCE, payload));
             }
             SequenceInfo::Explicit(values) => {
                 // Sequences are u64; the codec is i64 with wrapping
@@ -229,13 +238,19 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
                 let signed: Vec<i64> = values.iter().map(|&value| value as i64).collect();
                 let mut payload = encode_delta_of_delta(&signed);
                 payload.insert(0, SEQUENCE_EXPLICIT);
-                payload
+                sections.push((TRAILER_SEQUENCE, payload));
             }
-        };
-        out.extend_from_slice(&1u16.to_le_bytes()); // section count
-        out.extend_from_slice(&TRAILER_SEQUENCE.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
+        }
+        if let Some(superseded) = segment.superseded() {
+            let signed: Vec<i64> = superseded.iter().map(|&value| value as i64).collect();
+            sections.push((TRAILER_SUPERSEDED, encode_delta_of_delta(&signed)));
+        }
+        out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
+        for (tag, payload) in sections {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
     }
     let crc = crc32c(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -448,16 +463,29 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         zone_maps.push(zone_map);
     }
     let mut sequence = SequenceInfo::RowIds;
+    let mut superseded = None;
     if version == VERSION_TRAILERED {
         let section_count = reader.u16()?;
         for _ in 0..section_count {
             let tag = reader.u16()?;
             let length = reader.u32()? as usize;
             let payload = reader.take(length)?;
-            // Unknown trailer tags are skipped whole — the same
-            // forward-compatibility contract as manifest sections.
-            if tag == TRAILER_SEQUENCE {
-                sequence = decode_sequence_section(payload, row_count)?;
+            match tag {
+                TRAILER_SEQUENCE => {
+                    sequence = decode_sequence_section(payload, row_count)?;
+                }
+                TRAILER_SUPERSEDED => {
+                    let signed = decode_delta_of_delta(payload, row_count)?;
+                    superseded = Some(
+                        signed
+                            .into_iter()
+                            .map(|value| value as u64)
+                            .collect::<Vec<u64>>(),
+                    );
+                }
+                // Unknown trailer tags are skipped whole — the same
+                // forward-compatibility contract as manifest sections.
+                _ => {}
             }
         }
     }
@@ -480,6 +508,7 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         base_row_id,
         zone_maps,
         sequence,
+        superseded,
     ))
 }
 
