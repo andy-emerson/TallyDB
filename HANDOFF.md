@@ -27,15 +27,16 @@ constraints change only when the Human says so.
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`
    · `cargo test --workspace` ·
    `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` · the
-   Python oracle suites (build with `--features oracle-harness`, run
-   the five scripts in `.github/workflows/ci.yml`).
+   off-leg (`clippy`/`test`/`doc` for `-p engine`, default features) ·
+   the Python oracle suites (build with `--features oracle-harness`,
+   run the six scripts in `.github/workflows/ci.yml`).
 7. **Never touch the vendored Lua** under `crates/compute-lua/vendor`.
 8. The process is `AGENTS.md`: Plan → Develop → Assess → Review;
    claims at their evidence; code passes and doc passes never mix;
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-28, mid-M4: M4.0–M4.3 done, M4.4 next)
+## Snapshot (2026-07-28, mid-M4: M4.0–M4.4 done, M4.5 next)
 
 - **M3 merged** to `main` (PR #74); M0–M3 milestones closed.
 - **Current milestone: M4 — the extension model + corrections.** Plan
@@ -43,19 +44,29 @@ constraints change only when the Human says so.
   M4.0 (trait public, register_window, doctest), M4.1 (lua feature
   gate, CI both legs incl. off-leg rustdoc), M4.2 (vocabulary
   invariant registry-driven + tested; promotion test; the vectorized
-  column-function slot — ColumnFunction trait + register_lua_scalar +
-  .luascalar — closed #53; compose-don't-loop idiom recorded). M4.3
-  ruled and recorded (sequence column default-on, unbounded horizon,
-  bare AS OF carried on FOR SYSTEM_TIME AS OF, one-word ASOF JOIN).
-  NEXT: **M4.4 the corrections build** (sequence column
-  virtual-until-divergence, retaining compaction with history
-  segments, knowledge mask, AS OF clause; manifest revision designed
-  with F3's zone-map sections reserved; oracle = DuckDB re-deriving
-  as-of answers over an explicit history table) → M4.5 correctness
-  batch (#73 atomic mutation commit record, #63 Miri CI, #69 upstream
-  Lua suite, review-noted redundancies) → **the Lua trial** (Agent
-  brings the evidence brief; the Human alone rules; see the sunset
-  clause) → M4.6 SQL-in-Lua (#70) only on a pass.
+  column-function slot closed #53), M4.3 ruled (sequence column
+  default-on, unbounded horizon, one-word `ASOF` — structure
+  dispatches, `FOR SYSTEM_TIME AS OF` the accepted standard carrier),
+  **M4.4 the corrections build — all six steps landed** (#75 has the
+  step-by-step record): manifest v2 sections (byte-identical v1 while
+  empty), segment v2 sequence trailers (three-state SequenceInfo),
+  watermark plumbing (Shared.buffer_sequence_base; reopen folds
+  segment ends over the manifest watermark), retaining compaction
+  (history segments `hist-NNN` outside the generation protocol,
+  delete-log v2 kill stamps, divergence = retains-or-renumbers, crash
+  strays pre-cleaned), the `ASOF n` clause (extraction pre-parse,
+  KnowledgeSnapshot::as_of masks, snapshot time travel, teaching
+  errors, Table::next_sequence), and the DuckDB explicit-history-table
+  oracle (sixth CI suite; 253 cuts swept twice across a reopen).
+  NEXT: **M4.5 correctness batch** (#73 atomic mutation commit record,
+  #63 Miri CI, #69 upstream Lua suite, review-noted redundancies) →
+  **the Lua trial** (Agent brings the evidence brief; the Human alone
+  rules) → M4.6 SQL-in-Lua (#70) only on a pass.
+- **Loose end to surface at the M4.4 wrap:** the sequence column is
+  reachable as `ASOF`'s coordinate and via `Table::next_sequence()`,
+  but not yet projectable from SQL (`SELECT _seq ...`); the M4.3
+  ruling said its exposure surface is designed in M4.4 — propose the
+  design (standard system-column precedent) before M4 closes.
 - **Open rulings pending:** F1 (time bucketing, an M5 concern); the
   Human's noted-but-unstated reservation about how `KEY` was coined.
   Issue #75 tracks the corrections build; #73/#63/#69 are M4's
