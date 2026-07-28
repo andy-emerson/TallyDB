@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 /// One embedder-installed sink shared by every kernel of a table: each
 /// `LuaState` owns its sink box, so a shared destination crosses as an
 /// `Arc` behind this forwarding shim.
-struct SharedSink(Arc<dyn LogSink + Sync>);
+pub(crate) struct SharedSink(pub(crate) Arc<dyn LogSink + Sync>);
 
 impl LogSink for SharedSink {
     fn log(&self, message: &str) {

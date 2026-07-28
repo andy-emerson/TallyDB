@@ -295,6 +295,25 @@ pub(crate) unsafe fn bind_input(
     name: &CStr,
     view: &ColumnView<'_>,
 ) -> Result<(), String> {
+    unsafe {
+        push_input(raw, generation, name, view)?;
+        ffi::lua_setglobal(raw, name.as_ptr());
+    }
+    Ok(())
+}
+
+/// Pushes `view` as an input-view userdata — the value [`bind_input`]
+/// binds — leaving it on the stack (the driver seam names result
+/// columns with table keys, not globals). Same lifetime contract.
+///
+/// # Safety
+/// Same contract as [`bind_input`].
+pub(crate) unsafe fn push_input(
+    raw: *mut ffi::lua_State,
+    generation: *const u64,
+    name: &CStr,
+    view: &ColumnView<'_>,
+) -> Result<(), String> {
     let payload = match *view {
         ColumnView::F64 { values, validity } => InputPayload {
             data: values.as_ptr().cast(),
@@ -333,7 +352,6 @@ pub(crate) unsafe fn bind_input(
             .cast::<InputPayload>();
         slot.write(payload);
         ffi::luaL_setmetatable(raw, META_INPUT.as_ptr());
-        ffi::lua_setglobal(raw, name.as_ptr());
     }
     Ok(())
 }

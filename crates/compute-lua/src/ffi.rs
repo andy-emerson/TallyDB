@@ -37,6 +37,7 @@ pub(crate) const LUA_TNIL: c_int = 0;
 pub(crate) const LUA_TBOOLEAN: c_int = 1;
 pub(crate) const LUA_TNUMBER: c_int = 3;
 pub(crate) const LUA_TSTRING: c_int = 4;
+pub(crate) const LUA_TTABLE: c_int = 5;
 
 unsafe extern "C" {
     // State lifecycle.
@@ -97,6 +98,12 @@ unsafe extern "C" {
     pub(crate) fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) -> c_int;
     pub(crate) fn lua_setglobal(L: *mut lua_State, name: *const c_char);
     pub(crate) fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int;
+
+    // Tables and traversal — the driver seam's result and row shapes.
+    pub(crate) fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int);
+    pub(crate) fn lua_settable(L: *mut lua_State, idx: c_int);
+    pub(crate) fn lua_next(L: *mut lua_State, idx: c_int) -> c_int;
+    pub(crate) fn lua_checkstack(L: *mut lua_State, n: c_int) -> c_int;
 
     // Curated standard libraries (opened individually — there is no
     // luaL_openlibs call anywhere in this crate, by policy).

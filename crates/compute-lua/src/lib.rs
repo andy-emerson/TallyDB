@@ -63,6 +63,7 @@
 //! it gets a narrow, scoped addition — not a new paradigm bolted on. See
 //! DESIGN.md for the reasoning.
 
+mod driver;
 mod ffi;
 mod host;
 mod log;
@@ -70,6 +71,7 @@ mod state;
 mod values;
 mod vector;
 
+pub use driver::{ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 pub use host::HostFunction;
 pub use log::LogSink;
 pub use state::{Chunk, LuaState};

@@ -32,6 +32,10 @@ use storage_lite::RowValue;
 #[derive(Default)]
 pub struct Database {
     tables: HashMap<String, Table>,
+    /// The `log(...)` destination for driver scripts (`run_script`);
+    /// kernels use their table's sink.
+    #[cfg(feature = "lua")]
+    script_log_sink: Option<std::sync::Arc<dyn compute_lua::LogSink + Sync>>,
 }
 
 impl Database {
@@ -197,6 +201,36 @@ impl Database {
             .get_mut(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
             .register_lua_scalar(name, parameters, chunk)
+    }
+
+    /// Runs `source` as a **driver script** — SQL-in-Lua (#70): the
+    /// script's `query(sql)` and `append(table, row)` globals reach
+    /// this database, so it can issue SQL, receive result columns as
+    /// views (single-segment results zero-copy; several segments
+    /// concatenate — the bounded copy), and feed derived rows back
+    /// exactly. Each call runs in a fresh interpreter: no state
+    /// crosses between scripts. See `driver` module docs for what
+    /// each statement kind means here.
+    #[cfg(feature = "lua")]
+    pub fn run_script(&mut self, source: &str) -> Result<(), EngineError> {
+        let mut state = compute_lua::LuaState::new().map_err(EngineError::Script)?;
+        if let Some(sink) = &self.script_log_sink {
+            state.set_log_sink(Box::new(crate::script::SharedSink(std::sync::Arc::clone(
+                sink,
+            ))));
+        }
+        let chunk = state.compile(source).map_err(EngineError::Script)?;
+        let mut host = crate::driver::DatabaseHost { database: self };
+        state
+            .run_driver(&chunk, &mut host)
+            .map_err(EngineError::Script)
+    }
+
+    /// Installs the destination for driver scripts' `log(...)` output
+    /// (see [`Database::run_script`]); off (a no-op) until set.
+    #[cfg(feature = "lua")]
+    pub fn set_script_log_sink(&mut self, sink: std::sync::Arc<dyn compute_lua::LogSink + Sync>) {
+        self.script_log_sink = Some(sink);
     }
 
     /// Compacts the named table (see [`Table::compact`]).

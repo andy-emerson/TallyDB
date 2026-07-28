@@ -361,6 +361,43 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
     }
 }
 
+/// The driver-pipeline family (SQL-in-Lua, #70): a script drives the
+/// engine end to end over the persistent, reopened, multi-segment M1
+/// fixture — SELECT out, the vectorized vocabulary over the result
+/// views (the contiguous result crosses segment boundaries and merges
+/// per-segment key dictionaries), exact row-by-row feed-back into a
+/// scratch table, SELECT back in. Exports the derived table (`ts, sym,
+/// x, y, rel, rdot`) for the oracle script to re-derive with NumPy.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_driver_pipeline_stream(out: *mut ArrowArrayStream) {
+    let mut database = Database::new();
+    database.add_table(fixture_table()).expect("fixture adds");
+    let script = format!(
+        "query(\"CREATE TABLE derived (ts BIGINT ORDERING KEY, sym KEY NOT NULL, \
+         x DOUBLE, y DOUBLE, rel DOUBLE, rdot DOUBLE)\")\n\
+         local r, n = query(\"SELECT ts, sym, x, y FROM trades\")\n\
+         local rel = (r.x - r.y) / r.y\n\
+         local rdot = rolling_dot(r.x, r.y, {window})\n\
+         for i = 1, n do\n\
+           append(\"derived\", {{ ts = r.ts[i], sym = r.sym:text(i), x = r.x[i], \
+           y = r.y[i], rel = rel[i], rdot = rdot[i] }})\n\
+         end\n\
+         local d, m = query(\"SELECT ts FROM derived\")\n\
+         assert(m == n, \"feed-back kept every row\")",
+        window = LUA_PRECEDING + 1
+    );
+    database.run_script(&script).expect("driver pipeline runs");
+    match database.query_stream("SELECT ts, sym, x, y, rel, rdot FROM derived") {
+        // SAFETY: the caller (the oracle script) provides a valid,
+        // writable destination struct.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("derived-table export failed: {error}"),
+    }
+}
+
 /// An open benchmark context: one prebuilt table, so the timed calls
 /// measure query + export only — never fixture construction.
 pub struct BenchContext {

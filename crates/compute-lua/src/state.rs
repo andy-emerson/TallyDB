@@ -38,6 +38,7 @@
 //! *The Lua layer*), a kernel that proves hot graduates to a curated
 //! native op rather than the interpreter getting a JIT.
 
+use crate::driver::{self, DriverCall, DriverSlot, ScriptHost};
 use crate::ffi;
 use crate::host::{self, HostFunction, HostSlot};
 use crate::log::{self, LogSink, SinkSlot};
@@ -81,6 +82,9 @@ pub struct LuaState {
     /// Registered host functions, one stable box each (the closures'
     /// upvalues point at them); freed in `Drop`.
     host_functions: Vec<*mut HostSlot>,
+    /// The driver slot `query`/`append` reach — null except inside
+    /// [`LuaState::run_driver`]; freed in `Drop`.
+    driver: *mut DriverSlot,
     /// This interpreter's identity, stamped into every [`Chunk`] it
     /// compiles so a chunk cannot be run against another state.
     id: u64,
@@ -106,11 +110,14 @@ impl LuaState {
             crate::vector::install(raw);
             let sink = Box::into_raw(Box::new(SinkSlot(None)));
             log::install(raw, sink);
+            let driver_slot = Box::into_raw(Box::new(DriverSlot(std::ptr::null_mut())));
+            driver::install(raw, driver_slot);
             Ok(LuaState {
                 raw,
                 generation,
                 sink,
                 host_functions: Vec::new(),
+                driver: driver_slot,
                 id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 next_chunk: 0,
             })
@@ -232,6 +239,37 @@ impl LuaState {
                 .and_then(|()| crate::vector::read_column_result(self.raw));
             let result = result.and_then(|column| write_column_result(column, &mut output));
             self.end_call();
+            result
+        }
+    }
+
+    /// Runs `chunk` as a **driver script** — the SQL-in-Lua shape
+    /// (#70): for this call only, the globals `query` and `append`
+    /// reach `host`, so the script issues SQL, receives result columns
+    /// as zero-copy views, and feeds derived rows back. Result views
+    /// (like input views everywhere else) are valid only inside this
+    /// call: the held result buffers drop after the generation bump
+    /// poisons them. Outside this method, `query`/`append` raise —
+    /// a window or scalar kernel cannot re-enter the engine.
+    pub fn run_driver(&mut self, chunk: &Chunk, host: &mut dyn ScriptHost) -> Result<(), String> {
+        unsafe {
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            // Erase the borrow's lifetime into the raw slot pointer:
+            // the pointer is reachable only while this frame is live —
+            // the slot is nulled again before this method returns.
+            let host: *mut (dyn ScriptHost + '_) = host;
+            let host: *mut dyn ScriptHost = std::mem::transmute(host);
+            let mut call = DriverCall {
+                host,
+                held: Vec::new(),
+                generation: self.generation,
+            };
+            (*self.driver).0 = &mut call;
+            let result = self.run(chunk, 0);
+            (*self.driver).0 = std::ptr::null_mut();
+            self.end_call();
+            // `call` (host pointer, held results) drops here — after
+            // the bump, so no live view can reach a freed buffer.
             result
         }
     }
@@ -403,10 +441,13 @@ fn write_column_result(
 //    created in `new`, closed in `Drop`, and the pointer is never
 //    copied out of the struct (`view_data_pointer` returns buffer
 //    pointers, not the state). `generation` points into that same
-//    interpreter's registry-anchored allocation; `sink` and each
-//    `host_functions` entry point into Boxes this struct alone owns
-//    (their `LogSink` / `HostFunction` contents are themselves `Send`
-//    by the traits' bounds), so all of it moves with it.
+//    interpreter's registry-anchored allocation; `sink`, `driver`, and
+//    each `host_functions` entry point into Boxes this struct alone
+//    owns (their `LogSink` / `HostFunction` contents are themselves
+//    `Send` by the traits' bounds; the driver slot holds only a null
+//    pointer between `run_driver` calls, and during one the frame it
+//    points at lives on the single calling thread's stack), so all of
+//    it moves with it.
 // 2. Every operation takes `&mut self`, so after a move to another
 //    thread exactly one thread touches the interpreter at a time.
 // 3. Vendored PUC Lua 5.4, compiled unmodified with the ANSI config,
@@ -430,6 +471,7 @@ impl Drop for LuaState {
             // After close nothing can reach the closures' upvalues; the
             // slots are safe to free.
             drop(Box::from_raw(self.sink));
+            drop(Box::from_raw(self.driver));
             for slot in self.host_functions.drain(..) {
                 drop(Box::from_raw(slot));
             }

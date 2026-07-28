@@ -77,6 +77,8 @@
 //! a rewrite later.
 
 pub mod database;
+#[cfg(feature = "lua")]
+mod driver;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
 #[cfg(feature = "lua")]

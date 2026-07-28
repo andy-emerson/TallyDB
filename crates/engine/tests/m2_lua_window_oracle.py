@@ -150,6 +150,36 @@ def main():
             checked += 1
     print(f"PASS lua windows vs numpy ({checked} windows x 4 kernels)")
     print(f"PASS composed column kernels vs numpy ({len(x)} rows x 2 kernels)")
+
+    # The driver pipeline (SQL-in-Lua, #70): a script SELECTed the same
+    # fixture, computed rel/rdot over the result views, and fed every
+    # row back through append into a scratch table; the export here is
+    # that derived table. The inputs must round-trip bit-for-bit
+    # (SELECT -> view -> Lua number -> append -> storage -> export),
+    # the key texts must survive the per-segment dictionary merge, and
+    # the derived columns must re-derive in NumPy exactly like the
+    # kernel-slot versions above.
+    derived = read_stream_hook(lib, "tallydb_driver_pipeline_stream")
+    d_ts = derived.column("ts").to_numpy(zero_copy_only=False)
+    if not np.array_equal(d_ts, np.sort(ts)):
+        sys.exit("driver pipeline: ts set changed through the round trip")
+    order = np.argsort(ts, kind="stable")
+    if derived.column("sym").to_pylist() != [symbols[i] for i in order]:
+        sys.exit("driver pipeline: key texts changed through the merge/feed-back")
+    d_x = derived.column("x").to_numpy(zero_copy_only=False)
+    d_y = derived.column("y").to_numpy(zero_copy_only=False)
+    if not (np.array_equal(d_x, x[order]) and np.array_equal(d_y, y[order])):
+        sys.exit("driver pipeline: numeric inputs changed through the round trip")
+    d_rel = derived.column("rel").to_numpy(zero_copy_only=False)
+    if not np.array_equal(d_rel, (d_x - d_y) / d_y):
+        sys.exit("driver pipeline: rel differs from (x - y) / y")
+    d_rdot = derived.column("rdot").to_numpy(zero_copy_only=False)
+    for i in range(len(d_x)):
+        lo = max(0, i - window + 1)
+        expected = float(np.dot(d_x[lo : i + 1], d_y[lo : i + 1]))
+        if not np.isclose(d_rdot[i], expected, rtol=1e-12, atol=1e-9):
+            sys.exit(f"driver pipeline: rdot row {i}: {d_rdot[i]} != {expected}")
+    print(f"PASS driver pipeline (SQL -> Lua -> SQL) vs numpy ({len(d_x)} rows)")
     print(
         f"Lua-window family validated end-to-end over the storage round trip "
         f"(numpy {np.__version__}, pyarrow {pa.__version__}, "

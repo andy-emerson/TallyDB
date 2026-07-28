@@ -104,6 +104,7 @@ impl Console {
                 .add_table(table)
                 .map_err(|error| error.to_string())?;
         }
+        database.set_script_log_sink(Arc::clone(&sink));
         Ok(Console {
             database,
             dir,
@@ -215,6 +216,21 @@ impl Console {
                 };
                 let count = self.import_csv(Path::new(file), table)?;
                 Ok(Outcome::Note(format!("{count} rows imported")))
+            }
+            "run" => {
+                // The driver direction (SQL-in-Lua, #70): the script's
+                // `query`/`append` drive this console's database. Tables
+                // the script CREATEs are in-memory scratch — durable
+                // tables are created at the prompt, before the script.
+                if argument.is_empty() {
+                    return Err(".run FILE — run a Lua driver script from a file".to_owned());
+                }
+                let source = std::fs::read_to_string(argument)
+                    .map_err(|error| format!("{argument}: {error}"))?;
+                self.database
+                    .run_script(&source)
+                    .map_err(|error| error.to_string())?;
+                Ok(Outcome::Note(format!("{argument}: done")))
             }
             "lua" => {
                 let (name, parameters, chunk) = parse_lua_command(argument)?;
@@ -518,6 +534,12 @@ Commands:
                             register a Lua per-row function: whole
                             columns bind to PARAMS, the script fills
                             out[i] (unwritten slots return NULL)
+  .run FILE                 run a Lua driver script: query(sql) issues
+                            SQL and returns result columns as views
+                            plus a row count; append(table, row) feeds
+                            derived rows back exactly. Tables a script
+                            CREATEs are in-memory scratch; durable
+                            tables are created at this prompt first
   .quit                     leave";
 
 #[cfg(test)]
@@ -655,6 +677,41 @@ mod tests {
              AS s FROM t;",
         );
         assert!(rendered.contains("25.0"), "3^2+4^2: {rendered}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn driver_scripts_run_from_the_console() {
+        let dir = scratch("run");
+        let mut console = Console::open(&dir).unwrap();
+        note(
+            &mut console,
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE NOT NULL);",
+        );
+        note(&mut console, "INSERT INTO t VALUES (1, 3.0), (2, 4.0);");
+        let script = dir.join("pipeline.lua");
+        std::fs::write(
+            &script,
+            "local r, n = query('SELECT ts, x FROM t')\n\
+             local double = r.x + r.x\n\
+             for i = 1, n do append('t', { ts = 10 + r.ts[i], x = double[i] }) end\n",
+        )
+        .unwrap();
+        note(&mut console, &format!(".run {}", script.display()));
+        let rendered = table(&mut console, "SELECT ts, x FROM t ORDER BY ts;");
+        assert!(
+            rendered.contains("6.0") && rendered.contains("8.0"),
+            "appended doubles: {rendered}"
+        );
+        // A missing file and a broken script are loud, and the console
+        // survives both.
+        assert!(console.execute(".run nope.lua").is_err());
+        std::fs::write(&script, "query('SELECT nope FROM t')").unwrap();
+        let error = console
+            .execute(&format!(".run {}", script.display()))
+            .unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+        note(&mut console, ".tables");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
