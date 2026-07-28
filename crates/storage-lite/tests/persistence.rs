@@ -7,6 +7,7 @@ use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 use std::sync::Arc;
 use storage_lite::{
     encode_segment, FsBackend, IoError, MemBackend, RowValue, StorageBackend, StorageError, Store,
+    StoreOptions, WalSync,
 };
 
 fn schema() -> Schema {
@@ -57,17 +58,30 @@ fn each_backend(test: impl Fn(Arc<dyn StorageBackend>)) {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The flush-boundary contract, which `WalSync::Off` preserves (#43):
+/// without a log, unflushed rows are memory-only.
 #[test]
 fn reopen_sees_exactly_the_flushed_rows() {
+    let no_wal = |backend: Arc<dyn StorageBackend>| {
+        Store::persistent_with(
+            backend,
+            schema(),
+            0,
+            StoreOptions {
+                segment_rows: Some(4),
+                wal_sync: WalSync::Off,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap()
+    };
     each_backend(|backend| {
         {
-            let mut store =
-                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 4).unwrap();
+            let mut store = no_wal(backend.clone());
             append_n(&mut store, 0..10); // 8 rows auto-flushed, 2 live
             assert_eq!(store.len(), 10);
         } // dropped without a final flush — the live rows are gone
-        let mut store =
-            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 4).unwrap();
+        let mut store = no_wal(backend.clone());
         assert_eq!(store.len(), 8, "unflushed rows do not survive");
         assert_eq!(ts_values(&store), (0..8).collect::<Vec<_>>());
         // Row ids continue where the flushed data ended (#1).

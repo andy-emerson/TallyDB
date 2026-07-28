@@ -54,6 +54,16 @@
 //! parameters or dimensions — where no closed form exists. See DESIGN.md,
 //! *Curated compute: what the engine calls, and why*.
 //!
+//! ## Concurrency: single writer, concurrent snapshot readers
+//! Exactly one `&mut Table` writer exists at a time — a compile-time
+//! fact, not a runtime policy — while any number of threads hold
+//! [`TableReader`]s and query point-in-time [`TableSnapshot`]s. A
+//! snapshot never blocks the writer for longer than one write-buffer
+//! copy under a brief per-table lock, and a compaction never
+//! invalidates a held snapshot (its segments stay alive through their
+//! `Arc`s). Cross-table snapshot consistency is deliberately not
+//! promised.
+//!
 //! ## Current milestone: native only
 //! Nothing here should assume a filesystem, threading model, or blocking
 //! I/O that would foreclose a future wasm32 build — but building that
@@ -67,10 +77,11 @@ pub mod harness;
 mod script;
 pub mod table;
 
+pub use compute_lua::LogSink;
 pub use database::Database;
 pub use query_lite::QueryOutput;
-pub use storage_lite::RowValue;
-pub use table::{EngineError, Table};
+pub use storage_lite::{RowValue, StoreOptions, WalSync};
+pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`
 // runs application-registered Lua kernels as SQL window functions
@@ -82,5 +93,6 @@ pub use table::{EngineError, Table};
 // TODO: expose the remaining compute-linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced
 //       cleanly (not panics)
-// TODO: the scalar-projection Lua slot (#53, post-M2: PlanItem is
-//       Column|WindowAgg only; computed projections aren't built)
+// TODO: the Lua half of scalar projections (#53): the computed-
+//       projection slot exists (PlanItem::Computed, M3.4) — what's
+//       left is letting a registered Lua function appear in it

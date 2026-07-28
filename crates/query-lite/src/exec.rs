@@ -36,13 +36,16 @@
 //! remapped into a query-lifetime key space (the query-time remap
 //! decision #6 accepted).
 
-use crate::plan::{AggCall, AggFunction, AggItem, OrderBy, Plan, PlanItem, Projection, QueryError};
-use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate};
+use crate::plan::{
+    AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
+    ScalarExpr, ScalarFunction,
+};
+use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use storage_lite::{Segment, SegmentView};
 
@@ -56,6 +59,29 @@ pub trait WindowAggregate: Send + Sync {
     /// the aggregate is undefined for this window and becomes SQL `NULL`;
     /// `Err` aborts the query.
     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String>;
+
+    /// Evaluates every trailing frame over one contiguous run of rows —
+    /// position `i`'s frame is rows `i.saturating_sub(preceding) ..= i`
+    /// (all rows from the run's start when `preceding` is `None`), the
+    /// executor's one frame shape. `columns` holds one slice per
+    /// argument (at least one — every aggregate takes arguments), all
+    /// the same length; the result holds one entry per position, in
+    /// order. The executor always calls this, once per contiguous run
+    /// (the whole snapshot, or one partition).
+    ///
+    /// The default recomputes each frame through [`Self::evaluate`] —
+    /// correct for any aggregate, `O(run · window)`. An aggregate whose
+    /// consecutive frames share work (running moments) overrides this
+    /// with an incremental form; because the executor only ever calls
+    /// through here, the override is a pure implementation swap with no
+    /// caller change.
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        recompute_frames(self, columns, preceding)
+    }
 
     /// The Arrow type of this window's output column. Computed in `f64`
     /// internally, but a function whose result is logically integral (e.g.
@@ -412,8 +438,23 @@ fn execute_single(
     let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
     let mut output = match &plan.projection {
         Projection::Items(items) => project_items(schema, &views, items, registry)?,
-        Projection::Aggregate { keys, items } => project_aggregate(schema, &views, keys, items)?,
+        Projection::Aggregate {
+            keys,
+            items,
+            having,
+        } => match having {
+            None => project_aggregate(schema, &views, keys, items)?,
+            Some(having) => {
+                let mut extended = items.to_vec();
+                extended.extend(having.items.iter().cloned());
+                let output = project_aggregate(schema, &views, keys, &extended)?;
+                filter_having(output, &having.predicate, items.len())?
+            }
+        },
     };
+    if plan.distinct {
+        output = distinct_output(output);
+    }
     if let Some(order_by) = &plan.order_by {
         output = sort_output(output, order_by)?;
     }
@@ -421,6 +462,68 @@ fn execute_single(
         output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
     }
     Ok(output)
+}
+
+/// `SELECT DISTINCT`: keeps each projected row's first occurrence.
+/// Row identity is by *value*, type-tagged per cell: key cells compare
+/// as their dictionary strings (per-segment dictionaries make codes
+/// incomparable across batches), `f64` under the one comparison
+/// relation (NaN equals itself; `-0.0` merges with `0.0`, DuckDB's
+/// behavior), and NULLs equal — SQL's DISTINCT semantics. The result
+/// consolidates to one batch.
+fn distinct_output(output: QueryOutput) -> QueryOutput {
+    let mut seen = HashSet::new();
+    let mut picks: Vec<(usize, usize)> = Vec::new();
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        for row in 0..batch.num_rows() {
+            let mut identity = Vec::new();
+            for column in batch.columns() {
+                match column {
+                    Column::Numeric(NumericData::F64(numeric)) => {
+                        if numeric.is_valid(row) {
+                            let value = numeric.values().as_slice()[row];
+                            let canonical = if value.is_nan() {
+                                f64::NAN
+                            } else if value == 0.0 {
+                                0.0
+                            } else {
+                                value
+                            };
+                            identity.push(1u8);
+                            identity.extend_from_slice(&canonical.to_bits().to_le_bytes());
+                        } else {
+                            identity.push(0);
+                        }
+                    }
+                    Column::Numeric(NumericData::I64(numeric)) => {
+                        if numeric.is_valid(row) {
+                            identity.push(2);
+                            identity
+                                .extend_from_slice(&numeric.values().as_slice()[row].to_le_bytes());
+                        } else {
+                            identity.push(0);
+                        }
+                    }
+                    Column::Key(keys) => match keys.value_at(row) {
+                        Some(value) => {
+                            identity.push(3);
+                            identity.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                            identity.extend_from_slice(value.as_bytes());
+                        }
+                        None => identity.push(0),
+                    },
+                }
+            }
+            if seen.insert(identity) {
+                picks.push((batch_index, row));
+            }
+        }
+    }
+    let batch = take_rows(&output.schema, &output.batches, &picks);
+    QueryOutput {
+        schema: output.schema,
+        batches: vec![batch],
+    }
 }
 
 /// The row-per-row projection: plain columns and window calls, one
@@ -436,6 +539,7 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
+            PlanItem::Computed { expr, name } => computed_column(schema, views, expr, name)?,
             PlanItem::WindowAgg {
                 function,
                 args,
@@ -466,6 +570,182 @@ fn project_items(
         .map(|columns| RecordBatch::new(schema.clone(), columns))
         .collect();
     Ok(QueryOutput { schema, batches })
+}
+
+/// Applies `HAVING`: the filter runs over the aggregate output rows —
+/// hidden `__having{i}` columns included — through the same predicate
+/// machinery WHERE uses (the output wraps as a query-lifetime segment,
+/// so numeric and key comparison semantics cannot diverge), keeps the
+/// TRUE rows (UNKNOWN filters, per SQL), and drops the hidden columns.
+fn filter_having(
+    output: QueryOutput,
+    predicate: &Predicate,
+    visible: usize,
+) -> Result<QueryOutput, QueryError> {
+    let full_schema = output.schema.clone();
+    let mut picks: Vec<(usize, usize)> = Vec::new();
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        let view = SegmentView::all_live(Arc::new(Segment::from_batch(batch.clone(), 0, false)));
+        let matched = evaluate_predicate(predicate, &full_schema, &view)?;
+        for row in 0..batch.num_rows() {
+            if matched.get(row) {
+                picks.push((batch_index, row));
+            }
+        }
+    }
+    let filtered = take_rows(&full_schema, &output.batches, &picks);
+    let schema = Schema::new(full_schema.fields()[..visible].to_vec());
+    let columns = filtered.columns()[..visible].to_vec();
+    Ok(QueryOutput {
+        schema: schema.clone(),
+        batches: vec![RecordBatch::new(schema, columns)],
+    })
+}
+
+/// The computed-projection slot (#49): evaluates a scalar expression
+/// per view, vectorized over the live rows, three-valued throughout —
+/// the output is a nullable `f64` column per view.
+fn computed_column(
+    schema: &Schema,
+    views: &[&SegmentView],
+    expr: &ScalarExpr,
+    name: &str,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let mut columns = Vec::with_capacity(views.len());
+    for view in views {
+        let (values, validity) = evaluate_scalar(expr, schema, view)?;
+        columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values, validity,
+        ))));
+    }
+    Ok((Field::new(name, ColumnType::F64, true), columns))
+}
+
+/// One view's worth of a scalar expression: `(values, validity)` over
+/// the live rows, in stored order.
+fn evaluate_scalar(
+    expr: &ScalarExpr,
+    schema: &Schema,
+    view: &SegmentView,
+) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+    let rows = view.live_rows();
+    match expr {
+        ScalarExpr::Column(name) => {
+            let (index, field) = resolve(schema, name)?;
+            match &view.segment.batch().columns()[index] {
+                Column::Numeric(NumericData::F64(numeric)) => {
+                    let raw = numeric.values().as_slice();
+                    let mut values = Vec::with_capacity(rows);
+                    let mut validity = Vec::with_capacity(rows);
+                    for row in live_rows(view) {
+                        values.push(raw[row]);
+                        validity.push(numeric.is_valid(row));
+                    }
+                    Ok((values, validity))
+                }
+                Column::Numeric(NumericData::I64(_)) => Err(QueryError::TypeError(format!(
+                    "column '{name}' is i64: exact integer expression arithmetic \
+                     is not built (#40); cast at ingest or use an f64 column"
+                ))),
+                Column::Key(_) => Err(QueryError::TypeError(format!(
+                    "column '{}' is a key: expressions are numeric (numeric-or-key)",
+                    field.name()
+                ))),
+            }
+        }
+        ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
+        ScalarExpr::Negate(inner) => {
+            let (mut values, validity) = evaluate_scalar(inner, schema, view)?;
+            for value in &mut values {
+                *value = -*value;
+            }
+            Ok((values, validity))
+        }
+        ScalarExpr::Binary { op, left, right } => {
+            let (lv, lval) = evaluate_scalar(left, schema, view)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view)?;
+            let values = lv
+                .iter()
+                .zip(&rv)
+                .map(|(&a, &b)| match op {
+                    ArithOp::Add => a + b,
+                    ArithOp::Sub => a - b,
+                    ArithOp::Mul => a * b,
+                    ArithOp::Div => a / b,
+                    ArithOp::Mod => a % b,
+                })
+                .collect();
+            let validity = lval.iter().zip(&rval).map(|(&a, &b)| a && b).collect();
+            Ok((values, validity))
+        }
+        ScalarExpr::Call { function, args } => {
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(evaluate_scalar(arg, schema, view)?);
+            }
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let valid = evaluated.iter().all(|(_, v)| v[row]);
+                validity.push(valid);
+                let arg = |i: usize| evaluated[i].0[row];
+                values.push(match function {
+                    ScalarFunction::Abs => arg(0).abs(),
+                    ScalarFunction::Round => arg(0).round(),
+                    ScalarFunction::Floor => arg(0).floor(),
+                    ScalarFunction::Ceil => arg(0).ceil(),
+                    ScalarFunction::Sqrt => arg(0).sqrt(),
+                    ScalarFunction::Ln => arg(0).ln(),
+                    ScalarFunction::Exp => arg(0).exp(),
+                    ScalarFunction::Power => arg(0).powf(arg(1)),
+                });
+            }
+            Ok((values, validity))
+        }
+        ScalarExpr::Case { whens, otherwise } => {
+            // Conditions evaluate vectorized, once per view (the WHERE
+            // machinery); selection is then per live row, first TRUE arm
+            // wins, UNKNOWN falls through like FALSE.
+            let mut conditions = Vec::with_capacity(whens.len());
+            let mut arms = Vec::with_capacity(whens.len());
+            for (predicate, arm) in whens {
+                conditions.push(evaluate_predicate(predicate, schema, view)?);
+                arms.push(evaluate_scalar(arm, schema, view)?);
+            }
+            let fallback = otherwise
+                .as_ref()
+                .map(|expr| evaluate_scalar(expr, schema, view))
+                .transpose()?;
+            let mut values = vec![0.0f64; rows];
+            let mut validity = vec![false; rows];
+            for (out, row) in live_rows(view).enumerate() {
+                let mut chosen = None;
+                for (condition, arm) in conditions.iter().zip(&arms) {
+                    if condition.get(row) {
+                        chosen = Some((arm.0[out], arm.1[out]));
+                        break;
+                    }
+                }
+                let (value, valid) = chosen.unwrap_or_else(|| match &fallback {
+                    Some((values, validity)) => (values[out], validity[out]),
+                    None => (0.0, false),
+                });
+                values[out] = value;
+                validity[out] = valid;
+            }
+            Ok((values, validity))
+        }
+    }
+}
+
+/// Builds a nullable `f64` column from parallel values/validity.
+fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
+    let buffer = Buffer::from_slice(&values);
+    if validity.iter().all(|&valid| valid) {
+        NumericColumn::new_non_null(buffer)
+    } else {
+        NumericColumn::new_nullable(buffer, Bitmap::from_bools(validity))
+    }
 }
 
 /// Looks up a column by name in the table schema.
@@ -550,6 +830,48 @@ fn passthrough(
 /// The window slice for row `position` in a run of rows: `preceding`
 /// rows back (`None` = from the start of the run) through the current
 /// row, ragged at the start of the run.
+/// Frame-by-frame recomputation over one contiguous run — the
+/// [`WindowAggregate::evaluate_frames`] default, exposed so an
+/// incremental override can fall back to it for frame shapes it does
+/// not accelerate.
+pub fn recompute_frames<A: WindowAggregate + ?Sized>(
+    aggregate: &A,
+    columns: &[&[f64]],
+    preceding: Option<usize>,
+) -> Result<Vec<Option<f64>>, String> {
+    let rows = columns.first().map_or(0, |column| column.len());
+    let mut results = Vec::with_capacity(rows);
+    let mut frame: Vec<&[f64]> = Vec::with_capacity(columns.len());
+    for position in 0..rows {
+        let (start, end) = window_bounds(position, preceding);
+        frame.clear();
+        frame.extend(columns.iter().map(|column| &column[start..end]));
+        results.push(aggregate.evaluate(&frame)?);
+    }
+    Ok(results)
+}
+
+/// Calls the aggregate's frame-sequence evaluation and holds it to the
+/// executor's contract: one result per row of the run.
+fn evaluate_run(
+    aggregate: &dyn WindowAggregate,
+    columns: &[&[f64]],
+    rows: usize,
+    preceding: Option<usize>,
+) -> Result<Vec<Option<f64>>, QueryError> {
+    debug_assert!(columns.iter().all(|column| column.len() == rows));
+    let results = aggregate
+        .evaluate_frames(columns, preceding)
+        .map_err(QueryError::Compute)?;
+    if results.len() != rows {
+        return Err(QueryError::Compute(format!(
+            "window aggregate returned {} results for {rows} frames",
+            results.len()
+        )));
+    }
+    Ok(results)
+}
+
 fn window_bounds(position: usize, preceding: Option<usize>) -> (usize, usize) {
     let start = match preceding {
         Some(preceding) => position.saturating_sub(preceding),
@@ -754,15 +1076,11 @@ fn unpartitioned(
             .collect();
         gathered.iter().map(Vec::as_slice).collect()
     };
-    let mut windows: Vec<&[f64]> = Vec::with_capacity(arg_slices.len());
-    let mut global = 0usize;
+    let rows: usize = results.iter().map(Vec::len).sum();
+    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, preceding)?.into_iter();
     for result in results.iter_mut() {
         for slot in result.iter_mut() {
-            let (start, end) = window_bounds(global, preceding);
-            windows.clear();
-            windows.extend(arg_slices.iter().map(|values| &values[start..end]));
-            *slot = aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
-            global += 1;
+            *slot = outputs.next().expect("length checked by evaluate_run");
         }
     }
     Ok(())
@@ -831,14 +1149,11 @@ fn partitioned(
             origins[partition].push((view_index, live_position));
         }
     }
-    let mut windows: Vec<&[f64]> = Vec::with_capacity(args.len());
     for (values, rows) in scratch.iter().zip(&origins) {
-        for (position, &(view_index, live_position)) in rows.iter().enumerate() {
-            let (start, end) = window_bounds(position, preceding);
-            windows.clear();
-            windows.extend(values.iter().map(|argument| &argument[start..end]));
-            results[view_index][live_position] =
-                aggregate.evaluate(&windows).map_err(QueryError::Compute)?;
+        let columns: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
+        let outputs = evaluate_run(aggregate, &columns, rows.len(), preceding)?;
+        for (output, &(view_index, live_position)) in outputs.into_iter().zip(rows) {
+            results[view_index][live_position] = output;
         }
     }
     Ok(())
@@ -1357,11 +1672,17 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
         (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
         (left, right) => left.partial_cmp(right).expect("same variant per column"),
     };
+    // Nulls last in both directions unless the query says otherwise
+    // (NULLS FIRST/LAST) — placement sits outside the DESC reversal.
+    let null_order = if order_by.nulls_first.unwrap_or(false) {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    };
     order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
-        // Nulls last in both directions — outside the reversal.
         (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => null_order,
+        (Some(_), None) => null_order.reverse(),
         (Some(left), Some(right)) => {
             let ordering = compare_values(left, right);
             if order_by.descending {
@@ -1408,11 +1729,17 @@ fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> Que
 /// into a fresh dictionary — the sources' per-segment dictionaries don't
 /// share codes.
 fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)]) -> RecordBatch {
-    let columns = (0..schema.fields().len())
-        .map(|column_index| {
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(column_index, field)| {
             let cell_column = |batch: usize| &batches[batch].columns()[column_index];
-            match cell_column(picks.first().map(|&(batch, _)| batch).unwrap_or(0)) {
-                Column::Numeric(NumericData::F64(_)) => {
+            // The schema, not a sample batch, decides each column's
+            // variant: with zero picks there is no batch to sample, and
+            // the empty result still needs correctly-typed columns.
+            match field.column_type() {
+                ColumnType::F64 => {
                     let mut values: Buffer<f64> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
                     for &(batch, row) in picks {
@@ -1424,7 +1751,7 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
                     }
                     assemble_numeric_f64(values, validity)
                 }
-                Column::Numeric(NumericData::I64(_)) => {
+                ColumnType::I64 => {
                     let mut values: Buffer<i64> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
                     for &(batch, row) in picks {
@@ -1436,7 +1763,7 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
                     }
                     assemble_numeric_i64(values, validity)
                 }
-                Column::Key(_) => {
+                ColumnType::Key => {
                     let mut dictionary = Dictionary::new();
                     let mut codes: Buffer<u32> = Buffer::with_capacity(picks.len());
                     let mut validity: Vec<bool> = Vec::with_capacity(picks.len());
@@ -2178,6 +2505,306 @@ mod query1_tests {
         .unwrap();
         // DuckDB's default (our oracle): nulls last under DESC too.
         assert_eq!(flatten(&descending, 0), [Some(3.0), Some(2.0), None]);
+    }
+
+    #[test]
+    fn executor_routes_windows_through_the_frame_sequence() {
+        // An aggregate that only answers through evaluate_frames: if the
+        // executor ever took the per-frame path, the query would error.
+        // Proves the sequence seam is the one road in.
+        struct SequenceOnly;
+        impl WindowAggregate for SequenceOnly {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Err("per-frame path used".to_owned())
+            }
+            fn evaluate_frames(
+                &self,
+                columns: &[&[f64]],
+                preceding: Option<usize>,
+            ) -> Result<Vec<Option<f64>>, String> {
+                // Frame sums, carried incrementally: enough state to
+                // prove the whole run arrives in one call.
+                let column = columns[0];
+                let mut sum = 0.0f64;
+                Ok((0..column.len())
+                    .map(|position| {
+                        sum += column[position];
+                        if let Some(preceding) = preceding {
+                            if position > preceding {
+                                sum -= column[position - preceding - 1];
+                            }
+                        }
+                        Some(sum)
+                    })
+                    .collect())
+            }
+        }
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 4.0)]);
+        let mut registry = Registry::new();
+        registry.register("runsum", Arc::new(SequenceOnly));
+        let sql = "SELECT runsum(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND \
+                   CURRENT ROW) AS w FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(
+            flatten(&output.unwrap(), 0),
+            [Some(1.0), Some(3.0), Some(6.0)]
+        );
+        // Partitioned: each key's rows form their own run.
+        let sql = "SELECT runsum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 1 \
+                   PRECEDING AND CURRENT ROW) AS w FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(
+            flatten(&output.unwrap(), 0),
+            [Some(1.0), Some(2.0), Some(5.0)]
+        );
+    }
+
+    #[test]
+    fn a_wrong_length_frame_sequence_is_an_error_not_a_panic() {
+        struct ShortChanger;
+        impl WindowAggregate for ShortChanger {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, _: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(0.0))
+            }
+            fn evaluate_frames(
+                &self,
+                _: &[&[f64]],
+                _: Option<usize>,
+            ) -> Result<Vec<Option<f64>>, String> {
+                Ok(vec![Some(0.0)]) // one result, however many frames
+            }
+        }
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 4.0)]);
+        let mut registry = Registry::new();
+        registry.register("short", Arc::new(ShortChanger));
+        let sql = "SELECT short(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND \
+                   CURRENT ROW) AS w FROM t";
+        let error = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, QueryError::Compute(message) if message.contains("1 results for 3 frames")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_deduplicates_by_value_across_segments() {
+        // Two segments (threshold 2) so 'A' appears under different
+        // dictionary codes; DISTINCT must merge them by value.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "B", 1.0), (3, "A", 1.0), (4, "A", 2.0)],
+            2,
+        );
+        let registry = Registry::new();
+        let sql = "SELECT sym, x FROM t";
+        let all = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(all.num_rows(), 4);
+        let sql = "SELECT DISTINCT sym, x FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 3); // (A,1) (B,1) (A,2)
+        assert_eq!(output.batches.len(), 1, "DISTINCT consolidates");
+        let sql = "SELECT DISTINCT x FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn computed_projections_evaluate_vectorized() {
+        let views = segmented(&[(1, "A", 1.0), (2, "B", 4.0), (3, "A", 9.0)], 2);
+        let registry = Registry::new();
+        let sql = "SELECT x * 2 + 1 AS y, SQRT(x) AS r FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(9.0), Some(19.0)]);
+        assert_eq!(flatten(&output, 1), [Some(1.0), Some(2.0), Some(3.0)]);
+        // Unaliased names render the expression's SQL text.
+        let sql = "SELECT x + 1 FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.schema.fields()[0].name(), "x + 1");
+        // Nested function arguments work.
+        let sql = "SELECT ABS(1 - x) AS d FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(0.0), Some(3.0), Some(8.0)]);
+        // i64 and key columns are refused loudly (numeric-or-key, #40).
+        for sql in ["SELECT ts + 1 FROM t", "SELECT sym * 2 FROM t"] {
+            let error = crate::plan::plan(sql)
+                .and_then(|plan| execute(&schema(), &views, &plan, &registry));
+            assert!(error.is_err(), "{sql} should be refused");
+        }
+    }
+
+    #[test]
+    fn case_selects_per_row_with_three_valued_conditions() {
+        let views = segmented(&[(1, "A", 1.0), (2, "B", 2.0), (3, "A", 3.0)], 2);
+        let registry = Registry::new();
+        let sql = "SELECT CASE WHEN x > 2 THEN 100 WHEN sym = 'A' THEN x ELSE 0 END AS c FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(0.0), Some(100.0)]);
+        // Missing ELSE yields NULL.
+        let sql = "SELECT CASE WHEN x > 2 THEN 1 END AS c FROM t";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 0), [None, None, Some(1.0)]);
+    }
+
+    #[test]
+    fn having_filters_groups_and_hides_its_columns() {
+        let views = segmented(
+            &[
+                (1, "A", 1.0),
+                (2, "B", 2.0),
+                (3, "A", 3.0),
+                (4, "B", 4.0),
+                (5, "C", 10.0),
+            ],
+            2,
+        );
+        let registry = Registry::new();
+        let sql = "SELECT sym, SUM(x) AS s FROM t GROUP BY sym HAVING SUM(x) > 4 ORDER BY s";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.schema.fields().len(), 2, "hidden columns dropped");
+        assert_eq!(flatten(&output, 1), [Some(6.0), Some(10.0)]); // B=6, C=10... A=4 filtered
+                                                                  // HAVING may reference the group key too.
+        let sql = "SELECT sym, COUNT(x) AS c FROM t GROUP BY sym HAVING sym <> 'C'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 2);
+        // HAVING without aggregation is refused toward WHERE.
+        assert!(crate::plan::plan("SELECT x FROM t HAVING x > 1").is_err());
+    }
+
+    #[test]
+    fn like_filters_keys_per_distinct_value() {
+        let views = segment(&[(1, "AAPL", 1.0), (2, "MSFT", 2.0), (3, "AMZN", 3.0)]);
+        let registry = Registry::new();
+        let sql = "SELECT x FROM t WHERE sym LIKE 'A%'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
+        let sql = "SELECT x FROM t WHERE sym NOT LIKE '_S%'";
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
+    }
+
+    #[test]
+    fn nulls_first_overrides_the_default_placement() {
+        let views = segment(&[(1, "A", 1.0), (2, "B", 2.0), (3, "C", 3.0)]);
+        // needs2-style: the first window produces NULL.
+        struct NeedsTwo;
+        impl WindowAggregate for NeedsTwo {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok((args[0].len() >= 2).then(|| args[0][args[0].len() - 1]))
+            }
+        }
+        let mut registry = Registry::new();
+        registry.register("needs2", Arc::new(NeedsTwo));
+        let frame = "OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)";
+        let sql = format!("SELECT needs2(x) {frame} AS w FROM t ORDER BY w NULLS FIRST");
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(&sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [None, Some(2.0), Some(3.0)]);
+        let sql = format!("SELECT needs2(x) {frame} AS w FROM t ORDER BY w DESC NULLS LAST");
+        let output = execute(
+            &schema(),
+            &views,
+            &crate::plan::plan(&sql).unwrap(),
+            &registry,
+        );
+        assert_eq!(flatten(&output.unwrap(), 0), [Some(3.0), Some(2.0), None]);
     }
 
     #[test]

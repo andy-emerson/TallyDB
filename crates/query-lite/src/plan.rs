@@ -1,13 +1,16 @@
 //! Parsing and lowering: SQL text → logical plans.
 //!
 //! sqlparser-rs parses (taken as-is, pinned); the subsetting happens
-//! here, in what this lowering accepts. Three statements lower today:
+//! here, in what this lowering accepts. Five statements lower today:
 //!
 //! ```sql
-//! SELECT <columns | window calls | GROUP BY keys + aggregates>
+//! SELECT [DISTINCT] <columns | scalar expressions | CASE | window calls
+//!                    | GROUP BY keys + aggregates>
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
-//! [WHERE predicate] [GROUP BY keys]
-//! [ORDER BY column [DESC]] [LIMIT n] [OFFSET n];
+//! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
+//! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
+//! CREATE TABLE t (col BIGINT|DOUBLE|KEY [NOT NULL|ORDERING KEY], ...);
+//! INSERT INTO t [(columns)] VALUES (literals), ...;
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];
 //! ```
@@ -16,11 +19,10 @@
 //! window calls are `fn(args) OVER ([PARTITION BY key] ORDER BY
 //! ordering_key ROWS BETWEEN n PRECEDING AND CURRENT ROW)`; aggregates
 //! are `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over plain columns). Everything
-//! else — joins, subqueries, HAVING, DISTINCT, other frame shapes, SET
-//! or projection expressions beyond literals and columns — is rejected
-//! with a message naming what was rejected. The rejection is scope
-//! honesty, not a parser limit: those features arrive through this same
-//! lowering as M2 proceeds.
+//! else — extra joins, subqueries, CTEs, other frame shapes — is
+//! rejected with a message naming what was rejected. The rejection is
+//! scope honesty, not a parser limit: what the inclusion principle
+//! admits arrives through this same lowering.
 
 use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;
@@ -65,7 +67,7 @@ impl fmt::Display for QueryError {
 impl std::error::Error for QueryError {}
 
 /// One item of the SELECT list.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum PlanItem {
     /// A stored column, passed through.
     Column {
@@ -73,6 +75,14 @@ pub enum PlanItem {
         name: String,
         /// Output name, if aliased.
         alias: Option<String>,
+    },
+    /// A computed scalar projection (`x + 1`, `ABS(x)`, `CASE ...`).
+    Computed {
+        /// The expression.
+        expr: ScalarExpr,
+        /// The output column name: the alias, or the expression's SQL
+        /// text when unaliased.
+        name: String,
     },
     /// A window aggregate over a trailing frame.
     WindowAgg {
@@ -89,6 +99,99 @@ pub enum PlanItem {
         preceding: Option<usize>,
         /// Output name, if aliased.
         alias: Option<String>,
+    },
+}
+
+/// A scalar arithmetic operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArithOp {
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `*`
+    Mul,
+    /// `/` (IEEE: `x/0` is ±inf or NaN, never an error — NaN is a value)
+    Div,
+    /// `%` (f64 remainder)
+    Mod,
+}
+
+/// A built-in scalar function of the projection slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalarFunction {
+    /// `ABS(x)`
+    Abs,
+    /// `ROUND(x)` — half away from zero
+    Round,
+    /// `FLOOR(x)`
+    Floor,
+    /// `CEIL(x)` / `CEILING(x)`
+    Ceil,
+    /// `SQRT(x)` — IEEE: negative input yields NaN
+    Sqrt,
+    /// `LN(x)`
+    Ln,
+    /// `EXP(x)`
+    Exp,
+    /// `POWER(x, y)`
+    Power,
+}
+
+impl ScalarFunction {
+    fn from_name(name: &str) -> Option<(ScalarFunction, usize)> {
+        Some(match name {
+            "abs" => (ScalarFunction::Abs, 1),
+            "round" => (ScalarFunction::Round, 1),
+            "floor" => (ScalarFunction::Floor, 1),
+            "ceil" | "ceiling" => (ScalarFunction::Ceil, 1),
+            "sqrt" => (ScalarFunction::Sqrt, 1),
+            "ln" => (ScalarFunction::Ln, 1),
+            "exp" => (ScalarFunction::Exp, 1),
+            "power" | "pow" => (ScalarFunction::Power, 2),
+            _ => return None,
+        })
+    }
+}
+
+/// A scalar expression over one row — the computed-projection slot
+/// (#49; also the seam #53's Lua scalar functions will plug into).
+/// Everything computes in `f64` under three-valued logic: a NULL
+/// operand makes the result NULL. `i64` columns are refused loudly for
+/// now (exact integer expression arithmetic is #40's territory); key
+/// columns are refused by numeric-or-key (no string production).
+#[derive(Clone, PartialEq, Debug)]
+pub enum ScalarExpr {
+    /// A stored `f64` column's value.
+    Column(String),
+    /// A numeric literal.
+    Literal(f64),
+    /// Unary minus.
+    Negate(Box<ScalarExpr>),
+    /// A binary arithmetic operation.
+    Binary {
+        /// The operator.
+        op: ArithOp,
+        /// Left operand.
+        left: Box<ScalarExpr>,
+        /// Right operand.
+        right: Box<ScalarExpr>,
+    },
+    /// A built-in scalar function call.
+    Call {
+        /// The function.
+        function: ScalarFunction,
+        /// Arguments, in call order.
+        args: Vec<ScalarExpr>,
+    },
+    /// `CASE WHEN p THEN e ... [ELSE e] END` — conditions are the WHERE
+    /// grammar (three-valued: an UNKNOWN condition falls through), a
+    /// missing ELSE yields NULL.
+    Case {
+        /// The WHEN arms, in order.
+        whens: Vec<(crate::Predicate, ScalarExpr)>,
+        /// The ELSE arm.
+        otherwise: Option<Box<ScalarExpr>>,
     },
 }
 
@@ -147,7 +250,7 @@ pub enum AggItem {
 }
 
 /// What the SELECT list computes.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Projection {
     /// Plain columns and window calls, one output row per input row.
     Items(Vec<PlanItem>),
@@ -157,7 +260,23 @@ pub enum Projection {
         keys: Vec<String>,
         /// The SELECT list.
         items: Vec<AggItem>,
+        /// The `HAVING` filter, if present.
+        having: Option<Having>,
     },
+}
+
+/// A lowered `HAVING` clause: every aggregate call it references is
+/// computed as a hidden output column (aliased `__having{i}`, dropped
+/// after filtering), so the filter itself is ordinary WHERE grammar
+/// over the aggregate output row — group keys included. Standard SQL
+/// semantics: a group survives only where the predicate is TRUE
+/// (UNKNOWN filters, like WHERE).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Having {
+    /// The hidden aggregate columns.
+    pub items: Vec<AggItem>,
+    /// The filter, referencing output names (hidden ones included).
+    pub predicate: Predicate,
 }
 
 /// Top-level `ORDER BY`: one output column, a direction.
@@ -167,6 +286,9 @@ pub struct OrderBy {
     pub column: String,
     /// `true` for `DESC`.
     pub descending: bool,
+    /// Explicit `NULLS FIRST` / `NULLS LAST`; `None` keeps the default
+    /// (nulls last in both directions, DuckDB's convention — D2).
+    pub nulls_first: Option<bool>,
 }
 
 /// A star-schema equi-join: the fact table joined to one small
@@ -193,6 +315,11 @@ pub struct Plan {
     pub join: Option<JoinPlan>,
     /// What the SELECT list computes.
     pub projection: Projection,
+    /// `SELECT DISTINCT`: deduplicate the projected rows (plain column
+    /// projections only; keys compare by value across segments, `f64`
+    /// under the one comparison relation — NaN equals itself — and
+    /// NULLs equal, per SQL DISTINCT).
+    pub distinct: bool,
     /// The WHERE predicate, applied before everything else.
     pub predicate: Option<Predicate>,
     /// Top-level ORDER BY, applied to the projected output.
@@ -247,16 +374,342 @@ pub struct DeletePlan {
 /// One supported SQL statement, lowered.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Statement {
-    /// A `SELECT`.
-    Select(Plan),
+    /// A `SELECT`. Boxed: a `Plan` (with its projection expressions)
+    /// dwarfs the mutation variants, and statements are moved around.
+    Select(Box<Plan>),
+    /// A `CREATE TABLE`.
+    CreateTable(CreateTablePlan),
+    /// An `INSERT INTO ... VALUES ...`.
+    Insert(InsertPlan),
     /// An `UPDATE ... SET ... [WHERE ...]`.
     Update(UpdatePlan),
     /// A `DELETE FROM ... [WHERE ...]`.
     Delete(DeletePlan),
 }
 
-/// Parses and lowers one SQL statement.
+/// One column of a `CREATE TABLE` plan.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ColumnSpec {
+    /// The column name.
+    pub name: String,
+    /// `"BIGINT"`, `"DOUBLE"`, or `"KEY"` — resolved to the engine's
+    /// column types by the embedder (query-lite stays schema-agnostic).
+    pub type_name: String,
+    /// `NOT NULL` present (the ordering key implies it).
+    pub not_null: bool,
+    /// `ORDERING KEY` present.
+    pub ordering_key: bool,
+}
+
+/// A lowered `CREATE TABLE`: the DDL surface of the stdlib table (#49,
+/// ruled 2026-07-27) — standard names where standard exists (`BIGINT`,
+/// `DOUBLE`), the coined `KEY` for dictionary keys, the ordering key
+/// declared like a constraint. `VARCHAR`/`TEXT` are refused with a
+/// teaching error: keys are interned labels, not text values.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateTablePlan {
+    /// The table name.
+    pub table: String,
+    /// The columns, in declared order.
+    pub columns: Vec<ColumnSpec>,
+}
+
+/// A cell literal of an `INSERT ... VALUES` row.
+#[derive(Clone, PartialEq, Debug)]
+pub enum InsertValue {
+    /// A numeric literal.
+    Number(Number),
+    /// A string literal (a key value).
+    String(String),
+    /// `NULL`.
+    Null,
+}
+
+/// A lowered `INSERT INTO ... [(columns)] VALUES (...), (...)`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct InsertPlan {
+    /// The table name.
+    pub table: String,
+    /// The named column order, if the statement gave one; `None`
+    /// means the schema's declared order.
+    pub columns: Option<Vec<String>>,
+    /// The literal rows.
+    pub rows: Vec<Vec<InsertValue>>,
+}
+
+fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, QueryError> {
+    let table = object_name(&create.name)?;
+    if create.if_not_exists || create.or_replace {
+        return Err(QueryError::Unsupported(
+            "IF NOT EXISTS / OR REPLACE".to_owned(),
+        ));
+    }
+    if let Some(constraint) = create.constraints.first() {
+        // Out-of-scope constructs are refused, never dropped; silence
+        // here would let `UNIQUE (x)` vanish without a trace.
+        return Err(QueryError::Unsupported(format!(
+            "table-level constraint '{constraint}' (columns carry the only \
+             constraints here: NOT NULL and ORDERING KEY)"
+        )));
+    }
+    let mut columns = Vec::with_capacity(create.columns.len());
+    for column in &create.columns {
+        let type_name = match &column.data_type {
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => "BIGINT",
+            ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => {
+                "DOUBLE"
+            }
+            ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("key") => {
+                "KEY"
+            }
+            ast::DataType::Varchar(_)
+            | ast::DataType::Text
+            | ast::DataType::Char(_)
+            | ast::DataType::String(_) => {
+                return Err(QueryError::Unsupported(format!(
+                    "column '{}': strings are not a column type here — keys are \
+                     interned labels used for filtering, grouping, and joining; \
+                     declare it KEY",
+                    ident(&column.name)
+                )))
+            }
+            other => {
+                return Err(QueryError::Unsupported(format!(
+                    "column type '{other}' (BIGINT, DOUBLE, or KEY)"
+                )))
+            }
+        };
+        let mut not_null = false;
+        let mut ordering_key = false;
+        for option in &column.options {
+            match &option.option {
+                ast::ColumnOption::NotNull => not_null = true,
+                ast::ColumnOption::Null => {}
+                // The rewrite carries ORDERING KEY through the parser as
+                // PRIMARY KEY (user-typed PRIMARY KEY was refused at the
+                // door); map the carrier back.
+                ast::ColumnOption::PrimaryKey(_) => {
+                    ordering_key = true;
+                    not_null = true; // the ordering key is NOT NULL
+                }
+                other => {
+                    return Err(QueryError::Unsupported(format!("column option '{other}'")));
+                }
+            }
+        }
+        columns.push(ColumnSpec {
+            name: ident(&column.name),
+            type_name: type_name.to_owned(),
+            not_null,
+            ordering_key,
+        });
+    }
+    for (index, column) in columns.iter().enumerate() {
+        // A duplicated name would make the later column silently
+        // unreachable (every resolver takes the first match).
+        if columns[..index]
+            .iter()
+            .any(|other| other.name == column.name)
+        {
+            return Err(QueryError::Unsupported(format!(
+                "column '{}' is declared twice",
+                column.name
+            )));
+        }
+    }
+    match columns.iter().filter(|column| column.ordering_key).count() {
+        1 => Ok(CreateTablePlan { table, columns }),
+        0 => Err(QueryError::Unsupported(
+            "declare exactly one ORDERING KEY column (the BIGINT column \
+             ingest arrives roughly sorted on)"
+                .to_owned(),
+        )),
+        _ => Err(QueryError::Unsupported(
+            "more than one ORDERING KEY column".to_owned(),
+        )),
+    }
+}
+
+fn lower_insert(insert: &ast::Insert) -> Result<InsertPlan, QueryError> {
+    let ast::TableObject::TableName(name) = &insert.table else {
+        return Err(QueryError::Unsupported(
+            "INSERT into something other than a table".to_owned(),
+        ));
+    };
+    let table = object_name(name)?;
+    let columns = if insert.columns.is_empty() {
+        None
+    } else {
+        Some(
+            insert
+                .columns
+                .iter()
+                .map(object_name)
+                .collect::<Result<Vec<String>, QueryError>>()?,
+        )
+    };
+    let Some(source) = &insert.source else {
+        return Err(QueryError::Unsupported("INSERT without VALUES".to_owned()));
+    };
+    let ast::SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(QueryError::Unsupported(
+            "INSERT ... SELECT (VALUES only)".to_owned(),
+        ));
+    };
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let mut cells = Vec::with_capacity(row.content.len());
+        for cell in &row.content {
+            cells.push(lower_insert_value(cell)?);
+        }
+        rows.push(cells);
+    }
+    if rows.is_empty() {
+        return Err(QueryError::Unsupported("INSERT of zero rows".to_owned()));
+    }
+    Ok(InsertPlan {
+        table,
+        columns,
+        rows,
+    })
+}
+
+fn lower_insert_value(expr: &ast::Expr) -> Result<InsertValue, QueryError> {
+    match expr {
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Number(text, _) => {
+                Ok(InsertValue::Number(crate::predicate::parse_number(text)?))
+            }
+            ast::Value::SingleQuotedString(text) => Ok(InsertValue::String(text.clone())),
+            ast::Value::Null => Ok(InsertValue::Null),
+            other => Err(QueryError::Unsupported(format!("INSERT literal '{other}'"))),
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => match lower_insert_value(expr)? {
+            InsertValue::Number(Number::Int(value)) => Ok(InsertValue::Number(Number::Int(-value))),
+            InsertValue::Number(Number::Float(value)) => {
+                Ok(InsertValue::Number(Number::Float(-value)))
+            }
+            _ => Err(QueryError::Unsupported(
+                "negation of a non-number".to_owned(),
+            )),
+        },
+        other => Err(QueryError::Unsupported(format!(
+            "INSERT expression '{other}' (literals only)"
+        ))),
+    }
+}
+
+/// Carries the ruled `ORDERING KEY` syntax through a parser that does
+/// not know the phrase: outside quotes, user-typed `PRIMARY KEY` is
+/// refused with a teaching error (the ordering key is *not* a
+/// uniqueness constraint — duplicate ordering-key values are
+/// first-class here), then `ORDERING KEY` rewrites to `PRIMARY KEY`
+/// as the internal carrier the parser accepts; the lowering maps the
+/// carrier back. Only `CREATE TABLE` statements are rewritten.
+fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut quote: Option<char> = None;
+    let mut index = 0;
+    // Matches `word_a <whitespace> word_b` at a char position, entirely
+    // in chars (never byte offsets — the two must not mix), returning
+    // the phrase's char length. Both words must sit on word boundaries.
+    let phrase_at = |index: usize, word_a: &str, word_b: &str| -> Option<usize> {
+        let word = |at: usize, word: &str| -> bool {
+            word.chars().enumerate().all(|(offset, w)| {
+                chars
+                    .get(at + offset)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&w))
+            })
+        };
+        if !word(index, word_a) {
+            return None;
+        }
+        let mut spaces = 0;
+        while chars
+            .get(index + word_a.len() + spaces)
+            .is_some_and(|c| c.is_whitespace())
+        {
+            spaces += 1;
+        }
+        if spaces == 0 || !word(index + word_a.len() + spaces, word_b) {
+            return None;
+        }
+        let end = word_a.len() + spaces + word_b.len();
+        let boundary = |position: usize| {
+            chars
+                .get(index + position)
+                .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
+        };
+        let start_ok = index == 0 || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_';
+        // A column *definition* also starts `word KEY` — `ordering KEY,`
+        // declares a key column named `ordering`. A constraint never
+        // opens a definition, so the phrase only counts when the
+        // preceding token is not `(` or `,` (nor the statement start,
+        // where no column list is open yet).
+        let previous = chars[..index].iter().rev().find(|c| !c.is_whitespace());
+        let constraint_position = !matches!(previous, None | Some('(') | Some(','));
+        (start_ok && boundary(end) && constraint_position).then_some(end)
+    };
+    while index < chars.len() {
+        let c = chars[index];
+        match quote {
+            Some(open) => {
+                if c == open {
+                    quote = None;
+                }
+                out.push(c);
+                index += 1;
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push(c);
+                    index += 1;
+                } else if phrase_at(index, "primary", "key").is_some() {
+                    return Err(QueryError::Unsupported(
+                        "PRIMARY KEY: TallyDB's ordering key is not a uniqueness \
+                         constraint (duplicate ordering-key values are first-class) — \
+                         declare the ingest-order column with ORDERING KEY"
+                            .to_owned(),
+                    ));
+                } else if let Some(end) = phrase_at(index, "ordering", "key") {
+                    out.push_str("PRIMARY KEY");
+                    index += end;
+                } else {
+                    out.push(c);
+                    index += 1;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the statement's first two words are `CREATE TABLE` — the
+/// rewrite gate. Word-wise, not a byte prefix: `CREATE  TABLE` and
+/// `CREATE\tTABLE` are the same statement and must hit the same gate,
+/// or user-typed `PRIMARY KEY` would slip past its refusal.
+fn is_create_table(sql: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    matches!(
+        (words.next(), words.next()),
+        (Some(create), Some(table))
+            if create.eq_ignore_ascii_case("create") && table.eq_ignore_ascii_case("table")
+    )
+}
+
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    let rewritten;
+    let sql = if is_create_table(sql) {
+        rewritten = rewrite_ordering_key(sql)?;
+        &rewritten
+    } else {
+        sql
+    };
     let statements =
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| QueryError::Parse(e.to_string()))?;
     let [statement] = statements.as_slice() else {
@@ -266,11 +719,15 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
         )));
     };
     match statement {
-        ast::Statement::Query(query) => Ok(Statement::Select(lower_query(query)?)),
+        ast::Statement::Query(query) => Ok(Statement::Select(Box::new(lower_query(query)?))),
         ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
         ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
+        ast::Statement::CreateTable(create) => {
+            Ok(Statement::CreateTable(lower_create_table(create)?))
+        }
+        ast::Statement::Insert(insert) => Ok(Statement::Insert(lower_insert(insert)?)),
         _ => Err(QueryError::Unsupported(
-            "only SELECT, UPDATE, and DELETE statements are supported".to_owned(),
+            "only SELECT, INSERT, UPDATE, DELETE, and CREATE TABLE are supported".to_owned(),
         )),
     }
 }
@@ -279,9 +736,12 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
 /// [`parse_statement`]).
 pub fn plan(sql: &str) -> Result<Plan, QueryError> {
     match parse_statement(sql)? {
-        Statement::Select(plan) => Ok(plan),
-        Statement::Update(_) | Statement::Delete(_) => Err(QueryError::Unsupported(
-            "mutations run through the mutation entry point, not query".to_owned(),
+        Statement::Select(plan) => Ok(*plan),
+        Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::CreateTable(_)
+        | Statement::Insert(_) => Err(QueryError::Unsupported(
+            "mutations and DDL run through their entry points, not query".to_owned(),
         )),
     }
 }
@@ -405,6 +865,7 @@ fn lower_order_by(order_by: Option<&ast::OrderBy>) -> Result<Option<OrderBy>, Qu
             Ok(Some(OrderBy {
                 column: ident(column),
                 descending: order.options.asc == Some(false),
+                nulls_first: order.options.nulls_first,
             }))
         }
         _ => Err(QueryError::Unsupported(
@@ -454,9 +915,13 @@ fn lower_limit(
 }
 
 fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
-    if select.having.is_some() || select.distinct.is_some() {
-        return Err(QueryError::Unsupported("HAVING / DISTINCT".to_owned()));
-    }
+    let distinct = match &select.distinct {
+        None | Some(ast::Distinct::All) => false,
+        Some(ast::Distinct::Distinct) => true,
+        Some(ast::Distinct::On(_)) => {
+            return Err(QueryError::Unsupported("DISTINCT ON".to_owned()));
+        }
+    };
     let [table] = select.from.as_slice() else {
         return Err(QueryError::Unsupported(format!(
             "exactly one FROM table, got {}",
@@ -510,25 +975,82 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
                 ast::SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => return false,
             };
-            matches!(expr, ast::Expr::Function(function) if function.over.is_none())
+            matches!(expr, ast::Expr::Function(function) if function.over.is_none()
+                && object_name(&function.name)
+                    .map(|name| AggFunction::from_name(&name.to_lowercase()).is_some())
+                    .unwrap_or(false))
         });
     let projection = if aggregate_shaped {
         let mut items = Vec::with_capacity(select_projection.len());
         for item in select_projection {
             items.push(lower_agg_item(item, &keys)?);
         }
-        Projection::Aggregate { keys, items }
+        let having = select
+            .having
+            .as_ref()
+            .map(|expr| {
+                let mut hidden = Vec::new();
+                let rewritten = extract_having_calls(expr, &mut hidden)?;
+                Ok::<Having, QueryError>(Having {
+                    items: hidden,
+                    predicate: crate::predicate::lower_predicate(&rewritten)?,
+                })
+            })
+            .transpose()?;
+        if having.is_some() {
+            // The hidden columns share the output row with the visible
+            // ones; a visible column occupying a `__having` name would
+            // shadow the filter's target and filter on the wrong value.
+            let output_name = |item: &AggItem| match item {
+                AggItem::Key { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+                AggItem::Call(call) => call.alias.clone().unwrap_or_default(),
+            };
+            if let Some(taken) = items
+                .iter()
+                .map(output_name)
+                .find(|name| name.starts_with("__having"))
+            {
+                return Err(QueryError::Unsupported(format!(
+                    "output name '{taken}' with HAVING (the __having prefix is \
+                     reserved for its hidden columns)"
+                )));
+            }
+        }
+        Projection::Aggregate {
+            keys,
+            items,
+            having,
+        }
     } else {
+        if select.having.is_some() {
+            return Err(QueryError::Unsupported(
+                "HAVING without aggregation (use WHERE)".to_owned(),
+            ));
+        }
         let mut items = Vec::with_capacity(select_projection.len());
         for item in select_projection {
             items.push(lower_item(item)?);
         }
         Projection::Items(items)
     };
+    if distinct {
+        match &projection {
+            Projection::Items(items)
+                if items
+                    .iter()
+                    .all(|item| matches!(item, PlanItem::Column { .. })) => {}
+            _ => {
+                return Err(QueryError::Unsupported(
+                    "DISTINCT over window or aggregate projections".to_owned(),
+                ))
+            }
+        }
+    }
     Ok(Plan {
         table,
         join,
         projection,
+        distinct,
         predicate,
         order_by: None,
         limit: None,
@@ -803,6 +1325,42 @@ fn lower_agg_argument(
     }
 }
 
+/// Rewrites a HAVING expression: every aggregate call becomes a
+/// reference to a hidden output column (`__having{i}`), collected into
+/// `hidden` for the executor to compute alongside the SELECT list.
+fn extract_having_calls(
+    expr: &ast::Expr,
+    hidden: &mut Vec<AggItem>,
+) -> Result<ast::Expr, QueryError> {
+    Ok(match expr {
+        ast::Expr::Nested(inner) => {
+            ast::Expr::Nested(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(extract_having_calls(expr, hidden)?),
+        },
+        ast::Expr::BinaryOp { left, op, right } => ast::Expr::BinaryOp {
+            left: Box::new(extract_having_calls(left, hidden)?),
+            op: op.clone(),
+            right: Box::new(extract_having_calls(right, hidden)?),
+        },
+        ast::Expr::Function(function) if function.over.is_none() => {
+            let name = format!("__having{}", hidden.len());
+            let item = lower_agg_item(
+                &ast::SelectItem::ExprWithAlias {
+                    expr: expr.clone(),
+                    alias: ast::Ident::new(name.clone()),
+                },
+                &[],
+            )?;
+            hidden.push(item);
+            ast::Expr::Identifier(ast::Ident::new(name))
+        }
+        other => other.clone(),
+    })
+}
+
 fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
     let (expr, alias) = match item {
         ast::SelectItem::UnnamedExpr(expr) => (expr, None),
@@ -818,9 +1376,143 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
             name: ident(name),
             alias,
         }),
-        ast::Expr::Function(function) => lower_window_call(function, alias),
+        ast::Expr::Function(function) if function.over.is_some() => {
+            lower_window_call(function, alias)
+        }
+        other => {
+            let scalar = lower_scalar_expr(other)?;
+            Ok(PlanItem::Computed {
+                expr: scalar,
+                name: alias.unwrap_or_else(|| other.to_string()),
+            })
+        }
+    }
+}
+
+/// Lowers a scalar expression for the computed-projection slot (#49):
+/// arithmetic, the built-in scalar functions, and `CASE` with WHERE
+/// grammar conditions. Anything else is refused loudly.
+fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
+    match expr {
+        ast::Expr::Nested(inner) => lower_scalar_expr(inner),
+        ast::Expr::Identifier(name) => Ok(ScalarExpr::Column(ident(name))),
+        ast::Expr::Value(value) => match &value.value {
+            ast::Value::Number(text, _) => {
+                let number = crate::predicate::parse_number(text)?;
+                Ok(ScalarExpr::Literal(match number {
+                    Number::Int(value) => value as f64,
+                    Number::Float(value) => value,
+                }))
+            }
+            other => Err(QueryError::Unsupported(format!(
+                "literal '{other}' in a scalar expression (numbers only)"
+            ))),
+        },
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(expr)?))),
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Plus,
+            expr,
+        } => lower_scalar_expr(expr),
+        ast::Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                ast::BinaryOperator::Plus => ArithOp::Add,
+                ast::BinaryOperator::Minus => ArithOp::Sub,
+                ast::BinaryOperator::Multiply => ArithOp::Mul,
+                ast::BinaryOperator::Divide => ArithOp::Div,
+                ast::BinaryOperator::Modulo => ArithOp::Mod,
+                other => {
+                    return Err(QueryError::Unsupported(format!(
+                        "operator '{other}' in a scalar expression"
+                    )))
+                }
+            };
+            Ok(ScalarExpr::Binary {
+                op,
+                left: Box::new(lower_scalar_expr(left)?),
+                right: Box::new(lower_scalar_expr(right)?),
+            })
+        }
+        ast::Expr::Function(function) => {
+            let name = object_name(&function.name)?.to_lowercase();
+            if function.over.is_some() {
+                return Err(QueryError::Unsupported(
+                    "a window call inside a scalar expression".to_owned(),
+                ));
+            }
+            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
+                return Err(QueryError::Unsupported(format!("scalar function '{name}'")));
+            };
+            let ast::FunctionArguments::List(list) = &function.args else {
+                return Err(QueryError::Unsupported(format!(
+                    "{name} without an argument list"
+                )));
+            };
+            let mut args = Vec::with_capacity(list.args.len());
+            for arg in &list.args {
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = arg else {
+                    return Err(QueryError::Unsupported(format!(
+                        "argument '{arg}' in {name}"
+                    )));
+                };
+                args.push(lower_scalar_expr(expr)?);
+            }
+            if args.len() != arity {
+                return Err(QueryError::Unsupported(format!(
+                    "{name} takes {arity} argument(s), got {}",
+                    args.len()
+                )));
+            }
+            Ok(ScalarExpr::Call {
+                function: scalar,
+                args,
+            })
+        }
+        // sqlparser gives FLOOR and CEIL dedicated AST nodes.
+        floor_or_ceil @ (ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field }) => {
+            let ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime) = field else {
+                return Err(QueryError::Unsupported(
+                    "FLOOR/CEIL with a scale or datetime field".to_owned(),
+                ));
+            };
+            let function = if matches!(floor_or_ceil, ast::Expr::Floor { .. }) {
+                ScalarFunction::Floor
+            } else {
+                ScalarFunction::Ceil
+            };
+            Ok(ScalarExpr::Call {
+                function,
+                args: vec![lower_scalar_expr(expr)?],
+            })
+        }
+        ast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if operand.is_some() {
+                return Err(QueryError::Unsupported(
+                    "CASE <operand> WHEN (use CASE WHEN <condition>)".to_owned(),
+                ));
+            }
+            let mut whens = Vec::with_capacity(conditions.len());
+            for case_when in conditions {
+                whens.push((
+                    crate::predicate::lower_predicate(&case_when.condition)?,
+                    lower_scalar_expr(&case_when.result)?,
+                ));
+            }
+            let otherwise = else_result
+                .as_ref()
+                .map(|expr| lower_scalar_expr(expr).map(Box::new))
+                .transpose()?;
+            Ok(ScalarExpr::Case { whens, otherwise })
+        }
         other => Err(QueryError::Unsupported(format!(
-            "expression '{other}' (columns and window calls only)"
+            "expression '{other}' in a projection"
         ))),
     }
 }
@@ -1024,7 +1716,11 @@ mod tests {
             ("SELECT w.x FROM t JOIN u ON t.a = u.a", "names no table"),
             ("SELECT x FROM t ORDER BY x, y", "one column"),
             ("SELECT x FROM t WHERE x > 1 HAVING x > 2", "HAVING"),
-            ("SELECT DISTINCT x FROM t", "DISTINCT"),
+            ("SELECT DISTINCT ON (x) x FROM t", "DISTINCT ON"),
+            (
+                "SELECT DISTINCT count(x) FROM t",
+                "DISTINCT over window or aggregate projections",
+            ),
             (
                 "SELECT x, sum(y) FROM t GROUP BY x, x + 1",
                 "plain key columns",
@@ -1037,7 +1733,7 @@ mod tests {
                 "ROWS only",
             ),
             ("SELECT sum(x) OVER (ORDER BY ts) FROM t", "without a frame"),
-            ("INSERT INTO t VALUES (1)", "SELECT"),
+            ("INSERT INTO t VALUES (1)", "entry points"), // supported, elsewhere
         ] {
             let error = plan(sql).expect_err(sql);
             let message = error.to_string();
@@ -1051,5 +1747,75 @@ mod tests {
     #[test]
     fn parse_errors_surface() {
         assert!(matches!(plan("SELEKT nope"), Err(QueryError::Parse(_))));
+    }
+
+    #[test]
+    fn the_ddl_gate_is_word_wise_not_a_byte_prefix() {
+        // Any whitespace between CREATE and TABLE hits the same gate:
+        // PRIMARY KEY is refused, ORDERING KEY parses.
+        for sql in [
+            "CREATE  TABLE t (ts BIGINT PRIMARY KEY)",
+            "CREATE\tTABLE t (ts BIGINT PRIMARY KEY)",
+            "create   table t (ts BIGINT PRIMARY KEY)",
+        ] {
+            let error = parse_statement(sql).expect_err(sql).to_string();
+            assert!(error.contains("ORDERING KEY"), "{sql}: {error}");
+        }
+        for sql in [
+            "CREATE  TABLE t (ts BIGINT ORDERING KEY)",
+            "CREATE\tTABLE t (ts BIGINT ORDERING  KEY)",
+        ] {
+            assert!(
+                matches!(parse_statement(sql), Ok(Statement::CreateTable(_))),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_named_ordering_is_not_the_constraint() {
+        // `ordering KEY` after `(` or `,` declares a key column named
+        // `ordering`; only the constraint position rewrites.
+        let Ok(Statement::CreateTable(plan)) = parse_statement(
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY, primary_ish DOUBLE)",
+        ) else {
+            panic!("parses as CREATE TABLE")
+        };
+        assert_eq!(plan.columns.len(), 3);
+        assert_eq!(plan.columns[1].name, "ordering");
+        assert_eq!(plan.columns[1].type_name, "KEY");
+        assert!(!plan.columns[1].ordering_key);
+        assert!(plan.columns[0].ordering_key);
+    }
+
+    #[test]
+    fn duplicate_column_names_are_refused_not_shadowed() {
+        // Two columns named `x`: every resolver takes the first match,
+        // so the second would be silently unreachable forever.
+        let error = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE, x DOUBLE)")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("declared twice"), "{error}");
+    }
+
+    #[test]
+    fn table_level_constraints_are_refused_not_dropped() {
+        let error =
+            parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE, UNIQUE (x))")
+                .expect_err("refused")
+                .to_string();
+        assert!(error.contains("table-level constraint"), "{error}");
+    }
+
+    #[test]
+    fn the_having_prefix_is_reserved_when_having_is_present() {
+        // A visible column on a __having name would shadow the hidden
+        // filter column and filter on the wrong aggregate.
+        let error = plan("SELECT sym, COUNT(x) AS __having0 FROM t GROUP BY sym HAVING SUM(x) > 4")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("__having"), "{error}");
+        // Without HAVING the name is just a name.
+        assert!(plan("SELECT sym, COUNT(x) AS __having0 FROM t GROUP BY sym").is_ok());
     }
 }

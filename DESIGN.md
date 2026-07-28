@@ -95,8 +95,8 @@ intermediate results, and query outputs are always numeric or key; a bare
 string never exists in the engine. That is more permissive than it sounds:
 
 - **String *predicates* on key columns are in scope.** `WHERE symbol =
-  '...'` / `IN (...)` are built; `WHERE name LIKE '%Bank%'` and regex
-  matching are in scope but not yet implemented (rejected loudly until
+  '...'` / `IN (...)` / `WHERE name LIKE '%Bank%'` are built; regex
+  matching is in scope but not yet implemented (rejected loudly until
   then — a todo, not a silent gap). All consume the interned strings and
   emit a *row selection*, not a string, so they don't need a third type.
   Because keys are dictionary-encoded, such a predicate is evaluated once
@@ -157,13 +157,25 @@ surprises the people who built the tool. The invariants are the boundary,
 not our imagination. The two surfaces share this *method* and differ only
 in *which* invariants apply.
 
+**The moat test (adopted from external review, ruled 2026-07-28).** The
+inclusion principle is a negative filter: it says what is *admissible*.
+It cannot order the backlog. The companion positive filter does: **build
+first the things the three assumptions make cheaper for this engine than
+for a general database.** Of each admissible-but-unbuilt candidate, ask
+*"does DuckDB have to work harder than us here?"* If yes, building it
+cashes a dividend the cuts already paid for — ordered ingest turning a
+hash aggregate into a streaming sweep, contiguity turning a partition
+into a slice. If no, it is generality wearing a feature's clothes, and
+it spends the very thing the cuts purchased. The inclusion principle
+decides *in or out*; the moat test decides *what's next*.
+
 **SQL is bounded by** (a) numeric-or-key — no non-numeric, non-key column
 type — and (b) no general-purpose cost-based optimizer.
 
 | SQL capability | In / Out | Bounding invariant |
 |---|---|---|
-| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE` | **in** (built) | — |
-| scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE`/regex on keys, `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
+| `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE`, scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE` on keys, `NULLS FIRST`/`LAST`, `CREATE TABLE`/`INSERT` | **in** (built) | — |
+| regex on keys (#57), `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
 | `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
 | joins no structural fact licenses — neither side small enough to materialize, inputs not co-ordered on the join key, join-*order* search | **out** | (b): would need a cost-based optimizer (see *the join constraint, completed*) |
 | a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
@@ -257,8 +269,8 @@ into the engine*.
 > (they put absence *on* the number line for sorting while predicates
 > keep it off — one seam, two answers), and IEEE-strict predicates
 > (NaN invisible to every operator but `<>` while sorting as a value —
-> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is an
-> additive todo. The choice was made from the numeric-or-key thesis,
+> the trap this ruling closed). `NULLS FIRST`/`LAST` syntax is built
+> (M3.4). The choice was made from the numeric-or-key thesis,
 > not oracle convenience: where the SQL standard leaves semantics
 > implementation-defined, the choice is ours and the differential
 > harness normalizes.
@@ -364,9 +376,81 @@ compaction resolves tombstones and merges segments. This means:
 > rqlite wraps SQLite and MotherDuck wraps DuckDB. The engine-side
 > obligation that keeps third-party servers viable is only this: stay
 > embeddable in a concurrent host — snapshot reads through `&self`,
-> single writer, a clean `Send`/`Sync` story. No reopen condition is
-> foreseen for the listener; the network-boundary argument is
-> structural.
+> single writer, a clean `Send`/`Sync` story. *Satisfied 2026-07-27
+> (#51):* `Table::reader()` hands any thread a cloneable `Send + Sync`
+> handle minting point-in-time `TableSnapshot`s while the one
+> `&mut Table` writer appends, mutates, or compacts — the shared state
+> sits behind a per-table lock held only for reads and swaps (bounded
+> by one write-buffer copy), compaction is read-copy-update through the
+> segment `Arc`s, and the single-writer cut stays a compile-time fact.
+> No reopen condition is foreseen for the listener; the
+> network-boundary argument is structural.
+
+## The console, and the deployment roadmap beyond it
+
+**Decision record — the M3.5 console (#39, ruled 2026-07-27).** The
+shell / security / systems separation is the architecture: the engine
+(systems) stays dependency-clean; `tallydb-shell`'s `Console` is a
+reusable module a future served product embeds; `main.rs` is a thin
+skin. Rulings, each with its losing alternatives: **dependencies** —
+rustyline and csv only, confined to the shell crate (zero-dep
+hand-rolling rejected as reinvention; a CLI framework rejected as
+surface without need). **DDL grammar** — `BIGINT` / `DOUBLE` / the
+coined `KEY`, one `ORDERING KEY` column constraint; `VARCHAR`/`TEXT`
+refused with the keys-are-interned-labels teaching error rather than
+aliased (an alias teaches the wrong model); user-typed `PRIMARY KEY`
+refused with its own teaching error (the ordering key is not a
+uniqueness constraint — duplicates are first-class), while serving
+internally as the parser's carrier for the `ORDERING KEY` phrase.
+**Import** — CSV in the shell layer feeding the ordinary append path;
+the engine never parses CSV. **Code registration** — the explicit
+`.lua` dot-command only; `CREATE FUNCTION ... LANGUAGE LUA` is
+deliberately *not* SQL, so a SQL string is never a code-injection
+vector — the SQL form is a recorded decision for the served product's
+threat model, not before. Local security posture: an OS file lock
+(released by the OS on death — no stale locks) admits one process per
+directory; table names stay identifiers (they become directory names).
+
+**The roadmap beyond native GA (recorded 2026-07-27; reordered
+2026-07-28, twice — first the desk before the browser, then the
+extension model before the desk: the 2026-07-28 review rulings touched
+M0–M3 design, and the back-end must settle before anything user-facing
+is built on it).** M3 ships *embed in your application* plus the
+console. **M4 (the extension model)** makes the 2026-07-28 rulings
+real and small: the `WindowAggregate` trait and `register_window`
+become public engine surface (the primary extension path); compute-lua
+becomes a non-default feature the console enables; the Lua-as-NumPy
+plan lands — the vocabulary invariant (anything SQL can call, Lua can
+call), the vectorized whole-column kernel slot wired (`eval_column`,
+built in M2.7 and never connected), the compose-don't-loop idiom
+documented, and promotion made mechanical (one registry name, Lua
+implementation swappable for a trait implementation with no query
+change); the vendored interpreter is finally validated against the
+upstream Lua test suite (#69); plus the accumulated low-hanging
+correctness work (#73 atomic mutations, #63 Miri in CI, the review
+pass's noted redundancies). **M5 (desk adoption)** then builds what
+the target user needs, chosen by the moat test: multi-factor curated
+compute (K > 2 — the recorded LAPACK-class-returns trigger firing,
+served by faer), the ordered-axis dividends (cross-sectional
+partitioning, time bucketing pending F1, `LAG`/`LEAD`, `RANGE` frames,
+`ASOF` #65, corrections pending F2), segment-lazy open (F3),
+cross-process readers (F4), and reach (bulk Arrow ingest, a Python
+binding with host-callback NumPy kernels — distribution method open: a
+wheel is one form, not the ruling). **M6 (WASM parity)** adds *embed
+in a browser*: the compute stack already compiles for wasm32; the
+remaining work is a browser `StorageBackend` (OPFS/IndexedDB behind
+the existing trait — written knowing an HTTP-fetch sibling comes
+later), the JS bindings, and `lua.wasm` behind the same feature flag.
+**M7** adds *embed in a server*: a Servette-shaped served product and
+a workbench UI, both **separate artifacts embedding the engine** (the
+never-a-server guardrail's sanctioned form), the console module reused
+as the server's shell. The load-bearing observation for M7's sync
+story: **segments are immutable, self-describing, CRC'd objects
+committed by a generation manifest — the storage format is already
+the replication format.** A read-only browser or client replica
+fetches the manifest and pulls segments lazily (zone maps prune the
+fetch), verified by the same checks reopen runs; the single writer
+stays wherever the WAL is. Nothing earlier may foreclose this.
 
 ## Current milestone: native only
 
@@ -482,18 +566,18 @@ rebuild, being wrong about the additive one costs a later layer.
 | Axis | Our position | Licensing assumption | Reversal class |
 |---|---|---|---|
 | Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
-| Working set | **Cut, now owned**: v1 opens decode-into-memory | A table fits in memory (see below) | Foundational |
+| Working set | **Cut, amended by ruling 2026-07-28**: the *queried working set* fits in memory. Segment-lazy open lands in M5 — the manifest carries per-segment zone maps so pruning runs before decode, and a segment's bytes load on first touch; decode-into-memory stands until then. (Distinct from the retired mmap/ranged-read path: whole-object reads and the backend contract are untouched.) | The rows a query touches fit in memory (see below) | Foundational |
 | Query (planner) | Cut: a **fixed-strategy planner** — `plan()` exists; search, costing, and choice do not | One access path ⇒ nothing to choose between | Additive |
 | Query (surface) | **Refused**: broad standard SQL, bounded by the inclusion principle | — | Additive |
 | Access path | Cut totally: no secondary indexes; ordering-key clustering + scan is the one path (zone maps are pruning metadata, not a path) | Ordered ingest on the declared key (assumption 2) | Invasive |
 | Write | **Refused**: cheap online single-row append is the design center | — | n/a |
 | Transaction | Cut: submitted units only — no `BEGIN`/`COMMIT`/`ROLLBACK`, no session state (contract below) | Work arrives as single statements | Invasive |
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
-| Concurrency | Single writer, concurrent snapshot readers (facade currently overcuts to single-accessor — corrective work tracked, pre-M3) | One writer at a time is enough | Additive to correct |
+| Concurrency | Single writer *per table*, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds. Writers scale by table (one owner each — a thread, or a whole process: directory locks are per table). **Cross-process readers ruled in 2026-07-28 (M5):** writer-exclusive / reader-shared locks; POSIX-first — unlink-keeps-open-files-alive gives reader safety for free on Linux/macOS, Windows requires deferred deletes and is documented as the lagging platform until its cleanup pass | One writer per table is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
 | Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
-| Durability | Not cut: publish is atomic **and synced** (power-loss durable at the flush); cadence policy open as #43 | — | — |
+| Durability | Not cut: publish is atomic **and synced**, and the write buffer sits behind a sidecar WAL with sync levels (#43, ruled on measurement: default group commit ≤ 100ms, `Full` for a zero loss window, `Off` restoring the flush boundary) | — | — |
 
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
@@ -507,8 +591,8 @@ frozen segments (`Store::snapshot` appends the buffer's rows to the
 segment sequence; the contract is that a snapshot covers exactly the rows
 appended before the call), so a row appended microseconds ago is visible
 to the very next query. Freeze/flush is the *durability and layout*
-boundary — a fresh row is queryable but not power-loss durable until flush
-(cadence is #43) — never a visibility gate. So an application that ingests
+boundary for segments; power-loss durability of the newest rows is the
+WAL's, at the configured sync level (#43) — neither is a visibility gate. So an application that ingests
 a live feed and recomputes over it in the same process — real-time risk,
 live P&L, a moving regression on the newest window — is squarely in scope,
 and is the compute-without-copying sweet spot: socket → storage → SQL →
@@ -559,17 +643,18 @@ mutations after the call are invisible to it (test:
 `snapshot_is_isolated_from_later_appends`). One guarantee — snapshot
 isolation at statement granularity — no isolation-level menu.
 
-*One consistency obligation for the concurrent-reader work (#51):* a
-statement that reads more than one table — today only a join, which
-snapshots the fact table and each dimension separately
-(`table.rs:311-312`) — takes multiple `snapshot()` calls at distinct
-instants. This is sound under the current single-writer model because
-no writer can interleave between them, but the moment concurrent
-writers exist (#51) those inputs could come from different instants —
-a cross-table torn read. The snapshot-handle design must give a
-multi-input statement one consistent snapshot epoch across all inputs;
-the single-`snapshot()`-per-input mechanism does not survive #51
-unchanged.
+*Cross-table consistency, as shipped (#51, M3.1):* a statement that
+reads more than one table — today only a join, which snapshots the
+fact table and each dimension separately — takes multiple `snapshot()`
+calls at distinct instants. Through a `Database` handle this is sound:
+the writer needs `&mut` on the same handle, so no write interleaves
+mid-statement. The detached reader handles are **single-table by
+scope** (`TableSnapshot` serves `SELECT` over its one table; joins
+resolve only through a `Database`), so no shipped path can take a
+cross-table torn read — and no cross-table snapshot epoch is promised.
+#51 kept the single writer; concurrent *writers* never arrived. If a
+future surface lets detached readers span tables, the one-epoch
+obligation recorded here revives with it.
 
 **Truth values — decided (2026-07-25).** There is no boolean type and
 none is coming. A flag column is `i64` in {0, 1} — which is the right
@@ -661,10 +746,70 @@ early drafts named it):
 
 Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
 exact and errors loudly on overflow; query output is one Arrow batch
-per segment; window frames are `ROWS`-only for now. Interim states with
-their decisions still open: durability boundary is the flush (issue
-#43, must close before M3 ships a binary) and segments freeze at a
-fixed row count (issue #44) — the two sibling cadence questions.
+per segment; window frames are `ROWS`-only for now. The two sibling cadence
+questions closed together, both ruled by the Human 2026-07-27 on a
+measurement (recorded in #43/#44 and built in M3.2/M3.3):
+
+**Decision record — durability: WAL with sync levels (#43).** A
+sidecar write-ahead log (the segment format untouched), three levels:
+`Group(interval)` — the default, 100 ms — logs every append and
+group-commits with an in-thread sync, bounding the loss window at the
+interval for +0.4–1µs on a ~1µs append (measured; the in-repo
+`measure_wal_regimes` re-earns the number: off 0.99µs, group-100ms
+2.06µs, full 728µs per append, run 2026-07-27, container fs); `Full`
+syncs every append — zero window at ~700× per-append cost, shipped
+documented, never default; `Off` writes no log and restores the
+flush-boundary contract for replayable upstreams. Replay recovers the
+per-record-CRC clean prefix, skips segment-covered rows, and ignores
+wrong-generation logs (compaction reassigns row ids). *Rejected:*
+flush-boundary-only as the GA contract (strangers assume a database
+keeps what it acknowledged) and per-table dual contracts with no
+default answer. *Reopen trigger:* tail-latency complaints from the
+unlucky append paying the in-thread sync (10–46 ms worst on the
+measured disk) — the fix is a background sync thread, which is the
+may-the-library-own-a-thread question shared with #44's deferred
+time-aligned freezing.
+
+**Decision record — freeze threshold in bytes (#44).** The knob
+speaks bytes (the buffer bound an embedder budgets); numeric-or-key
+makes rows fixed-width, so bytes convert exactly to a per-schema row
+count at construction (8 per number, 4 per key code; dictionaries —
+bounded by distinct values — sit outside the bound, documented).
+Setting rows and bytes together is refused loudly. *Deferred with
+triggers:* time-aligned hybrid freezing — pruning-profile evidence
+from the end-to-end suite (#52), and the library-thread question
+above.
+
+## The SQL stdlib — the surface, tabulated (#49, ruled 2026-07-27)
+
+One table, so the in/out line is a deliberate record instead of an
+accumulation of implementation accidents. Every IN row is born with a
+DuckDB differential family; the shell's help cites this table.
+
+| Construct | Status | Note |
+|---|---|---|
+| `SELECT` projection, aliases | in, built | |
+| `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
+| regex on keys | in, later | needs a dependency ruling (#57) |
+| `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
+| `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
+| `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
+| scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
+| `CASE WHEN` | in, built | conditions are WHERE grammar; UNKNOWN falls through |
+| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention) |
+| multi-column `ORDER BY` | in, later | additive lowering |
+| `LIMIT`/`OFFSET` | in, built | |
+| window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
+| `RANGE` frames | in, later | needs ordering-key-typed ranges |
+| star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule |
+| `ASOF` / ordered-merge joins | in, later | #65 |
+| `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
+| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `ORDERING KEY` constraint; `VARCHAR` and `PRIMARY KEY` refused with teaching errors |
+| non-correlated subqueries / CTEs | in, later | named subplans |
+| `UNION ALL` (then `UNION`) | in, later | low priority |
+| correlated subqueries | **out** | the road to a cost-based optimizer — settled no |
+| string production (`CONCAT`, `CAST AS VARCHAR`, …) | **out** | numeric-or-key invariant |
+| `DISTINCT` over window/aggregate projections | out until asked | refused loudly today |
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
@@ -735,7 +880,7 @@ hardware, 20k rows, window 64).
 
 *What this bought beyond speed:* the engine no longer requires a system
 LAPACK to build or embed, which repairs the link-it-in-like-SQLite
-property, and **M4 no longer waits on a LAPACK-in-WASM layer** — the
+property, and **the WASM milestone (M6) no longer waits on a LAPACK-in-WASM layer** — the
 current feature set can reach WASM parity without one.
 
 *The closed forms are the corrected ones, and that distinction is
@@ -854,10 +999,32 @@ record predicted (`eigen_max` off by 9.6e7 at a 1e12 offset,
 permanently. A **shifted** variant — moments kept about a value near
 the data, accumulator rebuilt every window-length — keeps ~7× and sits
 at 5e-15–1.1e-14, marginally less accurate than the corrected
-recompute but still at the noise floor. So the speed is available at a
-noise-floor accuracy cost; adopting it needs a sequence-shaped window
-seam in the executor, which is not built, and any adoption must keep
-`window_numerics_guard` green.
+recompute but still at the noise floor.
+
+*Shipped 2026-07-27 (#72).* The sequence seam exists — a defaulted
+`evaluate_frames` on `WindowAggregate`: the executor hands each
+aggregate one contiguous run (the snapshot, or one partition) and the
+default recomputes per frame, so only overriders change behavior. The
+rejected seam shapes, for the record: a separate sequence trait
+(needless registry duplication) and executor special-casing of known
+op names (breaks the trait boundary and duplicates the math — rejected
+on sight). `PairStatistic` and `RollingRegression` override with the
+shifted sweep for bounded frames; unbounded frames recompute as
+before; one shared finalization keeps the NULL semantics identical on
+both paths. The guard extended before the speed landed:
+`window_numerics_guard` holds the incremental path — the one every SQL
+window now runs — to the same 1e-12 bound on every corpus, intercept
+included, and was verified to trip (1.07e-12, drifting-timestamp
+corpus) with the re-anchoring rebuild disabled. Arrival numbers
+(`m2_compute_latency_bench.py`, run 2026-07-27, release, container
+hardware, 20k rows, window 64): `regr_slope` 0.6ms — 9.6× ahead of the
+DuckDB+NumPy stack; `covar_pop`/`corr`/`eigen_max` 0.7–1.1ms —
+1.2–1.6× ahead of vectorized NumPy riding TallyDB's own export, 3–4×
+ahead of the DuckDB+NumPy stack. The in-engine path is now the fastest
+measured arrangement for every curated statistic *and* the only one
+holding 1e-12-to-truth at timestamp-scale offsets — the vectorized
+peer's cumsum form is exactly this record's rejected streaming
+algorithm.
 
 ## Batch, not per-row, for Lua and linear-algebra calls
 
@@ -869,6 +1036,60 @@ makes per-row calls the easy/obvious way to use it, that's a bug in the API
 shape.
 
 ## The Lua layer
+
+**Decision record — the extension model (ruled 2026-07-28, from
+external review).** User compute reaches the engine through **one
+mechanism per host**, and the embedded interpreter serves only the
+hosts that have no language of their own:
+
+1. **Rust host → the trait.** `WindowAggregate` is the extension API:
+   an embedder implements it (~20 lines) and registers the kernel on
+   the table — native speed, full type safety, no interpreter. This is
+   the *primary* extension path; the trait and a `register_window`
+   entry are public engine surface (correcting the M2.7 state, which
+   shipped only the interpreter path publicly).
+2. **Python host → callbacks through the binding (M5).** Python is
+   **never embedded in the engine** — ruled out on structure, not
+   taste: NumPy (the thing users actually know — the familiarity is
+   the library, not the syntax) is welded to CPython; CPython brings
+   the process-global GIL, no viable sandbox, tens of megabytes, and —
+   decisive — *circularity*, since the primary host process already is
+   Python, and a library importing a second interpreter into it fights
+   the first. (RustPython/MicroPython rejected: no NumPy, so the
+   familiarity argument evaporates.) Instead the binding registers a
+   host-side callable as a window kernel: the engine calls back into
+   the host's own interpreter through the `evaluate_frames` seam —
+   whole columns per call, zero-copy views in, vectorized NumPy
+   inside, an array out. In-query compute in real NumPy, with no
+   interpreter shipped.
+3. **No host language (console; browser at M6) → embedded Lua.** The
+   one territory where an embedded interpreter is non-substitutable —
+   a console user cannot compile Rust at a prompt. Lua becomes a
+   **non-default feature** the console (and later the browser bundle)
+   turns on; library embedders opt in or never carry the C boundary,
+   its sanitizer CI, or the interpreter at all. Its honest value:
+   interactive kernel registration, and the measured low-latency
+   niche (parity with NumPy-on-export at the newest-window shape,
+   where fixed costs dominate). It is **not** the extensibility story;
+   the trait is.
+
+**The sunset clause.** ~32k lines (vendored C + bindings) is not yet
+justified by that niche. Lua must demonstrate value before release
+1.0 — real console/browser kernel use, or the latency niche exercised
+in practice — or it is removed and tier 3 becomes query-only. If the
+sunset executes, the **no-coined-SQL-names principle reopens by its
+recorded trigger** (ruled 2026-07-28): with no scripting layer to
+carry novel compute names, SQL becomes their only home, and
+`eigen_max`-class naming must be re-decided there. The
+runaway-kernel guard (#61) is scoped by the same ruling: required
+before Lua ships in any surface serving untrusted input (the M7
+served product), optional for a local console.
+
+**A history correction (same review).** The four curated statistics
+were *not* produced by promoting Lua prototypes — the regressions
+predate the Lua layer by two milestones. The promotion ladder is the
+intended path for future kernels, not the origin story of the shipped
+ones; documentation must not claim otherwise.
 
 The embedded interpreter is **canonical PUC Lua 5.4**, compiled into the
 engine from the unmodified upstream sources — the embedding model Lua is
@@ -1126,7 +1347,7 @@ Native and WASM builds won't be bit-identical by default — floating-point
 addition isn't associative, and different SIMD widths / FMA usage change
 summation order. We're not solving full native/WASM bit-identity now; the
 portability *standard* (bit-exact, or bounded-difference, and over which
-ops) is set when M4 starts. But the ground is mostly already held: every
+ops) is set when the WASM milestone (M6) starts. But the ground is mostly already held: every
 closed-form window statistic and the `dot` kernel fix their operation
 order in source — plain Rust loops, no runtime dispatch — so their
 results are bit-identical across CPUs and targets by construction. The
@@ -1228,10 +1449,10 @@ tallydb/
                     #   buffers, u32-dictionary keys, C Data Interface export;
                     #   arrow-rs/PyArrow as dev-only round-trip oracles)
     storage-lite/   # append-optimized segments partitioned on the ordering
-                    #   key; compaction; zone maps; I/O behind a backend
-                    #   trait (native = a directory of files; mmap/ranged
-                    #   reads when pruning or profiling asks; OPFS/WASM
-                    #   backend can be added later)
+                    #   key; compaction; zone maps; the WAL; I/O behind a
+                    #   backend trait (native = a directory of files;
+                    #   decode-into-memory is the owned working-set cut —
+                    #   see *What v1 cuts*; OPFS/WASM backend later)
     query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces
@@ -1240,6 +1461,8 @@ tallydb/
                     #   hand-rolled bindings (lua.wasm, also 5.4, later)
     compute-linalg/ # multiplication-class kernels behind a trait; pure
                     #   Rust (faer + a source-fixed dot), wasm32-ready
+    shell/          # the tallydb console binary: rustyline + csv live here,
+                    #   the engine stays dependency-clean (#39's separation)
     corpus/         # dev-only: the seeded synthetic generators of "The
                     #   corpus" above; measurement and differential-test
                     #   data, never linked by the engine
@@ -1283,7 +1506,7 @@ on stored buffers with no copy → Arrow out — rather than leaving it for
 last. Building the storage engine beautifully while the compute story slips
 just yields "another embeddable TSDB" and misses the point.
 
-Don't try to scaffold all seven crates' real implementations in one pass.
+Don't try to scaffold all eight crates' real implementations in one pass.
 
 ## Who we write for
 

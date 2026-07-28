@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Why a backend operation failed.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -43,7 +43,9 @@ impl std::error::Error for IoError {}
 /// Contract: `write` publishes atomically — a reader (including a
 /// process that crashed mid-write and reopened) sees either the whole
 /// object or no object, never a torn one. `list` returns every published
-/// name, in unspecified order.
+/// name, in unspecified order. Names beginning with `.` are reserved
+/// for a backend's own bookkeeping (temporaries, locks) and are not
+/// part of the namespace.
 pub trait StorageBackend: Send + Sync {
     /// Publishes `bytes` under `name`, replacing any previous object.
     /// **Durability contract:** when `write` returns, the object is
@@ -64,6 +66,30 @@ pub trait StorageBackend: Send + Sync {
 
     /// Removes the object named `name` (an error if absent).
     fn remove(&self, name: &str) -> Result<(), IoError>;
+
+    /// Opens the *existing* object named `name` as an append-only log
+    /// and returns its writer (an error if absent). A log is born and
+    /// reborn through `write` — atomic, durable publish of its initial
+    /// contents — and only *appended* through this writer, so there is
+    /// never an instant where the old log is destroyed and its
+    /// replacement not yet durable. The log lists and reads back like
+    /// any object, but appended bytes' durability is governed by
+    /// [`LogWriter::sync`] — not `write`'s contract — because a log's
+    /// whole point is accumulating small appends between syncs (the
+    /// WAL, decision #43).
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError>;
+}
+
+/// An open append-only log. Bytes accumulate with `append`; `sync`
+/// makes everything appended so far durable against power loss.
+/// Dropping a writer without syncing loses at most the unsynced tail —
+/// the WAL's per-record CRCs turn that into a clean torn tail at
+/// replay, never corruption.
+pub trait LogWriter: Send {
+    /// Appends `bytes` to the log.
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError>;
+    /// Makes every appended byte durable against power loss.
+    fn sync(&mut self) -> Result<(), IoError>;
 }
 
 /// The native backend: one directory, one file per object. Writes go to
@@ -72,22 +98,70 @@ pub trait StorageBackend: Send + Sync {
 /// *and durable* publish on POSIX filesystems; leftover temporaries
 /// from a crash are invisible to `list` and overwritten by the next
 /// write.
+///
+/// Opening the backend takes an **exclusive OS file lock** on the
+/// directory (`.tallydb.lock`), held for the backend's life and
+/// released by the OS even if the process dies — so two processes
+/// linking the library cannot silently clobber one store (the same
+/// protection the console's own lock gives its whole database
+/// directory, now enforced where the files are actually written).
 pub struct FsBackend {
     dir: PathBuf,
     /// Distinguishes concurrent writes' temp files (R6).
     write_counter: AtomicU64,
+    /// The advisory process lock; released when the backend drops (or
+    /// the process dies — no stale-lock cleanup ever needed).
+    _lock: std::fs::File,
 }
 
 impl FsBackend {
-    /// A backend over `dir`, created if absent.
+    /// A backend over `dir`, created if absent; fails if another
+    /// process (or another backend in this one) holds the directory.
     pub fn new(dir: impl Into<PathBuf>) -> Result<FsBackend, IoError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .map_err(|error| IoError::Backend(format!("creating {}: {error}", dir.display())))?;
+        let lock_path = dir.join(".tallydb.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                IoError::Backend(format!("opening lock {}: {error}", lock_path.display()))
+            })?;
+        if let Err(error) = lock.try_lock() {
+            return Err(IoError::Backend(format!(
+                "another process holds {} ({error}); one accessor per store directory",
+                dir.display()
+            )));
+        }
         Ok(FsBackend {
             dir,
             write_counter: AtomicU64::new(0),
+            _lock: lock,
         })
+    }
+}
+
+/// [`LogWriter`] over one native file: `write(2)` per append,
+/// `fdatasync` per sync.
+struct FsLogWriter {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl LogWriter for FsLogWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+        std::io::Write::write_all(&mut self.file, bytes).map_err(|error| {
+            IoError::Backend(format!("appending {}: {error}", self.path.display()))
+        })
+    }
+
+    fn sync(&mut self) -> Result<(), IoError> {
+        self.file
+            .sync_data()
+            .map_err(|error| IoError::Backend(format!("syncing {}: {error}", self.path.display())))
     }
 }
 
@@ -152,14 +226,34 @@ impl StorageBackend for FsBackend {
             let Ok(name) = entry.file_name().into_string() else {
                 continue; // not a name this backend ever wrote
             };
-            if name.starts_with(".tmp-") {
-                continue; // unpublished leftovers are invisible
+            if name.starts_with('.') {
+                // The backend's own bookkeeping — unpublished `.tmp-`
+                // leftovers, the `.tallydb.lock` file — is not part of
+                // the namespace (dot-prefixed names are reserved).
+                continue;
             }
             if entry.path().is_file() {
                 names.push(name);
             }
         }
         Ok(names)
+    }
+
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        let path = self.dir.join(name);
+        let file = match std::fs::OpenOptions::new().append(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(IoError::NotFound(name.to_owned()))
+            }
+            Err(error) => {
+                return Err(IoError::Backend(format!(
+                    "opening {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        Ok(Box::new(FsLogWriter { file, path }))
     }
 
     fn remove(&self, name: &str) -> Result<(), IoError> {
@@ -181,7 +275,38 @@ impl StorageBackend for FsBackend {
 /// non-filesystem backends. Ordered map so `list` is deterministic.
 #[derive(Default)]
 pub struct MemBackend {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+}
+
+/// [`LogWriter`] over a [`MemBackend`] object, modeling power loss:
+/// appends buffer in the writer and only `sync` publishes them to the
+/// shared map, so a "crash" (drop the store, reopen over the same
+/// backend) sees exactly the synced prefix — which is what makes the
+/// crash-injection tests honest about sync levels.
+struct MemLogWriter {
+    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    name: String,
+    pending: Vec<u8>,
+}
+
+impl LogWriter for MemLogWriter {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), IoError> {
+        if !self.pending.is_empty() {
+            self.objects
+                .lock()
+                .expect("no poisoned locks")
+                .entry(self.name.clone())
+                .or_default()
+                .extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        Ok(())
+    }
 }
 
 impl MemBackend {
@@ -217,6 +342,25 @@ impl StorageBackend for MemBackend {
             .keys()
             .cloned()
             .collect())
+    }
+
+    fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        // The log must already exist (born through `write`'s atomic
+        // publish); appended bytes arrive in the shared map only at
+        // sync — which is what models power loss honestly.
+        if !self
+            .objects
+            .lock()
+            .expect("no poisoned locks")
+            .contains_key(name)
+        {
+            return Err(IoError::NotFound(name.to_owned()));
+        }
+        Ok(Box::new(MemLogWriter {
+            objects: Arc::clone(&self.objects),
+            name: name.to_owned(),
+            pending: Vec::new(),
+        }))
     }
 
     fn remove(&self, name: &str) -> Result<(), IoError> {
@@ -274,6 +418,27 @@ mod tests {
         assert_eq!(backend.list().unwrap(), ["real"]);
         backend.write("real", b"data-2").unwrap();
         assert_eq!(backend.read("real").unwrap(), b"data-2");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_directory_lock_admits_one_backend() {
+        // Two library embedders opening one store directory would
+        // silently clobber each other's segments; the lock makes the
+        // second open loud instead. Released with the file handle — by
+        // the OS even on a crash, so no stale-lock cleanup exists.
+        let dir = std::env::temp_dir().join(format!("tallydb-io-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = FsBackend::new(&dir).unwrap();
+        let Err(error) = FsBackend::new(&dir) else {
+            panic!("second accessor must be refused");
+        };
+        assert!(
+            error.to_string().contains("one accessor"),
+            "unexpected error: {error}"
+        );
+        drop(first);
+        drop(FsBackend::new(&dir).unwrap()); // released with the handle
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

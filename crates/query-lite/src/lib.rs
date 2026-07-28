@@ -28,9 +28,12 @@
 //! require a non-numeric, non-key column type, and (b) doesn't require a
 //! general-purpose cost-based optimizer. That's the actual filter — "can
 //! we think of a quant use case for it" is NOT the filter, and is not a
-//! reason to exclude something otherwise in scope. Concretely in scope:
-//! `SELECT` / `WHERE` / `GROUP BY` / `ORDER BY`, equi-joins, window
-//! functions, and `UPDATE` / `DELETE` (implemented as tombstone +
+//! reason to exclude something otherwise in scope. Concretely in scope
+//! (and built): `SELECT` / `WHERE` / `GROUP BY` (`HAVING` included) /
+//! `ORDER BY` (`NULLS FIRST`/`LAST` included) / `LIMIT`, `DISTINCT`,
+//! scalar expressions and `CASE` in projection, equi-joins, window
+//! functions, `CREATE TABLE` / `INSERT` (lowered here, executed by the
+//! embedder), and `UPDATE` / `DELETE` (implemented as tombstone +
 //! reinsert against `storage-lite`, not a separate mutation path — see
 //! that crate's docs). Concretely out of scope for now: general
 //! subqueries/CTEs, string-*producing* functions (`SUBSTRING`, `CONCAT`,
@@ -43,9 +46,9 @@
 //! not just stored columns), but that does NOT mean "no string operations."
 //! Key columns are dictionary-encoded interned strings, so string
 //! **predicates** on keys — `=`, `IN`, `LIKE`, regex — are in scope: they
-//! emit a row selection, not a string. (`=` and `IN` are built; `LIKE`
-//! and regex are in scope but not yet implemented, rejected loudly
-//! until then.) Implement them efficiently: evaluate
+//! emit a row selection, not a string. (`=`, `IN`, and `LIKE` are built;
+//! regex is in scope but not yet implemented, rejected loudly until
+//! then — #57.) Implement them efficiently: evaluate
 //! the predicate once per *distinct* value in the small dictionary to get a
 //! bitmap over dictionary indices, then filter rows by integer set
 //! membership — never re-run the string match per row. What's out is any
@@ -66,10 +69,11 @@ pub mod exec;
 pub mod plan;
 pub mod predicate;
 
-pub use exec::{execute, execute_join, QueryOutput, Registry, WindowAggregate};
+pub use exec::{execute, execute_join, recompute_frames, QueryOutput, Registry, WindowAggregate};
 pub use plan::{
-    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, DeletePlan, JoinPlan,
-    OrderBy, Plan, PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan,
+    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,
+    DeletePlan, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem, Projection, QueryError,
+    SetValue, Statement, UpdatePlan,
 };
 pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 

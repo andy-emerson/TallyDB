@@ -1,0 +1,35 @@
+# Release builds — the M3 GA deliverable (#39): one static-feeling
+# binary per platform, attached to the GitHub Release for a version
+# tag. The binary is the shell; the library ships as the crates.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: tallydb-linux-x86_64
+          - os: macos-latest
+            artifact: tallydb-macos-arm64
+          - os: windows-latest
+            artifact: tallydb-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the console binary
+        run: cargo build -p tallydb-shell --release
+      - name: Name the artifact (unix)
+        if: runner.os != 'Windows'
+        run: cp target/release/tallydb ${{ matrix.artifact }}
+      - name: Name the artifact (windows)
+        if: runner.os == 'Windows'
+        run: copy target\release\tallydb.exe ${{ matrix.artifact }}
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}

@@ -25,14 +25,18 @@
 //! a two-argument window) — the copy recorded in deferred issue #4
 //! (peak-memory accounting in #56).
 
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
+use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+use compute_lua::LogSink;
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, DeletePlan, Number, Plan, QueryError,
-    QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
+    evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
+    QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
 };
 use std::fmt;
-use std::sync::Arc;
-use storage_lite::{FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store};
+use std::sync::{Arc, Mutex};
+use storage_lite::{
+    FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store, StoreOptions,
+    StoreReader,
+};
 
 /// Why a table or database operation failed.
 #[derive(Debug)]
@@ -138,7 +142,15 @@ impl From<QueryError> for EngineError {
 pub struct Table {
     name: String,
     store: Store,
-    registry: Registry,
+    /// SQL name → window implementation, shared with every reader
+    /// handle. The lock is held only to clone or swap the inner `Arc`,
+    /// so a snapshot pins the function set of its moment and a later
+    /// registration never mutates what a reader already holds.
+    registry: Arc<Mutex<Arc<Registry>>>,
+    /// Where Lua kernels' `log(...)` goes — `None` (the default) keeps
+    /// `log` a no-op, per compute-lua's off-by-default contract. Applies
+    /// to kernels registered *after* it is set.
+    lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
 }
 
 impl Table {
@@ -181,6 +193,42 @@ impl Table {
         Ok(Table::from_store(
             name,
             Store::persistent(backend, schema, index)?,
+        ))
+    }
+
+    /// As [`Table::persistent`], with explicit [`StoreOptions`]: the
+    /// freeze threshold (rows, or bytes — the memory bound an embedder
+    /// actually budgets, #44) and the durability level (#43's ruling:
+    /// default `Group(100ms)`, measured ~free; `Full` for a zero loss
+    /// window at ~670× per-append cost; `Off` for the flush-boundary
+    /// contract and replayable upstreams).
+    pub fn persistent_with(
+        name: impl Into<String>,
+        schema: Schema,
+        ordering_key: &str,
+        dir: impl AsRef<std::path::Path>,
+        options: StoreOptions,
+    ) -> Result<Table, EngineError> {
+        let index = ordering_index(&schema, ordering_key)?;
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::persistent_with(backend, schema, index, options)?,
+        ))
+    }
+
+    /// Opens an existing persistent table, taking schema and ordering
+    /// key from its manifest — the shell's doorway to a table it did
+    /// not create in this process.
+    pub fn open(
+        name: impl Into<String>,
+        dir: impl AsRef<std::path::Path>,
+        options: StoreOptions,
+    ) -> Result<Table, EngineError> {
+        let backend = fs_backend(dir)?;
+        Ok(Table::from_store(
+            name,
+            Store::open_existing(backend, options)?,
         ))
     }
 
@@ -249,8 +297,14 @@ impl Table {
         Table {
             name: name.into(),
             store,
-            registry,
+            registry: Arc::new(Mutex::new(Arc::new(registry))),
+            lua_log_sink: None,
         }
+    }
+
+    /// The registry as of now — a cheap `Arc` clone under a brief lock.
+    fn current_registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry.lock().expect("registry lock poisoned"))
     }
 
     /// The table's name.
@@ -261,6 +315,21 @@ impl Table {
     /// The table's schema.
     pub fn schema(&self) -> &Schema {
         self.store.schema()
+    }
+
+    /// The ordering-key column's name — the schema alone cannot say
+    /// which column ingest is ordered on, so anything reconstructing a
+    /// full definition (the console's `.schema`) needs this too.
+    pub fn ordering_key(&self) -> &str {
+        self.store.schema().fields()[self.store.ordering_key()].name()
+    }
+
+    /// Installs the destination for Lua kernels' `log(...)` output.
+    /// Until an embedder calls this, `log` is a no-op (compute-lua's
+    /// off-by-default contract); afterwards, every *newly registered*
+    /// kernel routes through the sink — install before registering.
+    pub fn set_lua_log_sink(&mut self, sink: Arc<dyn LogSink + Sync>) {
+        self.lua_log_sink = Some(sink);
     }
 
     /// Appends one row (see [`RowValue`]); every cell is validated
@@ -297,7 +366,7 @@ impl Table {
             self.store.schema(),
             &segments,
             plan,
-            &self.registry,
+            &self.current_registry(),
         )?)
     }
 
@@ -316,8 +385,51 @@ impl Table {
             dimension.store.schema(),
             &dimension_views,
             plan,
-            &self.registry,
+            &self.current_registry(),
         )?)
+    }
+
+    /// A cheap, cloneable handle for reader threads: it mints
+    /// point-in-time [`TableSnapshot`]s while this table's single
+    /// writer (whoever holds `&mut Table`) appends, mutates, or
+    /// compacts. This is the single-writer/concurrent-readers cut made
+    /// visible in the types: exactly one `&mut Table` can exist, and
+    /// readers can neither block it for longer than a snapshot's
+    /// microseconds nor observe a torn state (#51).
+    ///
+    /// ```
+    /// # use arrow_lite::{ColumnType, Field, Schema};
+    /// # use engine::{RowValue, Table};
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("t", schema, "ts").unwrap();
+    /// for i in 0..10 {
+    ///     table.append(&[RowValue::I64(i), RowValue::F64(i as f64)]).unwrap();
+    /// }
+    /// let reader = table.reader();
+    /// let worker = std::thread::spawn(move || {
+    ///     let snapshot = reader.snapshot().unwrap();
+    ///     snapshot.query("SELECT x FROM t").unwrap().batches.len()
+    /// });
+    /// // The writer keeps writing while the reader thread queries.
+    /// table.append(&[RowValue::I64(10), RowValue::F64(10.0)]).unwrap();
+    /// assert!(worker.join().unwrap() >= 1);
+    /// ```
+    pub fn reader(&self) -> TableReader {
+        TableReader {
+            name: self.name.clone(),
+            schema: self.store.schema().clone(),
+            store: self.store.reader(),
+            registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// A point-in-time snapshot, directly from the writer's thread —
+    /// equivalent to `table.reader().snapshot()`.
+    pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
+        self.reader().snapshot()
     }
 
     /// Runs one SQL query and exports the result as an
@@ -327,6 +439,92 @@ impl Table {
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
         Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+    }
+
+    /// Applies an `INSERT ... VALUES` plan: rows validate and append
+    /// through the ordinary append path (WAL included), literals
+    /// coercing exactly or loudly — an integer literal fits an `f64`
+    /// column exactly or is refused; a float literal never silently
+    /// truncates into a `BIGINT` column; strings go to key columns
+    /// only. Returns the rows inserted.
+    pub(crate) fn insert(&mut self, plan: &query_lite::InsertPlan) -> Result<u64, EngineError> {
+        let schema = self.store.schema().clone();
+        let order: Vec<usize> = match &plan.columns {
+            None => (0..schema.fields().len()).collect(),
+            Some(names) => {
+                let mut order = Vec::with_capacity(names.len());
+                for name in names {
+                    let position = schema
+                        .fields()
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| {
+                            EngineError::Query(QueryError::UnknownColumn(name.clone()))
+                        })?;
+                    order.push(position);
+                }
+                order
+            }
+        };
+        let mut inserted = 0u64;
+        for row in &plan.rows {
+            if row.len() != order.len() {
+                return Err(EngineError::Query(QueryError::Unsupported(format!(
+                    "INSERT row has {} values for {} columns",
+                    row.len(),
+                    order.len()
+                ))));
+            }
+            let mut cells: Vec<RowValue<'_>> = vec![RowValue::Null; schema.fields().len()];
+            for (value, &position) in row.iter().zip(&order) {
+                let field = &schema.fields()[position];
+                cells[position] = match value {
+                    query_lite::InsertValue::Null => RowValue::Null,
+                    query_lite::InsertValue::String(text) => RowValue::Key(text),
+                    query_lite::InsertValue::Number(number) => match field.column_type() {
+                        ColumnType::F64 => match number {
+                            Number::Float(value) => RowValue::F64(*value),
+                            Number::Int(value) => {
+                                let as_f64 = *value as f64;
+                                // Compared in i128: the naive `as_f64 as
+                                // i64` saturates, so i64::MAX (rounded
+                                // up to 2^63 by the cast) saturates
+                                // right back and passes a check it
+                                // should fail.
+                                if as_f64 as i128 != i128::from(*value) {
+                                    return Err(EngineError::Query(QueryError::TypeError(
+                                        format!(
+                                            "integer {value} does not fit an f64 exactly \
+                                             (column '{}')",
+                                            field.name()
+                                        ),
+                                    )));
+                                }
+                                RowValue::F64(as_f64)
+                            }
+                        },
+                        ColumnType::I64 => match number {
+                            Number::Int(value) => RowValue::I64(*value),
+                            Number::Float(value) => {
+                                return Err(EngineError::Query(QueryError::TypeError(format!(
+                                    "float {value} into BIGINT column '{}' would truncate",
+                                    field.name()
+                                ))))
+                            }
+                        },
+                        ColumnType::Key => {
+                            return Err(EngineError::Query(QueryError::TypeError(format!(
+                                "number into KEY column '{}' (keys take strings)",
+                                field.name()
+                            ))))
+                        }
+                    },
+                };
+            }
+            self.append(&cells)?;
+            inserted += 1;
+        }
+        Ok(inserted)
     }
 
     /// Runs one SQL mutation (`UPDATE` or `DELETE`), returning the rows
@@ -345,6 +543,13 @@ impl Table {
             Statement::Select(_) => Err(EngineError::Query(QueryError::Unsupported(
                 "SELECT runs through query, not mutate".to_owned(),
             ))),
+            Statement::CreateTable(_) => Err(EngineError::Query(QueryError::Unsupported(
+                "CREATE TABLE runs through the database handle".to_owned(),
+            ))),
+            Statement::Insert(insert) => {
+                self.check_table(&insert.table)?;
+                self.insert(&insert)
+            }
             Statement::Delete(delete) => self.delete(delete),
             Statement::Update(update) => self.update(update),
         }
@@ -432,9 +637,13 @@ impl Table {
                 "function name '{name}' is not callable from SQL"
             )));
         }
-        let window = crate::script::LuaWindow::new(parameters, chunk, output)
-            .map_err(EngineError::Script)?;
-        self.registry.register(name, Arc::new(window));
+        let window =
+            crate::script::LuaWindow::new(parameters, chunk, output, self.lua_log_sink.clone())
+                .map_err(EngineError::Script)?;
+        let mut guard = self.registry.lock().expect("registry lock poisoned");
+        let mut next = (**guard).clone();
+        next.register(name, Arc::new(window));
+        *guard = Arc::new(next);
         Ok(())
     }
 
@@ -550,12 +759,13 @@ impl Table {
         }
         // Reappend the replacements first, then tombstone the originals
         // — the one mutation mechanism, ordered for crash safety. The
-        // tombstone durably flushes the buffer before writing its delete
-        // log, so on a persistent store the replacements are on disk
-        // before the delete that supersedes the originals. A crash
-        // between the two leaves originals and replacements both live
-        // (recoverable duplicates under the row-id identity rule), never
-        // the replacements lost.
+        // tombstone makes every superseding row durable (a WAL sync, or
+        // a flush without one) before committing its delete log, so on
+        // a persistent store the replacements always outlive the delete
+        // that supersedes the originals. A crash anywhere in between
+        // leaves originals and replacements both live (recoverable
+        // duplicates under the row-id identity rule), never the
+        // replacements lost.
         for cells in &corrected {
             let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
             self.store.append(&row)?;
@@ -621,6 +831,126 @@ fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineEr
 fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend>, EngineError> {
     let backend = FsBackend::new(dir.as_ref()).map_err(StorageError::from)?;
     Ok(Arc::new(backend))
+}
+
+/// Maps a lowered `CREATE TABLE` (the #49 DDL grammar: `BIGINT`,
+/// `DOUBLE`, the coined `KEY`, one `ORDERING KEY` column) onto the
+/// engine's schema types. Returns the schema and the ordering-key
+/// column name. Shared by every SQL surface — shell, and later the
+/// server and workbench — so the mapping cannot fork.
+pub fn schema_from_create(
+    plan: &query_lite::CreateTablePlan,
+) -> Result<(Schema, String), EngineError> {
+    let mut fields = Vec::with_capacity(plan.columns.len());
+    let mut ordering = None;
+    for column in &plan.columns {
+        let column_type = match column.type_name.as_str() {
+            "BIGINT" => ColumnType::I64,
+            "DOUBLE" => ColumnType::F64,
+            "KEY" => ColumnType::Key,
+            other => {
+                return Err(EngineError::Query(QueryError::Unsupported(format!(
+                    "column type '{other}'"
+                ))))
+            }
+        };
+        if column.ordering_key {
+            if column_type != ColumnType::I64 {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "the ORDERING KEY column must be BIGINT (a timestamp, sequence, \
+                     or offset — the monotonic-on-ingest key)"
+                        .to_owned(),
+                )));
+            }
+            ordering = Some(column.name.clone());
+        }
+        fields.push(Field::new(&column.name, column_type, !column.not_null));
+    }
+    let ordering = ordering.expect("the planner requires exactly one ORDERING KEY");
+    Ok((Schema::new(fields), ordering))
+}
+
+/// The DDL name of a column type — [`schema_from_create`]'s inverse,
+/// kept beside it so a renderer (the console's `.schema`) cannot fork
+/// its own mapping.
+pub fn type_name(column_type: ColumnType) -> &'static str {
+    match column_type {
+        ColumnType::I64 => "BIGINT",
+        ColumnType::F64 => "DOUBLE",
+        ColumnType::Key => "KEY",
+    }
+}
+
+/// A cheap, cloneable, `Send` handle a reader thread holds to mint
+/// point-in-time [`TableSnapshot`]s while the table's single writer
+/// proceeds. Created by [`Table::reader`]; see there for the
+/// concurrency contract. Each [`TableReader::snapshot`] takes the
+/// table's brief state lock (bounded by one write-buffer copy — the
+/// freeze threshold caps it) and returns fully detached views.
+#[derive(Clone)]
+pub struct TableReader {
+    name: String,
+    schema: Schema,
+    store: StoreReader,
+    registry: Arc<Mutex<Arc<Registry>>>,
+}
+
+impl TableReader {
+    /// A point-in-time snapshot: the rows and the registered functions
+    /// exactly as of this call. Appends, mutations, compactions, and
+    /// registrations after it never affect the returned snapshot.
+    pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
+        let views = self.store.snapshot()?;
+        Ok(TableSnapshot {
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            views,
+            registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
+        })
+    }
+}
+
+/// An immutable point-in-time view of one table: query it as often as
+/// desired, from any thread, entirely independent of the writer. Old
+/// segments a compaction replaced stay alive for as long as a snapshot
+/// references them (`Arc`-backed) — read-copy-update, no coordination.
+/// `Send + Sync`: share it or move it freely; Lua-backed window
+/// functions serialize internally on their interpreter's mutex.
+///
+/// Scope: single-table `SELECT`s. Joins resolve dimension tables
+/// through a [`crate::Database`], and no cross-table snapshot
+/// consistency is promised (by design — see DESIGN.md); mutation is
+/// the writer's alone.
+pub struct TableSnapshot {
+    name: String,
+    schema: Schema,
+    views: Vec<SegmentView>,
+    registry: Arc<Registry>,
+}
+
+impl TableSnapshot {
+    /// Runs one SQL `SELECT` over this frozen view.
+    pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+        let plan = plan(sql)?;
+        if plan.table != self.name {
+            return Err(EngineError::WrongTable {
+                expected: self.name.clone(),
+                got: plan.table,
+            });
+        }
+        Ok(execute(&self.schema, &self.views, &plan, &self.registry)?)
+    }
+
+    /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
+    pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
+        let QueryOutput { schema, batches } = self.query(sql)?;
+        Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+    }
+
+    /// The snapshot's schema.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 /// Which coefficient of the per-window fit `y ≈ intercept + slope · x`
@@ -708,6 +1038,53 @@ impl WindowAggregate for RollingRegression {
             RegressionOutput::Intercept => centered_intercept - slope * mean_x,
         }))
     }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            // Recompute per frame, exactly as before this override.
+            return recompute_frames(self, columns, None);
+        };
+        let (y, x) = (columns[0], columns[1]);
+        let mut results = Vec::with_capacity(y.len());
+        shifted_sweep(y, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => self.value_from_shifted(moments),
+                // A frame containing NaN/±Inf runs the reference
+                // arithmetic directly, so the two paths agree exactly
+                // where running sums cannot be trusted.
+                None => self
+                    .evaluate(&[&y[lo..=i], &x[lo..=i]])
+                    .expect("the closed-form regression does not error"),
+            });
+        });
+        Ok(results)
+    }
+}
+
+impl RollingRegression {
+    /// The regression's value from shifted moments — mirroring [`Self::evaluate`]'s
+    /// semantics exactly: NULL under two rows or non-positive `Sxx` (NaN
+    /// checked explicitly), `slope = Sxy / Sxx` over corrected sums, the
+    /// intercept extrapolated to `x = 0` from the window means.
+    fn value_from_shifted(&self, moments: &ShiftedMoments) -> Option<f64> {
+        if moments.rows() < 2 {
+            return None;
+        }
+        let (_, var_x, covar) = moments.population();
+        if var_x <= 0.0 || var_x.is_nan() {
+            return None;
+        }
+        let slope = covar / var_x;
+        Some(match self.output {
+            RegressionOutput::Slope => slope,
+            RegressionOutput::Intercept => moments.mean_y() - slope * moments.mean_x(),
+        })
+    }
 }
 
 /// Which pair statistic an instance computes.
@@ -763,17 +1140,54 @@ impl WindowAggregate for PairStatistic {
         var_y = (var_y - sum_dy * sum_dy / count) / count;
         var_x = (var_x - sum_dx * sum_dx / count) / count;
         covar = (covar - sum_dy * sum_dx / count) / count;
+        Ok(self.value_from_moments(n, var_y, var_x, covar))
+    }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            // Recompute per frame, exactly as before this override.
+            return recompute_frames(self, columns, None);
+        };
+        let (y, x) = (columns[0], columns[1]);
+        let mut results = Vec::with_capacity(y.len());
+        shifted_sweep(y, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => {
+                    let (var_y, var_x, covar) = moments.population();
+                    self.value_from_moments(moments.rows(), var_y, var_x, covar)
+                }
+                // Non-finite frame: the reference arithmetic, exactly
+                // as the recompute path would run it.
+                None => self
+                    .evaluate(&[&y[lo..=i], &x[lo..=i]])
+                    .expect("the pair statistics do not error"),
+            });
+        });
+        Ok(results)
+    }
+}
+
+impl PairStatistic {
+    /// The statistic's value from finished population moments — one
+    /// finalization shared by the per-window and incremental paths, so
+    /// the NULL semantics cannot diverge between them.
+    fn value_from_moments(&self, rows: usize, var_y: f64, var_x: f64, covar: f64) -> Option<f64> {
         match self.kind {
-            PairKind::CovarPop => Ok(Some(covar)),
+            PairKind::CovarPop => Some(covar),
             PairKind::Corr => {
                 if var_y <= 0.0 || var_x <= 0.0 {
-                    return Ok(None); // undefined, per corr's definition
+                    return None; // undefined, per corr's definition
                 }
-                Ok(Some(covar / (var_y * var_x).sqrt()))
+                Some(covar / (var_y * var_x).sqrt())
             }
             PairKind::EigenMax => {
-                if n < 2 {
-                    return Ok(None);
+                if rows < 2 {
+                    return None;
                 }
                 // The largest eigenvalue of a symmetric 2 × 2 in closed
                 // form: λ_max = t + r for half-trace t = (var_y + var_x)/2
@@ -787,9 +1201,136 @@ impl WindowAggregate for PairStatistic {
                 let half_trace = (var_y + var_x) / 2.0;
                 let half_gap = (var_y - var_x) / 2.0;
                 let radius = half_gap.hypot(covar);
-                Ok(Some(half_trace + radius))
+                Some(half_trace + radius)
             }
         }
+    }
+}
+
+/// Running moments about a shift taken from the data — the
+/// shifted-incremental window algorithm (3b-C) behind the
+/// `evaluate_frames` overrides above. Values enter and leave as
+/// deviations from `(ky, kx)`, so the accumulated sums stay at the
+/// window's own scale even when the data sits at a 1e12 offset; the
+/// E[d²] − E[d]² form is safe here for exactly that reason (about the
+/// *raw* values it is bug #45's catastrophic form — see
+/// `measure_incremental_windows`, variant B, rejected permanently).
+#[derive(Default, Clone, Copy)]
+struct ShiftedMoments {
+    n: f64,
+    sy: f64,
+    sx: f64,
+    syy: f64,
+    sxx: f64,
+    sxy: f64,
+    ky: f64,
+    kx: f64,
+}
+
+impl ShiftedMoments {
+    fn add(&mut self, yi: f64, xi: f64) {
+        let (dy, dx) = (yi - self.ky, xi - self.kx);
+        self.n += 1.0;
+        self.sy += dy;
+        self.sx += dx;
+        self.syy += dy * dy;
+        self.sxx += dx * dx;
+        self.sxy += dy * dx;
+    }
+
+    fn remove(&mut self, yi: f64, xi: f64) {
+        let (dy, dx) = (yi - self.ky, xi - self.kx);
+        self.n -= 1.0;
+        self.sy -= dy;
+        self.sx -= dx;
+        self.syy -= dy * dy;
+        self.sxx -= dx * dx;
+        self.sxy -= dy * dx;
+    }
+
+    /// Population `(var_y, var_x, covar)` about the window means.
+    fn population(&self) -> (f64, f64, f64) {
+        let (my, mx) = (self.sy / self.n, self.sx / self.n);
+        (
+            self.syy / self.n - my * my,
+            self.sxx / self.n - mx * mx,
+            self.sxy / self.n - my * mx,
+        )
+    }
+
+    fn mean_y(&self) -> f64 {
+        self.ky + self.sy / self.n
+    }
+
+    fn mean_x(&self) -> f64 {
+        self.kx + self.sx / self.n
+    }
+
+    fn rows(&self) -> usize {
+        self.n as usize
+    }
+}
+
+/// Sweeps one contiguous run with trailing frames of up to `w` rows,
+/// calling `emit` once per position with the frame's bounds and — for
+/// frames of finite values — that frame's moments. O(run): each step
+/// slides by one `add` and one `remove`, and the accumulator is rebuilt
+/// about a fresh shift every `w` steps so rounding cannot accumulate
+/// across the column. Measured (`measure_3b`, 2026-07-27): ~7× the
+/// per-window recompute at 20k rows / window 64, worst relative error
+/// 5e-15–1.1e-14 against the compensated reference — held to 1e-12 in
+/// CI by `window_numerics_guard`, which runs this exact path.
+///
+/// **Non-finite values break the sliding identity**: `NaN − NaN = NaN`,
+/// so once a NaN (or ±Inf, whose differences produce NaN) enters the
+/// running sums they stay poisoned even after the row leaves the frame
+/// — the incremental path would return NaN for windows whose true
+/// frames are clean. So the sweep counts the frame's non-finite rows:
+/// while any is present it emits `None` (the caller runs the per-frame
+/// reference arithmetic — bit-identical to the recompute path), and the
+/// first clean frame afterwards rebuilds the accumulator from scratch.
+fn shifted_sweep(
+    y: &[f64],
+    x: &[f64],
+    w: usize,
+    mut emit: impl FnMut(usize, usize, Option<&ShiftedMoments>),
+) {
+    debug_assert!(w >= 1 && y.len() == x.len());
+    let finite = |j: usize| y[j].is_finite() && x[j].is_finite();
+    let mut moments = ShiftedMoments::default();
+    let mut dirty = 0usize; // non-finite rows in the current frame
+    let mut since_rebuild = usize::MAX; // force a build on the first row
+    for i in 0..y.len() {
+        let lo = (i + 1).saturating_sub(w);
+        if !finite(i) {
+            dirty += 1;
+        }
+        if i >= w && !finite(i - w) {
+            dirty -= 1;
+        }
+        if dirty > 0 {
+            since_rebuild = usize::MAX; // rebuild when the frame comes clean
+            emit(lo, i, None);
+            continue;
+        }
+        if since_rebuild >= w {
+            moments = ShiftedMoments {
+                ky: y[i],
+                kx: x[i],
+                ..Default::default()
+            };
+            for j in lo..=i {
+                moments.add(y[j], x[j]);
+            }
+            since_rebuild = 0;
+        } else {
+            moments.add(y[i], x[i]);
+            if i >= w {
+                moments.remove(y[i - w], x[i - w]);
+            }
+            since_rebuild += 1;
+        }
+        emit(lo, i, Some(&moments));
     }
 }
 
@@ -805,6 +1346,32 @@ mod tests {
             Field::new("x", ColumnType::F64, false),
             Field::new("y", ColumnType::F64, false),
         ])
+    }
+
+    #[test]
+    fn empty_results_survive_the_materializing_stages() {
+        // ORDER BY, DISTINCT, and HAVING all gather rows into one
+        // batch; each must survive having zero batches to gather.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        let empty = [
+            "SELECT ts FROM t ORDER BY ts",
+            "SELECT ts, sym FROM t ORDER BY ts DESC NULLS LAST LIMIT 3",
+            "SELECT DISTINCT sym FROM t",
+        ];
+        for sql in empty {
+            assert_eq!(table.query(sql).unwrap().num_rows(), 0, "{sql} (no rows)");
+        }
+        for i in 0..6 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        // Rows exist, but the predicate (and pruning) removes them all.
+        for sql in [
+            "SELECT ts FROM t WHERE ts > 100 ORDER BY ts",
+            "SELECT DISTINCT sym FROM t WHERE ts > 100",
+            "SELECT sym, COUNT(x) AS n FROM t GROUP BY sym HAVING COUNT(x) > 100",
+        ] {
+            assert_eq!(table.query(sql).unwrap().num_rows(), 0, "{sql} (filtered)");
+        }
     }
 
     pub(super) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
@@ -1082,6 +1649,9 @@ mod tests {
         // And the reopened table keeps ingesting where it left off.
         let mut reopened = reopened;
         assert_eq!(reopened.append(&linear_row(30)).unwrap(), 30);
+        // Release the directory lock so the next open reaches the
+        // schema check (a held lock refuses first, by design).
+        drop(reopened);
         // Schema disagreement at open is refused loudly.
         let wrong = Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
@@ -1112,6 +1682,262 @@ mod tests {
             Table::new("t", m1_schema(), "x"),
             Err(EngineError::Storage(StorageError::BadOrderingKey { .. }))
         ));
+    }
+}
+
+#[cfg(test)]
+mod ddl_and_insert {
+    //! M3.5's engine half: `INSERT ... VALUES` through the mutation
+    //! entry (WAL included, exact-or-loud literal coercion) and the
+    //! #49 DDL grammar mapped onto engine types.
+
+    use super::tests::m1_schema;
+    use super::*;
+
+    #[test]
+    fn insert_appends_through_the_ordinary_path() {
+        // As m1_schema, but with y nullable so NULL literals land.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 4).unwrap();
+        let n = table
+            .mutate("INSERT INTO t VALUES (1, 'A', 1.5, 2.5), (2, 'B', -3, NULL)")
+            .unwrap();
+        assert_eq!(n, 2);
+        let output = table.query("SELECT ts, x, y FROM t ORDER BY ts").unwrap();
+        assert_eq!(output.num_rows(), 2);
+        // Integer literal -3 landed exactly in the f64 column.
+        let batch = &output.batches[0];
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(x)) = &batch.columns()[1]
+        else {
+            panic!("x is f64")
+        };
+        assert_eq!(x.values().as_slice()[1], -3.0);
+    }
+
+    #[test]
+    fn insert_honors_a_named_column_order() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        table
+            .mutate("INSERT INTO t (x, ts, sym, y) VALUES (9.0, 7, 'C', 1.0)")
+            .unwrap();
+        let output = table.query("SELECT ts, x FROM t").unwrap();
+        let batch = &output.batches[0];
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(ts)) = &batch.columns()[0]
+        else {
+            panic!("ts is i64")
+        };
+        assert_eq!(ts.values().as_slice()[0], 7);
+    }
+
+    #[test]
+    fn insert_coercions_are_exact_or_loud() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        // Float into BIGINT would truncate: loud.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1.5, 'A', 1.0, 1.0)")
+            .is_err());
+        // Number into KEY: loud.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 7, 1.0, 1.0)")
+            .is_err());
+        // String into numeric: loud (storage's own validation).
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 'A', 'oops', 1.0)")
+            .is_err());
+        // Wrong arity: loud.
+        assert!(table.mutate("INSERT INTO t VALUES (1, 'A', 1.0)").is_err());
+        // Nothing partial landed from the failures... the first row of a
+        // multi-row INSERT that fails midway HAS landed (documented
+        // non-atomicity is #56/#40 territory); here every statement
+        // failed on its only row, so the table is empty.
+        assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 0);
+    }
+
+    #[test]
+    fn int_to_double_exactness_holds_at_the_i64_edges() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 4).unwrap();
+        // i64::MAX rounds up to 2^63 as f64; the saturating cast back
+        // lands on i64::MAX again, so a naive round-trip check passes a
+        // value it must refuse.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 9223372036854775807)")
+            .is_err());
+        // 2^53 + 1 is the first plain integer f64 cannot hold.
+        assert!(table
+            .mutate("INSERT INTO t VALUES (1, 9007199254740993)")
+            .is_err());
+        // -2^53 is exactly representable: accepted (and the negative
+        // path through the unary minus works).
+        table
+            .mutate("INSERT INTO t VALUES (1, -9007199254740992)")
+            .unwrap();
+        assert_eq!(table.query("SELECT x FROM t").unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn the_ddl_grammar_maps_onto_engine_types() {
+        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym KEY NOT NULL, px DOUBLE)";
+        let Statement::CreateTable(plan) = parse_statement(sql).unwrap() else {
+            panic!("parses as CREATE TABLE")
+        };
+        let (schema, ordering) = schema_from_create(&plan).unwrap();
+        assert_eq!(ordering, "ts");
+        let fields = schema.fields();
+        assert_eq!(fields[0].column_type(), ColumnType::I64);
+        assert!(!fields[0].nullable(), "ordering key implies NOT NULL");
+        assert_eq!(fields[1].column_type(), ColumnType::Key);
+        assert!(!fields[1].nullable());
+        assert_eq!(fields[2].column_type(), ColumnType::F64);
+        assert!(fields[2].nullable());
+        // And the whole thing actually builds a working table.
+        let mut table = Table::new("ticks", schema, &ordering).unwrap();
+        table
+            .mutate("INSERT INTO ticks VALUES (1, 'ES', 5432.25)")
+            .unwrap();
+        assert_eq!(table.query("SELECT px FROM ticks").unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn varchar_is_refused_with_a_teaching_error() {
+        let error =
+            parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, name VARCHAR)").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("interned labels"), "{message}");
+        assert!(message.contains("KEY"), "{message}");
+        // No ordering key: loud, with guidance.
+        let error = parse_statement("CREATE TABLE t (a BIGINT, b DOUBLE)").unwrap_err();
+        assert!(error.to_string().contains("ORDERING KEY"), "{}", error);
+        // A DOUBLE ordering key: loud.
+        let Statement::CreateTable(plan) =
+            parse_statement("CREATE TABLE t (a DOUBLE ORDERING KEY)").unwrap()
+        else {
+            panic!()
+        };
+        assert!(schema_from_create(&plan).is_err());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_concurrency {
+    //! #51's evidence: single writer + concurrent snapshot readers. One
+    //! test sequences the interleaving deterministically over channels
+    //! (a held snapshot survives a delete, appends, and a compaction —
+    //! the generation swap — unchanged); one races freely as a smoke
+    //! test; one pins the Send/Sync story at compile time.
+
+    use super::tests::{linear_row, m1_schema};
+    use super::*;
+
+    /// COUNT over the snapshot — one number summarizing what it sees.
+    fn count(snapshot: &TableSnapshot) -> f64 {
+        let output = snapshot.query("SELECT COUNT(x) AS c FROM t").unwrap();
+        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(c)) =
+            &output.batches[0].columns()[0]
+        else {
+            panic!("COUNT returns i64");
+        };
+        c.values().as_slice()[0] as f64
+    }
+
+    #[test]
+    fn a_held_snapshot_survives_delete_append_and_compaction() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
+        for i in 0..100i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let reader = table.reader();
+        let (to_reader, reader_gate) = std::sync::mpsc::channel::<()>();
+        let (to_main, main_gate) = std::sync::mpsc::channel::<f64>();
+        let worker = std::thread::spawn(move || {
+            let held = reader.snapshot().unwrap();
+            to_main.send(count(&held)).unwrap();
+            // Main deletes, appends, and compacts before releasing us.
+            reader_gate.recv().unwrap();
+            // Point-in-time stability: the held snapshot's answer is
+            // unchanged across the mutation storm and the generation
+            // swap — its old segments live on through their Arcs.
+            to_main.send(count(&held)).unwrap();
+            // A fresh snapshot sees the new world.
+            let fresh = reader.snapshot().unwrap();
+            to_main.send(count(&fresh)).unwrap();
+        });
+        assert_eq!(main_gate.recv().unwrap(), 100.0);
+        table.mutate("DELETE FROM t WHERE ts < 10").unwrap();
+        for i in 100..150i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        table.compact().unwrap();
+        to_reader.send(()).unwrap();
+        assert_eq!(main_gate.recv().unwrap(), 100.0, "held snapshot moved");
+        assert_eq!(main_gate.recv().unwrap(), 140.0, "fresh snapshot wrong");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn snapshots_race_a_live_writer_safely() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 16).unwrap();
+        table.append(&linear_row(0)).unwrap();
+        let reader = table.reader();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut last = 0.0f64;
+            let mut snapshots = 0u32;
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let snapshot = reader.snapshot().unwrap();
+                let seen = count(&snapshot);
+                // An append-only writer can never make a later snapshot
+                // smaller; a torn read would.
+                assert!(seen >= last, "count went backwards: {seen} < {last}");
+                last = seen;
+                snapshots += 1;
+            }
+            snapshots
+        });
+        for i in 1..2_000i64 {
+            table.append(&linear_row(i)).unwrap();
+            if i % 900 == 0 {
+                table.compact().unwrap();
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let snapshots = worker.join().unwrap();
+        assert!(snapshots > 0, "the reader never got a snapshot in");
+    }
+
+    #[test]
+    fn reader_and_snapshot_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TableReader>();
+        assert_send_sync::<TableSnapshot>();
+    }
+
+    #[test]
+    fn snapshots_pin_the_functions_of_their_moment() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
+        for i in 0..4i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let before = table.snapshot().unwrap();
+        table
+            .register_lua_window("twice", &["x"], "return 2 * dot(x, x)", ColumnType::F64)
+            .unwrap();
+        let after = table.snapshot().unwrap();
+        let sql = "SELECT twice(x) OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING                    AND CURRENT ROW) AS d FROM t";
+        assert!(
+            before.query(sql).is_err(),
+            "pre-registration snapshot knows the function"
+        );
+        assert!(after.query(sql).is_ok());
     }
 }
 
@@ -1314,13 +2140,16 @@ mod window_truth {
     //! under test, or the shipped code standing in for truth. Nothing may
     //! be judged accurate by comparison with itself.
 
-    /// The four statistics one window's moments yield.
+    /// The statistics one window's moments yield. `intercept` needs the
+    /// window means as well as the central moments, so only
+    /// `high_precision` fills it; `stats_from` leaves it NaN.
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Stats {
         pub(crate) covar: f64,
         pub(crate) corr: f64,
         pub(crate) eigen_max: f64,
         pub(crate) slope: f64,
+        pub(crate) intercept: f64,
     }
 
     /// Derives the statistics from centered moments — the shared tail of
@@ -1338,6 +2167,7 @@ mod window_truth {
             corr,
             eigen_max: half_trace + radius,
             slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
+            intercept: f64::NAN,
         }
     }
 
@@ -1402,7 +2232,11 @@ mod window_truth {
                 let var_x = (sxx.value() - sdx * sdx / n) / n;
                 let var_y = (syy.value() - sdy * sdy / n) / n;
                 let covar = (sxy.value() - sdx * sdy / n) / n;
-                stats_from(var_y, var_x, covar)
+                let mut stats = stats_from(var_y, var_x, covar);
+                // The window means recover exactly from the shifts (x0,
+                // y0 are data values) plus the compensated residuals.
+                stats.intercept = (y0 + sdy / n) - stats.slope * (x0 + sdx / n);
+                stats
             })
             .collect()
     }
@@ -1475,7 +2309,7 @@ mod window_numerics_guard {
     //! the correction trips this test at the first 1e12 window,
     //! verified by hand 2026-07-27).
 
-    use super::window_truth::{corpora, high_precision};
+    use super::window_truth::{corpora, high_precision, Stats};
     use super::*;
 
     const BOUND: f64 = 1e-12;
@@ -1519,18 +2353,153 @@ mod window_numerics_guard {
                         relative(got, expected)
                     );
                 }
-                let got = RollingRegression {
-                    output: RegressionOutput::Slope,
+                for (output, expected) in [
+                    (RegressionOutput::Slope, truth.slope),
+                    (RegressionOutput::Intercept, truth.intercept),
+                ] {
+                    let got = RollingRegression { output }
+                        .evaluate(&window)
+                        .unwrap()
+                        .expect("defined on these corpora");
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} regression: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
                 }
-                .evaluate(&window)
-                .unwrap()
-                .expect("defined on these corpora");
-                assert!(
-                    relative(got, truth.slope) < BOUND,
-                    "{name} row {i} slope: {got} vs {} (relative {:.2e})",
-                    truth.slope,
-                    relative(got, truth.slope)
-                );
+            }
+        }
+    }
+
+    /// NaN and ±Inf are first-class values here, and they break the
+    /// sliding identity (`NaN − NaN = NaN` outlives the row): without
+    /// the dirty-frame handling in `shifted_sweep`, the incremental
+    /// path returns NaN for windows whose true frames are clean, for up
+    /// to a full window after the non-finite row leaves. The oracle
+    /// corpus contains no NaN, so only this test sees it: the two paths
+    /// must agree at every position — same NULLs, same NaNs, and
+    /// near-identical finite values.
+    #[test]
+    fn incremental_and_recompute_paths_agree_on_nan_and_inf() {
+        let rows = 60;
+        let mut y: Vec<f64> = (0..rows).map(|i| 0.7 * i as f64 + 3.0).collect();
+        let mut x: Vec<f64> = (0..rows).map(|i| 1e9 + 1.3 * i as f64).collect();
+        y[7] = f64::NAN;
+        x[19] = f64::INFINITY;
+        y[20] = f64::NEG_INFINITY;
+        y[21] = f64::NAN; // adjacent dirty rows: the counter, not a flag
+        let columns: [&[f64]; 2] = [&y, &x];
+        let aggregates: Vec<(&str, Box<dyn WindowAggregate>)> = vec![
+            (
+                "regr_slope",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::Slope,
+                }),
+            ),
+            (
+                "regr_intercept",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::Intercept,
+                }),
+            ),
+            (
+                "covar_pop",
+                Box::new(PairStatistic {
+                    kind: PairKind::CovarPop,
+                }),
+            ),
+            (
+                "corr",
+                Box::new(PairStatistic {
+                    kind: PairKind::Corr,
+                }),
+            ),
+            (
+                "eigen_max",
+                Box::new(PairStatistic {
+                    kind: PairKind::EigenMax,
+                }),
+            ),
+        ];
+        for preceding in [1usize, 3, 7] {
+            for (name, aggregate) in &aggregates {
+                let incremental = aggregate
+                    .evaluate_frames(&columns, Some(preceding))
+                    .unwrap();
+                let reference =
+                    query_lite::recompute_frames(aggregate.as_ref(), &columns, Some(preceding))
+                        .unwrap();
+                assert_eq!(incremental.len(), reference.len());
+                for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
+                    match (got, want) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) if a.is_nan() && b.is_nan() => {}
+                        // Dirty frames run the same arithmetic on both
+                        // paths — ±Inf results are bit-equal.
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => assert!(
+                            ((a - b) / b).abs() < 1e-9,
+                            "{name} w={} row {i}: {a} vs {b}",
+                            preceding + 1
+                        ),
+                        other => panic!(
+                            "{name} w={} row {i}: paths disagree on definedness: {other:?}",
+                            preceding + 1
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The incremental path (`evaluate_frames`, the shifted sweep) is
+    /// held to the same reference as the per-window path — the executor
+    /// routes every SQL window through it, so it inherits the contract.
+    #[test]
+    fn incremental_frame_sequences_track_the_compensated_reference() {
+        let rows = 2_000;
+        let w = 64;
+        for (name, y, x) in corpora(rows) {
+            let reference = high_precision(&y, &x, w);
+            let columns: [&[f64]; 2] = [&y, &x];
+            let check = |label: &str, results: Vec<Option<f64>>, pick: &dyn Fn(&Stats) -> f64| {
+                for (i, result) in results.iter().enumerate().skip(w - 1) {
+                    let got = result.expect("defined on these corpora");
+                    let expected = pick(&reference[i]);
+                    assert!(
+                        relative(got, expected) < BOUND,
+                        "{name} row {i} {label}: {got} vs {expected} (relative {:.2e})",
+                        relative(got, expected)
+                    );
+                }
+            };
+            for (kind, pick) in [
+                (
+                    PairKind::CovarPop,
+                    &(|s: &Stats| s.covar) as &dyn Fn(&Stats) -> f64,
+                ),
+                (PairKind::Corr, &|s: &Stats| s.corr),
+                (PairKind::EigenMax, &|s: &Stats| s.eigen_max),
+            ] {
+                let results = PairStatistic { kind }
+                    .evaluate_frames(&columns, Some(w - 1))
+                    .unwrap();
+                check(&format!("{kind:?}"), results, pick);
+            }
+            for (output, label, pick) in [
+                (
+                    RegressionOutput::Slope,
+                    "slope",
+                    &(|s: &Stats| s.slope) as &dyn Fn(&Stats) -> f64,
+                ),
+                (RegressionOutput::Intercept, "intercept", &|s: &Stats| {
+                    s.intercept
+                }),
+            ] {
+                let results = RollingRegression { output }
+                    .evaluate_frames(&columns, Some(w - 1))
+                    .unwrap();
+                check(label, results, pick);
             }
         }
     }

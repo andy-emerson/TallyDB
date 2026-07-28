@@ -33,10 +33,21 @@
 use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
 use compute_linalg::{LinalgBackend, RustLinalg};
-use compute_lua::{Chunk, ColumnView, HostFunction, LuaState, ReturnType, ScalarValue};
+use compute_lua::{Chunk, ColumnView, HostFunction, LogSink, LuaState, ReturnType, ScalarValue};
 use query_lite::WindowAggregate;
 use std::ffi::{CStr, CString};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// One embedder-installed sink shared by every kernel of a table: each
+/// `LuaState` owns its sink box, so a shared destination crosses as an
+/// `Arc` behind this forwarding shim.
+struct SharedSink(Arc<dyn LogSink + Sync>);
+
+impl LogSink for SharedSink {
+    fn log(&self, message: &str) {
+        self.0.log(message);
+    }
+}
 
 /// Words that cannot serve as Lua parameter names: the language's
 /// keywords, plus the `NULL` sentinel global a parameter must not
@@ -137,6 +148,7 @@ impl LuaWindow {
         parameters: &[&str],
         chunk: &str,
         output: ColumnType,
+        log_sink: Option<Arc<dyn LogSink + Sync>>,
     ) -> Result<LuaWindow, String> {
         if output == ColumnType::Key {
             return Err(
@@ -167,6 +179,9 @@ impl LuaWindow {
         }
         let mut state = LuaState::new()?;
         install_curated_ops(&mut state)?;
+        if let Some(sink) = log_sink {
+            state.set_log_sink(Box::new(SharedSink(sink)));
+        }
         // Compiling here is both the loud-early syntax check and the
         // per-window saving: queries call the compiled function.
         let compiled = state.compile(chunk)?;
@@ -278,6 +293,43 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn log_routes_to_the_installed_table_sink() {
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl compute_lua::LogSink for Capture {
+            fn log(&self, message: &str) {
+                self.0.lock().unwrap().push(message.to_owned());
+            }
+        }
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        for i in 0..3 {
+            table
+                .append(&[RowValue::I64(i), RowValue::Key("A"), RowValue::F64(1.0)])
+                .unwrap();
+        }
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        table.set_lua_log_sink(Arc::new(Capture(Arc::clone(&messages))));
+        table
+            .register_lua_window(
+                "noisy",
+                &["x"],
+                "log('rows', #x)\nreturn #x",
+                ColumnType::I64,
+            )
+            .unwrap();
+        table
+            .query(
+                "SELECT noisy(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 AS n FROM t",
+            )
+            .unwrap();
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 3, "one log per window");
+        assert_eq!(messages[0], "rows\t1");
+        assert_eq!(messages[1], "rows\t2");
     }
 
     #[test]
@@ -573,11 +625,21 @@ mod tests {
             let scripted = f64s(&output, 1);
             assert_eq!(native.len(), 14);
             for row in 0..native.len() {
-                assert_eq!(
-                    native[row].map(f64::to_bits),
-                    scripted[row].map(f64::to_bits),
-                    "{native_name} row {row}"
-                );
+                // Same finalization semantics: defined-ness must agree
+                // exactly. The values agree to the noise floor but not
+                // bitwise — the SQL window runs the incremental sweep
+                // (evaluate_frames) while the host op computes its one
+                // window directly; both are held to the compensated
+                // reference within 1e-12 by window_numerics_guard, so
+                // their mutual agreement is bounded by twice that.
+                match (native[row], scripted[row]) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => assert!(
+                        (a - b).abs() <= 2e-12 * a.abs().max(b.abs()).max(1.0),
+                        "{native_name} row {row}: {a} vs {b}"
+                    ),
+                    (a, b) => panic!("{native_name} row {row}: {a:?} vs {b:?}"),
+                }
             }
         }
     }

@@ -4,9 +4,8 @@
 //! routes each query to the table it names. It adds no storage or
 //! execution machinery of its own — each table still owns its store and
 //! its registered compute — but it is the shape applications program
-//! against (`create_table` / `append` / `query`), and it is where
-//! star-schema joins will resolve their dimension tables when they arrive
-//! (M2.5).
+//! against (`add_table` / `append` / `query` / `mutate`), and it is
+//! where star-schema joins resolve their dimension tables.
 
 use crate::table::{EngineError, Table};
 use arrow_lite::{ArrowArrayStream, Schema};
@@ -71,7 +70,22 @@ impl Database {
         self.tables.get(name)
     }
 
-    /// The named table, mutably (for appends through the table handle).
+    /// A reader handle for `table` — see [`Table::reader`]: reader
+    /// threads mint point-in-time snapshots from it while this database
+    /// handle keeps writing.
+    pub fn reader(&self, table: &str) -> Result<crate::TableReader, EngineError> {
+        self.table(table)
+            .map(Table::reader)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))
+    }
+
+    /// The open tables' names, in arbitrary order.
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    /// The named table, mutably (for appends and registration through
+    /// the table handle).
     pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
         self.tables.get_mut(name)
     }
@@ -116,6 +130,15 @@ impl Database {
         let table = match parse_statement(sql)? {
             Statement::Update(update) => update.table,
             Statement::Delete(delete) => delete.table,
+            Statement::Insert(insert) => insert.table,
+            Statement::CreateTable(_) => {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "CREATE TABLE makes a table, it doesn't mutate one — \
+                     build it with schema_from_create + a Table constructor \
+                     and add_table (the console does exactly this)"
+                        .to_owned(),
+                )))
+            }
             Statement::Select(_) => {
                 return Err(EngineError::Query(QueryError::Unsupported(
                     "SELECT runs through query, not mutate".to_owned(),

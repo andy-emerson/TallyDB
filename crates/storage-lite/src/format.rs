@@ -73,7 +73,7 @@
 //! ```
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
-use crate::mem::{Segment, ZoneMap};
+use crate::mem::{RowValue, Segment, ZoneMap};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
     NumericData, RecordBatch, Schema,
@@ -720,4 +720,192 @@ fn decode_dictionary(reader: &mut Reader<'_>, name: &str) -> Result<Dictionary, 
         }
     }
     Ok(dictionary)
+}
+
+// ---------------------------------------------------------------- WAL
+
+/// WAL file magic. The write-ahead log is a sidecar: it never changes
+/// the segment format (whose bytes stay locked by the committed
+/// golden), and it exists only between flushes — truncated whenever the
+/// rows it guards become segment-durable.
+pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
+/// WAL format version.
+pub const WAL_VERSION: u16 = 1;
+/// The header's encoded size: magic (8) + version (2) + generation (8)
+/// plus base row id (8) plus their CRC-32C (4) — the header carries a
+/// checksum like every other structure in the format. A log file
+/// shorter than this holds no acknowledged record (records follow the
+/// header in the same file) and reads as an empty log, not corruption.
+pub const WAL_HEADER_LEN: usize = 30;
+
+/// Encodes the WAL header: magic, version, generation, and the row id
+/// of the first record — replay skips records already covered by
+/// flushed segments (a crash between segment publish and WAL truncate
+/// leaves such a prefix) and refuses logs from another generation
+/// (compaction reassigns row ids, so cross-generation replay would be
+/// in the wrong id space).
+pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(WAL_HEADER_LEN);
+    out.extend_from_slice(&WAL_MAGIC);
+    out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+    out.extend_from_slice(&generation.to_le_bytes());
+    out.extend_from_slice(&base_row_id.to_le_bytes());
+    let crc = crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// One row as a WAL record: `u32` payload length, the payload (one
+/// presence-tagged cell per schema column), `u32` CRC-32C of the
+/// payload. A record whose length, payload, or CRC cannot be read
+/// whole is a torn tail — the crash boundary — never an error.
+pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16 * row.len());
+    for cell in row {
+        match cell {
+            RowValue::Null => payload.push(0u8),
+            RowValue::I64(value) => {
+                payload.push(1);
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            RowValue::F64(value) => {
+                payload.push(2);
+                payload.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            RowValue::Key(value) => {
+                payload.push(3);
+                payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                payload.extend_from_slice(value.as_bytes());
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc32c(&payload).to_le_bytes());
+    out
+}
+
+/// A WAL row, owned (`RowValue` borrows; replay needs owned cells).
+#[derive(Debug, PartialEq)]
+pub enum WalCell {
+    Null,
+    I64(i64),
+    F64(f64),
+    Key(String),
+}
+
+impl WalCell {
+    /// The borrowed view [`crate::Store::append`] takes.
+    pub fn as_row_value(&self) -> RowValue<'_> {
+        match self {
+            WalCell::Null => RowValue::Null,
+            WalCell::I64(value) => RowValue::I64(*value),
+            WalCell::F64(value) => RowValue::F64(*value),
+            WalCell::Key(value) => RowValue::Key(value),
+        }
+    }
+}
+
+/// A decoded WAL: where its records start in the row-id space, and the
+/// clean-prefix rows that survived.
+pub struct WalContents {
+    pub generation: u64,
+    pub base_row_id: u64,
+    pub rows: Vec<Vec<WalCell>>,
+}
+
+/// Decodes a WAL file. Header corruption is an error (the file is not a
+/// WAL); a torn or corrupt *record* ends the clean prefix silently —
+/// that is the crash boundary working as designed, and everything
+/// before it is intact (each record carries its own CRC).
+pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatError> {
+    let mut reader = Reader { bytes, position: 0 };
+    if reader.take(8)? != WAL_MAGIC {
+        return Err(FormatError::Corrupt("not a WAL file".to_owned()));
+    }
+    let version = reader.u16()?;
+    if version != WAL_VERSION {
+        return Err(FormatError::Corrupt(format!(
+            "WAL version {version} is not {WAL_VERSION}"
+        )));
+    }
+    let generation = reader.u64()?;
+    let base_row_id = reader.u64()?;
+    let stored_crc = reader.u32()?;
+    if crc32c(&bytes[..WAL_HEADER_LEN - 4]) != stored_crc {
+        return Err(FormatError::Corrupt(
+            "WAL header checksum mismatch".to_owned(),
+        ));
+    }
+    let mut rows = Vec::new();
+    loop {
+        let record_start = reader.position;
+        let Ok(length) = reader.u32() else { break };
+        let _ = record_start; // records are self-delimiting; a failed
+                              // read below simply ends the clean prefix
+        let Ok(payload) = reader.take(length as usize) else {
+            break;
+        };
+        let Ok(stored_crc) = reader.u32() else { break };
+        if crc32c(payload) != stored_crc {
+            break; // torn or corrupt record: the clean prefix ends here
+        }
+        let mut cells = Reader {
+            bytes: payload,
+            position: 0,
+        };
+        let mut row = Vec::with_capacity(columns);
+        let mut clean = true;
+        for _ in 0..columns {
+            let cell = match cells.u8() {
+                Ok(0) => WalCell::Null,
+                Ok(1) => match cells.take(8) {
+                    Ok(b) => WalCell::I64(i64::from_le_bytes(b.try_into().unwrap())),
+                    Err(_) => {
+                        clean = false;
+                        break;
+                    }
+                },
+                Ok(2) => match cells.take(8) {
+                    Ok(b) => {
+                        WalCell::F64(f64::from_bits(u64::from_le_bytes(b.try_into().unwrap())))
+                    }
+                    Err(_) => {
+                        clean = false;
+                        break;
+                    }
+                },
+                Ok(3) => {
+                    let ok = cells.u32().ok().and_then(|len| {
+                        cells
+                            .take(len as usize)
+                            .ok()
+                            .and_then(|b| std::str::from_utf8(b).ok().map(str::to_owned))
+                    });
+                    match ok {
+                        Some(text) => WalCell::Key(text),
+                        None => {
+                            clean = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    clean = false;
+                    break;
+                }
+            };
+            row.push(cell);
+        }
+        if !clean || row.len() != columns {
+            break; // CRC passed but shape is wrong: stop, don't guess
+        }
+        rows.push(row);
+    }
+    Ok(WalContents {
+        generation,
+        base_row_id,
+        rows,
+    })
 }

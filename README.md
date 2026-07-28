@@ -10,10 +10,17 @@
 > joins, window functions, and `UPDATE`/`DELETE` — with numeric compute
 > (regression, covariance, PCA) exposed as SQL. Every query family is born
 > cross-checked against DuckDB and NumPy in CI, over data that has
-> round-tripped through storage. M2's final increment — M2.7, embedded Lua
-> computing on the engine's own zero-copy buffers — is built: scripted
-> window kernels, the curated ops callable from scripts, and a
-> NumPy-checked oracle family in CI. The settled
+> round-tripped through storage. M2 (feature-complete) is merged: its
+> final increment, M2.7, put embedded Lua on the engine's own zero-copy
+> buffers — scripted window kernels, the curated ops callable from
+> scripts, a NumPy-checked oracle family in CI. M3 (native GA) is built
+> on the working branch: incremental window evaluation that beats both
+> DuckDB+NumPy and NumPy-over-our-own-export in every measured shape
+> under a compensated-truth CI guard, single-writer/concurrent-reader
+> snapshots, a crash-tested WAL with sync levels, the ruled SQL
+> IN-tier (`HAVING`, `DISTINCT`, scalar expressions, `CASE`, `LIKE`,
+> DDL), and the `tallydb` console binary with per-platform release
+> builds — awaiting the closing merges. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -99,9 +106,9 @@ always numeric or key; a bare string never exists in the engine. That is
 more permissive than it sounds:
 
 - **String *predicates* on key columns are in scope.** `WHERE symbol =
-  '...'` and `WHERE symbol IN (...)` are built today; `WHERE name LIKE
-  '%Bank%'` and regex matching are in scope but not yet implemented
-  (tracked as a todo — the engine rejects them loudly until then). All
+  '...'`, `WHERE symbol IN (...)`, and `WHERE name LIKE '%Bank%'` are
+  built today; regex matching is in scope but not yet implemented
+  (tracked as a todo — the engine rejects it loudly until then). All
   of them consume the interned strings and emit a *row selection*, not a
   string. Because keys are dictionary-encoded, such a predicate is
   evaluated once per *distinct* value and applied as integer
@@ -123,8 +130,10 @@ boundary, not our own foresight.
 
 - Link it into your application like SQLite or DuckDB — no server process,
   no separate database to administer. (A standalone single-file CLI
-  binary per release — the `sqlite3`-shell shape, still no server — is
-  planned for native GA; see `DESIGN.md`, *Deployment shapes*.)
+  binary per release — the `sqlite3`-shell shape, still no server — ships
+  with M3: `tallydb <dir>` opens a console with line editing, `CREATE
+  TABLE`/`INSERT`/CSV import, the full query surface, and `.lua` kernel
+  registration; see `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded
@@ -184,8 +193,12 @@ self-describing, CRC-checked, deterministic on-disk format whose bytes
 are locked by a committed golden: per-column codec tags with
 delta-of-delta on the ordered ordering key (measured on the checked-in
 corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
-zone maps awaiting query-time pruning, and reopen that verifies schema,
-checksums, and row-id contiguity (durability boundary is the flush).
+zone maps (driving query-time pruning), and reopen that verifies schema,
+checksums, and row-id contiguity. Durability is a sidecar write-ahead
+log with sync levels (default: group commit every 100ms, measured at
+~1µs added per append; `Full` for a zero loss window; `Off` restoring
+the flush boundary for replayable upstreams), crash-tested down to
+torn-record and stale-generation windows.
 Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
 row-id delete logs, reads resolve tombstones through live masks, and
 crash-safe generational compaction merges live rows back into sorted,
@@ -253,25 +266,40 @@ rows, window 64) now measures **two peers** — vectorized NumPy riding
 TallyDB's own ~0.1ms Arrow export (the *marginal* question: given data
 in TallyDB, is in-engine compute worth it?) and the competitor stack
 entire, the same rows stored in DuckDB with NumPy pulling from DuckDB
-(the *product* question: TallyDB, or DuckDB + NumPy?). Against the
-competitor stack, in-engine wins `regr_slope` by **2.4×**, holds parity
-on the pair statistics (`covar_pop`, `corr`, `eigen_max`: 0.84–1.08),
-and wins the live-query shape — the newest window, now — by **7–9×**,
-because pulling even 64 rows out of DuckDB costs ~1ms before any math
-happens, while the append-ordered engine serves the whole query in
-~120µs. Against the marginal peer the pair statistics still lose ~2.5×
-and the Lua kernels ~14×: the Arrow hop is nearly free in-process, and
-the engine recomputes each window from scratch where the vectorized
-peer sweeps the column once. Three rounds of overhead have come off
-already (kernels compile once rather than per window; the 2×2
-eigenvalue and the two-parameter regression are solved in closed form
-rather than by a general solver), and the remaining gap is measured and
-understood: it is the O(n·w) recompute, not the arithmetic. Incremental
-windows would close it — a 7× algorithmic win, measured, with the
-numerics settled — and need an executor change that is not built. The
-zero-copy property itself is pointer-verified and stands; the earned
-wall-clock claim is bulk parity and a decisive latency win against the
-stack a user would actually deploy, not a blanket win in every shape.
+(the *product* question: TallyDB, or DuckDB + NumPy?). The curated
+statistics now evaluate **incrementally** — running moments about a
+data-anchored shift, re-anchored every window-length so rounding cannot
+accumulate, through a frame-sequence seam every window function runs
+through (per-frame recompute remains the default for everything else).
+With that landed, in-engine compute wins every curated statistic in
+every measured shape: `regr_slope` by **9.6×** against the competitor
+stack, the pair statistics (`covar_pop`, `corr`, `eigen_max`) by
+**3–4×** against the competitor stack and **1.2–1.6×** against
+vectorized NumPy even when NumPy rides TallyDB's own ~free export, and
+the live-query shape — the newest window, now — by **6–9×**, because
+pulling even 64 rows out of DuckDB costs ~1ms before any math happens,
+while the append-ordered engine serves the whole query in ~120µs. It is
+also the only arrangement in the comparison holding 1e-12-to-truth
+accuracy at timestamp-scale offsets: the vectorized peer's fast idiom
+(rolling cumsum moments) is the catastrophic-cancellation form the
+engine rejected for correctness, so the peer buys its speed with wrong
+answers exactly where the ordering key lives. That accuracy contract is
+enforced in CI on every change by a compensated-reference guard over
+adversarial corpora, covering both the per-window and incremental
+paths. The Lua kernels remain interpreter-bound (~12–14× behind
+vectorized NumPy in bulk) — their measured value is interactive
+kernel registration at the console and the newest-window latency
+shape, where fixed costs dominate and they reach parity with NumPy
+over the engine's own export. The four statistics above are native
+implementations; the promotion ladder (prototype a kernel, then
+graduate it to native) is the intended path for future statistics,
+not how these four arrived. The extension model is ruled
+(2026-07-28): the Rust `WindowAggregate` trait is the primary
+extension path, Python composes from outside over the same Arrow
+buffers (never embedded), and Lua becomes an opt-in feature owned by
+the console — kept under a sunset clause, to prove its value before
+1.0 or leave. The zero-copy property itself is pointer-verified and
+stands.
 `lua.wasm` (the one WASM compute
 dependency still to come, for later) is a real, working, MIT-licensed
 project already in progress by the same author — tracked as a future
@@ -297,7 +325,8 @@ repo-specific half lives here:
   issues.
 - **Roadmap:** [GitHub Milestones](https://github.com/andy-emerson/TallyDB/milestones)
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
-  GA · M4 WASM parity.
+  GA · M4 extension model · M5 desk adoption · M6 WASM parity · M7 served
+  product + workbench.
 - **Checks:** GitHub Actions on every push to `main` — fmt, clippy, build,
   tests including doctests, rustdoc with warnings as errors, the Python
   oracle suite (PyArrow round trip; DuckDB and NumPy differentials,
