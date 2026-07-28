@@ -31,9 +31,14 @@
 //!
 //! ## Compute backend selection
 //! `compute-linalg` is consumed here through its trait interface (see that
-//! crate), not through a concrete type; `compute-lua` is currently
-//! consumed as its concrete native state (its backend trait is extracted
-//! when the WASM backend starts — see that crate's docs). Right now the
+//! crate), not through a concrete type; `compute-lua` sits behind the
+//! **non-default `lua` feature** (the console enables it; a library
+//! embedder who never asks for an interpreter carries neither the
+//! vendored C nor its CI surface — DESIGN.md, *the extension model*,
+//! ruled 2026-07-28) and is consumed as its concrete native state (its
+//! backend trait is extracted when the WASM backend starts — see that
+//! crate's docs). The primary extension path — [`WindowAggregate`] via
+//! [`Table::register_window`] — needs no feature at all. Right now the
 //! implementations (vendored Lua 5.4, pure-Rust linear algebra) are the only
 //! ones that exist — but this crate should never hardcode that
 //! assumption. Select the concrete implementation with
@@ -74,9 +79,11 @@
 pub mod database;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
+#[cfg(feature = "lua")]
 mod script;
 pub mod table;
 
+#[cfg(feature = "lua")]
 pub use compute_lua::LogSink;
 pub use database::Database;
 pub use query_lite::{recompute_frames, QueryOutput, Registry, WindowAggregate};

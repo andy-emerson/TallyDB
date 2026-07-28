@@ -9,7 +9,10 @@ name = "tallydb"
 path = "src/main.rs"
 
 [dependencies]
-engine = { path = "../engine" }
+# The console is the surface with no host language, so it is the one
+# embedding that turns the Lua feature on (DESIGN.md, *the extension
+# model*).
+engine = { path = "../engine", features = ["lua"] }
 arrow-lite = { path = "../arrow-lite" }
 query-lite = { path = "../query-lite" }
 # The console's two dependencies, both mature and narrow, both confined

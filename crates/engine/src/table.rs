@@ -26,6 +26,7 @@
 //! (peak-memory accounting in #56).
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+#[cfg(feature = "lua")]
 use compute_lua::LogSink;
 use query_lite::{
     evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
@@ -150,6 +151,7 @@ pub struct Table {
     /// Where Lua kernels' `log(...)` goes — `None` (the default) keeps
     /// `log` a no-op, per compute-lua's off-by-default contract. Applies
     /// to kernels registered *after* it is set.
+    #[cfg(feature = "lua")]
     lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
 }
 
@@ -298,6 +300,7 @@ impl Table {
             name: name.into(),
             store,
             registry: Arc::new(Mutex::new(Arc::new(registry))),
+            #[cfg(feature = "lua")]
             lua_log_sink: None,
         }
     }
@@ -324,6 +327,7 @@ impl Table {
         self.store.schema().fields()[self.store.ordering_key()].name()
     }
 
+    #[cfg(feature = "lua")]
     /// Installs the destination for Lua kernels' `log(...)` output.
     /// Until an embedder calls this, `log` is a no-op (compute-lua's
     /// off-by-default contract); afterwards, every *newly registered*
@@ -562,6 +566,7 @@ impl Table {
         Ok(self.store.compact()?)
     }
 
+    #[cfg(feature = "lua")]
     /// Registers a Lua kernel as a SQL window function on this table —
     /// the Lua-in-SQL window slot (#41). `parameters` names the frame's
     /// column arguments, positionally, as the globals the kernel reads
@@ -632,7 +637,7 @@ impl Table {
         chunk: &str,
         output: ColumnType,
     ) -> Result<(), EngineError> {
-        if !crate::script::is_identifier(name) {
+        if !is_identifier(name) {
             // Checked before compiling the chunk, so the name error is
             // the first thing a bad registration hears.
             return Err(EngineError::Script(format!(
@@ -726,7 +731,7 @@ impl Table {
         name: &str,
         kernel: Arc<dyn WindowAggregate>,
     ) -> Result<(), EngineError> {
-        if !crate::script::is_identifier(name) {
+        if !is_identifier(name) {
             return Err(EngineError::Script(format!(
                 "function name '{name}' is not callable from SQL"
             )));
@@ -910,6 +915,16 @@ impl OwnedValue {
 }
 
 /// Resolves the declared ordering key to its column index.
+/// Whether `name` is a plain identifier (ASCII letter or underscore,
+/// then letters, digits, underscores) — required of SQL function names
+/// so queries can actually call them, and of Lua parameter names so
+/// kernels can actually reference them.
+pub(crate) fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
     schema
         .fields()
@@ -2014,14 +2029,23 @@ mod snapshot_concurrency {
 
     #[test]
     fn snapshots_pin_the_functions_of_their_moment() {
+        // A native kernel through the public trait path, so this test
+        // runs identically with and without the `lua` feature.
+        struct Twice;
+        impl WindowAggregate for Twice {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(2.0 * args[0].iter().map(|v| v * v).sum::<f64>()))
+            }
+        }
         let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
         for i in 0..4i64 {
             table.append(&linear_row(i)).unwrap();
         }
         let before = table.snapshot().unwrap();
-        table
-            .register_lua_window("twice", &["x"], "return 2 * dot(x, x)", ColumnType::F64)
-            .unwrap();
+        table.register_window("twice", Twice).unwrap();
         let after = table.snapshot().unwrap();
         let sql = "SELECT twice(x) OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING                    AND CURRENT ROW) AS d FROM t";
         assert!(

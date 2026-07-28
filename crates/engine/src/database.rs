@@ -168,6 +168,7 @@ impl Database {
 
     /// Registers a Lua kernel as a SQL window function on the named
     /// table (see [`Table::register_lua_window`]).
+    #[cfg(feature = "lua")]
     pub fn register_lua_window(
         &mut self,
         table: &str,

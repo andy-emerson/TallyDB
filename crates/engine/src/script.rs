@@ -57,15 +57,7 @@ const RESERVED: &[&str] = &[
     "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "NULL",
 ];
 
-/// Whether `name` is a plain identifier (ASCII letter or underscore,
-/// then letters, digits, underscores) — required of Lua parameter names
-/// so kernels can actually reference them, and of SQL function names so
-/// queries can actually call them.
-pub(crate) fn is_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+use crate::table::is_identifier;
 
 /// `dot(x, y)` — the backend dot product as a script-callable op, the
 /// cheap end of the curated spread.
