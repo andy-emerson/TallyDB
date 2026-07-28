@@ -151,6 +151,21 @@ impl Database {
             .mutate(sql)
     }
 
+    /// Registers a native window kernel on the named table — the
+    /// primary extension path (see [`Table::register_window`] for the
+    /// full contract and the ~20-line example).
+    pub fn register_window(
+        &mut self,
+        table: &str,
+        name: &str,
+        kernel: impl query_lite::WindowAggregate + 'static,
+    ) -> Result<(), EngineError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
+            .register_window(name, kernel)
+    }
+
     /// Registers a Lua kernel as a SQL window function on the named
     /// table (see [`Table::register_lua_window`]).
     pub fn register_lua_window(

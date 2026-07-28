@@ -633,6 +633,8 @@ impl Table {
         output: ColumnType,
     ) -> Result<(), EngineError> {
         if !crate::script::is_identifier(name) {
+            // Checked before compiling the chunk, so the name error is
+            // the first thing a bad registration hears.
             return Err(EngineError::Script(format!(
                 "function name '{name}' is not callable from SQL"
             )));
@@ -640,9 +642,98 @@ impl Table {
         let window =
             crate::script::LuaWindow::new(parameters, chunk, output, self.lua_log_sink.clone())
                 .map_err(EngineError::Script)?;
+        self.register_kernel(name, Arc::new(window))
+    }
+
+    /// Registers a native window kernel — **the primary extension
+    /// path** (DESIGN.md, *the extension model*): implement
+    /// [`WindowAggregate`], register it, call it from SQL at native
+    /// speed. No interpreter is involved; the kernel is engine code,
+    /// compiled into the embedding application. The built-in
+    /// statistics (`regr_slope`, `covar_pop`, …) are ordinary
+    /// registrations of this same kind.
+    ///
+    /// Registering a name again **replaces** the previous
+    /// implementation — deliberately: that is the promotion path. A
+    /// kernel prototyped as a Lua script keeps its SQL name when an
+    /// embedder re-registers a native under it; every query and
+    /// script continues to work, now compiled. Snapshots taken before
+    /// a registration keep the function set they saw
+    /// (see [`Table::reader`]).
+    ///
+    /// ```
+    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::{RowValue, Table, WindowAggregate};
+    ///
+    /// // The whole extension surface: one trait, ~20 lines.
+    /// struct WeightedMean;
+    ///
+    /// impl WindowAggregate for WeightedMean {
+    ///     fn arity(&self) -> usize {
+    ///         2 // wmean(x, w)
+    ///     }
+    ///     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+    ///         let (x, w) = (args[0], args[1]);
+    ///         let sw: f64 = w.iter().sum();
+    ///         Ok((sw != 0.0)
+    ///             .then(|| x.iter().zip(w).map(|(a, b)| a * b).sum::<f64>() / sw))
+    ///     }
+    /// }
+    ///
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    ///     Field::new("w", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("t", schema, "ts").unwrap();
+    /// for i in 0..4i64 {
+    ///     table
+    ///         .append(&[
+    ///             RowValue::I64(i),
+    ///             RowValue::F64(i as f64),
+    ///             RowValue::F64(1.0),
+    ///         ])
+    ///         .unwrap();
+    /// }
+    /// table.register_window("wmean", WeightedMean).unwrap();
+    /// let output = table
+    ///     .query(
+    ///         "SELECT wmean(x, w) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+    ///          AND CURRENT ROW) AS m FROM t",
+    ///     )
+    ///     .unwrap();
+    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    ///     &output.batches[0].columns()[0]
+    /// else {
+    ///     panic!("expected f64")
+    /// };
+    /// // Unit weights: each two-row window's plain mean.
+    /// assert_eq!(m.values().as_slice(), &[0.0, 0.5, 1.5, 2.5]);
+    /// ```
+    pub fn register_window(
+        &mut self,
+        name: &str,
+        kernel: impl WindowAggregate + 'static,
+    ) -> Result<(), EngineError> {
+        self.register_kernel(name, Arc::new(kernel))
+    }
+
+    /// The one registration mechanism both extension paths share: an
+    /// identifier check, then a copy-and-swap of the registry `Arc` so
+    /// existing snapshots keep the function set they were minted with.
+    fn register_kernel(
+        &mut self,
+        name: &str,
+        kernel: Arc<dyn WindowAggregate>,
+    ) -> Result<(), EngineError> {
+        if !crate::script::is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
         let mut guard = self.registry.lock().expect("registry lock poisoned");
         let mut next = (**guard).clone();
-        next.register(name, Arc::new(window));
+        next.register(name, kernel);
         *guard = Arc::new(next);
         Ok(())
     }
