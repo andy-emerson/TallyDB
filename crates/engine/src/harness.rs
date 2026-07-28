@@ -452,6 +452,213 @@ pub unsafe extern "C" fn tallydb_bench_close(context: *mut BenchContext) {
     drop(unsafe { Box::from_raw(context) });
 }
 
+// ------------------------------------------------- the as-of oracle
+
+/// An open as-of oracle context (M4.4, issue #75): the M1 fixture in
+/// its own persistent directory, driven statement by statement from
+/// Python — mutations, compactions, reopens, and `ASOF` queries — so
+/// the script can read the ingest-sequence watermark around every
+/// mutation and build the explicit version table DuckDB re-derives
+/// every cut from. The emulation lives in the referee only.
+pub struct AsOfContext {
+    /// `None` transiently during [`tallydb_asof_reopen`] — the old
+    /// handle must drop before the directory is opened again.
+    table: Option<Table>,
+    dir: std::path::PathBuf,
+}
+
+impl AsOfContext {
+    fn table(&self) -> &Table {
+        self.table.as_ref().expect("context holds an open table")
+    }
+    fn table_mut(&mut self) -> &mut Table {
+        self.table.as_mut().expect("context holds an open table")
+    }
+}
+
+fn asof_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("x", ColumnType::F64, false),
+        Field::new("y", ColumnType::F64, false),
+    ])
+}
+
+/// Builds the as-of fixture — the M1 fixture's generator (same LCG,
+/// same symbols) in a dedicated directory — and returns an owned
+/// context. Release with [`tallydb_asof_close`].
+#[no_mangle]
+pub extern "C" fn tallydb_asof_open() -> *mut AsOfContext {
+    let dir = std::env::temp_dir().join(format!("tallydb-asof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut table =
+        Table::persistent_with_segment_rows("trades", asof_schema(), "ts", &dir, SEGMENT_ROWS)
+            .expect("as-of fixture schema is valid");
+    let mut rng = Lcg(0x5EED_1234_5678_9ABC);
+    let symbols = [
+        ("AAPL", 2.0, 5.0),
+        ("MSFT", -0.75, 12.0),
+        ("TSLA", 0.1, -3.0),
+    ];
+    for i in 0..ROWS {
+        let (sym, slope, intercept) = symbols[(i % 3) as usize];
+        let x = rng.next_f64() * 10.0;
+        let noise = (rng.next_f64() - 0.5) * 0.2;
+        let y = slope * x + intercept + noise;
+        table
+            .append(&[
+                RowValue::I64(i),
+                RowValue::Key(sym),
+                RowValue::F64(x),
+                RowValue::F64(y),
+            ])
+            .expect("as-of fixture rows are valid");
+    }
+    table.flush().expect("as-of fixture flush succeeds");
+    Box::into_raw(Box::new(AsOfContext {
+        table: Some(table),
+        dir,
+    }))
+}
+
+/// The context table's ingest-sequence watermark (the sequence the next
+/// appended row will receive) — what the oracle script records around
+/// every mutation to place version intervals.
+///
+/// # Safety
+/// `context` must come from [`tallydb_asof_open`] and not be closed.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_next_sequence(context: *mut AsOfContext) -> u64 {
+    // SAFETY: caller contract — a live context.
+    unsafe { &*context }.table().next_sequence()
+}
+
+/// Runs one mutation statement. Returns the rows changed, or -1 on
+/// failure (printed to stderr).
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`]; `sql` must be a valid
+/// NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_mutate(
+    context: *mut AsOfContext,
+    sql: *const std::os::raw::c_char,
+) -> i64 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_asof_mutate: SQL is not UTF-8");
+            return -1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.table_mut().mutate(sql) {
+        Ok(changed) => i64::try_from(changed).unwrap_or(i64::MAX),
+        Err(error) => {
+            eprintln!("tallydb_asof_mutate: {sql}: {error}");
+            -1
+        }
+    }
+}
+
+/// Compacts the context's table (superseded rows move to history).
+/// Returns 0 on success, 1 on failure.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_compact(context: *mut AsOfContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.table_mut().compact() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tallydb_asof_compact: {error}");
+            1
+        }
+    }
+}
+
+/// Closes and reopens the table from its directory — the storage round
+/// trip: manifest, segments, history, delete logs, and WAL all come
+/// back from bytes. Returns 0 on success, 1 on failure.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_reopen(context: *mut AsOfContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    let context = unsafe { &mut *context };
+    context.table = None; // drop the old handle before reopening
+    match Table::persistent_with_segment_rows(
+        "trades",
+        asof_schema(),
+        "ts",
+        &context.dir,
+        SEGMENT_ROWS,
+    ) {
+        Ok(table) => {
+            context.table = Some(table);
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_asof_reopen: {error}");
+            1
+        }
+    }
+}
+
+/// Runs one SQL query (`ASOF` included) against the context's table and
+/// exports the result. Returns 0 on success; 1 on failure with `out`
+/// untouched.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`]; `sql` must be a valid
+/// NUL-terminated string; `out` a valid, writable destination not
+/// holding a live export.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_query(
+    context: *mut AsOfContext,
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_asof_query: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &*context }.table().query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_asof_query: {sql}: {error}");
+            1
+        }
+    }
+}
+
+/// Releases an as-of context and its temporary directory.
+///
+/// # Safety
+/// `context` must come from [`tallydb_asof_open`] and not have been
+/// closed already.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_close(context: *mut AsOfContext) {
+    // SAFETY: caller contract — exactly one close per open.
+    let context = unsafe { Box::from_raw(context) };
+    let dir = context.dir.clone();
+    drop(context);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The mutation sequence the differential oracle replays in DuckDB.
 /// KEEP IN SYNC with `MUTATIONS` in `tests/m2_mutation_oracle.py` — a
 /// mismatch fails the oracle loudly, it cannot pass silently.
