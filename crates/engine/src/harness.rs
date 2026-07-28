@@ -401,6 +401,13 @@ pub extern "C" fn tallydb_bench_open(rows: u64) -> *mut BenchContext {
     table
         .register_lua_window("lua_mad", &["x"], BENCH_MAD, ColumnType::F64)
         .expect("lua_mad registers");
+    table
+        .register_lua_scalar(
+            "lua_spread",
+            &["a", "b"],
+            "for i = 1, #a do out[i] = (a[i] - b[i]) / b[i] end",
+        )
+        .expect("lua_spread registers");
     Box::into_raw(Box::new(BenchContext { table }))
 }
 

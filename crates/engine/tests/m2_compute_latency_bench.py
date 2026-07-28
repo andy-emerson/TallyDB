@@ -283,6 +283,29 @@ def main():
         "lua_mad (pure Lua)",
         "NumPy vectorized MAD",
     )
+    # The column-kernel shape (#53): per-row math, but the interpreter
+    # is entered once per column view, never per row — the amortization
+    # the front-end architecture promises. The native scalar expression
+    # below it is the same arithmetic in the engine's own projection
+    # slot: the floor a promoted kernel reaches.
+    family(
+        "lua_spread",
+        "SELECT lua_spread(x, y) AS r FROM bench",
+        lambda px, py: (px - py) / py,
+        1e-12,
+        1e-12,
+        "lua_spread (column)",
+        "NumPy (x - y) / y",
+    )
+    family(
+        "native_expr",
+        "SELECT (x - y) / y AS r FROM bench",
+        lambda px, py: (px - py) / py,
+        1e-12,
+        1e-12,
+        "(x - y) / y (native)",
+        "NumPy (x - y) / y",
+    )
 
     elapsed, values = engine(f"SELECT regr_slope(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = duckdb_peer()
