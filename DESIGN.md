@@ -1123,6 +1123,20 @@ runaway-kernel guard (#61) is scoped by the same ruling: required
 before Lua ships in any surface serving untrusted input (the M7
 served product), optional for a local console.
 
+**The idiom: compose, don't loop (M4.2).** Lua's cost model has three
+tiers, and the documentation teaches the same discipline NumPy's
+culture teaches Python: (1) an element loop written in Lua pays an
+interpreted dispatch per element — the 13× tier, the code smell;
+(2) a kernel that *composes registered ops* (`return 2 * sumsq(x)`)
+runs compiled arithmetic with one interpreter entry per call; (3) the
+engine-driven paths (`evaluate_frames` for windows, `eval_column` for
+column functions) enter the interpreter once per *run or view*. The
+vocabulary invariant makes tier 2 grow for free — anything SQL can
+call, a kernel can call, registry-driven — and the vectorized column
+slot puts scripted per-row work in tier 3. Promotion is mechanical:
+one registry name, a Lua implementation swappable for a trait
+implementation with no query change (both pinned by contract tests).
+
 **A history correction (same review).** The four curated statistics
 were *not* produced by promoting Lua prototypes — the regressions
 predate the Lua layer by two milestones. The promotion ladder is the
