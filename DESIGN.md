@@ -436,12 +436,23 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
   documented, promotion made mechanical (one registry name, Lua
   implementation swappable for a trait implementation with no query
   change).
-- **M4.3 The corrections design cycle** — F2 ruled **(a) whole**
-  (2026-07-28): the sub-decisions (column default-on vs opt-in — the
-  virtual-until-divergence option makes default-on nearly free;
-  retention horizon semantics; the `AS OF` spelling, standard
-  `FOR SYSTEM_TIME AS OF` available) are ruled here, on paper, while
-  M4.0–M4.2 build.
+- **M4.3 The corrections design cycle — ruled 2026-07-28, closed.**
+  F2 is **(a) whole**, and its three sub-decisions are settled: the
+  ingest-sequence column is **default-on** for every table (one
+  solution for arrival order, the `AS OF` coordinate, and the
+  ready-at-hand stable id; the virtual-until-divergence design makes
+  it nearly free — store nothing while sequence == row id, materialize
+  delta-coded from the first divergence); the retention horizon is
+  **unbounded by default** with a per-table bound available; and the
+  knowledge-time clause is **bare `AS OF n` as the user-facing form,
+  carried on standard `FOR SYSTEM_TIME AS OF`** (which sqlparser
+  parses natively — the bare form is a small pre-parse rewrite onto
+  it, and both spellings are accepted). `ASOF JOIN` stays one word
+  (the DuckDB/ClickHouse/QuestDB/Snowflake convention; Snowflake
+  proves the coexistence), lexically distinct from the two-word
+  clause, with teaching errors in both directions for the human
+  near-miss (`ASOF 41520` → "did you mean AS OF"; `AS OF JOIN` →
+  "did you mean ASOF JOIN").
 - **M4.4 The corrections build** — the hidden ingest-sequence column
   (the permanent knowledge axis; delta-coded to almost nothing while
   uncorrected), retaining compaction (history segments), the knowledge

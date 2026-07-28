@@ -35,21 +35,31 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-28, M4 kickoff)
+## Snapshot (2026-07-28, mid-M4: M4.0–M4.3 done, M4.4 next)
 
 - **M3 merged** to `main` (PR #74); M0–M3 milestones closed.
-- **Current milestone: M4 — the extension model + corrections.** The
-  approved plan of record is in `DESIGN.md`, *The roadmap beyond
-  native GA*: M4.0 trait exposure → M4.1 feature gate → M4.2 Lua
-  front-end → M4.3 corrections design cycle (F2 ruled (a) whole; the
-  Human rules the sub-decisions on paper) → M4.4 corrections build →
-  M4.5 correctness batch (#73, #63, #69, review-noted redundancies) →
-  **the Lua trial** (evidence brief from the Agent; verdict is the
-  Human's alone; see `DESIGN.md`, *The Lua layer*, the sunset clause)
-  → M4.6 SQL-in-Lua (#70) only on a pass.
-- **Open rulings pending:** F1 (time bucketing, an M5 concern);
-  the Human's noted-but-unstated reservation about how `KEY` was
-  coined.
+- **Current milestone: M4 — the extension model + corrections.** Plan
+  of record in `DESIGN.md`, *The roadmap beyond native GA*. DONE:
+  M4.0 (trait public, register_window, doctest), M4.1 (lua feature
+  gate, CI both legs incl. off-leg rustdoc), M4.2 (vocabulary
+  invariant registry-driven + tested; promotion test; the vectorized
+  column-function slot — ColumnFunction trait + register_lua_scalar +
+  .luascalar — closed #53; compose-don't-loop idiom recorded). M4.3
+  ruled and recorded (sequence column default-on, unbounded horizon,
+  bare AS OF carried on FOR SYSTEM_TIME AS OF, one-word ASOF JOIN).
+  NEXT: **M4.4 the corrections build** (sequence column
+  virtual-until-divergence, retaining compaction with history
+  segments, knowledge mask, AS OF clause; manifest revision designed
+  with F3's zone-map sections reserved; oracle = DuckDB re-deriving
+  as-of answers over an explicit history table) → M4.5 correctness
+  batch (#73 atomic mutation commit record, #63 Miri CI, #69 upstream
+  Lua suite, review-noted redundancies) → **the Lua trial** (Agent
+  brings the evidence brief; the Human alone rules; see the sunset
+  clause) → M4.6 SQL-in-Lua (#70) only on a pass.
+- **Open rulings pending:** F1 (time bucketing, an M5 concern); the
+  Human's noted-but-unstated reservation about how `KEY` was coined.
+  Issue #75 tracks the corrections build; #73/#63/#69 are M4's
+  correctness batch; #70 is conditional on the Lua trial.
 - **Not to build yet:** M5 (desk adoption), M6 (WASM), M7 (served) —
   contents recorded in the same roadmap section.
 - Reviews absorbed: three independent passes (2026-07-28) — findings
