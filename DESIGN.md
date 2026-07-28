@@ -419,13 +419,15 @@ is built on it).** M3 ships *embed in your application* plus the
 console. **M4 (the extension model)** makes the 2026-07-28 rulings
 real and small: the `WindowAggregate` trait and `register_window`
 become public engine surface (the primary extension path); compute-lua
-becomes a non-default feature the console enables; the Lua-as-NumPy
-plan lands — the vocabulary invariant (anything SQL can call, Lua can
-call), the vectorized whole-column kernel slot wired (`eval_column`,
-built in M2.7 and never connected), the compose-don't-loop idiom
-documented, and promotion made mechanical (one registry name, Lua
-implementation swappable for a trait implementation with no query
-change); the vendored interpreter is finally validated against the
+becomes a non-default feature the console enables; Lua becomes a thin
+front-end over compiled ops, on the architecture NumPy proved (a slow
+interpreter is fine when the loops live in compiled code and scripts
+only compose): the vocabulary invariant (anything SQL can call, Lua
+can call), the vectorized whole-column kernel slot wired
+(`eval_column`, built in M2.7 and never connected), the
+compose-don't-loop idiom documented, and promotion made mechanical
+(one registry name, Lua implementation swappable for a trait
+implementation with no query change); the vendored interpreter is finally validated against the
 upstream Lua test suite (#69); plus the accumulated low-hanging
 correctness work (#73 atomic mutations, #63 Miri in CI, the review
 pass's noted redundancies). **M5 (desk adoption)** then builds what
