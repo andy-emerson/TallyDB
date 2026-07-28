@@ -411,30 +411,46 @@ threat model, not before. Local security posture: an OS file lock
 (released by the OS on death — no stale locks) admits one process per
 directory; table names stay identifiers (they become directory names).
 
-**The roadmap beyond native GA (recorded 2026-07-27; reordered by
-ruling 2026-07-28 — the desk before the browser).** M3 ships *embed in
-your application* plus the console. **M4 (desk adoption)** builds what
-the target user needs before any new deployment shape matters, chosen
-by the moat test: multi-factor curated compute (K > 2 — the recorded
-LAPACK-class-returns trigger firing, served by faer), the ordered-axis
-dividends (cross-sectional partitioning, time bucketing, `LAG`/`LEAD`,
-`RANGE` frames, `ASOF` #65), and reach (bulk Arrow ingest, a Python
-binding — distribution method open: a wheel is one form, not the
-ruling). **M5 (WASM parity)** then adds *embed in a browser*: the
-compute stack already compiles for wasm32; the remaining work is a
-browser `StorageBackend` (OPFS/IndexedDB behind the existing trait —
-written knowing an HTTP-fetch sibling comes later), the JS bindings,
-and `lua.wasm`. **M6** adds *embed in a server*: a Servette-shaped
-served product and a workbench UI, both **separate artifacts embedding
-the engine** (the never-a-server guardrail's sanctioned form), the
-console module reused as the server's shell. The load-bearing
-observation for M6's sync story: **segments are immutable,
-self-describing, CRC'd objects committed by a generation manifest —
-the storage format is already the replication format.** A read-only
-browser or client replica fetches the manifest and pulls segments
-lazily (zone maps prune the fetch), verified by the same checks reopen
-runs; the single writer stays wherever the WAL is. Nothing earlier may
-foreclose this.
+**The roadmap beyond native GA (recorded 2026-07-27; reordered
+2026-07-28, twice — first the desk before the browser, then the
+extension model before the desk: the 2026-07-28 review rulings touched
+M0–M3 design, and the back-end must settle before anything user-facing
+is built on it).** M3 ships *embed in your application* plus the
+console. **M4 (the extension model)** makes the 2026-07-28 rulings
+real and small: the `WindowAggregate` trait and `register_window`
+become public engine surface (the primary extension path); compute-lua
+becomes a non-default feature the console enables; the Lua-as-NumPy
+plan lands — the vocabulary invariant (anything SQL can call, Lua can
+call), the vectorized whole-column kernel slot wired (`eval_column`,
+built in M2.7 and never connected), the compose-don't-loop idiom
+documented, and promotion made mechanical (one registry name, Lua
+implementation swappable for a trait implementation with no query
+change); the vendored interpreter is finally validated against the
+upstream Lua test suite (#69); plus the accumulated low-hanging
+correctness work (#73 atomic mutations, #63 Miri in CI, the review
+pass's noted redundancies). **M5 (desk adoption)** then builds what
+the target user needs, chosen by the moat test: multi-factor curated
+compute (K > 2 — the recorded LAPACK-class-returns trigger firing,
+served by faer), the ordered-axis dividends (cross-sectional
+partitioning, time bucketing pending F1, `LAG`/`LEAD`, `RANGE` frames,
+`ASOF` #65, corrections pending F2), segment-lazy open (F3),
+cross-process readers (F4), and reach (bulk Arrow ingest, a Python
+binding with host-callback NumPy kernels — distribution method open: a
+wheel is one form, not the ruling). **M6 (WASM parity)** adds *embed
+in a browser*: the compute stack already compiles for wasm32; the
+remaining work is a browser `StorageBackend` (OPFS/IndexedDB behind
+the existing trait — written knowing an HTTP-fetch sibling comes
+later), the JS bindings, and `lua.wasm` behind the same feature flag.
+**M7** adds *embed in a server*: a Servette-shaped served product and
+a workbench UI, both **separate artifacts embedding the engine** (the
+never-a-server guardrail's sanctioned form), the console module reused
+as the server's shell. The load-bearing observation for M7's sync
+story: **segments are immutable, self-describing, CRC'd objects
+committed by a generation manifest — the storage format is already
+the replication format.** A read-only browser or client replica
+fetches the manifest and pulls segments lazily (zone maps prune the
+fetch), verified by the same checks reopen runs; the single writer
+stays wherever the WAL is. Nothing earlier may foreclose this.
 
 ## Current milestone: native only
 
@@ -550,14 +566,14 @@ rebuild, being wrong about the additive one costs a later layer.
 | Axis | Our position | Licensing assumption | Reversal class |
 |---|---|---|---|
 | Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
-| Working set | **Cut, amended by ruling 2026-07-28**: the *queried working set* fits in memory. Segment-lazy open lands in M4 — the manifest carries per-segment zone maps so pruning runs before decode, and a segment's bytes load on first touch; decode-into-memory stands until then. (Distinct from the retired mmap/ranged-read path: whole-object reads and the backend contract are untouched.) | The rows a query touches fit in memory (see below) | Foundational |
+| Working set | **Cut, amended by ruling 2026-07-28**: the *queried working set* fits in memory. Segment-lazy open lands in M5 — the manifest carries per-segment zone maps so pruning runs before decode, and a segment's bytes load on first touch; decode-into-memory stands until then. (Distinct from the retired mmap/ranged-read path: whole-object reads and the backend contract are untouched.) | The rows a query touches fit in memory (see below) | Foundational |
 | Query (planner) | Cut: a **fixed-strategy planner** — `plan()` exists; search, costing, and choice do not | One access path ⇒ nothing to choose between | Additive |
 | Query (surface) | **Refused**: broad standard SQL, bounded by the inclusion principle | — | Additive |
 | Access path | Cut totally: no secondary indexes; ordering-key clustering + scan is the one path (zone maps are pruning metadata, not a path) | Ordered ingest on the declared key (assumption 2) | Invasive |
 | Write | **Refused**: cheap online single-row append is the design center | — | n/a |
 | Transaction | Cut: submitted units only — no `BEGIN`/`COMMIT`/`ROLLBACK`, no session state (contract below) | Work arrives as single statements | Invasive |
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
-| Concurrency | Single writer *per table*, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds. Writers scale by table (one owner each — a thread, or a whole process: directory locks are per table). **Cross-process readers ruled in 2026-07-28 (M4):** writer-exclusive / reader-shared locks; POSIX-first — unlink-keeps-open-files-alive gives reader safety for free on Linux/macOS, Windows requires deferred deletes and is documented as the lagging platform until its cleanup pass | One writer per table is enough | Additive to correct |
+| Concurrency | Single writer *per table*, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds. Writers scale by table (one owner each — a thread, or a whole process: directory locks are per table). **Cross-process readers ruled in 2026-07-28 (M5):** writer-exclusive / reader-shared locks; POSIX-first — unlink-keeps-open-files-alive gives reader safety for free on Linux/macOS, Windows requires deferred deletes and is documented as the lagging platform until its cleanup pass | One writer per table is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
 | Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
@@ -864,7 +880,7 @@ hardware, 20k rows, window 64).
 
 *What this bought beyond speed:* the engine no longer requires a system
 LAPACK to build or embed, which repairs the link-it-in-like-SQLite
-property, and **M4 no longer waits on a LAPACK-in-WASM layer** — the
+property, and **the WASM milestone (M6) no longer waits on a LAPACK-in-WASM layer** — the
 current feature set can reach WASM parity without one.
 
 *The closed forms are the corrected ones, and that distinction is
@@ -1032,7 +1048,7 @@ hosts that have no language of their own:
    the *primary* extension path; the trait and a `register_window`
    entry are public engine surface (correcting the M2.7 state, which
    shipped only the interpreter path publicly).
-2. **Python host → callbacks through the binding (M4).** Python is
+2. **Python host → callbacks through the binding (M5).** Python is
    **never embedded in the engine** — ruled out on structure, not
    taste: NumPy (the thing users actually know — the familiarity is
    the library, not the syntax) is welded to CPython; CPython brings
@@ -1046,7 +1062,7 @@ hosts that have no language of their own:
    whole columns per call, zero-copy views in, vectorized NumPy
    inside, an array out. In-query compute in real NumPy, with no
    interpreter shipped.
-3. **No host language (console; browser at M5) → embedded Lua.** The
+3. **No host language (console; browser at M6) → embedded Lua.** The
    one territory where an embedded interpreter is non-substitutable —
    a console user cannot compile Rust at a prompt. Lua becomes a
    **non-default feature** the console (and later the browser bundle)
@@ -1066,7 +1082,7 @@ recorded trigger** (ruled 2026-07-28): with no scripting layer to
 carry novel compute names, SQL becomes their only home, and
 `eigen_max`-class naming must be re-decided there. The
 runaway-kernel guard (#61) is scoped by the same ruling: required
-before Lua ships in any surface serving untrusted input (the M6
+before Lua ships in any surface serving untrusted input (the M7
 served product), optional for a local console.
 
 **A history correction (same review).** The four curated statistics
@@ -1331,7 +1347,7 @@ Native and WASM builds won't be bit-identical by default — floating-point
 addition isn't associative, and different SIMD widths / FMA usage change
 summation order. We're not solving full native/WASM bit-identity now; the
 portability *standard* (bit-exact, or bounded-difference, and over which
-ops) is set when M4 starts. But the ground is mostly already held: every
+ops) is set when the WASM milestone (M6) starts. But the ground is mostly already held: every
 closed-form window statistic and the `dot` kernel fix their operation
 order in source — plain Rust loops, no runtime dispatch — so their
 results are bit-identical across CPUs and targets by construction. The

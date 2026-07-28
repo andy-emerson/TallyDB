@@ -325,7 +325,8 @@ repo-specific half lives here:
   issues.
 - **Roadmap:** [GitHub Milestones](https://github.com/andy-emerson/TallyDB/milestones)
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
-  GA · M4 WASM parity.
+  GA · M4 extension model · M5 desk adoption · M6 WASM parity · M7 served
+  product + workbench.
 - **Checks:** GitHub Actions on every push to `main` — fmt, clippy, build,
   tests including doctests, rustdoc with warnings as errors, the Python
   oracle suite (PyArrow round trip; DuckDB and NumPy differentials,
