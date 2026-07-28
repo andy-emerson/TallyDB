@@ -135,27 +135,27 @@ pub enum ScalarValue {
     Null,
 }
 
-const TAG_F64: u8 = 0;
-const TAG_I64: u8 = 1;
-const TAG_KEY: u8 = 2;
+pub(crate) const TAG_F64: u8 = 0;
+pub(crate) const TAG_I64: u8 = 1;
+pub(crate) const TAG_KEY: u8 = 2;
 
 /// Payload of an input-view userdata: borrowed engine buffers plus the
 /// generation stamp that bounds their lifetime.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct InputPayload {
-    data: *const u8,
+pub(crate) struct InputPayload {
+    pub(crate) data: *const u8,
     /// Null means every element is valid.
-    validity: *const Bitmap,
+    pub(crate) validity: *const Bitmap,
     /// Null unless `tag == TAG_KEY`.
-    dictionary: *const Dictionary,
-    len: usize,
-    tag: u8,
+    pub(crate) dictionary: *const Dictionary,
+    pub(crate) len: usize,
+    pub(crate) tag: u8,
     /// The interpreter generation this view was bound in.
-    born: u64,
+    pub(crate) born: u64,
     /// The live generation counter; a mismatch with `born` means the
     /// view outlived its call.
-    generation: *const u64,
+    pub(crate) generation: *const u64,
 }
 
 /// Payload of the `out` output-view userdata.
@@ -184,7 +184,7 @@ struct MaskPayload {
     generation: *const u64,
 }
 
-const META_INPUT: &CStr = c"tallydb.column";
+pub(crate) const META_INPUT: &CStr = c"tallydb.column";
 const META_OUTPUT: &CStr = c"tallydb.output";
 const META_MASK: &CStr = c"tallydb.mask";
 const META_NULL: &CStr = c"tallydb.null";
@@ -545,7 +545,7 @@ unsafe fn coerce(
 
 /// The exact `i64` → `f64` conversion, or `None` where rounding would
 /// occur (integers beyond ±2⁵³ are not all representable).
-fn int_as_f64_exact(integer: i64) -> Option<f64> {
+pub(crate) fn int_as_f64_exact(integer: i64) -> Option<f64> {
     let float = integer as f64;
     // Compare in i128: `float` can be 2⁶³ exactly, which i64 cannot hold.
     (float as i128 == i128::from(integer)).then_some(float)
@@ -553,7 +553,7 @@ fn int_as_f64_exact(integer: i64) -> Option<f64> {
 
 /// The exact `f64` → `i64` conversion: losslessly integral and in
 /// range, or `None`. NaN and the infinities fail the fract test.
-fn float_as_i64_exact(float: f64) -> Option<i64> {
+pub(crate) fn float_as_i64_exact(float: f64) -> Option<i64> {
     const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
     if float.fract() != 0.0 {
         return None;
@@ -573,6 +573,15 @@ pub(crate) unsafe fn raise(state: *mut ffi::lua_State, message: &CStr) -> c_int 
     }
 }
 
+/// Whether the value at `idx` is the NULL sentinel.
+///
+/// # Safety
+/// `raw` must be a state [`install`] has prepared and `idx` a valid
+/// stack index.
+pub(crate) unsafe fn is_null_sentinel(raw: *mut ffi::lua_State, idx: c_int) -> bool {
+    unsafe { !ffi::luaL_testudata(raw, idx, META_NULL.as_ptr()).is_null() }
+}
+
 /// Pushes the NULL sentinel.
 pub(crate) unsafe fn push_null(state: *mut ffi::lua_State) {
     unsafe {
@@ -582,7 +591,11 @@ pub(crate) unsafe fn push_null(state: *mut ffi::lua_State) {
 
 /// Reads the integer at `idx` as a 1-based element index into a view of
 /// `len` elements, or raises.
-unsafe fn element_index(state: *mut ffi::lua_State, idx: c_int, len: usize) -> Result<usize, ()> {
+pub(crate) unsafe fn element_index(
+    state: *mut ffi::lua_State,
+    idx: c_int,
+    len: usize,
+) -> Result<usize, ()> {
     unsafe {
         let mut is_integer = 0;
         let index = ffi::lua_tointegerx(state, idx, &mut is_integer);
@@ -599,7 +612,7 @@ unsafe fn element_index(state: *mut ffi::lua_State, idx: c_int, len: usize) -> R
 }
 
 /// Whether element `offset` is valid under a possibly-absent bitmap.
-unsafe fn is_valid(validity: *const Bitmap, offset: usize) -> bool {
+pub(crate) unsafe fn is_valid(validity: *const Bitmap, offset: usize) -> bool {
     unsafe { validity.is_null() || (*validity).get(offset) }
 }
 
@@ -970,10 +983,15 @@ unsafe extern "C" fn mask_newindex(state: *mut ffi::lua_State) -> c_int {
 // NULL-sentinel metamethods
 // ---------------------------------------------------------------------
 
-/// Every arithmetic/bitwise/concat metamethod: the result is NULL (3VL).
+/// Every arithmetic/bitwise/concat metamethod: the result is NULL
+/// (3VL). When the other operand is a sized column (a view or a
+/// vector), the NULL propagates *elementwise* — an all-NULL vector —
+/// so `NULL * v` and `v * NULL` agree.
 unsafe extern "C" fn null_propagate(state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        push_null(state);
+        if !crate::vector::push_null_arith_result(state) {
+            push_null(state);
+        }
         1
     }
 }

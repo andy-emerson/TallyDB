@@ -306,6 +306,27 @@ def main():
         "(x - y) / y (native)",
         "NumPy (x - y) / y",
     )
+    # The composed shapes (option A): one interpreter entry, operators
+    # and rolling combinators vectorized in native code — the ufunc
+    # half of the NumPy model.
+    family(
+        "lua_rel",
+        "SELECT lua_rel(x, y) AS r FROM bench",
+        lambda px, py: (px - py) / py,
+        1e-12,
+        1e-12,
+        "lua (a-b)/b composed",
+        "NumPy (x - y) / y",
+    )
+    family(
+        "lua_rdot",
+        "SELECT lua_rdot(x, y) AS r FROM bench",
+        lambda px, py: peer_dot(px, py),
+        1e-9,
+        1e-9,
+        "lua rolling_dot(64)",
+        "NumPy rolling dot",
+    )
 
     elapsed, values = engine(f"SELECT regr_slope(y, x) {FRAME} AS r FROM bench", "r")
     peer_time, peer_values = duckdb_peer()

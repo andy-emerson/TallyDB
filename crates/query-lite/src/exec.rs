@@ -654,12 +654,117 @@ fn computed_column(
     name: &str,
     registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // A registered kernel must see the query's rows as ONE column:
+    // storage segmentation is an internal detail, and a kernel with
+    // window semantics (a rolling combinator) would otherwise reset at
+    // segment boundaries. Pure expressions stay on the per-view path —
+    // elementwise semantics don't care, and it copies nothing.
+    if views.len() > 1 && uses_registered(expr) {
+        return computed_column_whole(schema, views, expr, name, registry);
+    }
     let mut columns = Vec::with_capacity(views.len());
     for view in views {
         let (values, validity) = evaluate_scalar(expr, schema, view, registry)?;
         columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
             values, validity,
         ))));
+    }
+    Ok((Field::new(name, ColumnType::F64, true), columns))
+}
+
+/// Whether the expression calls a registered kernel anywhere.
+fn uses_registered(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Registered { .. } => true,
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+        ScalarExpr::Negate(inner) => uses_registered(inner),
+        ScalarExpr::Binary { left, right, .. } => uses_registered(left) || uses_registered(right),
+        ScalarExpr::Call { args, .. } => args.iter().any(uses_registered),
+        ScalarExpr::Case { whens, otherwise } => {
+            whens.iter().any(|(_, value)| uses_registered(value))
+                || otherwise.as_deref().is_some_and(uses_registered)
+        }
+    }
+}
+
+/// Column names a registered-kernel expression reads. `CASE` is
+/// refused here — its predicates would need their own gather (keys
+/// included), which nothing motivates yet.
+fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), QueryError> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            out.push(name.clone());
+            Ok(())
+        }
+        ScalarExpr::Literal(_) => Ok(()),
+        ScalarExpr::Negate(inner) => registered_columns(inner, out),
+        ScalarExpr::Binary { left, right, .. } => {
+            registered_columns(left, out)?;
+            registered_columns(right, out)
+        }
+        ScalarExpr::Call { args, .. } | ScalarExpr::Registered { args, .. } => {
+            for arg in args {
+                registered_columns(arg, out)?;
+            }
+            Ok(())
+        }
+        ScalarExpr::Case { .. } => Err(QueryError::Unsupported(
+            "CASE combined with a registered function in one expression              (lift the function out of the CASE)"
+                .to_owned(),
+        )),
+    }
+}
+
+/// The whole-query path: gather the used columns dense (live rows, in
+/// view order — a bounded copy, like the cross-segment window
+/// gathers), evaluate the expression ONCE over a synthetic single
+/// view, and split the result back per view.
+fn computed_column_whole(
+    schema: &Schema,
+    views: &[&SegmentView],
+    expr: &ScalarExpr,
+    name: &str,
+    registry: &Registry,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let mut names = Vec::new();
+    registered_columns(expr, &mut names)?;
+    names.sort();
+    names.dedup();
+    let total: usize = views.iter().map(|view| view.live_rows()).sum();
+    // Column 0 is a synthetic i64 ordering key so the batch satisfies
+    // the segment shape; the expression never references it.
+    let mut fields = vec![Field::new("__row", ColumnType::I64, false)];
+    let row_ids: Buffer<i64> = (0..total as i64).collect();
+    let mut gathered: Vec<Column> = vec![Column::Numeric(NumericData::I64(
+        NumericColumn::new_non_null(row_ids),
+    ))];
+    for column_name in &names {
+        let mut values = Vec::with_capacity(total);
+        let mut validity = Vec::with_capacity(total);
+        for view in views {
+            let column = ScalarExpr::Column(column_name.clone());
+            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry)?;
+            values.append(&mut v);
+            validity.append(&mut m);
+        }
+        fields.push(Field::new(column_name.clone(), ColumnType::F64, true));
+        gathered.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values, validity,
+        ))));
+    }
+    let batch = RecordBatch::new(Schema::new(fields), gathered);
+    let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch(batch, 0, false)));
+    let reduced = synthetic.segment.batch().schema().clone();
+    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry)?;
+    let mut columns = Vec::with_capacity(views.len());
+    let mut offset = 0;
+    for view in views {
+        let count = view.live_rows();
+        columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values[offset..offset + count].to_vec(),
+            validity[offset..offset + count].to_vec(),
+        ))));
+        offset += count;
     }
     Ok((Field::new(name, ColumnType::F64, true), columns))
 }

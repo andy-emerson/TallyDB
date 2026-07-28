@@ -15,6 +15,16 @@ recomputes every window independently in NumPy and diffs:
   lua_spread  max - min, NULL under three rows — the kernel-NULL path
               (the sentinel crossing back out as SQL NULL)
 
+Two composed COLUMN kernels (option A) ride the same stream, checked
+unpartitioned over the whole exported column (storage order = ts order
+in this fixture):
+
+  lua_rel     return (a - b) / b — vectorized operators; must equal the
+              NumPy expression bit-for-bit (same IEEE ops, same order)
+  lua_rdot    return rolling_dot(a, b, 10) — the native rolling
+              combinator, continuous across the fixture's 64-row
+              segment boundaries
+
 Usage: m2_lua_window_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
 """
@@ -88,6 +98,18 @@ def main():
     got_npos = table.column("npos").to_pylist()
     got_spread = table.column("spread").to_pylist()
 
+    # The composed column kernels: whole-column, unpartitioned.
+    got_rel = table.column("rel").to_numpy(zero_copy_only=False)
+    got_rdot = table.column("rdot").to_numpy(zero_copy_only=False)
+    if not np.array_equal(got_rel, (x - y) / y):
+        worst = np.nanmax(np.abs(got_rel - (x - y) / y))
+        sys.exit(f"lua_rel differs from (x - y) / y (worst {worst})")
+    for i in range(len(x)):
+        lo = max(0, i - window + 1)
+        expected = float(np.dot(x[lo : i + 1], y[lo : i + 1]))
+        if not np.isclose(got_rdot[i], expected, rtol=1e-12, atol=1e-9):
+            sys.exit(f"lua_rdot row {i}: {got_rdot[i]} != {expected}")
+
     checked = 0
     for symbol in sorted(set(symbols)):
         rows = [i for i, s in enumerate(symbols) if s == symbol]
@@ -127,6 +149,7 @@ def main():
                 )
             checked += 1
     print(f"PASS lua windows vs numpy ({checked} windows x 4 kernels)")
+    print(f"PASS composed column kernels vs numpy ({len(x)} rows x 2 kernels)")
     print(
         f"Lua-window family validated end-to-end over the storage round trip "
         f"(numpy {np.__version__}, pyarrow {pa.__version__}, "

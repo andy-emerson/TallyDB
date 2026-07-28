@@ -68,6 +68,7 @@ mod host;
 mod log;
 mod state;
 mod values;
+mod vector;
 
 pub use host::HostFunction;
 pub use log::LogSink;

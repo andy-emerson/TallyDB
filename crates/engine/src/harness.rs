@@ -325,6 +325,20 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
             ColumnType::F64,
         )
         .expect("lua_spread registers");
+    // The composed column kernels (option A): operators and rolling
+    // combinators vectorized in native code, one interpreter entry per
+    // query — including across segment boundaries, which the fixture's
+    // 64-row segments exercise.
+    table
+        .register_lua_scalar("lua_rel", &["a", "b"], "return (a - b) / b")
+        .expect("lua_rel registers");
+    table
+        .register_lua_scalar(
+            "lua_rdot",
+            &["a", "b"],
+            &format!("return rolling_dot(a, b, {})", LUA_PRECEDING + 1),
+        )
+        .expect("lua_rdot registers");
     let frame = format!(
         "OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN {LUA_PRECEDING} PRECEDING \
          AND CURRENT ROW)"
@@ -334,7 +348,9 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
          lua_mad(x) {frame} AS mad, \
          lua_wdot(y, x) {frame} AS wdot, \
          lua_npos(x) {frame} AS npos, \
-         lua_spread(x) {frame} AS spread \
+         lua_spread(x) {frame} AS spread, \
+         lua_rel(x, y) AS rel, \
+         lua_rdot(x, y) AS rdot \
          FROM trades"
     );
     match table.query_stream(&sql) {
@@ -408,6 +424,12 @@ pub extern "C" fn tallydb_bench_open(rows: u64) -> *mut BenchContext {
             "for i = 1, #a do out[i] = (a[i] - b[i]) / b[i] end",
         )
         .expect("lua_spread registers");
+    table
+        .register_lua_scalar("lua_rel", &["a", "b"], "return (a - b) / b")
+        .expect("lua_rel registers");
+    table
+        .register_lua_scalar("lua_rdot", &["a", "b"], "return rolling_dot(a, b, 64)")
+        .expect("lua_rdot registers");
     Box::into_raw(Box::new(BenchContext { table }))
 }
 

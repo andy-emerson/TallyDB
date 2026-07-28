@@ -972,4 +972,58 @@ mod tests {
             .register_lua_window("nope", "f", &["x"], "return 0", ColumnType::F64)
             .is_err());
     }
+    #[test]
+    fn a_composed_kernel_matches_the_native_expression_bit_for_bit() {
+        // Option A's promise, pinned: one interpreter entry, operators
+        // vectorized over the whole column, the same IEEE arithmetic as
+        // the native scalar-expression slot — so promotion changes
+        // nothing but speed. The tiny segment threshold matters: the
+        // rolling combinator must be continuous across storage-segment
+        // boundaries (whole-query evaluation), never reset by them.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("y", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 16).unwrap();
+        for i in 0..50i64 {
+            let x = i as f64 * 0.5 + 3.0;
+            let y = (i as f64).mul_add(-0.25, 40.0);
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(x), RowValue::F64(y)])
+                .unwrap();
+        }
+        table
+            .register_lua_scalar("rel", &["a", "b"], "return (a - b) / b")
+            .unwrap();
+        let composed = f64s(&table.query("SELECT rel(x, y) AS r FROM t").unwrap(), 0);
+        let native = f64s(&table.query("SELECT (x - y) / y AS r FROM t").unwrap(), 0);
+        assert_eq!(composed.len(), 50);
+        assert_eq!(composed.len(), native.len());
+        for (c, n) in composed.iter().zip(&native) {
+            match (c, n) {
+                (Some(c), Some(n)) => assert_eq!(c.to_bits(), n.to_bits()),
+                (c, n) => assert_eq!(c, n),
+            }
+        }
+        // The rolling combinator against a per-window recompute over
+        // the WHOLE column — windows straddle the 16-row segments.
+        table
+            .register_lua_scalar("rdot", &["a", "b"], "return rolling_dot(a, b, 5)")
+            .unwrap();
+        let rolled = f64s(&table.query("SELECT rdot(x, y) AS r FROM t").unwrap(), 0);
+        let raw = table.query("SELECT ts, x, y FROM t").unwrap();
+        let x = f64s(&raw, 1);
+        let y = f64s(&raw, 2);
+        for (i, got) in rolled.iter().enumerate() {
+            let lo = (i + 1).saturating_sub(5);
+            let expected: f64 = (lo..=i).map(|j| x[j].unwrap() * y[j].unwrap()).sum();
+            let got = got.unwrap();
+            let scale = expected.abs().max(1.0);
+            assert!(
+                ((got - expected) / scale).abs() < 1e-12,
+                "row {i}: {got} vs {expected}"
+            );
+        }
+    }
 }
