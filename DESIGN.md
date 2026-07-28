@@ -1075,14 +1075,23 @@ hosts that have no language of their own:
    where fixed costs dominate). It is **not** the extensibility story;
    the trait is.
 
-**The sunset clause.** ~32k lines (vendored C + bindings) is not yet
-justified by that niche. Lua must demonstrate value before release
-1.0 — real console/browser kernel use, or the latency niche exercised
-in practice — or it is removed and tier 3 becomes query-only. If the
-sunset executes, the **no-coined-SQL-names principle reopens by its
-recorded trigger** (ruled 2026-07-28): with no scripting layer to
-carry novel compute names, SQL becomes their only home, and
-`eigen_max`-class naming must be re-decided there. The
+**The sunset clause (restructured 2026-07-28).** ~32k lines (vendored
+C + bindings) is not yet justified by that niche, so Lua stands trial
+**at the end of M4**, once its best case exists: the trait beneath it,
+the vocabulary invariant, the vectorized whole-column slot, the
+compose-don't-loop idiom, and the upstream test suite all built. The
+Agent brings the evidence brief — measured bulk and latency ratios
+after the wiring, console ergonomics demonstrated, upstream-suite
+results, and the honest remaining costs (the per-kernel mutex, #61) —
+and **the Human alone renders the verdict** from that evidence. On a
+pass: the clause dissolves, and **SQL-in-Lua (#70) is built and tested
+as M4's closing increment** — the second direction earned by the
+first. On a fail: Lua is removed whole (the crate, the feature flag,
+the console's `.lua`), tier 3 becomes query-only, and the
+**no-coined-SQL-names principle reopens by its recorded trigger**:
+with no scripting layer to carry novel compute names, SQL becomes
+their only home, and `eigen_max`-class naming must be re-decided
+there. The
 runaway-kernel guard (#61) is scoped by the same ruling: required
 before Lua ships in any surface serving untrusted input (the M7
 served product), optional for a local console.
