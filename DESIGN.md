@@ -550,14 +550,14 @@ rebuild, being wrong about the additive one costs a later layer.
 | Axis | Our position | Licensing assumption | Reversal class |
 |---|---|---|---|
 | Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
-| Working set | **Cut, now owned**: v1 opens decode-into-memory | A table fits in memory (see below) | Foundational |
+| Working set | **Cut, amended by ruling 2026-07-28**: the *queried working set* fits in memory. Segment-lazy open lands in M4 — the manifest carries per-segment zone maps so pruning runs before decode, and a segment's bytes load on first touch; decode-into-memory stands until then. (Distinct from the retired mmap/ranged-read path: whole-object reads and the backend contract are untouched.) | The rows a query touches fit in memory (see below) | Foundational |
 | Query (planner) | Cut: a **fixed-strategy planner** — `plan()` exists; search, costing, and choice do not | One access path ⇒ nothing to choose between | Additive |
 | Query (surface) | **Refused**: broad standard SQL, bounded by the inclusion principle | — | Additive |
 | Access path | Cut totally: no secondary indexes; ordering-key clustering + scan is the one path (zone maps are pruning metadata, not a path) | Ordered ingest on the declared key (assumption 2) | Invasive |
 | Write | **Refused**: cheap online single-row append is the design center | — | n/a |
 | Transaction | Cut: submitted units only — no `BEGIN`/`COMMIT`/`ROLLBACK`, no session state (contract below) | Work arrives as single statements | Invasive |
 | Isolation | Fixed: snapshot isolation at statement granularity (contract below) | One guarantee suffices | Invasive |
-| Concurrency | Single writer, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds | One writer at a time is enough | Additive to correct |
+| Concurrency | Single writer *per table*, concurrent snapshot readers — shipped at the facade in M3.1 (#51): `Table::reader()` mints `Send + Sync` snapshot handles while the one writer proceeds. Writers scale by table (one owner each — a thread, or a whole process: directory locks are per table). **Cross-process readers ruled in 2026-07-28 (M4):** writer-exclusive / reader-shared locks; POSIX-first — unlink-keeps-open-files-alive gives reader safety for free on Linux/macOS, Windows requires deferred deletes and is documented as the lagging platform until its cleanup pass | One writer per table is enough | Additive to correct |
 | Distribution | Cut totally: one machine | Data and load fit one node — and **compute-without-copying exists only because no network boundary exists anywhere**, the deployment argument generalized | Foundational |
 | Deployment | Cut: library, never a server (see *Deployment shapes*; live in-process ingest+compute is in, networked subscriber fan-out is out — *Live data* below) | One application owns the data | Additive |
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
