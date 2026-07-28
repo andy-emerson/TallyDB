@@ -30,11 +30,10 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
-use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
 use arrow_lite::ColumnType;
 use compute_linalg::{LinalgBackend, RustLinalg};
 use compute_lua::{Chunk, ColumnView, HostFunction, LogSink, LuaState, ReturnType, ScalarValue};
-use query_lite::WindowAggregate;
+use query_lite::{Registry, WindowAggregate};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
@@ -75,13 +74,13 @@ impl HostFunction for DotOp {
     }
 }
 
-/// Adapts a native window statistic to the host-function seam — the
-/// same argument shape (dense `f64` slices) and the same
+/// Adapts a registered window implementation to the host-function seam
+/// — the same argument shape (dense `f64` slices) and the same
 /// undefined-is-NULL convention, so one implementation serves both the
 /// SQL window registry and scripts.
-struct CuratedOp<A>(A);
+struct RegistryOp(Arc<dyn WindowAggregate>);
 
-impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
+impl HostFunction for RegistryOp {
     fn arity(&self) -> usize {
         self.0.arity()
     }
@@ -90,28 +89,19 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
     }
 }
 
-/// Installs the curated compute spread into a kernel's state: `dot`
-/// (compute-linalg), `regr_slope` / `regr_intercept` (closed-form least squares),
-/// and
-/// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
-/// implementations the SQL windows run, reading the same view buffers
-/// with no copy. This is the compute-without-copying surface inside a
-/// script: engine buffers, curated native ops, and the interpreter all
-/// share memory.
-fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
+/// Installs the whole registered vocabulary into a kernel's state —
+/// **the vocabulary invariant: anything SQL can call, a Lua kernel can
+/// call**, by the same name, over the same view buffers with no copy.
+/// Registry-driven rather than a hardcoded list, so every future
+/// native (and every embedder-registered kernel that exists at this
+/// registration) flows into scripts for free. `dot` (compute-linalg)
+/// rides along as the one op that lives outside the registry. This is
+/// the compute-without-copying surface inside a script: engine
+/// buffers, native ops, and the interpreter all share memory.
+fn install_vocabulary(state: &mut LuaState, ops: &Registry) -> Result<(), String> {
     state.register_host_function("dot", Box::new(DotOp(RustLinalg)))?;
-    for (name, output) in [
-        ("regr_slope", RegressionOutput::Slope),
-        ("regr_intercept", RegressionOutput::Intercept),
-    ] {
-        state.register_host_function(name, Box::new(CuratedOp(RollingRegression { output })))?;
-    }
-    for (name, kind) in [
-        ("covar_pop", PairKind::CovarPop),
-        ("corr", PairKind::Corr),
-        ("eigen_max", PairKind::EigenMax),
-    ] {
-        state.register_host_function(name, Box::new(CuratedOp(PairStatistic { kind })))?;
+    for (name, aggregate) in ops.entries() {
+        state.register_host_function(name, Box::new(RegistryOp(Arc::clone(aggregate))))?;
     }
     Ok(())
 }
@@ -141,6 +131,7 @@ impl LuaWindow {
         chunk: &str,
         output: ColumnType,
         log_sink: Option<Arc<dyn LogSink + Sync>>,
+        ops: &Registry,
     ) -> Result<LuaWindow, String> {
         if output == ColumnType::Key {
             return Err(
@@ -170,7 +161,7 @@ impl LuaWindow {
             names.push(name);
         }
         let mut state = LuaState::new()?;
-        install_curated_ops(&mut state)?;
+        install_vocabulary(&mut state, ops)?;
         if let Some(sink) = log_sink {
             state.set_log_sink(Box::new(SharedSink(sink)));
         }
@@ -322,6 +313,111 @@ mod tests {
         assert_eq!(messages.len(), 3, "one log per window");
         assert_eq!(messages[0], "rows\t1");
         assert_eq!(messages[1], "rows\t2");
+    }
+
+    #[test]
+    fn anything_sql_can_call_lua_can_call() {
+        // The vocabulary invariant, registry-driven: a native
+        // registered through the public trait path is immediately
+        // callable from a Lua kernel by its SQL name — including
+        // natives that did not exist when the vocabulary was designed.
+        struct SumSq;
+        impl query_lite::WindowAggregate for SumSq {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(args[0].iter().map(|v| v * v).sum()))
+            }
+        }
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        for i in 0..6i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::Key("A"), RowValue::F64(2.0)])
+                .unwrap();
+        }
+        table.register_window("sumsq", SumSq).unwrap();
+        table
+            .register_lua_window(
+                "twice_sumsq",
+                &["x"],
+                "return 2 * sumsq(x)",
+                ColumnType::F64,
+            )
+            .unwrap();
+        let output = table
+            .query(
+                "SELECT twice_sumsq(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+                 AND CURRENT ROW) AS s FROM t",
+            )
+            .unwrap();
+        // Full two-row frames of 2.0: 2 * (4 + 4) = 16.
+        assert_eq!(f64s(&output, 0)[1..], [Some(16.0); 5]);
+        // And every built-in statistic is reachable from a kernel by
+        // its SQL name — the registry is the single source of names.
+        for name in [
+            "regr_slope",
+            "regr_intercept",
+            "covar_pop",
+            "corr",
+            "eigen_max",
+        ] {
+            table
+                .register_lua_window(
+                    &format!("via_{name}"),
+                    &["y", "x"],
+                    &format!("return {name}(y, x)"),
+                    ColumnType::F64,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn promotion_swaps_a_lua_kernel_for_a_native_under_its_name() {
+        // The promotion path made mechanical: a kernel prototyped in
+        // Lua keeps its SQL name when a native lands under it — the
+        // query text never changes, and matching fold order gives
+        // matching results.
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        let data = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        for (i, &x) in data.iter().enumerate() {
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(x),
+                ])
+                .unwrap();
+        }
+        let sql = "SELECT mean2(x) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING \
+                   AND CURRENT ROW) AS m FROM t";
+        table
+            .register_lua_window(
+                "mean2",
+                &["x"],
+                "local s = 0.0\nfor i = 1, #x do s = s + x[i] end\nreturn s / #x",
+                ColumnType::F64,
+            )
+            .unwrap();
+        let prototype = f64s(&table.query(sql).unwrap(), 0);
+        struct Mean;
+        impl query_lite::WindowAggregate for Mean {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                let mut sum = 0.0;
+                for &value in args[0] {
+                    sum += value;
+                }
+                Ok(Some(sum / args[0].len() as f64))
+            }
+        }
+        table.register_window("mean2", Mean).unwrap();
+        let promoted = f64s(&table.query(sql).unwrap(), 0);
+        // Same fold order on both sides: bit-identical, not approximate.
+        assert_eq!(prototype, promoted);
     }
 
     #[test]

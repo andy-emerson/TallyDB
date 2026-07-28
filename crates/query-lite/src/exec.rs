@@ -111,6 +111,15 @@ impl Registry {
         self.aggregates.insert(name.to_lowercase(), aggregate);
     }
 
+    /// Every registered name and its implementation, in no particular
+    /// order — what lets an embedding expose the whole vocabulary to a
+    /// scripting layer (anything SQL can call, a script can call).
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Arc<dyn WindowAggregate>)> {
+        self.aggregates
+            .iter()
+            .map(|(name, aggregate)| (name.as_str(), aggregate))
+    }
+
     fn get(&self, name: &str) -> Option<&Arc<dyn WindowAggregate>> {
         self.aggregates.get(name)
     }

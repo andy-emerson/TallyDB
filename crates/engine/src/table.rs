@@ -644,9 +644,17 @@ impl Table {
                 "function name '{name}' is not callable from SQL"
             )));
         }
-        let window =
-            crate::script::LuaWindow::new(parameters, chunk, output, self.lua_log_sink.clone())
-                .map_err(EngineError::Script)?;
+        // The kernel's vocabulary is the registry as of this moment —
+        // every native and every previously registered kernel, by name.
+        let ops = self.current_registry();
+        let window = crate::script::LuaWindow::new(
+            parameters,
+            chunk,
+            output,
+            self.lua_log_sink.clone(),
+            &ops,
+        )
+        .map_err(EngineError::Script)?;
         self.register_kernel(name, Arc::new(window))
     }
 
