@@ -1,0 +1,931 @@
+/* TallyDB landing page. Organized in page order: tokens, base, shared
+   patterns, then one block per section of index.html. */
+
+/* ── Design tokens ─────────────────────────────────────────────── */
+
+:root {
+  --paper: #f2e9dc;
+  --paper-2: #ebdfcd;
+  --card: #f8f2e8;
+  --line: #d9c9ae;
+  --ink: #2e2419;
+  --ink-2: #5c4b38;
+  --ink-3: #8a7757;
+  --accent: #8c4a1e;
+  --accent-soft: #e6d2b6;
+  --code-bg: #ece0c9;
+  --band: #2e2419;
+  --band-ink: #f2e9dc;
+}
+
+html[data-theme="dark"] {
+  --paper: #191512;
+  --paper-2: #211b16;
+  --card: #221c17;
+  --line: #3b322a;
+  --ink: #eee2cd;
+  --ink-2: #c3b295;
+  --ink-3: #8d7d64;
+  --accent: #d99a5b;
+  --accent-soft: #3a2e21;
+  --code-bg: #120f0d;
+  --band: #0f0d0b;
+  --band-ink: #eee2cd;
+}
+
+/* ── Base ──────────────────────────────────────────────────────── */
+
+* { box-sizing: border-box; }
+
+html {
+  background: var(--paper);
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-wrap: pretty;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover { color: var(--ink); }
+
+h1, h2, h3 {
+  font-family: Newsreader, Georgia, serif;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+
+code, pre { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+pre { min-width: 0; }
+
+::selection { background: color-mix(in oklab, var(--accent) 30%, transparent); }
+
+/* ── Shared patterns ───────────────────────────────────────────── */
+
+/* Centered column. Vertical padding belongs to the section that uses it. */
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-inline: clamp(16px, 3vw, 28px);
+}
+
+/* Responsive card grid. Callers set --min (column floor) and --gap. */
+.autogrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--min, 280px), 1fr));
+  gap: var(--gap, 20px);
+}
+
+.section { padding-block: clamp(56px, 7vw, 84px) 0; }
+.section--last { padding-block: clamp(56px, 7vw, 84px); }
+
+/* Section opener: heading plus lead paragraph, held to a readable measure. The
+   gap to the section body varies a little by section; see those blocks below. */
+.sec-head {
+  max-width: 62ch;
+  margin-bottom: 36px;
+}
+
+.sec-head h2 {
+  font-size: clamp(28px, 3.4vw, 38px);
+  line-height: 1.15;
+  margin-bottom: 12px;
+}
+
+.sec-head p {
+  margin: 0;
+  font-size: 17.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+/* Sub-opener: mono eyebrow, serif heading, one paragraph. */
+.sub-head {
+  max-width: 66ch;
+  margin-bottom: 24px;
+}
+
+.sub-head h3 {
+  font-size: clamp(22px, 2.4vw, 27px);
+  line-height: 1.2;
+  margin-bottom: 10px;
+}
+
+/* The eyebrow is also a <p> here, and carries its own type — exclude it rather
+   than relying on source order to break the specificity tie. */
+.sub-head p:not(.eyebrow) {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+.sub-head p code { font-size: 15px; }
+
+.eyebrow {
+  margin: 0 0 10px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* Running prose below a card grid. */
+.prose {
+  margin-top: 24px;
+  max-width: 74ch;
+  display: grid;
+  gap: 16px;
+}
+
+.prose p {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+.prose p.aside { color: var(--ink-3); }
+
+.rule {
+  height: 1px;
+  background: var(--line);
+  margin: clamp(40px, 5vw, 60px) 0;
+}
+
+/* The quill glyph, painted as a mask so it takes the current palette. */
+.mark {
+  flex: none;
+  display: block;
+  background: var(--ink);
+  mask: url("logo.png") center / contain no-repeat;
+  -webkit-mask: url("logo.png") center / contain no-repeat;
+}
+
+.wordmark {
+  font-family: Newsreader, Georgia, serif;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.wordmark i {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.wordmark b {
+  font-weight: inherit;
+  color: var(--ink);
+}
+
+.btn {
+  display: inline-block;
+  font-weight: 500;
+  border-radius: 8px;
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.btn--outline {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.btn--on-band {
+  border: 1px solid color-mix(in oklab, var(--band-ink) 30%, transparent);
+  color: var(--band-ink);
+}
+
+.btn--s { font-size: 14px; padding: 8px 14px; }
+.btn--m { font-size: 14px; padding: 9px 16px; }
+.btn--l { font-size: 15.5px; padding: 14px 24px; }
+.btn--l-narrow { font-size: 15.5px; padding: 14px 22px; }
+
+/* Spans inside <pre> blocks: de-emphasized comments, emphasized input. */
+.cmt { color: var(--ink-3); }
+.hi { color: var(--ink); }
+.acc { color: var(--accent); }
+
+/* ── Header ────────────────────────────────────────────────────── */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+
+.site-header .wrap {
+  padding-block: 10px;
+  min-height: 64px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 28px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink);
+  flex: none;
+}
+
+.brand .mark {
+  width: 28px;
+  height: 28px;
+}
+
+.brand .wordmark { font-size: 27px; }
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  font-size: 14.5px;
+  color: var(--ink-2);
+  flex: 1 1 200px;
+}
+
+.site-nav a { color: inherit; }
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  flex: 0 1 auto;
+  margin-left: auto;
+}
+
+.theme-toggle {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+  font: 500 13px/1 "IBM Plex Mono", monospace;
+}
+
+.theme-toggle:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+/* ── Hero ──────────────────────────────────────────────────────── */
+
+.hero {
+  --min: 340px;
+  --gap: 48px;
+  padding-block: clamp(48px, 7vw, 88px) 64px;
+  align-items: center;
+}
+
+.hero-brand {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 2vw, 22px);
+  margin-bottom: 22px;
+}
+
+.hero-brand .mark {
+  width: clamp(52px, 7vw, 76px);
+  height: clamp(52px, 7vw, 76px);
+}
+
+.hero-brand .wordmark {
+  font-size: clamp(46px, 7vw, 82px);
+  letter-spacing: -0.03em;
+}
+
+.pill {
+  margin: 0 0 18px;
+  display: inline-block;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 7px 11px;
+  border-radius: 999px;
+}
+
+.hero h1 {
+  font-size: clamp(36px, 5.2vw, 60px);
+  line-height: 1.04;
+  margin-bottom: 20px;
+}
+
+.hero-lead {
+  font-size: 19.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+  margin: 0 0 16px;
+  max-width: 48ch;
+}
+
+.hero-sub {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-3);
+  margin: 0 0 30px;
+  max-width: 52ch;
+}
+
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 26px;
+}
+
+.install-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 12px 12px 16px;
+  max-width: 460px;
+}
+
+.install-line__prompt {
+  color: var(--ink-3);
+  font: 400 14px/1 "IBM Plex Mono", monospace;
+}
+
+.install-line code {
+  flex: 1;
+  font-size: 14px;
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.copy-btn {
+  flex: none;
+  font: 500 11px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.copy-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+/* Hero terminal transcript. */
+.term {
+  min-width: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 18px 40px -28px rgba(46, 36, 25, 0.5);
+}
+
+.term__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  font: 400 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.term__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: block;
+}
+
+.term pre {
+  margin: 0;
+  padding: 22px 20px;
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--ink-2);
+  overflow-x: auto;
+}
+
+/* ── Stat band ─────────────────────────────────────────────────── */
+
+.statband {
+  background: var(--band);
+  color: var(--band-ink);
+}
+
+.statband .wrap {
+  --min: 200px;
+  --gap: 32px;
+  padding-block: 40px;
+}
+
+.stat__n {
+  margin: 0 0 6px;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 34px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.stat__what {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  opacity: 0.82;
+}
+
+/* ── Benchmarks ────────────────────────────────────────────────── */
+
+.panel {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: clamp(20px, 3vw, 34px);
+}
+
+.panel__axis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  align-items: center;
+  margin-bottom: 24px;
+  font: 400 12.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.bars {
+  display: grid;
+  gap: 26px;
+}
+
+.bar__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.bar__label {
+  font-size: 15.5px;
+  color: var(--ink);
+}
+
+.bar__tag {
+  font: 500 14px/1 "IBM Plex Mono", monospace;
+  color: var(--accent);
+}
+
+.bar__rows {
+  display: grid;
+  gap: 7px;
+}
+
+.bar__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.bar__who {
+  flex: 0 1 auto;
+  min-width: 62px;
+  width: clamp(62px, 14vw, 132px);
+  font: 500 12px/1 "IBM Plex Mono", monospace;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.bar__track {
+  flex: 1 1 auto;
+  min-width: 100px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--paper-2);
+}
+
+/* Width is per-measurement data and is set inline on the element. */
+.bar__fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+}
+
+.bar__pace {
+  flex: 0 1 auto;
+  min-width: 66px;
+  width: clamp(66px, 12vw, 116px);
+  text-align: right;
+  font: 500 13px/1 "IBM Plex Mono", monospace;
+  color: var(--ink);
+}
+
+.bar__row--peer .bar__who { color: var(--ink-3); }
+
+.bar__row--peer .bar__fill {
+  background: var(--ink-3);
+  opacity: 0.45;
+}
+
+.bar__row--peer .bar__pace {
+  font-weight: 400;
+  color: var(--ink-3);
+}
+
+.panel__foot {
+  --min: 260px;
+  --gap: 24px;
+  margin-top: 28px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+
+.panel__foot h3 {
+  font-size: 17px;
+  margin-bottom: 7px;
+}
+
+.panel__foot p {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+/* ── The three assumptions ─────────────────────────────────────── */
+
+.principles {
+  --min: 280px;
+  --gap: 20px;
+}
+
+.principle {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 26px 24px;
+}
+
+.principle__num {
+  margin: 0 0 12px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+
+.principle h3 {
+  font-size: 21px;
+  margin-bottom: 9px;
+}
+
+/* Excludes the number, which is also a <p>. */
+.principle p:not(.principle__num) {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--ink-2);
+}
+
+.principle code { font-size: 13.5px; }
+
+/* ── Comparison table ─────────────────────────────────────────── */
+
+.tablewrap {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+.ctable {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.ctable thead tr { background: var(--paper-2); }
+
+.ctable th,
+.ctable td {
+  padding: 15px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ctable th { text-align: left; }
+
+.ctable th.ctable__dim {
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.ctable th.ctable__ours {
+  font-family: Newsreader, Georgia, serif;
+  font-size: 17px;
+  color: var(--accent);
+}
+
+.ctable th.ctable__peer {
+  font: 500 13px/1 "IBM Plex Sans", sans-serif;
+  color: var(--ink-2);
+}
+
+.ctable td { color: var(--ink-2); }
+
+.ctable td.ctable__ours {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* ── Fit / misfit cards ───────────────────────────────────────── */
+
+.fits {
+  --min: 300px;
+  --gap: 20px;
+  margin-top: 24px;
+}
+
+.fit {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  background: var(--card);
+}
+
+.fit--alt { background: var(--paper-2); }
+
+.fit h3 {
+  font-size: 19px;
+  margin-bottom: 9px;
+}
+
+.fit p {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--ink-2);
+}
+
+/* ── Install cards ────────────────────────────────────────────── */
+
+#install .sec-head { margin-bottom: 40px; }
+
+.icards {
+  --min: 320px;
+  --gap: 20px;
+}
+
+.icard {
+  min-width: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.icard__head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.icard__head h3 {
+  font-size: 19px;
+  margin-bottom: 4px;
+}
+
+.icard__head p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-3);
+}
+
+.icard pre {
+  margin: 0;
+  padding: 20px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink);
+  background: var(--code-bg);
+  overflow-x: auto;
+}
+
+/* ── Docs tabs ────────────────────────────────────────────────── */
+
+#docs .sec-head { margin-bottom: 32px; }
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.tab {
+  font-size: 14.5px;
+  font-weight: 500;
+  padding: 10px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.tabpanel {
+  --min: 320px;
+  --gap: 24px;
+  align-items: start;
+}
+
+/* Beats .autogrid's display:grid, which would otherwise defeat [hidden]. */
+.tabpanel[hidden] { display: none; }
+
+/* The prose half of a tab. Kept a class of its own so these rules cannot reach
+   into the code sample beside it, whose label is also a <p>. */
+.tab-prose h3 {
+  font-size: 23px;
+  margin-bottom: 10px;
+}
+
+.tab-prose p {
+  margin: 0 0 14px;
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+.tab-prose p.aside {
+  margin: 0;
+  font-size: 15px;
+  color: var(--ink-3);
+}
+
+.tab-prose code { font-size: 14px; }
+
+/* Labelled code sample beside each tab's prose. */
+.snippet {
+  min-width: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.snippet__label {
+  margin: 0;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.snippet pre {
+  margin: 0;
+  padding: 22px 20px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink);
+  overflow-x: auto;
+}
+
+/* ── Closing call to action ───────────────────────────────────── */
+
+.cta {
+  --min: 280px;
+  --gap: 36px;
+  background: var(--band);
+  color: var(--band-ink);
+  border-radius: 14px;
+  padding: clamp(32px, 5vw, 56px);
+  align-items: center;
+}
+
+.cta h2 {
+  font-size: clamp(26px, 3.2vw, 34px);
+  line-height: 1.15;
+  margin-bottom: 12px;
+}
+
+.cta p {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.6;
+  opacity: 0.82;
+}
+
+.cta__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Stretched to the column's full width, so the label needs centering. */
+.cta__actions .btn { text-align: center; }
+
+/* ── Footer ───────────────────────────────────────────────────── */
+
+.site-footer {
+  border-top: 1px solid var(--line);
+  background: var(--paper-2);
+}
+
+.site-footer > .wrap {
+  --min: 180px;
+  --gap: 32px;
+  padding-block: 44px;
+}
+
+.footer-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.footer-brand .mark {
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+}
+
+.footer-brand .wordmark { font-size: 25px; }
+
+.footer-tag {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+
+.footer-label {
+  margin: 0 0 12px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.footer-links {
+  display: grid;
+  gap: 9px;
+  font-size: 14.5px;
+}
+
+.footer-links a { color: var(--ink-2); }
+
+.legal { border-top: 1px solid var(--line); }
+
+.legal .wrap {
+  padding-block: 18px;
+  font-size: 13.5px;
+  color: var(--ink-3);
+}
