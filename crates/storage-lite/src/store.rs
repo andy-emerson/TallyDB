@@ -793,9 +793,17 @@ impl Store {
                 "a delete log ran ahead of its rows; retrying".to_owned(),
             )));
         }
-        let mut history = Vec::with_capacity(store.manifest_sections.history.len());
-        for name in &store.manifest_sections.history.clone() {
+        let history_names = store.manifest_sections.history.clone();
+        let mut history = Vec::with_capacity(history_names.len());
+        for name in &history_names {
             let segment = decode_segment(&backend.read(name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!(
+                        "history segment '{name}' was written under a different schema"
+                    ),
+                });
+            }
             history.push(Arc::new(segment));
         }
         let recorded = store.manifest_sections.next_sequence;
