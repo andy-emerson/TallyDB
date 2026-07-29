@@ -114,6 +114,30 @@ def families() -> list[str]:
         "AND CURRENT ROW) AS w FROM corpus JOIN sensors "
         "ON corpus.sym = sensors.sym ORDER BY ts",
     ]
+    # Join projection pushdown (#81): only the dimension columns a
+    # query reads are gathered, so the queries that matter are the ones
+    # reading a dimension column WITHOUT projecting it — a wrong
+    # used-set computation shows up here and nowhere else.
+    queries += [
+        "SELECT ts, x FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE site = 'north' ORDER BY ts",
+        "SELECT ts, x FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE calib > 1.0 AND site <> 'east' ORDER BY ts",
+        "SELECT ts, x * calib AS scaled FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, CASE WHEN site = 'north' THEN x ELSE 0 END AS northern "
+        "FROM corpus JOIN sensors ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT site, count(*) AS n FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym WHERE calib > 1.0 GROUP BY site ORDER BY site",
+        "SELECT site, avg(x) AS a FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym GROUP BY site HAVING sum(calib) > 100 "
+        "ORDER BY site",
+        "SELECT ts, sum(x) OVER (PARTITION BY site ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, x FROM corpus LEFT JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE calib IS NULL ORDER BY ts",
+    ]
     # The full window surface: standard aggregates as windows, mixed
     # frames, several windows in one query.
     queries += [

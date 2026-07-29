@@ -345,6 +345,127 @@ pub struct Plan {
     pub as_of: Option<u64>,
 }
 
+impl Plan {
+    /// Every stored-column name this plan reads, by any route: the
+    /// projection (plain, computed, window), `GROUP BY`, `HAVING`, and
+    /// the `WHERE` predicate. Deliberately over-inclusive — output
+    /// aliases and hidden `__having` names come along, and a name that
+    /// matches no column simply never matches anything.
+    ///
+    /// The join uses it to gather only the dimension columns a query
+    /// actually needs (#81). That makes completeness load-bearing:
+    /// omitting a route here would drop a column the query then cannot
+    /// resolve. It fails loudly rather than silently — the column is
+    /// absent, not null-filled — but it fails, so every variant above
+    /// must be walked, and a new one has to be added here too.
+    pub fn referenced_columns(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        if let Some(predicate) = &self.predicate {
+            predicate_columns(predicate, &mut names);
+        }
+        if let Some(order_by) = &self.order_by {
+            // Resolved against the *output* schema, so this is only
+            // ever an alias — harmless, and free insurance for the
+            // unaliased case where the two names coincide.
+            names.insert(order_by.column.clone());
+        }
+        match &self.projection {
+            Projection::Items(items) => {
+                for item in items {
+                    match item {
+                        PlanItem::Column { name, .. } => {
+                            names.insert(name.clone());
+                        }
+                        PlanItem::Computed { expr, .. } => scalar_columns(expr, &mut names),
+                        PlanItem::WindowAgg {
+                            args,
+                            partition_by,
+                            order_by,
+                            ..
+                        } => {
+                            names.extend(args.iter().cloned());
+                            names.extend(partition_by.iter().cloned());
+                            names.insert(order_by.clone());
+                        }
+                    }
+                }
+            }
+            Projection::Aggregate {
+                keys,
+                items,
+                having,
+            } => {
+                names.extend(keys.iter().cloned());
+                let agg_item =
+                    |item: &AggItem, names: &mut std::collections::HashSet<String>| match item {
+                        AggItem::Key { name, .. } => {
+                            names.insert(name.clone());
+                        }
+                        AggItem::Call(call) => names.extend(call.argument.iter().cloned()),
+                    };
+                for item in items {
+                    agg_item(item, &mut names);
+                }
+                if let Some(having) = having {
+                    for item in &having.items {
+                        agg_item(item, &mut names);
+                    }
+                    predicate_columns(&having.predicate, &mut names);
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Every column name a predicate tests.
+fn predicate_columns(predicate: &Predicate, names: &mut std::collections::HashSet<String>) {
+    match predicate {
+        Predicate::Compare { column, .. }
+        | Predicate::KeyEquals { column, .. }
+        | Predicate::KeyLike { column, .. }
+        | Predicate::KeyIn { column, .. }
+        | Predicate::IsNull { column, .. } => {
+            names.insert(column.clone());
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_columns(left, names);
+            predicate_columns(right, names);
+        }
+        Predicate::Not(inner) => predicate_columns(inner, names),
+    }
+}
+
+/// Every column name a scalar expression reads, `CASE` conditions
+/// included.
+fn scalar_columns(expr: &ScalarExpr, names: &mut std::collections::HashSet<String>) {
+    match expr {
+        ScalarExpr::Column(name) => {
+            names.insert(name.clone());
+        }
+        ScalarExpr::Literal(_) => {}
+        ScalarExpr::Negate(inner) => scalar_columns(inner, names),
+        ScalarExpr::Binary { left, right, .. } => {
+            scalar_columns(left, names);
+            scalar_columns(right, names);
+        }
+        ScalarExpr::Call { args, .. } | ScalarExpr::Registered { args, .. } => {
+            for argument in args {
+                scalar_columns(argument, names);
+            }
+        }
+        ScalarExpr::Case { whens, otherwise } => {
+            for (condition, value) in whens {
+                predicate_columns(condition, names);
+                scalar_columns(value, names);
+            }
+            if let Some(otherwise) = otherwise {
+                scalar_columns(otherwise, names);
+            }
+        }
+    }
+}
+
 /// A value the right side of `SET column = ...` may hold.
 #[derive(Clone, PartialEq, Debug)]
 pub enum SetValue {

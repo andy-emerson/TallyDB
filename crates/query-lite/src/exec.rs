@@ -272,15 +272,22 @@ pub fn execute_join(
             }
         }
     }
-    // The joined schema: fact columns, then dimension columns minus its
-    // key (it duplicates the fact key), all nullable (LEFT produces
-    // nulls; INNER's placeholders sit under the dead mask).
+    // The joined schema: fact columns, then the dimension columns the
+    // query actually reads (#81) minus its key (which duplicates the
+    // fact key), all nullable (LEFT produces nulls; INNER's
+    // placeholders sit under the dead mask). Gathering an unread
+    // attribute would cost a full fact-cardinality column for nothing —
+    // dimensions are wide and queries are narrow.
+    let referenced = plan.referenced_columns();
     let mut fields: Vec<Field> = fact_schema.fields().to_vec();
     let mut dimension_columns: Vec<usize> = Vec::new();
     for (index, field) in dimension_schema.fields().iter().enumerate() {
         if index == dimension_key_index {
             continue;
         }
+        // The name clash is refused whether or not the query reads the
+        // column: which query runs must not decide whether a schema
+        // pairing is legal.
         if fact_schema
             .fields()
             .iter()
@@ -291,6 +298,9 @@ pub fn execute_join(
                  distinct attribute names",
                 field.name()
             )));
+        }
+        if !referenced.contains(field.name()) {
+            continue;
         }
         dimension_columns.push(index);
         fields.push(Field::new(field.name(), field.column_type(), true));
