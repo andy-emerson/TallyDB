@@ -524,7 +524,11 @@ fn execute_single(
         output = distinct_output(output);
     }
     if let Some(order_by) = &plan.order_by {
-        output = sort_output(output, order_by)?;
+        // Only the rows OFFSET/LIMIT can reach are worth sorting.
+        let keep = plan
+            .limit
+            .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
+        output = sort_output(output, order_by, keep)?;
     }
     if plan.limit.is_some() || plan.offset.is_some() {
         output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
@@ -1912,39 +1916,43 @@ enum SortCell {
     Text(String),
 }
 
-/// Sorts the whole output by one column into a single batch — the
-/// materialization ORDER BY inherently asks for, plus (today) a `String`
-/// per row for key columns and a doubled `picks` index, and **no top-k**:
-/// `ORDER BY ... LIMIT k` still sorts and materializes the entire result
-/// before the limit applies (#56). Nulls sort **last in
-/// both directions**, DuckDB's default (PostgreSQL flips them under
-/// DESC; when the two disagree we follow our oracle); `f64` uses total
-/// order, so NaN sorts above every number.
-fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, QueryError> {
+/// One row's place in the sort: its key cell, where the row lives, and
+/// its input position — which breaks ties, so every path here returns
+/// exactly the stable order.
+type SortEntry = (Option<SortCell>, (usize, usize), usize);
+
+/// Sorts the output by one column into a single batch. Nulls sort
+/// **last in both directions**, DuckDB's default (PostgreSQL flips them
+/// under DESC; when the two disagree we follow our oracle); `f64` uses
+/// total order, so NaN sorts above every number.
+///
+/// `keep` is how many leading rows the query can actually use —
+/// `OFFSET + LIMIT`, or `None` when it asks for all of them. Given a
+/// bound, this takes the **top-k** path (#80): one sweep holding a
+/// heap of the k best rows, so the work is O(n log k) and the memory
+/// O(k), where the full sort costs O(n log n) and materializes a
+/// sorted copy of everything — a ten-row answer no longer pays for a
+/// million-row sort. Both paths return the same rows in the same
+/// order; the tie-breaking position is what makes that exact rather
+/// than merely equivalent.
+fn sort_output(
+    output: QueryOutput,
+    order_by: &OrderBy,
+    keep: Option<usize>,
+) -> Result<QueryOutput, QueryError> {
     let (column_index, _) = resolve(&output.schema, &order_by.column)?;
-    let mut picks: Vec<(usize, usize)> = Vec::with_capacity(output.num_rows());
-    let mut cells: Vec<Option<SortCell>> = Vec::with_capacity(output.num_rows());
-    for (batch_index, batch) in output.batches.iter().enumerate() {
-        let column = &batch.columns()[column_index];
-        for row in 0..batch.num_rows() {
-            picks.push((batch_index, row));
-            cells.push(match column {
-                Column::Numeric(NumericData::F64(numeric)) => numeric
-                    .is_valid(row)
-                    .then(|| SortCell::F64(numeric.values().as_slice()[row])),
-                Column::Numeric(NumericData::I64(numeric)) => numeric
-                    .is_valid(row)
-                    .then(|| SortCell::I64(numeric.values().as_slice()[row])),
-                Column::Key(keys) => keys
-                    .value_at(row)
-                    .map(|value| SortCell::Text(value.to_owned())),
-            });
+    let cell = |batch: &RecordBatch, row: usize| -> Option<SortCell> {
+        match &batch.columns()[column_index] {
+            Column::Numeric(NumericData::F64(numeric)) => numeric
+                .is_valid(row)
+                .then(|| SortCell::F64(numeric.values().as_slice()[row])),
+            Column::Numeric(NumericData::I64(numeric)) => numeric
+                .is_valid(row)
+                .then(|| SortCell::I64(numeric.values().as_slice()[row])),
+            Column::Key(keys) => keys
+                .value_at(row)
+                .map(|value| SortCell::Text(value.to_owned())),
         }
-    }
-    let mut order: Vec<usize> = (0..picks.len()).collect();
-    let compare_values = |left: &SortCell, right: &SortCell| match (left, right) {
-        (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
-        (left, right) => left.partial_cmp(right).expect("same variant per column"),
     };
     // Nulls last in both directions unless the query says otherwise
     // (NULLS FIRST/LAST) — placement sits outside the DESC reversal.
@@ -1953,25 +1961,101 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
     } else {
         std::cmp::Ordering::Greater
     };
-    order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => null_order,
-        (Some(_), None) => null_order.reverse(),
-        (Some(left), Some(right)) => {
-            let ordering = compare_values(left, right);
-            if order_by.descending {
-                ordering.reverse()
-            } else {
-                ordering
+    let compare = |left: &SortEntry, right: &SortEntry| {
+        let ordering = match (&left.0, &right.0) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => null_order,
+            (Some(_), None) => null_order.reverse(),
+            (Some(left), Some(right)) => {
+                let ordering = match (left, right) {
+                    (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
+                    (left, right) => left.partial_cmp(right).expect("same variant per column"),
+                };
+                if order_by.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+        };
+        // Input position breaks every tie: this is what a stable sort
+        // does, and holding to it keeps top-k's answer identical to
+        // the full sort's rather than merely as valid.
+        ordering.then(left.2.cmp(&right.2))
+    };
+    let rows = output.num_rows();
+    let mut entries: Vec<SortEntry> = Vec::with_capacity(keep.unwrap_or(rows).min(rows));
+    let mut position = 0usize;
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        for row in 0..batch.num_rows() {
+            let entry = (cell(batch, row), (batch_index, row), position);
+            position += 1;
+            match keep {
+                // Bounded: the heap's root is the worst row kept, so a
+                // candidate is admitted only by displacing it — and
+                // nothing else is ever retained.
+                Some(k) if entries.len() == k => {
+                    if k > 0 && compare(&entry, &entries[0]) == std::cmp::Ordering::Less {
+                        entries[0] = entry;
+                        sift_down(&mut entries, 0, &compare);
+                    }
+                }
+                _ => {
+                    entries.push(entry);
+                    let last = entries.len() - 1;
+                    sift_up(&mut entries, last, &compare);
+                }
             }
         }
-    });
-    let picks: Vec<(usize, usize)> = order.into_iter().map(|index| picks[index]).collect();
+    }
+    entries.sort_by(compare);
+    let picks: Vec<(usize, usize)> = entries.into_iter().map(|entry| entry.1).collect();
     let batch = take_rows(&output.schema, &output.batches, &picks);
     Ok(QueryOutput {
         schema: output.schema,
         batches: vec![batch],
     })
+}
+
+/// Restores the max-heap property upward from `index` — the worst
+/// entry (greatest under `compare`) rises toward the root.
+fn sift_up(
+    heap: &mut [SortEntry],
+    mut index: usize,
+    compare: &impl Fn(&SortEntry, &SortEntry) -> std::cmp::Ordering,
+) {
+    while index > 0 {
+        let parent = (index - 1) / 2;
+        if compare(&heap[index], &heap[parent]) != std::cmp::Ordering::Greater {
+            break;
+        }
+        heap.swap(index, parent);
+        index = parent;
+    }
+}
+
+/// Restores the max-heap property downward from `index`.
+fn sift_down(
+    heap: &mut [SortEntry],
+    mut index: usize,
+    compare: &impl Fn(&SortEntry, &SortEntry) -> std::cmp::Ordering,
+) {
+    loop {
+        let (left, right) = (2 * index + 1, 2 * index + 2);
+        let mut worst = index;
+        if left < heap.len() && compare(&heap[left], &heap[worst]) == std::cmp::Ordering::Greater {
+            worst = left;
+        }
+        if right < heap.len() && compare(&heap[right], &heap[worst]) == std::cmp::Ordering::Greater
+        {
+            worst = right;
+        }
+        if worst == index {
+            return;
+        }
+        heap.swap(index, worst);
+        index = worst;
+    }
 }
 
 /// Applies OFFSET/LIMIT across the output's rows (in the output's
@@ -2466,6 +2550,117 @@ mod tests {
             let error = run(&views, sql).unwrap_err().to_string();
             assert!(error.contains("can be selected"), "{sql}: {error}");
         }
+    }
+
+    #[test]
+    fn top_k_returns_exactly_the_leading_rows_of_the_full_sort() {
+        // The bounded heap must not merely produce *a* valid answer: it
+        // must produce the same rows, in the same order, as sorting
+        // everything and cutting — ties included, which is where a heap
+        // that ignores input position drifts from a stable sort.
+        let rows: Vec<(i64, &str, f64)> = (0..40)
+            .map(|i| {
+                // x repeats every 4 rows: 10 four-way ties, so almost
+                // every k lands inside a tie group.
+                (i as i64, ["A", "B", "C"][i % 3], (i % 4) as f64)
+            })
+            .collect();
+        let views = segmented(&rows, 7);
+        let ts_of = |output: &QueryOutput| -> Vec<i64> {
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("ts is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        for order in [
+            "ORDER BY x",
+            "ORDER BY x DESC",
+            "ORDER BY sym",
+            "ORDER BY ts DESC",
+        ] {
+            let full = ts_of(&run(&views, &format!("SELECT ts, sym, x FROM t {order}")).unwrap());
+            for k in [0usize, 1, 3, 9, 39, 40, 100] {
+                let bounded = ts_of(
+                    &run(
+                        &views,
+                        &format!("SELECT ts, sym, x FROM t {order} LIMIT {k}"),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(bounded, full[..k.min(full.len())], "{order} LIMIT {k}");
+            }
+            // OFFSET rides along: the bound is offset + limit, and the
+            // window taken from it must still match the full sort's.
+            for (offset, limit) in [(0, 5), (5, 5), (37, 5), (40, 1)] {
+                let window = ts_of(
+                    &run(
+                        &views,
+                        &format!("SELECT ts, sym, x FROM t {order} LIMIT {limit} OFFSET {offset}"),
+                    )
+                    .unwrap(),
+                );
+                let expected: Vec<i64> = full
+                    .iter()
+                    .copied()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                assert_eq!(window, expected, "{order} LIMIT {limit} OFFSET {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_k_places_nulls_where_the_full_sort_does() {
+        // Null placement is the other thing the heap has to carry: a
+        // NULLS FIRST query's k rows are the null ones.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        for i in 0..12i64 {
+            let y = if i % 3 == 0 {
+                RowValue::Null
+            } else {
+                RowValue::F64((12 - i) as f64)
+            };
+            buffer.append(&[RowValue::I64(i), y]).unwrap();
+        }
+        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let registry = registry();
+        let go = |sql: &str| -> Vec<i64> {
+            let output =
+                execute(&schema, &views, &crate::plan::plan(sql).unwrap(), &registry).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("ts is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST LIMIT 4"),
+            [0, 3, 6, 9]
+        );
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST LIMIT 4"),
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST")[..4]
+        );
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y DESC LIMIT 3"),
+            go("SELECT ts, y FROM t ORDER BY y DESC")[..3]
+        );
     }
 
     #[test]
