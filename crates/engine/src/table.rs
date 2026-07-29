@@ -382,10 +382,14 @@ impl Table {
     }
 
     /// The table's ingest-sequence watermark: the sequence the next
-    /// appended row will receive — one past the newest knowledge the
-    /// table holds, so `ASOF next_sequence() - 1` (on a non-empty
-    /// table) reads the latest state. Record it before a correction to
-    /// keep a queryable before/after boundary.
+    /// appended row will receive. Every knowledge coordinate the table
+    /// holds is `<=` it, so **`ASOF next_sequence()` reads the latest
+    /// state** whatever the table's mutation history. Record it before
+    /// a correction to keep a queryable before/after boundary.
+    ///
+    /// Not `next_sequence() - 1`: a `DELETE` stamps its kill at the
+    /// watermark without consuming it, so that cut still shows the
+    /// deleted rows (`Store::next_sequence` has the full note).
     pub fn next_sequence(&self) -> u64 {
         self.store.next_sequence()
     }
@@ -998,7 +1002,6 @@ impl OwnedValue {
     }
 }
 
-/// Resolves the declared ordering key to its column index.
 /// Whether `name` is a plain identifier (ASCII letter or underscore,
 /// then letters, digits, underscores) — required of SQL function names
 /// so queries can actually call them, and of Lua parameter names so
@@ -1009,6 +1012,7 @@ pub(crate) fn is_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Resolves the declared ordering key to its column index.
 fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
     schema
         .fields()
@@ -1623,6 +1627,63 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// `ASOF next_sequence()` is the latest state in every mutation
+    /// shape. The tempting off-by-one — `next_sequence() - 1` — held
+    /// for appends and `UPDATE` but not for `DELETE`, which stamps its
+    /// kill at the watermark without consuming it; the docs claimed the
+    /// wrong one until this test was written.
+    #[test]
+    fn as_of_at_the_watermark_is_the_latest_state_after_any_mutation() {
+        let build = || {
+            let schema = Schema::new(vec![
+                Field::new("ts", ColumnType::I64, false),
+                Field::new("x", ColumnType::F64, false),
+            ]);
+            let mut table = Table::new("t", schema, "ts").unwrap();
+            for i in 0..5i64 {
+                table
+                    .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                    .unwrap();
+            }
+            table
+        };
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("appends only", vec![]),
+            ("update", vec!["UPDATE t SET x = 9.0 WHERE ts = 1"]),
+            ("delete", vec!["DELETE FROM t WHERE ts = 2"]),
+            (
+                "delete then update",
+                vec![
+                    "DELETE FROM t WHERE ts = 2",
+                    "UPDATE t SET x = 9.0 WHERE ts = 1",
+                ],
+            ),
+            (
+                "update then delete",
+                vec![
+                    "UPDATE t SET x = 9.0 WHERE ts = 1",
+                    "DELETE FROM t WHERE ts = 2",
+                ],
+            ),
+        ];
+        for (label, mutations) in cases {
+            let mut table = build();
+            for sql in &mutations {
+                table.mutate(sql).unwrap();
+            }
+            let latest = table.query("SELECT ts FROM t").unwrap().num_rows();
+            let watermark = table.next_sequence();
+            let at_watermark = table
+                .query(&format!("SELECT ts FROM t ASOF {watermark}"))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                at_watermark, latest,
+                "{label}: ASOF next_sequence() must read the latest state"
+            );
+        }
     }
 
     #[test]

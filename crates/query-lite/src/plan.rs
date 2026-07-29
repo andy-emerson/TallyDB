@@ -722,18 +722,43 @@ fn is_create_table(sql: &str) -> bool {
 /// keyword followed by `JOIN` and is left alone) and the SQL:2011
 /// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
 /// as known at ingest sequence n". Returns the SQL with the clause
-/// removed (`None` when the text held no clause — untouched input never
-/// pays reassembly) and the cut it named. The two-word near-miss
+/// spliced out (`None` when the text held no clause — untouched input is
+/// never rewritten) and the cut it named. The two-word near-miss
 /// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
 /// alias named OF), so it gets a teaching error instead of a puzzle.
 fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
-    // Shallow tokenization: quoted runs ('…' with '' escapes, "…") stay
-    // single tokens so nothing inside a string literal can look like a
-    // clause; hugging punctuation splits off so `ASOF 5,` scans.
+    // Shallow tokenization, recording each token's byte span: quoted runs
+    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
+    // string literal can look like a clause; comments are skipped whole so
+    // nothing inside one does either; hugging punctuation splits off so
+    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
+    // ORIGINAL text (below), never reassembled from tokens — reassembly
+    // would collapse the newline that terminates a `--` comment and
+    // silently comment out the rest of the statement.
     let mut tokens: Vec<&str> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut chars = sql.char_indices().peekable();
     while let Some((start, ch)) = chars.next() {
         if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek().is_some_and(|&(_, next)| next == '-') {
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().is_some_and(|&(_, next)| next == '*') {
+            chars.next();
+            let mut previous = '\0';
+            for (_, c) in chars.by_ref() {
+                if previous == '*' && c == '/' {
+                    break;
+                }
+                previous = c;
+            }
             continue;
         }
         if ch == '\'' || ch == '"' {
@@ -749,10 +774,13 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
                 }
             }
             tokens.push(&sql[start..end]);
+            spans.push((start, end));
             continue;
         }
         if "(),;".contains(ch) {
-            tokens.push(&sql[start..start + ch.len_utf8()]);
+            let end = start + ch.len_utf8();
+            tokens.push(&sql[start..end]);
+            spans.push((start, end));
             continue;
         }
         let mut end = sql.len();
@@ -764,6 +792,7 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
             chars.next();
         }
         tokens.push(&sql[start..end]);
+        spans.push((start, end));
     }
     let lower: Vec<String> = tokens
         .iter()
@@ -772,12 +801,13 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
     let parse_cut = |token: &str| -> Result<u64, QueryError> {
         token.parse::<u64>().map_err(|_| {
             QueryError::Unsupported(format!(
-                "ASOF expects a non-negative integer ingest-sequence literal, got '{token}'"
+                "ASOF expects a non-negative integer ingest-sequence literal, got '{token}' \
+                 (ASOF is a clause keyword here, so it cannot also name a column)"
             ))
         })
     };
     let mut cut: Option<u64> = None;
-    let mut keep = vec![true; tokens.len()];
+    let mut removed: Option<(usize, usize)> = None;
     let mut index = 0;
     while index < tokens.len() {
         let matched = if index + 4 < tokens.len()
@@ -821,24 +851,22 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
                     ));
                 }
                 cut = Some(value);
-                for kept in &mut keep[index..index + width] {
-                    *kept = false;
-                }
+                removed = Some((spans[index].0, spans[index + width - 1].1));
                 index += width;
             }
             None => index += 1,
         }
     }
-    if cut.is_none() {
+    // Splice the clause out of the original text: every other byte —
+    // newlines, comments, string literals, spacing — reaches the parser
+    // exactly as the caller wrote it.
+    let Some((start, end)) = removed else {
         return Ok((None, None));
-    }
-    let kept: Vec<&str> = tokens
-        .iter()
-        .zip(&keep)
-        .filter(|&(_, &kept)| kept)
-        .map(|(&token, _)| token)
-        .collect();
-    Ok((Some(kept.join(" ")), cut))
+    };
+    let mut cleaned = String::with_capacity(sql.len() - (end - start));
+    cleaned.push_str(&sql[..start]);
+    cleaned.push_str(&sql[end..]);
+    Ok((Some(cleaned), cut))
 }
 
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
@@ -1889,6 +1917,32 @@ mod tests {
         // Inside a string literal the words are inert.
         let inert = plan("SELECT x FROM t WHERE sym = 'ASOF 5'").unwrap();
         assert_eq!(inert.as_of, None);
+    }
+
+    /// Extraction splices the clause out of the original text rather
+    /// than reassembling tokens. Reassembly collapsed every newline,
+    /// which let a `--` comment swallow the rest of the statement — a
+    /// silently wrong answer, exactly what the clause's ruling forbids.
+    #[test]
+    fn extraction_preserves_the_rest_of_the_statement_verbatim() {
+        // A line comment still ends at its newline.
+        let commented =
+            plan("SELECT x FROM t ASOF 5 -- pick the tail\nWHERE x > 1").expect("plans");
+        assert_eq!(commented.as_of, Some(5));
+        assert!(
+            commented.predicate.is_some(),
+            "the WHERE after a comment must survive extraction"
+        );
+        // And the clause is inert *inside* a comment: comments are
+        // skipped whole, so nothing in one is ever read as a clause.
+        let in_comment = plan("SELECT x FROM t -- ASOF 5\nWHERE x > 1").expect("plans");
+        assert_eq!(in_comment.as_of, None);
+        let block = plan("SELECT x FROM t /* ASOF 5 */ WHERE x > 1").expect("plans");
+        assert_eq!(block.as_of, None);
+        // A clause elsewhere in a commented statement still extracts.
+        let both = plan("SELECT x FROM t ASOF 7 /* note */ WHERE x > 1").expect("plans");
+        assert_eq!(both.as_of, Some(7));
+        assert!(both.predicate.is_some());
     }
 
     #[test]

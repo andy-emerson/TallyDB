@@ -849,10 +849,18 @@ impl Store {
     }
 
     /// The ingest-sequence watermark: the sequence the next appended
-    /// row will receive — also one past the newest knowledge the table
-    /// holds, so `AS OF next_sequence() - 1` (on a non-empty table) is
-    /// the latest state. Equal to [`Store::len`] until the table
+    /// row will receive. Every knowledge coordinate the table holds is
+    /// `<=` this, so **`AS OF next_sequence()` is the latest state** —
+    /// in every mutation shape. Equal to [`Store::len`] until the table
     /// diverges.
+    ///
+    /// `next_sequence() - 1` is *not* the idiom: a `DELETE` stamps its
+    /// kill at the current watermark without consuming it (see
+    /// [`Store::tombstone`]), so after one, the cut one below the
+    /// watermark still shows the deleted rows. Whether a delete should
+    /// instead consume its own coordinate — making every knowledge
+    /// event totally ordered, at the cost of a coordinate per delete —
+    /// is an open question for the design, not settled here.
     pub fn next_sequence(&self) -> u64 {
         lock(&self.shared).watermark(self.rows)
     }
@@ -1126,11 +1134,9 @@ impl Store {
         let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
         {
             let mut shared = lock(&self.shared);
-            let flushed = segment.batch().num_rows() as u64;
             shared.segments.push(Arc::new(segment));
             shared.buffer = fresh;
             shared.buffer_base = self.rows;
-            let _ = flushed;
             // The empty buffer restarts contiguous at the watermark.
             if let Some(knowledge) = &mut shared.knowledge {
                 knowledge.buffer_base = knowledge.next;
@@ -1233,6 +1239,18 @@ impl Store {
     ///
     /// The shared coordinate is precisely `sequence != row id`, so a
     /// supersession diverges a virtual table on the spot.
+    ///
+    /// At least one victim is required. The commit record is a delete
+    /// log carrying the coordinate, and that field spells "no
+    /// supersession" as `0` — so a mutation whose coordinate genuinely
+    /// *is* 0 (only reachable superseding nothing on an empty table)
+    /// would write evidence indistinguishable from a plain delete, and
+    /// replay would drop its acknowledged replacements. Rather than
+    /// leave that hole open, the shape is refused: a supersession with
+    /// no victim is an append, and [`Store::append`] is that operation.
+    /// Making the field a presence flag instead of a magic value is a
+    /// format revision, deferred until insert-as-supersession is
+    /// actually wanted.
     pub fn supersede(
         &mut self,
         replacements: &[Vec<RowValue<'_>>],
@@ -1240,6 +1258,13 @@ impl Store {
     ) -> Result<u64, StorageError> {
         // Validate everything up front: a refused mutation changes
         // nothing anywhere.
+        if victims.is_empty() {
+            return Err(StorageError::Misuse(
+                "supersede needs at least one victim row (a supersession with \
+                 nothing to supersede is an append — use append)"
+                    .to_owned(),
+            ));
+        }
         {
             let shared = lock(&self.shared);
             for row in replacements {

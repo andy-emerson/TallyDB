@@ -264,9 +264,19 @@ impl LuaState {
                 held: Vec::new(),
                 generation: self.generation,
             };
+            // A guard, not a trailing statement: the slot must be nulled
+            // even if this frame unwinds, or a later call would follow a
+            // dangling pointer to `call`. Structural beats argued.
+            struct Disarm(*mut DriverSlot);
+            impl Drop for Disarm {
+                fn drop(&mut self) {
+                    unsafe { (*self.0).0 = std::ptr::null_mut() };
+                }
+            }
             (*self.driver).0 = &mut call;
+            let disarm = Disarm(self.driver);
             let result = self.run(chunk, 0);
-            (*self.driver).0 = std::ptr::null_mut();
+            drop(disarm);
             self.end_call();
             // `call` (host pointer, held results) drops here — after
             // the bump, so no live view can reach a freed buffer.

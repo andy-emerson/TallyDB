@@ -70,7 +70,8 @@ pub mod plan;
 pub mod predicate;
 
 pub use exec::{
-    execute, execute_join, recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate,
+    contiguous, execute, execute_join, recompute_frames, ColumnFunction, QueryOutput, Registry,
+    WindowAggregate,
 };
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,

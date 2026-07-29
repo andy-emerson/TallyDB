@@ -69,6 +69,11 @@ pub enum StorageError {
     MissingRows { expected_base: u64 },
     /// A tombstone names a row id that was never assigned.
     TombstoneOutOfRange { id: u64 },
+    /// The call itself is not a legal shape for this operation — the
+    /// store is untouched (see [`Store::supersede`]).
+    ///
+    /// [`Store::supersede`]: crate::Store::supersede
+    Misuse(String),
 }
 
 impl fmt::Display for StorageError {
@@ -101,6 +106,7 @@ impl fmt::Display for StorageError {
             StorageError::TombstoneOutOfRange { id } => {
                 write!(f, "tombstone names row id {id}, which was never assigned")
             }
+            StorageError::Misuse(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -559,8 +565,21 @@ impl Segment {
     /// The zone map for column `index`, if it has one (see [`ZoneMap`]).
     /// Query planning prunes segments whose ranges cannot satisfy a
     /// predicate; correctness never depends on these being present.
+    ///
+    /// `None` here means *this column has no valid, comparable values*
+    /// (an all-null column) — a pruner may act on that. It does **not**
+    /// mean "maps were never computed"; ask [`Segment::zone_maps_present`]
+    /// first, because the two conclusions are opposite.
     pub fn zone_map(&self, index: usize) -> Option<&ZoneMap> {
         self.zone_maps.get(index).and_then(Option::as_ref)
+    }
+
+    /// Whether this segment carries zone maps at all. A segment built by
+    /// [`Segment::from_batch_unpruned`] carries none, and a pruner must
+    /// then treat every segment as "maybe" — absent maps disable
+    /// pruning, they never justify it.
+    pub fn zone_maps_present(&self) -> bool {
+        !self.zone_maps.is_empty()
     }
 
     /// Wraps an already-built batch as a free-standing segment — the
@@ -581,10 +600,15 @@ impl Segment {
     }
 
     /// As [`Segment::from_batch`], but with no zone maps — for
-    /// query-lifetime scratch segments that are never zone-pruned
-    /// (absent maps disable pruning, never falsify it).
+    /// query-lifetime scratch segments that are never zone-pruned.
+    ///
+    /// The map vector is left *empty* rather than filled with `None`,
+    /// which is what makes the difference observable: `None` at a column
+    /// index means "all null, prune away", while no maps at all means
+    /// "nothing is known, prune nothing" ([`Segment::zone_maps_present`]).
+    /// Conflating the two would let a pruner drop every row.
     pub fn from_batch_unpruned(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {
-        let zone_maps = batch.columns().iter().map(|_| None).collect();
+        let zone_maps = Vec::new();
         Segment {
             batch,
             ordering_key,

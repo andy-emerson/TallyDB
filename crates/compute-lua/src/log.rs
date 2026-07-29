@@ -67,6 +67,13 @@ unsafe extern "C" fn lua_log(state: *mut ffi::lua_State) -> c_int {
     unsafe {
         let slot = ffi::lua_touserdata(state, ffi::lua_upvalueindex(1)).cast::<SinkSlot>();
         let argc = ffi::lua_gettop(state);
+        // A C frame is guaranteed only LUA_MINSTACK (20) free slots, and
+        // phase 1 pushes one per argument: `log(table.unpack(t))` with 21
+        // elements would otherwise write past the frame's top (an abort
+        // under LUA_USE_APICHECK, silent corruption without it).
+        if ffi::lua_checkstack(state, argc) == 0 {
+            return values::raise(state, c"log: too many arguments to format");
+        }
         // Phase 1: push each argument's string form above the arguments
         // — views as summaries, everything else via __tostring.
         for index in 1..=argc {

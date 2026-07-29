@@ -627,7 +627,13 @@ fn filter_having(
     let full_schema = output.schema.clone();
     let mut picks: Vec<(usize, usize)> = Vec::new();
     for (batch_index, batch) in output.batches.iter().enumerate() {
-        let view = SegmentView::all_live(Arc::new(Segment::from_batch(batch.clone(), 0, false)));
+        // Query-lifetime scratch: the predicate is evaluated row-wise
+        // here, never zone-pruned, so computing maps would be waste.
+        let view = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(
+            batch.clone(),
+            0,
+            false,
+        )));
         let matched = evaluate_predicate(predicate, &full_schema, &view)?;
         for row in 0..batch.num_rows() {
             if matched.get(row) {
@@ -659,7 +665,12 @@ fn computed_column(
     // window semantics (a rolling combinator) would otherwise reset at
     // segment boundaries. Pure expressions stay on the per-view path —
     // elementwise semantics don't care, and it copies nothing.
-    if views.len() > 1 && uses_registered(expr) {
+    //
+    // The routing does NOT depend on how many segments the rows happen
+    // to occupy: whether a query is accepted must not turn on an
+    // internal detail, so a one-segment table takes the same path (and
+    // meets the same refusals) as a hundred-segment one.
+    if uses_registered(expr) {
         return computed_column_whole(schema, views, expr, name, registry);
     }
     let mut columns = Vec::with_capacity(views.len());
@@ -709,7 +720,8 @@ fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), Qu
             Ok(())
         }
         ScalarExpr::Case { .. } => Err(QueryError::Unsupported(
-            "CASE combined with a registered function in one expression              (lift the function out of the CASE)"
+            "CASE combined with a registered function in one expression \
+             (lift the function out of the CASE)"
                 .to_owned(),
         )),
     }
@@ -1932,6 +1944,33 @@ fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> Que
         schema: output.schema,
         batches: vec![batch],
     }
+}
+
+/// Every row of `output`, in order, as **one** batch — for consumers
+/// that need contiguity (the script driver hands result columns to Lua
+/// as single views, so it needs exactly this). A result already in one
+/// batch is moved out untouched; several batches pay one gather, with
+/// key columns re-encoded into a merged dictionary because per-segment
+/// dictionaries do not share codes. An empty result still yields
+/// correctly-typed empty columns.
+///
+/// This lives here, beside the row gather it delegates to, so the
+/// merge-and-remap rule has exactly one implementation in the
+/// workspace.
+pub fn contiguous(output: QueryOutput) -> RecordBatch {
+    let QueryOutput {
+        schema,
+        mut batches,
+    } = output;
+    if batches.len() == 1 {
+        return batches.pop().expect("length checked");
+    }
+    let picks: Vec<(usize, usize)> = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(batch, rows)| (0..rows.num_rows()).map(move |row| (batch, row)))
+        .collect();
+    take_rows(&schema, &batches, &picks)
 }
 
 /// Gathers `picks` (batch, row) into one batch. Key columns re-encode

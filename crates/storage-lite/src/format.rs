@@ -1102,11 +1102,9 @@ pub(crate) fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, Fo
         ));
     }
     let mut entries = Vec::new();
-    loop {
-        let record_start = reader.position;
-        let Ok(length) = reader.u32() else { break };
-        let _ = record_start; // records are self-delimiting; a failed
-                              // read below simply ends the clean prefix
+    // Records are self-delimiting, so a failed read simply ends the
+    // clean prefix — no start offset needs remembering.
+    while let Ok(length) = reader.u32() {
         let Ok(payload) = reader.take(length as usize) else {
             break;
         };

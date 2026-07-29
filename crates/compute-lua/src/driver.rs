@@ -203,32 +203,43 @@ unsafe extern "C" fn driver_query(state: *mut ffi::lua_State) -> c_int {
                 1
             }
             Ok(Ok(SqlOutcome::Rows(result))) => {
+                // Table + one string and one userdata per column, plus
+                // the row count. Reserved BEFORE the `columns` Vec below
+                // exists, so this refusal's raise crosses no destructor.
+                if ffi::lua_checkstack(state, 6) == 0 {
+                    return values::raise(state, c"query result overflows the Lua stack");
+                }
                 // Park the result: the Box gives its buffers a stable
                 // address while the Vec grows, and `run_driver` drops
                 // them only after the generation bump poisons every
                 // view handed out below.
                 (*call).held.push(result);
                 let result = (*call).held.last().expect("just pushed").as_ref();
-                let rows = result.rows();
-                let columns = result.columns();
-                // Table + one string and one userdata per column, plus
-                // the row count: reserve stack up front so the pushes
-                // below cannot fail for stack room. (`columns` is
-                // transient and non-Copy; an OOM raise inside a push
-                // leaks it — bounded, never unsound, same note as the
-                // host trampoline's message push.)
-                if ffi::lua_checkstack(state, 6) == 0 {
-                    return values::raise(state, c"query result overflows the Lua stack");
-                }
+                // `rows`/`columns` are embedder code behind a public
+                // trait, so they run contained like every other embedder
+                // entry point — a panicking implementation must not
+                // unwind into C (which aborts the process).
+                let described = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (result.rows(), result.columns())
+                }));
+                let Ok((rows, columns)) = described else {
+                    return values::raise(state, c"query result columns panicked");
+                };
                 ffi::lua_createtable(state, 0, columns.len() as c_int);
                 for (name, view) in &columns {
+                    // The column's own name, so a malformed result says
+                    // which column is malformed.
+                    let named = std::ffi::CString::new(name.as_str())
+                        .unwrap_or_else(|_| c"result".to_owned());
                     ffi::lua_pushlstring(state, name.as_ptr().cast::<c_char>(), name.len());
                     if let Err(message) =
-                        values::push_input(state, (*call).generation, c"result", view)
+                        values::push_input(state, (*call).generation, &named, view)
                     {
+                        drop(named);
                         drop(columns);
                         return raise_message(state, message);
                     }
+                    drop(named);
                     ffi::lua_settable(state, -3);
                 }
                 drop(columns);

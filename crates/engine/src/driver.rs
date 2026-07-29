@@ -30,12 +30,9 @@
 //! [`Database::run_script`]: crate::Database::run_script
 
 use crate::database::Database;
-use arrow_lite::{
-    Bitmap, Buffer, Column, ColumnType, Dictionary, KeyColumn, NumericColumn, NumericData,
-    RecordBatch,
-};
+use arrow_lite::{Column, NumericData, RecordBatch};
 use compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
-use query_lite::{parse_statement, QueryOutput, Statement};
+use query_lite::{parse_statement, Statement};
 use storage_lite::RowValue;
 
 /// The [`ScriptHost`] a driving script reaches: statements resolve
@@ -54,7 +51,9 @@ impl ScriptHost for DatabaseHost<'_> {
                     .database
                     .query(sql)
                     .map_err(|error| error.to_string())?;
-                Ok(SqlOutcome::Rows(Box::new(HeldOutput::contiguous(output)?)))
+                Ok(SqlOutcome::Rows(Box::new(HeldOutput {
+                    batch: query_lite::contiguous(output),
+                })))
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
                 Ok(SqlOutcome::Affected(
@@ -109,38 +108,11 @@ impl ScriptHost for DatabaseHost<'_> {
     }
 }
 
-/// A SELECT's buffers, held for the rest of the driving call.
+/// A SELECT's buffers, held for the rest of the driving call — always
+/// one batch, because a script sees each result column as a single
+/// view.
 struct HeldOutput {
     batch: RecordBatch,
-}
-
-impl HeldOutput {
-    /// One contiguous batch from a query's output: a single-segment
-    /// result passes through untouched (its views are zero-copy);
-    /// several segments concatenate — the bounded copy.
-    fn contiguous(output: QueryOutput) -> Result<HeldOutput, String> {
-        let QueryOutput {
-            schema,
-            mut batches,
-        } = output;
-        if batches.len() == 1 {
-            return Ok(HeldOutput {
-                batch: batches.pop().expect("one batch"),
-            });
-        }
-        let columns = (0..schema.fields().len())
-            .map(|index| {
-                let parts: Vec<&Column> = batches
-                    .iter()
-                    .map(|batch| &batch.columns()[index])
-                    .collect();
-                concatenate(&parts, schema.fields()[index].column_type())
-            })
-            .collect::<Result<Vec<Column>, String>>()?;
-        Ok(HeldOutput {
-            batch: RecordBatch::new(schema, columns),
-        })
-    }
 }
 
 impl ResultColumns for HeldOutput {
@@ -176,95 +148,6 @@ impl ResultColumns for HeldOutput {
     }
 }
 
-/// One column concatenated across per-segment batches. Key columns
-/// merge their dictionaries (per-segment code spaces differ) and remap
-/// codes into the merged space.
-fn concatenate(parts: &[&Column], column_type: ColumnType) -> Result<Column, String> {
-    match column_type {
-        ColumnType::F64 => {
-            let (values, validity) = concatenate_numeric::<f64>(parts, |column| match column {
-                Column::Numeric(NumericData::F64(numeric)) => Some(numeric),
-                _ => None,
-            })?;
-            Ok(Column::Numeric(NumericData::F64(assemble(
-                values, validity,
-            ))))
-        }
-        ColumnType::I64 => {
-            let (values, validity) = concatenate_numeric::<i64>(parts, |column| match column {
-                Column::Numeric(NumericData::I64(numeric)) => Some(numeric),
-                _ => None,
-            })?;
-            Ok(Column::Numeric(NumericData::I64(assemble(
-                values, validity,
-            ))))
-        }
-        ColumnType::Key => {
-            let mut dictionary = Dictionary::new();
-            let mut codes: Vec<u32> = Vec::new();
-            let mut validity: Vec<bool> = Vec::new();
-            for part in parts {
-                let Column::Key(key) = part else {
-                    return Err("result column changed type between segments".to_owned());
-                };
-                let remap: Vec<u32> = (0..key.dictionary().len() as u32)
-                    .map(|code| dictionary.intern(key.dictionary().value(code)))
-                    .collect();
-                for (row, &code) in key.codes().as_slice().iter().enumerate() {
-                    let valid = key.validity().is_none_or(|bitmap| bitmap.get(row));
-                    // The code under a null slot must stay in range of
-                    // the merged dictionary; 0 is safe once anything is
-                    // interned, and an all-null empty dictionary keeps
-                    // the column empty of codes anyway.
-                    codes.push(if valid { remap[code as usize] } else { 0 });
-                    validity.push(valid);
-                }
-            }
-            let codes = Buffer::from_slice(&codes);
-            if dictionary.is_empty() && validity.iter().any(|&valid| !valid) {
-                // A wholly-null key column: intern nothing, but code 0
-                // must exist to stay in range.
-                dictionary.intern("");
-            }
-            Ok(Column::Key(if validity.iter().all(|&valid| valid) {
-                KeyColumn::new_non_null(codes, dictionary)
-            } else {
-                KeyColumn::new_nullable(codes, Bitmap::from_bools(validity), dictionary)
-            }))
-        }
-    }
-}
-
-/// Values and validity of numeric parts, concatenated.
-fn concatenate_numeric<T: arrow_lite::Element>(
-    parts: &[&Column],
-    project: impl Fn(&Column) -> Option<&NumericColumn<T>>,
-) -> Result<(Vec<T>, Vec<bool>), String> {
-    let mut values = Vec::new();
-    let mut validity = Vec::new();
-    for part in parts {
-        let Some(numeric) = project(part) else {
-            return Err("result column changed type between segments".to_owned());
-        };
-        let slice = numeric.values().as_slice();
-        values.extend_from_slice(slice);
-        let bitmap = numeric.validity();
-        validity.extend((0..slice.len()).map(|row| bitmap.is_none_or(|bitmap| bitmap.get(row))));
-    }
-    Ok((values, validity))
-}
-
-/// A numeric column from parallel values/validity; the bitmap exists
-/// only if some value is actually absent.
-fn assemble<T: arrow_lite::Element>(values: Vec<T>, validity: Vec<bool>) -> NumericColumn<T> {
-    let buffer = Buffer::from_slice(&values);
-    if validity.iter().all(|&valid| valid) {
-        NumericColumn::new_non_null(buffer)
-    } else {
-        NumericColumn::new_nullable(buffer, Bitmap::from_bools(validity))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! #70's evidence: the end-to-end scripted pipeline (SQL → Lua →
@@ -275,6 +158,7 @@ mod tests {
     use crate::table::Table;
     use crate::Database;
     use arrow_lite::{ColumnType, Field, Schema};
+    use query_lite::QueryOutput;
 
     /// Column `index` of every batch, flattened — the hand-staged
     /// concatenation the script's contiguous result is checked against.

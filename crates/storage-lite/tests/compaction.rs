@@ -333,6 +333,35 @@ fn compacting_an_empty_or_untouched_store_is_sound() {
     assert_eq!(store.len(), 5);
 }
 
+/// A supersession with no victim is refused, and refused *before* it
+/// changes anything. The commit record spells "no supersession" as the
+/// coordinate `0`, so a mutation whose coordinate genuinely is 0 — only
+/// reachable superseding nothing on an empty table — would write
+/// evidence indistinguishable from a plain delete and lose its
+/// acknowledged rows on reopen. The shape is an append; `append` is
+/// that operation.
+#[test]
+fn a_supersession_with_no_victim_is_refused_and_changes_nothing() {
+    let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+    let replacement = vec![vec![
+        RowValue::I64(10),
+        RowValue::Key("A"),
+        RowValue::F64(1.0),
+    ]];
+    let error = store
+        .supersede(&replacement, &[])
+        .expect_err("a victimless supersession must be refused");
+    assert!(
+        format!("{error}").contains("use append"),
+        "the refusal must name the right operation: {error}"
+    );
+    assert_eq!(store.len(), 0, "a refused mutation changes nothing");
+    // With a victim, the same call works and the coordinate is >= 1.
+    append(&mut store, 10, "A", 1.0);
+    store.supersede(&replacement, &[0]).unwrap();
+    assert!(store.next_sequence() >= 1);
+}
+
 #[test]
 fn retaining_compaction_moves_superseded_rows_to_history() {
     // The corrections model (#75): a deleted row leaves the live set
