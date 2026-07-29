@@ -36,7 +36,28 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-29, M4 merged; M5 ruling batch complete, doc pass next)
+## Snapshot (2026-07-29, M4 merged; step 2 of the 10-step plan done)
+
+**Where execution is:** steps 1 (doc pass) and 2 (the fruit table) are
+complete and pushed. Seven builds landed, each gated and committed
+separately: `IS NULL`/`IS NOT NULL`; the `_seq` pseudocolumn;
+DELETE-consumes-a-coordinate; top-k under `ORDER BY … LIMIT` (#80);
+join projection pushdown (#81); `SYMBOL` replacing `KEY`; and #58(B)'s
+`ORDER BY`-on-symbol refusal. A doc pass followed (this commit).
+**Next: step 3, the repo-wide code pass, then the step-4 PAUSE.**
+
+Agenda additions for that pause, found while building:
+- **`_seq` is projection-only.** Not filtered or grouped on. Defensible
+  (`AS OF` is how a coordinate filters) but it is a scope call the
+  Human has not made — a fork, not a settled no.
+- **`ORDER BY` resolves against the output schema only**, so ordering
+  by a column the query does not project is refused. Standard SQL
+  allows it. Small, additive.
+- **`UPDATE … SET x = -1` is refused**: `SET` does not accept a
+  negative literal (unary minus over a number), though `WHERE` does.
+  A real gap, a few lines.
+
+### Superseded snapshot (kept for the ledger below)
 
 **State:** M4 merged to `main` (PR #79, merge `05e7507`); `claude/dev`
 restarted from it, clean, pushed. M0-M4 closed. Full gate green at the
@@ -159,14 +180,9 @@ table). The ledger stays here as the working reference.**
 
 ### The agreed execution plan (the Human's 10 steps, post-compaction)
 
-1. **Doc pass** — the entire ledger above into DESIGN.md (+ README
-   where user-facing: SYMBOL, as-of join when built); update issue
-   bodies: #65 (hybrid + corrected free-evidence claim), #57 (menu +
-   option-f sketch), #77 (rulings), #58 (B), #75 (closed by _seq
-   ruling — close it), #42 (scope). HANDOFF snapshot refresh.
-2. **Everything on the fruit table** (order): IS NULL -> `_seq`
-   projection -> DELETE-consumes (+oracle re-sweep) -> #80 top-k ->
-   #81 pushdown -> SYMBOL rename -> #58(B) enforcement.
+1. ~~**Doc pass**~~ — DONE (`dc0e16f`).
+2. ~~**Everything on the fruit table**~~ — DONE, seven commits
+   `d41acf8`..`255432f` plus the doc pass that follows them.
 3. **Repo-wide code pass** (review + fixes).
 4. **PAUSE for the Human.** Agenda to offer: FIRST/LAST naming, #62
    split approval, anything the reviews raised.

@@ -13,14 +13,19 @@
 > round-tripped through storage. M2 (feature-complete) is merged: its
 > final increment, M2.7, put embedded Lua on the engine's own zero-copy
 > buffers — scripted window kernels, the curated ops callable from
-> scripts, a NumPy-checked oracle family in CI. M3 (native GA) is built
-> on the working branch: incremental window evaluation that beats both
+> scripts, a NumPy-checked oracle family in CI. M3 (native GA) is
+> merged: incremental window evaluation that beats both
 > DuckDB+NumPy and NumPy-over-our-own-export in every measured shape
 > under a compensated-truth CI guard, single-writer/concurrent-reader
 > snapshots, a crash-tested WAL with sync levels, the ruled SQL
 > IN-tier (`HAVING`, `DISTINCT`, scalar expressions, `CASE`, `LIKE`,
 > DDL), and the `tallydb` console binary with per-platform release
-> builds — awaiting the closing merges. The settled
+> builds. M4 (extension model) is merged too: the native
+> `WindowAggregate` trait as the primary extension path, Lua behind an
+> off-by-default feature the console turns on, corrections on a
+> knowledge axis (`AS OF` reads the table as it was known), and
+> SQL-in-Lua driver scripts. M5 (desk adoption) is under way on the
+> working branch. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -95,7 +100,10 @@ application code.
 
 **Null and NaN, precisely.** NULL is absence, not a value: it matches no
 comparison (three-valued logic), aggregates skip it, and `ORDER BY`
-places it after all values in *both* directions. NaN is a value —
+places it after all values in *both* directions. `IS NULL` /
+`IS NOT NULL` is the one test that always has an answer — it asks about
+presence, so it is never UNKNOWN, which is exactly why SQL needs it.
+NaN is a value —
 computed, greater than every number, equal to itself — under one
 comparison relation shared by sorting, `WHERE`, `MIN`/`MAX`, and
 zone-map pruning (see `DESIGN.md`, *Null, NaN, and ordering semantics*).
@@ -107,12 +115,19 @@ more permissive than it sounds:
 
 - **String *predicates* on key columns are in scope.** `WHERE symbol =
   '...'`, `WHERE symbol IN (...)`, and `WHERE name LIKE '%Bank%'` are
-  built today; regex matching is in scope but not yet implemented
-  (tracked as a todo — the engine rejects it loudly until then). All
+  built today; regex matching is in scope but deferred by ruling
+  (2026-07-29) with its design menu open on issue #57 — the engine
+  rejects it loudly until then. All
   of them consume the interned strings and emit a *row selection*, not a
   string. Because keys are dictionary-encoded, such a predicate is
   evaluated once per *distinct* value and applied as integer
   set-membership: string filtering is not just allowed, it's cheap.
+- **Symbols are labels, not ordered text.** `ORDER BY` on a symbol
+  column is refused: the stored codes are per-segment interning ranks,
+  so they rank nothing, and ranking the labels as text would ask an
+  engine that never produces a string to order strings. Group by them,
+  filter by them, order by a number. (The column type is declared
+  `SYMBOL`, the spelling kdb+ and QuestDB use.)
 - **String *production* is out.** No function may *emit* a string value: no
   `SUBSTRING`/`CONCAT` projection, no `CAST(x AS VARCHAR)`, no
   `GROUP_CONCAT`. A key comes back as its integer code plus the dictionary
@@ -201,20 +216,25 @@ log with sync levels (default: group commit every 100ms, measured at
 the flush boundary for replayable upstreams), crash-tested down to
 torn-record and stale-generation windows.
 Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
-row-id delete logs, reads resolve tombstones through live masks, and
+row-id delete logs, each mutation spending exactly one coordinate on the
+ingest-sequence axis — so `AS OF` the last spent one is the latest
+state, permanently, and `_seq` reads a row's own coordinate back
+through SQL. Reads resolve tombstones through live masks, and
 crash-safe generational compaction merges live rows back into sorted,
 contiguous segments — with end-state semantics validated against DuckDB
 in CI. `query-lite` speaks a real query subset via sqlparser-rs: SELECT with
 WHERE (the predicate fragment — numeric comparisons, key string
-equality and `IN` evaluated once per distinct dictionary value,
-`AND`/`OR`/`NOT` — with zone-map pruning skipping segments that cannot
-match), GROUP BY over key columns with
+equality, `IN` and `LIKE` evaluated once per distinct dictionary value,
+`IS [NOT] NULL`, `AND`/`OR`/`NOT` — with zone-map pruning skipping
+segments that cannot match), GROUP BY over key columns with
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
 `i64` stays exact and errors loudly on overflow rather than silently
-widening), top-level ORDER BY and LIMIT/OFFSET, equi-joins (one large table
+widening), top-level ORDER BY and LIMIT/OFFSET (bounded, the sort runs
+top-k: a ten-row answer holds ten rows, not the whole sorted result),
+equi-joins (one large table
 against small key-unique dimension tables — the star-schema family —
 INNER or LEFT, run fact-driven through the same pipeline as everything
-else), the standard
+else, gathering only the dimension columns the query reads), the standard
 aggregates as window functions over `ROWS BETWEEN n | UNBOUNDED
 PRECEDING AND CURRENT ROW` frames, and `UPDATE`/`DELETE`. It
 executes across all segments of a snapshot, returning one Arrow batch

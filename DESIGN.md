@@ -875,22 +875,22 @@ DuckDB differential family; the shell's help cites this table.
 | `SELECT` projection, aliases | in, built | |
 | `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
 | regex on keys | deferred by ruling (2026-07-29) | menu incl. the Lua-pattern house option on #57 |
-| `IS NULL` / `IS NOT NULL` | in, later | one predicate arm over the validity bitmap |
+| `IS NULL` / `IS NOT NULL` | in, built | one predicate arm over the validity bitmap; the only *total* leaf (never UNKNOWN); `IS NOT NULL` prunes an all-null segment |
 | `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
 | `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, ruled (F1 = d), M5.3 | streams O(1); `FIRST`/`LAST` naming pending |
 | `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
 | `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
 | scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
 | `CASE WHEN` | in, built | conditions are WHERE grammar; UNKNOWN falls through |
-| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention); on symbol columns: ruled OUT 2026-07-29 (#58 = B, unordered labels) — refusal pending build |
+| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention); refused on symbol columns (#58 = B, unordered labels); bounded by `LIMIT` it runs top-k, O(k) memory |
 | multi-column `ORDER BY` | in, later | additive lowering |
 | `LIMIT`/`OFFSET` | in, built | |
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
 | `RANGE` frames | in, later | needs ordering-key-typed ranges |
-| star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule |
+| star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
 | `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
-| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `ORDERING KEY` constraint; `VARCHAR` and `PRIMARY KEY` refused with teaching errors; type spelling `KEY` → `SYMBOL` ruled 2026-07-29, rename pending |
+| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `BIGINT`/`DOUBLE`/`SYMBOL`, `ORDERING KEY` constraint; `VARCHAR`, `PRIMARY KEY` and the retired `KEY` spelling refused with teaching errors |
 | non-correlated subqueries / CTEs | in, later | named subplans |
 | `UNION ALL` (then `UNION`) | in, later | low priority |
 | correlated subqueries | **out** | the road to a cost-based optimizer — settled no |
@@ -960,8 +960,8 @@ none is built unless its row in the stdlib table says so.
    `DELETE` diverges it (the sequence column materializes;
    delta-codes to almost nothing).
 8. **The sequence column's SQL surface (#75): a fixed-name
-   pseudocolumn, `_seq`.** Never declared, refused in `CREATE TABLE`,
-   resolvable wherever an `i64` column can appear. Chosen by the
+   pseudocolumn, `_seq`.** Never declared, refused in `CREATE TABLE`.
+   Chosen by the
    visibility rule: the engine refuses `SELECT *`, so the column is
    never seen unbidden — the short system-side name wins over the
    spelled-out one. Kill-coordinate exposure deferred until asked.
@@ -1001,7 +1001,20 @@ Also recorded from the same sitting: regex on symbols (#57) is
 option (registered single-symbol Lua-pattern predicates in `WHERE`,
 evaluated once per distinct dictionary value); and `IS NULL` /
 `IS NOT NULL` was found missing from the predicate fragment — standard
-SQL, in scope, tracked as the smallest open todo.
+SQL, in scope, and built immediately after.
+
+**Built since (2026-07-29).** Items 7, 8, 9 and 10 are code, not
+plans: a delete consumes its coordinate and reopen recovers the spent
+one from the delete logs; `_seq` reads a row's birth coordinate back
+through SQL; `SYMBOL` is the DDL spelling and `KEY` is refused with a
+pointer to it; `ORDER BY` on a symbol column is a teaching error and
+the differential families that leaned on it now diff as sets. Two
+scope notes belong with them. `_seq` is **projection-only** — it can
+be selected, aliased, ordered and paged by, but not filtered or
+grouped on, because `AS OF` is how a coordinate filters and a second,
+weaker spelling of that would be worse than none; whether predicates
+should reach it is a live question, not a settled no. And the
+kill-coordinate column stays deferred, as ruled.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
