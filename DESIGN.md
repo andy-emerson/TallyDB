@@ -337,11 +337,21 @@ compaction resolves tombstones and merges segments. This means:
 > it), Elf (near-parity ratio bought with ~215× slower decode and a
 > global erase-and-restore correctness obligation), and zstd±byte-split
 > (float-blind, and a dependency where a hand-roll fits the registry).
-> Implementation is #42, scheduled by footprint need rather than
-> milestone; until it lands, uncompressed remains the shipped answer.
-> Measurement caveat: before ALP is measured, the corpus ticks family
-> must round to a realistic tick size — real prices are decimals, and
-> an unrounded random walk misrepresents the target workload.
+> **Built (#42, 2026-07-29)** — `storage-lite/src/alp.rs`, registry
+> tags 2–4: ALP with per-vector RD and raw fallbacks for `f64`
+> (the encoder computes all candidates and keeps the smallest, so it
+> can never bloat), and the integer sibling — frame-of-reference +
+> bit-packing — for non-clock `i64` columns and `u32` symbol codes.
+> The corpus ticks family rounds to pennies first, per the caveat.
+> Measured (release, seed 42, 1M rows/family, 2026-07-29,
+> `measure_42`): ticks prices **4.18×** vs raw through ALP; telemetry
+> continuous reals 1.16× through RD (lossless real doubles are
+> near-incompressible — ~1.2× is the published family); symbol codes
+> 6.4–10.5×; integer cents 4.0–4.2×. Decode 31–93M values/s, the
+> shipped delta-of-delta's band, paid once per segment at open. The
+> writer-policy change was the first deliberate encoder revision:
+> `segment_v1.bin` became the decode-compat golden (old bytes decode
+> forever), `segment_v2.bin` locks the new encoder.
 
 ## Deployment shapes
 
@@ -517,7 +527,11 @@ LAPACK-class-returns trigger firing, served by faer), the ordered-axis
 dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
 2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
 `LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — design ruled, see *The
-M5 ruling batch*), segment-lazy open (F3), cross-process readers (F4),
+M5 ruling batch*), segment-lazy open (F3), cross-process readers (F4 —
+**built 2026-07-29**: read-only opens over a live writer's directory
+see the durable prefix consistently, old-or-new per mutation;
+`tallydb DIR --read-only` with `.refresh`/`.flush` is the console
+half; #42's codecs landed the same day),
 and reach (bulk Arrow ingest, a Python binding with host-callback
 NumPy kernels — distribution ruled 2026-07-29: wheels on PyPI for the
 binding; the console stays a Python-free single binary). **M6 (WASM parity)** adds *embed
@@ -958,7 +972,17 @@ none is built unless its row in the stdlib table says so.
    event own one coordinate and makes `ASOF next_sequence() - 1` the
    universally stable "latest" idiom. Cost accepted: a table's first
    `DELETE` diverges it (the sequence column materializes;
-   delta-codes to almost nothing).
+   delta-codes to almost nothing). A second cost surfaced in the
+   build and was ruled accepted too (2026-07-29, option (a) of the
+   recorded three): a persistent `DELETE` flushes the write buffer
+   first — recovery must not renumber rows across the consumed
+   coordinate — so interleaved delete/append workloads seal small
+   segments until compaction merges them. Reopen trigger: a real
+   workload shows delete-driven fragmentation that compaction
+   cadence cannot absorb; the fix on the shelf is a WAL
+   consumption marker, rejected for now because it grows the most
+   safety-critical code we have to optimize a verb the design says
+   not to lean on.
 8. **The sequence column's SQL surface (#75): a fixed-name
    pseudocolumn, `_seq`.** Never declared, refused in `CREATE TABLE`.
    Chosen by the

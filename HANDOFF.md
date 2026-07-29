@@ -38,24 +38,25 @@ constraints change only when the Human says so.
 
 ## Snapshot (2026-07-29, M4 merged; step 2 of the 10-step plan done)
 
-**Where execution is:** steps 1 (doc pass) and 2 (the fruit table) are
-complete and pushed. Seven builds landed, each gated and committed
-separately: `IS NULL`/`IS NOT NULL`; the `_seq` pseudocolumn;
-DELETE-consumes-a-coordinate; top-k under `ORDER BY … LIMIT` (#80);
-join projection pushdown (#81); `SYMBOL` replacing `KEY`; and #58(B)'s
-`ORDER BY`-on-symbol refusal. A doc pass followed (this commit).
-**Next: step 3, the repo-wide code pass, then the step-4 PAUSE.**
+**Where execution is: steps 1–6 are complete and pushed. Next: step 7
+— the Human's merge.** The branch holds, in order: the doc pass; the
+seven fruit builds (IS NULL, `_seq`, DELETE-consumes, #80 top-k, #81
+pushdown, SYMBOL, #58(B)); the step-3 code pass; the pause outcomes
+(FIRST/LAST ruled (a); #62 split into #62+#83, both decisions open;
+`_seq` stays, revisit open; hidden ORDER BY + SET negative literal
+built; delete-flush cost ruled (a), documented); step 5's research
+items — #42 (corpus tick size, ALP+RD+raw for f64, FOR+bit-packing
+for i64/u32, golden split v1-decode/v2-encode, measured 4.18×
+ticks / 1.16× telemetry / 6–10× codes) and F4 (read-only
+cross-process opens: FsBackend::open_read_only,
+Store::open_read_only with the supersession-visibility rule,
+Table::open_read_only/refresh, console --read-only with
+.refresh/.flush); and the step-6 code+doc passes. Gate green at
+head: 402 tests both legs, six oracles, fmt/clippy/doc.
 
-Agenda additions for that pause, found while building:
-- **`_seq` is projection-only.** Not filtered or grouped on. Defensible
-  (`AS OF` is how a coordinate filters) but it is a scope call the
-  Human has not made — a fork, not a settled no.
-- **`ORDER BY` resolves against the output schema only**, so ordering
-  by a column the query does not project is refused. Standard SQL
-  allows it. Small, additive.
-- **`UPDATE … SET x = -1` is refused**: `SET` does not accept a
-  negative literal (unary minus over a number), though `WHERE` does.
-  A real gap, a few lines.
+Post-merge (steps 8–10): M5.0–M5.4 per the recorded table, then
+code/doc pass, then the second merge. FIRST/LAST = (a) is the ruled
+naming for M5.3.
 
 ### Superseded snapshot (kept for the ledger below)
 

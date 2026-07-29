@@ -144,7 +144,11 @@ boundary, not our own foresight.
 ## How you'll use it
 
 - Link it into your application like SQLite or DuckDB — no server process,
-  no separate database to administer. (A standalone single-file CLI
+  no separate database to administer. One process writes; any number of
+  read-only processes (`tallydb DIR --read-only`, or `Table::open_read_only`)
+  watch the same directory and see its durable state, refreshed when they
+  choose — a feed writer plus analyst consoles, with no server between
+  them. (A standalone single-file CLI
   binary per release — the `sqlite3`-shell shape, still no server — ships
   with M3: `tallydb <dir>` opens a console with line editing, `CREATE
   TABLE`/`INSERT`/CSV import, the full query surface, `.lua` kernel
@@ -209,6 +213,12 @@ self-describing, CRC-checked, deterministic on-disk format whose bytes
 are locked by a committed golden: per-column codec tags with
 delta-of-delta on the ordered ordering key (measured on the checked-in
 corpus: 2–2.5× vs raw, ahead of plain delta on both corpus families),
+ALP for `f64` values — decimals-in-doubles become bit-packed integers,
+verified bit-exact per value at encode time, with the ALP-RD and raw
+fallbacks so the codec never bloats (penny-priced ticks measure 4.2×
+vs raw; continuous sensor reals 1.16×, near the lossless ceiling for
+that shape) — and frame-of-reference + bit-packing on symbol codes
+(6–10×) and non-clock integers,
 zone maps (driving query-time pruning), and reopen that verifies schema,
 checksums, and row-id contiguity. Durability is a sidecar write-ahead
 log with sync levels (default: group commit every 100ms, measured at
