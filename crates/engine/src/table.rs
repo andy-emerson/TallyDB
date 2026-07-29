@@ -57,6 +57,8 @@ pub enum EngineError {
     DuplicateTable(String),
     /// The declared ordering key is not a column of the schema.
     UnknownOrderingKey(String),
+    /// The schema declares a column whose name the engine reserves.
+    ReservedColumn(String),
     /// Registering a script-backed function failed (bad kernel syntax,
     /// unusable parameter name, unsupported output type).
     Script(String),
@@ -75,6 +77,11 @@ impl fmt::Display for EngineError {
             EngineError::UnknownOrderingKey(name) => {
                 write!(f, "ordering key '{name}' is not a column")
             }
+            EngineError::ReservedColumn(name) => write!(
+                f,
+                "column '{name}' is reserved — it is the ingest-sequence \
+                 pseudocolumn every table already has"
+            ),
             EngineError::Script(message) => write!(f, "script: {message}"),
         }
     }
@@ -192,7 +199,7 @@ impl Table {
         ordering_key: &str,
         dir: impl AsRef<std::path::Path>,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -213,7 +220,7 @@ impl Table {
         dir: impl AsRef<std::path::Path>,
         options: StoreOptions,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -244,7 +251,7 @@ impl Table {
         dir: impl AsRef<std::path::Path>,
         segment_rows: usize,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -258,7 +265,7 @@ impl Table {
         ordering_key: &str,
         segment_rows: Option<usize>,
     ) -> Result<Table, EngineError> {
-        let ordering_index = ordering_index(&schema, ordering_key)?;
+        let ordering_index = validated_ordering_index(&schema, ordering_key)?;
         let store = match segment_rows {
             None => Store::new(schema, ordering_index)?,
             Some(rows) => Store::with_segment_rows(schema, ordering_index, rows)?,
@@ -1013,7 +1020,22 @@ pub(crate) fn is_identifier(name: &str) -> bool {
 }
 
 /// Resolves the declared ordering key to its column index.
-fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
+/// Checks a schema at definition time and locates its ordering key.
+/// Beyond the ordering key itself, the one rule is the reserved name:
+/// `_seq` is the ingest-sequence pseudocolumn every table already has
+/// (#75), and a declared column of that name would shadow it. `CREATE
+/// TABLE` refuses it in the planner; this is the same refusal for
+/// schemas built through the Rust API.
+fn validated_ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
+    if schema
+        .fields()
+        .iter()
+        .any(|field| field.name() == query_lite::SEQUENCE_COLUMN)
+    {
+        return Err(EngineError::ReservedColumn(
+            query_lite::SEQUENCE_COLUMN.to_owned(),
+        ));
+    }
     schema
         .fields()
         .iter()
@@ -1629,6 +1651,78 @@ mod tests {
             .collect()
     }
 
+    /// `_seq` (#75) reads back the coordinate `AS OF` addresses — the
+    /// point of the pseudocolumn is that a session can learn a cut from
+    /// SQL alone, with no Rust-side `next_sequence()` call.
+    #[test]
+    fn the_sequence_pseudocolumn_addresses_the_knowledge_axis() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        for i in 0..4i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        let seqs = |table: &Table, sql: &str| -> Vec<i64> {
+            let output = table.query(sql).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(column)) =
+                        &batch.columns()[0]
+                    else {
+                        panic!("_seq is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        assert_eq!(seqs(&table, "SELECT _seq FROM t"), [0, 1, 2, 3]);
+        // A correction: the replacement is born at coordinate 4, and
+        // `_seq` reports *birth*, not position — so the corrected row
+        // carries 4 while its neighbours keep their original
+        // coordinates, and the table is now diverged (row id != seq).
+        table.mutate("UPDATE t SET x = 100.0 WHERE ts = 1").unwrap();
+        let coordinates = seqs(&table, "SELECT _seq, ts FROM t ORDER BY ts");
+        assert_eq!(coordinates, [0, 4, 2, 3]);
+        // The readback is a usable cut: the largest coordinate is the
+        // latest state, and one below it is the state before the
+        // correction — no Rust-side call anywhere in the loop.
+        let latest = seqs(&table, "SELECT _seq FROM t ORDER BY _seq DESC LIMIT 1")[0];
+        assert_eq!(latest, 4);
+        assert_eq!(
+            flatten(
+                &table
+                    .query(&format!("SELECT ts, x FROM t ASOF {latest} ORDER BY ts"))
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(100.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(
+            flatten(
+                &table
+                    .query(&format!(
+                        "SELECT ts, x FROM t ASOF {} ORDER BY ts",
+                        latest - 1
+                    ))
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
+        );
+        // Compaction reassigns row ids; birth coordinates do not move.
+        table.compact().unwrap();
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ORDER BY ts"),
+            coordinates
+        );
+    }
+
     /// `ASOF next_sequence()` is the latest state in every mutation
     /// shape. The tempting off-by-one — `next_sequence() - 1` — held
     /// for appends and `UPDATE` but not for `DELETE`, which stamps its
@@ -2022,6 +2116,16 @@ mod tests {
         assert!(matches!(
             Table::new("t", m1_schema(), "x"),
             Err(EngineError::Storage(StorageError::BadOrderingKey { .. }))
+        ));
+        // The reserved pseudocolumn name, refused through the Rust API
+        // exactly as `CREATE TABLE` refuses it.
+        let shadowing = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new(query_lite::SEQUENCE_COLUMN, ColumnType::I64, false),
+        ]);
+        assert!(matches!(
+            Table::new("t", shadowing, "ts"),
+            Err(EngineError::ReservedColumn(_))
         ));
     }
 }

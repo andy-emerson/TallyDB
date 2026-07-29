@@ -717,7 +717,7 @@ fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
         .fields()
         .iter()
         .position(|field| field.name() == name)
-        .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
+        .ok_or_else(|| crate::plan::no_such_column(name))
 }
 
 #[cfg(test)]

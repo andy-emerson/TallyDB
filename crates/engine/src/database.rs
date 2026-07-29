@@ -417,6 +417,44 @@ mod join_tests {
     }
 
     #[test]
+    fn the_sequence_pseudocolumn_survives_the_join() {
+        // Joining widens rows without adding, dropping or reordering
+        // them, so a fact row's birth coordinate is the same one it had
+        // unjoined. If the joined segment lost its sequences, `_seq`
+        // would quietly become the row's position instead.
+        let db = database();
+        let seqs = |sql: &str| -> Vec<i64> {
+            let output = db.query(sql).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("_seq is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        // INNER drops the two D rows (ingest coordinates 3 and 6).
+        assert_eq!(
+            seqs(
+                "SELECT _seq, ts FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts"
+            ),
+            [0, 1, 2, 4, 5, 7]
+        );
+        // LEFT keeps them, still carrying their own coordinates.
+        assert_eq!(
+            seqs(
+                "SELECT _seq, ts FROM trades LEFT JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts"
+            ),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
     fn join_against_empty_dimension_does_not_panic() {
         // B2 regression: an empty dimension has no views to sniff a column
         // type from. The gather must take each column's type from the

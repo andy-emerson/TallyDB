@@ -531,6 +531,14 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
                 column.name
             )));
         }
+        // The pseudocolumn is the engine's to define; a declared one
+        // would shadow it and mean something else entirely.
+        if column.name == SEQUENCE_COLUMN {
+            return Err(QueryError::Unsupported(format!(
+                "column '{SEQUENCE_COLUMN}' is reserved — it is the ingest-sequence \
+                 pseudocolumn every table already has"
+            )));
+        }
     }
     match columns.iter().filter(|column| column.ordering_key).count() {
         1 => Ok(CreateTablePlan { table, columns }),
@@ -542,6 +550,34 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
         _ => Err(QueryError::Unsupported(
             "more than one ORDERING KEY column".to_owned(),
         )),
+    }
+}
+
+/// The ingest-sequence pseudocolumn's fixed name (#75, ruled
+/// 2026-07-29). Every row has a birth sequence — the coordinate `AS OF`
+/// addresses — and this is how SQL reads it back. It is never declared:
+/// `CREATE TABLE` refuses a column of this name, so the pseudocolumn
+/// can never be shadowed, and since `SELECT *` is refused nobody meets
+/// it unbidden.
+///
+/// The short underscore spelling (over a spelled-out
+/// `ingest_sequence`) follows from that invisibility: a name users do
+/// not normally see is better short and unlikely to collide than
+/// long and self-explaining.
+pub const SEQUENCE_COLUMN: &str = "_seq";
+
+/// The error for a name that is not a column of the schema — with the
+/// pseudocolumn's own answer, since every resolver that reaches here has
+/// already passed the one place `_seq` exists (projection).
+pub(crate) fn no_such_column(name: &str) -> QueryError {
+    if name == SEQUENCE_COLUMN {
+        QueryError::Unsupported(format!(
+            "'{SEQUENCE_COLUMN}' can be selected, not filtered or grouped on \
+             (project it, then order or page by it; `AS OF` is how a coordinate \
+             filters)"
+        ))
+    } else {
+        QueryError::UnknownColumn(name.to_owned())
     }
 }
 
@@ -2071,6 +2107,20 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(error.contains("declared twice"), "{error}");
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_cannot_be_declared() {
+        // Declaring `_seq` would shadow the pseudocolumn with something
+        // else entirely — the name is the engine's.
+        for ddl in [
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, _seq BIGINT)",
+            "CREATE TABLE t (_seq BIGINT ORDERING KEY, x DOUBLE)",
+        ] {
+            let error = parse_statement(ddl).expect_err("refused").to_string();
+            assert!(error.contains("reserved"), "{error}");
+            assert!(error.contains("ingest-sequence"), "{error}");
+        }
     }
 
     #[test]

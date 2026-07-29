@@ -38,7 +38,7 @@
 
 use crate::plan::{
     AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
-    ScalarExpr, ScalarFunction,
+    ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
@@ -47,7 +47,7 @@ use arrow_lite::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use storage_lite::{Segment, SegmentView};
+use storage_lite::{Segment, SegmentView, SequenceInfo};
 
 /// One window-aggregate implementation, registered by the embedder.
 pub trait WindowAggregate: Send + Sync {
@@ -337,11 +337,24 @@ pub fn execute_join(
             ));
         }
         let joined = RecordBatch::new(joined_schema.clone(), columns);
+        // Joining widens rows, it never adds, drops or reorders them
+        // (INNER's misses die under the mask, in place) — so the fact
+        // segment's birth sequences still describe row i, and `_seq`
+        // reads the same coordinate through a join as without one. The
+        // virtual form has to be made explicit: it means "sequence ==
+        // row id", and this scratch segment's row ids start at 0.
+        let sequence = match view.segment.sequence_info() {
+            SequenceInfo::RowIds => SequenceInfo::Contiguous {
+                base: view.segment.base_row_id(),
+            },
+            carried => carried.clone(),
+        };
         let segment = Segment::from_batch(
             joined,
             view.segment.ordering_key(),
             view.segment.is_ordered(),
-        );
+        )
+        .with_sequence(sequence);
         joined_views.push(SegmentView {
             segment: Arc::new(segment),
             live,
@@ -992,7 +1005,28 @@ fn resolve<'a>(schema: &'a Schema, name: &str) -> Result<(usize, &'a Field), Que
         .iter()
         .enumerate()
         .find(|(_, field)| field.name() == name)
-        .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
+        // Everything reaching here resolves against the *stored*
+        // schema, where the pseudocolumn does not exist: projection
+        // intercepts it first, so this is always a refusal.
+        .ok_or_else(|| crate::plan::no_such_column(name))
+}
+
+/// The ingest-sequence pseudocolumn, materialized per view: every row's
+/// birth sequence as `BIGINT`, live rows only, in stored order — the
+/// same rows and order [`passthrough`] would hand back for a real
+/// column. Sequences are `u64` in storage and `i64` here because SQL has
+/// no unsigned type; the gap is unreachable (`i64::MAX` appends).
+fn sequence_column(views: &[&SegmentView], name: &str) -> (Field, Vec<Column>) {
+    let columns = views
+        .iter()
+        .map(|view| {
+            let values: Buffer<i64> = live_rows(view)
+                .map(|row| view.segment.sequence_at(row) as i64)
+                .collect();
+            Column::Numeric(NumericData::I64(NumericColumn::new_non_null(values)))
+        })
+        .collect();
+    (Field::new(name, ColumnType::I64, false), columns)
 }
 
 /// Local row indices a reader sees, in stored order.
@@ -1046,6 +1080,9 @@ fn passthrough(
     name: &str,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    if name == SEQUENCE_COLUMN {
+        return Ok(sequence_column(views, alias.unwrap_or(name)));
+    }
     let (index, field) = resolve(schema, name)?;
     let mut out = Field::new(alias.unwrap_or(name), field.column_type(), field.nullable());
     if let Some(logical) = field.logical() {
@@ -2368,6 +2405,66 @@ mod tests {
             let out = f64_column(batch, 0);
             // Zero-copy: each result batch is its segment's buffer, shared.
             assert_eq!(out.values().as_ptr(), stored.values().as_ptr());
+        }
+    }
+
+    /// The `_seq` values of a result, flattened across batches.
+    fn seq_values(output: &QueryOutput, index: usize) -> Vec<i64> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
+                    panic!("_seq is i64")
+                };
+                column.values().as_slice().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_reads_each_rows_coordinate() {
+        let rows: Vec<(i64, &str, f64)> = (0..7)
+            .map(|i| (i as i64, "A", i as f64))
+            .collect::<Vec<_>>();
+        let views = segmented(&rows, 3);
+        let output = run(&views, "SELECT _seq, ts FROM t").unwrap();
+        // A table that never diverged: sequence == row id == ts here.
+        assert_eq!(seq_values(&output, 0), (0..7).collect::<Vec<i64>>());
+        assert_eq!(output.schema.fields()[0].name(), "_seq");
+        assert_eq!(output.schema.fields()[0].column_type(), ColumnType::I64);
+        assert!(!output.schema.fields()[0].nullable());
+        // It is a column like any other downstream — order and page by
+        // it, which is how a session reads back its latest coordinate.
+        let latest = run(&views, "SELECT _seq FROM t ORDER BY _seq DESC LIMIT 1").unwrap();
+        assert_eq!(seq_values(&latest, 0), [6]);
+        let aliased = run(&views, "SELECT _seq AS at FROM t ORDER BY at DESC LIMIT 1").unwrap();
+        assert_eq!(aliased.schema.fields()[0].name(), "at");
+        assert_eq!(seq_values(&aliased, 0), [6]);
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_follows_the_live_mask() {
+        // WHERE narrows the rows; the coordinates must stay attached to
+        // the rows that survive, not renumber to their output position.
+        let rows: Vec<(i64, &str, f64)> = (0..6)
+            .map(|i| (i as i64, if i % 2 == 0 { "A" } else { "B" }, i as f64))
+            .collect::<Vec<_>>();
+        let views = segmented(&rows, 2);
+        let output = run(&views, "SELECT _seq, ts FROM t WHERE sym = 'B'").unwrap();
+        assert_eq!(seq_values(&output, 0), [1, 3, 5]);
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_is_projection_only() {
+        let views = segment(&[(1, "A", 1.0)]);
+        for sql in [
+            "SELECT ts FROM t WHERE _seq > 0",
+            "SELECT count(*) AS n FROM t GROUP BY _seq",
+            "SELECT _seq + 1 AS next FROM t",
+        ] {
+            let error = run(&views, sql).unwrap_err().to_string();
+            assert!(error.contains("can be selected"), "{sql}: {error}");
         }
     }
 
