@@ -5,7 +5,7 @@
 use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage_lite::{FsBackend, IoError, MemBackend, RowValue, StorageBackend, Store};
+use storage_lite::{FsBackend, IoError, MemBackend, RowValue, SequenceInfo, StorageBackend, Store};
 
 /// A backend that, once armed, fails every `remove` — used to model a
 /// post-commit cleanup failure during compaction (R1).
@@ -331,6 +331,183 @@ fn compacting_an_empty_or_untouched_store_is_sound() {
     store.compact().unwrap();
     assert_eq!(rows(&store), before);
     assert_eq!(store.len(), 5);
+}
+
+/// A supersession with no victim is refused, and refused *before* it
+/// changes anything. The commit record spells "no supersession" as the
+/// coordinate `0`, so a mutation whose coordinate genuinely is 0 — only
+/// reachable superseding nothing on an empty table — would write
+/// evidence indistinguishable from a plain delete and lose its
+/// acknowledged rows on reopen. The shape is an append; `append` is
+/// that operation.
+#[test]
+fn a_supersession_with_no_victim_is_refused_and_changes_nothing() {
+    let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+    let replacement = vec![vec![
+        RowValue::I64(10),
+        RowValue::Key("A"),
+        RowValue::F64(1.0),
+    ]];
+    let error = store
+        .supersede(&replacement, &[])
+        .expect_err("a victimless supersession must be refused");
+    assert!(
+        format!("{error}").contains("use append"),
+        "the refusal must name the right operation: {error}"
+    );
+    assert_eq!(store.len(), 0, "a refused mutation changes nothing");
+    // With a victim, the same call works and the coordinate is >= 1.
+    append(&mut store, 10, "A", 1.0);
+    store.supersede(&replacement, &[0]).unwrap();
+    assert!(store.next_sequence() >= 1);
+}
+
+#[test]
+fn retaining_compaction_moves_superseded_rows_to_history() {
+    // The corrections model (#75): a deleted row leaves the live set
+    // but its version is retained — birth sequence, kill coordinate,
+    // full cells — in history segments that latest-knowledge reads
+    // never touch.
+    let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+    append(&mut store, 10, "A", 1.0); // id 0
+    append(&mut store, 20, "B", 2.0); // id 1
+    append(&mut store, 30, "A", 3.0); // id 2
+    store.tombstone(&[0]).unwrap(); // stamped at watermark 3
+    append(&mut store, 40, "B", 4.0); // id 3
+    store.tombstone(&[2]).unwrap(); // stamped at watermark 4
+    store.compact().unwrap();
+    // Live reads: unchanged semantics, history invisible.
+    assert_eq!(
+        rows(&store),
+        [(20, "B".to_owned(), 2.0), (40, "B".to_owned(), 4.0)]
+    );
+    assert_eq!(store.snapshot().unwrap().len(), 1);
+    // The dead rows live on, addressed by sequence alone: births are
+    // their virtual-era row ids, kills the watermark each delete
+    // landed at, cells intact, merge-ordered (ts 10 before ts 30).
+    let history = store.history();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].sequence_info(),
+        &SequenceInfo::Explicit(vec![0, 2])
+    );
+    assert_eq!(history[0].superseded(), Some(&[3, 4][..]));
+    let Column::Numeric(NumericData::I64(ts)) = &history[0].batch().columns()[0] else {
+        panic!("ts type")
+    };
+    assert_eq!(ts.values().as_slice(), &[10, 30]);
+    // The live rows diverged with their birth sequences preserved.
+    let views = store.snapshot().unwrap();
+    assert_eq!(
+        views[0].segment.sequence_info(),
+        &SequenceInfo::Explicit(vec![1, 3])
+    );
+    // A second round accumulates history; it never rewrites what an
+    // earlier compaction retained.
+    store.tombstone(&[0]).unwrap(); // ts 20, birth 1, stamped at 4
+    store.compact().unwrap();
+    let history = store.history();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        history[0].sequence_info(),
+        &SequenceInfo::Explicit(vec![0, 2])
+    );
+    assert_eq!(history[1].sequence_info(), &SequenceInfo::Explicit(vec![1]));
+    assert_eq!(history[1].superseded(), Some(&[4][..]));
+}
+
+#[test]
+fn an_ordered_untombstoned_table_stays_virtual_through_compaction() {
+    let mut store = Store::with_segment_rows(schema(), 0, 3).unwrap();
+    for i in 0..7i64 {
+        append(&mut store, i, "A", i as f64);
+    }
+    store.compact().unwrap();
+    // Nothing retained, nothing moved: no history, still virtual.
+    assert!(store.history().is_empty());
+    let views = store.snapshot().unwrap();
+    assert!(views
+        .iter()
+        .all(|view| view.segment.sequence_info() == &SequenceInfo::RowIds));
+    // But mere disorder — no delete anywhere — moves row ids, and
+    // moved ids diverge the table: birth sequences freeze as they
+    // were while ids renumber under the sort.
+    append(&mut store, 3, "A", 99.0); // late arrival: id 7, sequence 7
+    store.compact().unwrap();
+    assert!(store.history().is_empty());
+    let sequences: Vec<u64> = store
+        .snapshot()
+        .unwrap()
+        .iter()
+        .flat_map(|view| {
+            (0..view.segment.batch().num_rows())
+                .map(|row| view.segment.sequence_at(row))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // The late row sorts into the middle carrying its birth sequence.
+    assert_eq!(sequences, [0, 1, 2, 3, 7, 4, 5, 6]);
+}
+
+#[test]
+fn history_survives_reopen_and_unlisted_strays_are_invisible() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+            for i in 0..5i64 {
+                append(&mut store, i, "A", i as f64);
+            }
+            store.tombstone(&[1, 3]).unwrap(); // one event, stamped at 5
+            store.compact().unwrap();
+        }
+        // Plant a stray: a hist- file the manifest never named — a
+        // crashed compaction's leftover.
+        {
+            let donor = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100)
+                .unwrap()
+                .history()[0]
+                .clone();
+            backend
+                .write(
+                    "hist-0000009999.tlyseg",
+                    &storage_lite::encode_segment(&donor),
+                )
+                .unwrap();
+        }
+        let mut store =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        // The listed history came back whole; the stray was not loaded.
+        let history = store.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].sequence_info(),
+            &SequenceInfo::Explicit(vec![1, 3])
+        );
+        assert_eq!(history[0].superseded(), Some(&[5, 5][..]));
+        assert_eq!(store.live_len(), 3);
+        // The next compaction pre-cleans the stray and keeps — never
+        // rewrites — the listed files.
+        store.tombstone(&[0]).unwrap();
+        store.compact().unwrap();
+        let names = backend.list().unwrap();
+        assert!(
+            !names.contains(&"hist-0000009999.tlyseg".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"hist-0000000000.tlyseg".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"hist-0000000001.tlyseg".to_owned()),
+            "{names:?}"
+        );
+        let reopened =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        assert_eq!(reopened.history().len(), 2);
+        assert_eq!(reopened.live_len(), 2);
+    });
 }
 
 #[test]

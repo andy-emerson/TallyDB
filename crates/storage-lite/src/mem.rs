@@ -69,6 +69,11 @@ pub enum StorageError {
     MissingRows { expected_base: u64 },
     /// A tombstone names a row id that was never assigned.
     TombstoneOutOfRange { id: u64 },
+    /// The call itself is not a legal shape for this operation — the
+    /// store is untouched (see [`Store::supersede`]).
+    ///
+    /// [`Store::supersede`]: crate::Store::supersede
+    Misuse(String),
 }
 
 impl fmt::Display for StorageError {
@@ -101,6 +106,7 @@ impl fmt::Display for StorageError {
             StorageError::TombstoneOutOfRange { id } => {
                 write!(f, "tombstone names row id {id}, which was never assigned")
             }
+            StorageError::Misuse(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -311,6 +317,8 @@ impl WriteBuffer {
             ordered: self.ordered,
             base_row_id,
             zone_maps,
+            sequence: SequenceInfo::RowIds,
+            superseded: None,
         })
     }
 
@@ -487,6 +495,34 @@ pub(crate) fn compute_zone_map(column: &Column) -> Option<ZoneMap> {
     }
 }
 
+/// Where a segment's rows' ingest sequences live (the corrections
+/// design, issue #75). Every row has a **birth sequence** — the value of
+/// the table's ingest counter when it arrived, the coordinate `AS OF`
+/// queries address. The three states are the three lives of a segment:
+///
+/// - [`SequenceInfo::RowIds`] — the virtual state: sequence == row id
+///   for every row, so nothing is stored. Every segment of a table that
+///   has never diverged (run a retaining compaction) is here.
+/// - [`SequenceInfo::Contiguous`] — post-divergence fresh segments:
+///   appends still receive consecutive sequences, so one base suffices,
+///   but row ids no longer match (compaction reassigned them downward).
+/// - [`SequenceInfo::Explicit`] — compacted or history segments, where
+///   the (ordering-key, sequence) merge order makes sequences
+///   non-contiguous: one value per row.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum SequenceInfo {
+    /// Sequence == row id; zero bytes stored (the virtual state).
+    #[default]
+    RowIds,
+    /// Row `i` carries sequence `base + i`.
+    Contiguous {
+        /// The first row's sequence.
+        base: u64,
+    },
+    /// One birth sequence per row (delta-of-delta coded on disk).
+    Explicit(Vec<u64>),
+}
+
 /// An immutable, in-memory segment: a record batch plus what storage knows
 /// about it.
 pub struct Segment {
@@ -495,6 +531,12 @@ pub struct Segment {
     ordered: bool,
     base_row_id: u64,
     zone_maps: Vec<Option<ZoneMap>>,
+    sequence: SequenceInfo,
+    /// Per-row kill coordinates — `Some` only on history segments,
+    /// whose every row is a superseded version: the sequence at which
+    /// the row's tombstone was known (0 = unknown, from a v1 delete
+    /// log — treated as superseded before any `AS OF` cut).
+    superseded: Option<Vec<u64>>,
 }
 
 impl Segment {
@@ -506,6 +548,8 @@ impl Segment {
         ordered: bool,
         base_row_id: u64,
         zone_maps: Vec<Option<ZoneMap>>,
+        sequence: SequenceInfo,
+        superseded: Option<Vec<u64>>,
     ) -> Segment {
         Segment {
             batch,
@@ -513,14 +557,29 @@ impl Segment {
             ordered,
             base_row_id,
             zone_maps,
+            sequence,
+            superseded,
         }
     }
 
     /// The zone map for column `index`, if it has one (see [`ZoneMap`]).
     /// Query planning prunes segments whose ranges cannot satisfy a
     /// predicate; correctness never depends on these being present.
+    ///
+    /// `None` here means *this column has no valid, comparable values*
+    /// (an all-null column) — a pruner may act on that. It does **not**
+    /// mean "maps were never computed"; ask [`Segment::zone_maps_present`]
+    /// first, because the two conclusions are opposite.
     pub fn zone_map(&self, index: usize) -> Option<&ZoneMap> {
         self.zone_maps.get(index).and_then(Option::as_ref)
+    }
+
+    /// Whether this segment carries zone maps at all. A segment built by
+    /// [`Segment::from_batch_unpruned`] carries none, and a pruner must
+    /// then treat every segment as "maybe" — absent maps disable
+    /// pruning, they never justify it.
+    pub fn zone_maps_present(&self) -> bool {
+        !self.zone_maps.is_empty()
     }
 
     /// Wraps an already-built batch as a free-standing segment — the
@@ -535,6 +594,29 @@ impl Segment {
             ordered,
             base_row_id: 0,
             zone_maps,
+            sequence: SequenceInfo::RowIds,
+            superseded: None,
+        }
+    }
+
+    /// As [`Segment::from_batch`], but with no zone maps — for
+    /// query-lifetime scratch segments that are never zone-pruned.
+    ///
+    /// The map vector is left *empty* rather than filled with `None`,
+    /// which is what makes the difference observable: `None` at a column
+    /// index means "all null, prune away", while no maps at all means
+    /// "nothing is known, prune nothing" ([`Segment::zone_maps_present`]).
+    /// Conflating the two would let a pruner drop every row.
+    pub fn from_batch_unpruned(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {
+        let zone_maps = Vec::new();
+        Segment {
+            batch,
+            ordering_key,
+            ordered,
+            base_row_id: 0,
+            zone_maps,
+            sequence: SequenceInfo::RowIds,
+            superseded: None,
         }
     }
 
@@ -561,6 +643,69 @@ impl Segment {
     /// wins" resolution address rows by these ids, never by key tuples.
     pub fn base_row_id(&self) -> u64 {
         self.base_row_id
+    }
+
+    /// Where this segment's birth sequences live (see [`SequenceInfo`]).
+    /// Freshly frozen segments are virtual ([`SequenceInfo::RowIds`]);
+    /// anything else is attached by [`Segment::with_sequence`].
+    pub fn sequence_info(&self) -> &SequenceInfo {
+        &self.sequence
+    }
+
+    /// The birth sequence of the row at `offset` within this segment.
+    pub fn sequence_at(&self, offset: usize) -> u64 {
+        match &self.sequence {
+            SequenceInfo::RowIds => self.base_row_id + offset as u64,
+            SequenceInfo::Contiguous { base } => base + offset as u64,
+            SequenceInfo::Explicit(values) => values[offset],
+        }
+    }
+
+    /// One past the largest birth sequence in this segment — what
+    /// reopen folds over to recover the ingest-sequence watermark,
+    /// since flushes advance sequences without rewriting the manifest.
+    pub fn sequence_end(&self) -> u64 {
+        let rows = self.batch.num_rows() as u64;
+        match &self.sequence {
+            SequenceInfo::RowIds => self.base_row_id + rows,
+            SequenceInfo::Contiguous { base } => base + rows,
+            SequenceInfo::Explicit(values) => values.iter().max().map_or(0, |largest| largest + 1),
+        }
+    }
+
+    /// Attaches sequence data — the doorway a retaining compaction (and
+    /// post-divergence appends) use to record where sequences diverged
+    /// from row ids. An explicit array must carry one value per row.
+    pub fn with_sequence(mut self, sequence: SequenceInfo) -> Segment {
+        if let SequenceInfo::Explicit(values) = &sequence {
+            assert_eq!(
+                values.len(),
+                self.batch.num_rows(),
+                "an explicit sequence array carries one value per row"
+            );
+        }
+        self.sequence = sequence;
+        self
+    }
+
+    /// Per-row kill coordinates, present only on history segments: the
+    /// sequence at which each row's tombstone was known (0 = unknown,
+    /// from a v1 delete log — superseded before any `AS OF` cut).
+    pub fn superseded(&self) -> Option<&[u64]> {
+        self.superseded.as_deref()
+    }
+
+    /// Marks this segment as history: every row a superseded version,
+    /// `superseded[i]` the sequence its tombstone landed at. One value
+    /// per row.
+    pub fn with_superseded(mut self, superseded: Vec<u64>) -> Segment {
+        assert_eq!(
+            superseded.len(),
+            self.batch.num_rows(),
+            "a superseded array carries one value per row"
+        );
+        self.superseded = Some(superseded);
+        self
     }
 
     /// First and last values of the ordering key, or `None` if the

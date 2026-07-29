@@ -1,18 +1,23 @@
-//! `extern "C"` hooks for the M1 end-to-end oracle script (dev/CI only).
+//! `extern "C"` hooks for the Python oracle scripts (dev/CI only).
 //!
-//! Compiled only under the `oracle-harness` feature so
-//! `tests/m1_slice_oracle.py` can drive the whole vertical slice from
-//! Python: build with `cargo build -p engine --features oracle-harness`,
-//! then run the script against `target/debug/libengine.so`.
+//! Compiled only under the `oracle-harness` feature so the scripts in
+//! `tests/` can drive the engine from Python: build with `cargo build
+//! -p engine --features oracle-harness`, then run a script against
+//! `target/debug/libengine.so`. Every hook here is called by name from
+//! one of them — `m1_slice_oracle`, `m2_mutation_oracle`,
+//! `m2_differential_oracle`, `m2_lua_window_oracle` (which also covers
+//! the SQL-in-Lua driver pipeline), `m4_asof_oracle`, and the latency
+//! benchmark — so nothing in this module is reachable from Rust.
 //!
-//! Both hooks build the *same* deterministic table (a fixed
-//! linear-congruential generator — no ambient randomness, so every run
-//! and both hooks see identical data), append its rows one at a time
-//! through the real ingest path, run real SQL, and export through the
-//! real `ArrowArrayStream` doorway. The script then recomputes every
-//! window with `np.linalg.lstsq` (and DuckDB's `regr_slope`, when
-//! available) and diffs. That external recomputation — not this crate's
-//! own tests — is what earns M1's "compute proven" cross-check.
+//! The fixtures are deterministic (a fixed linear-congruential
+//! generator — no ambient randomness, so every run and every hook sees
+//! identical data). Rows are appended one at a time through the real
+//! ingest path; queries run real SQL; results leave through the real
+//! `ArrowArrayStream` doorway; and the persistent fixtures are closed
+//! and reopened from disk first, so a cross-check covers the storage
+//! round trip too. The scripts then recompute independently — NumPy,
+//! DuckDB — and diff. That external recomputation, not this crate's own
+//! tests, is what earns the cross-check claims.
 
 use crate::database::Database;
 use crate::table::Table;
@@ -325,6 +330,20 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
             ColumnType::F64,
         )
         .expect("lua_spread registers");
+    // The composed column kernels (option A): operators and rolling
+    // combinators vectorized in native code, one interpreter entry per
+    // query — including across segment boundaries, which the fixture's
+    // 64-row segments exercise.
+    table
+        .register_lua_scalar("lua_rel", &["a", "b"], "return (a - b) / b")
+        .expect("lua_rel registers");
+    table
+        .register_lua_scalar(
+            "lua_rdot",
+            &["a", "b"],
+            &format!("return rolling_dot(a, b, {})", LUA_PRECEDING + 1),
+        )
+        .expect("lua_rdot registers");
     let frame = format!(
         "OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN {LUA_PRECEDING} PRECEDING \
          AND CURRENT ROW)"
@@ -334,7 +353,9 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
          lua_mad(x) {frame} AS mad, \
          lua_wdot(y, x) {frame} AS wdot, \
          lua_npos(x) {frame} AS npos, \
-         lua_spread(x) {frame} AS spread \
+         lua_spread(x) {frame} AS spread, \
+         lua_rel(x, y) AS rel, \
+         lua_rdot(x, y) AS rdot \
          FROM trades"
     );
     match table.query_stream(&sql) {
@@ -342,6 +363,43 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
         // writable destination struct.
         Ok(stream) => unsafe { out.write(stream) },
         Err(error) => panic!("lua-window fixture query failed: {error}"),
+    }
+}
+
+/// The driver-pipeline family (SQL-in-Lua, #70): a script drives the
+/// engine end to end over the persistent, reopened, multi-segment M1
+/// fixture — SELECT out, the vectorized vocabulary over the result
+/// views (the contiguous result crosses segment boundaries and merges
+/// per-segment key dictionaries), exact row-by-row feed-back into a
+/// scratch table, SELECT back in. Exports the derived table (`ts, sym,
+/// x, y, rel, rdot`) for the oracle script to re-derive with NumPy.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_driver_pipeline_stream(out: *mut ArrowArrayStream) {
+    let mut database = Database::new();
+    database.add_table(fixture_table()).expect("fixture adds");
+    let script = format!(
+        "query(\"CREATE TABLE derived (ts BIGINT ORDERING KEY, sym KEY NOT NULL, \
+         x DOUBLE, y DOUBLE, rel DOUBLE, rdot DOUBLE)\")\n\
+         local r, n = query(\"SELECT ts, sym, x, y FROM trades\")\n\
+         local rel = (r.x - r.y) / r.y\n\
+         local rdot = rolling_dot(r.x, r.y, {window})\n\
+         for i = 1, n do\n\
+           append(\"derived\", {{ ts = r.ts[i], sym = r.sym:text(i), x = r.x[i], \
+           y = r.y[i], rel = rel[i], rdot = rdot[i] }})\n\
+         end\n\
+         local d, m = query(\"SELECT ts FROM derived\")\n\
+         assert(m == n, \"feed-back kept every row\")",
+        window = LUA_PRECEDING + 1
+    );
+    database.run_script(&script).expect("driver pipeline runs");
+    match database.query_stream("SELECT ts, sym, x, y, rel, rdot FROM derived") {
+        // SAFETY: the caller (the oracle script) provides a valid,
+        // writable destination struct.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("derived-table export failed: {error}"),
     }
 }
 
@@ -401,6 +459,19 @@ pub extern "C" fn tallydb_bench_open(rows: u64) -> *mut BenchContext {
     table
         .register_lua_window("lua_mad", &["x"], BENCH_MAD, ColumnType::F64)
         .expect("lua_mad registers");
+    table
+        .register_lua_scalar(
+            "lua_spread",
+            &["a", "b"],
+            "for i = 1, #a do out[i] = (a[i] - b[i]) / b[i] end",
+        )
+        .expect("lua_spread registers");
+    table
+        .register_lua_scalar("lua_rel", &["a", "b"], "return (a - b) / b")
+        .expect("lua_rel registers");
+    table
+        .register_lua_scalar("lua_rdot", &["a", "b"], "return rolling_dot(a, b, 64)")
+        .expect("lua_rdot registers");
     Box::into_raw(Box::new(BenchContext { table }))
 }
 
@@ -450,6 +521,213 @@ pub unsafe extern "C" fn tallydb_bench_query(
 pub unsafe extern "C" fn tallydb_bench_close(context: *mut BenchContext) {
     // SAFETY: caller contract — exactly one close per open.
     drop(unsafe { Box::from_raw(context) });
+}
+
+// ------------------------------------------------- the as-of oracle
+
+/// An open as-of oracle context (M4.4, issue #75): the M1 fixture in
+/// its own persistent directory, driven statement by statement from
+/// Python — mutations, compactions, reopens, and `ASOF` queries — so
+/// the script can read the ingest-sequence watermark around every
+/// mutation and build the explicit version table DuckDB re-derives
+/// every cut from. The emulation lives in the referee only.
+pub struct AsOfContext {
+    /// `None` transiently during [`tallydb_asof_reopen`] — the old
+    /// handle must drop before the directory is opened again.
+    table: Option<Table>,
+    dir: std::path::PathBuf,
+}
+
+impl AsOfContext {
+    fn table(&self) -> &Table {
+        self.table.as_ref().expect("context holds an open table")
+    }
+    fn table_mut(&mut self) -> &mut Table {
+        self.table.as_mut().expect("context holds an open table")
+    }
+}
+
+fn asof_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("x", ColumnType::F64, false),
+        Field::new("y", ColumnType::F64, false),
+    ])
+}
+
+/// Builds the as-of fixture — the M1 fixture's generator (same LCG,
+/// same symbols) in a dedicated directory — and returns an owned
+/// context. Release with [`tallydb_asof_close`].
+#[no_mangle]
+pub extern "C" fn tallydb_asof_open() -> *mut AsOfContext {
+    let dir = std::env::temp_dir().join(format!("tallydb-asof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut table =
+        Table::persistent_with_segment_rows("trades", asof_schema(), "ts", &dir, SEGMENT_ROWS)
+            .expect("as-of fixture schema is valid");
+    let mut rng = Lcg(0x5EED_1234_5678_9ABC);
+    let symbols = [
+        ("AAPL", 2.0, 5.0),
+        ("MSFT", -0.75, 12.0),
+        ("TSLA", 0.1, -3.0),
+    ];
+    for i in 0..ROWS {
+        let (sym, slope, intercept) = symbols[(i % 3) as usize];
+        let x = rng.next_f64() * 10.0;
+        let noise = (rng.next_f64() - 0.5) * 0.2;
+        let y = slope * x + intercept + noise;
+        table
+            .append(&[
+                RowValue::I64(i),
+                RowValue::Key(sym),
+                RowValue::F64(x),
+                RowValue::F64(y),
+            ])
+            .expect("as-of fixture rows are valid");
+    }
+    table.flush().expect("as-of fixture flush succeeds");
+    Box::into_raw(Box::new(AsOfContext {
+        table: Some(table),
+        dir,
+    }))
+}
+
+/// The context table's ingest-sequence watermark (the sequence the next
+/// appended row will receive) — what the oracle script records around
+/// every mutation to place version intervals.
+///
+/// # Safety
+/// `context` must come from [`tallydb_asof_open`] and not be closed.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_next_sequence(context: *mut AsOfContext) -> u64 {
+    // SAFETY: caller contract — a live context.
+    unsafe { &*context }.table().next_sequence()
+}
+
+/// Runs one mutation statement. Returns the rows changed, or -1 on
+/// failure (printed to stderr).
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`]; `sql` must be a valid
+/// NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_mutate(
+    context: *mut AsOfContext,
+    sql: *const std::os::raw::c_char,
+) -> i64 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_asof_mutate: SQL is not UTF-8");
+            return -1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.table_mut().mutate(sql) {
+        Ok(changed) => i64::try_from(changed).unwrap_or(i64::MAX),
+        Err(error) => {
+            eprintln!("tallydb_asof_mutate: {sql}: {error}");
+            -1
+        }
+    }
+}
+
+/// Compacts the context's table (superseded rows move to history).
+/// Returns 0 on success, 1 on failure.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_compact(context: *mut AsOfContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.table_mut().compact() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tallydb_asof_compact: {error}");
+            1
+        }
+    }
+}
+
+/// Closes and reopens the table from its directory — the storage round
+/// trip: manifest, segments, history, delete logs, and WAL all come
+/// back from bytes. Returns 0 on success, 1 on failure.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_reopen(context: *mut AsOfContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    let context = unsafe { &mut *context };
+    context.table = None; // drop the old handle before reopening
+    match Table::persistent_with_segment_rows(
+        "trades",
+        asof_schema(),
+        "ts",
+        &context.dir,
+        SEGMENT_ROWS,
+    ) {
+        Ok(table) => {
+            context.table = Some(table);
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_asof_reopen: {error}");
+            1
+        }
+    }
+}
+
+/// Runs one SQL query (`ASOF` included) against the context's table and
+/// exports the result. Returns 0 on success; 1 on failure with `out`
+/// untouched.
+///
+/// # Safety
+/// As for [`tallydb_asof_next_sequence`]; `sql` must be a valid
+/// NUL-terminated string; `out` a valid, writable destination not
+/// holding a live export.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_query(
+    context: *mut AsOfContext,
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_asof_query: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &*context }.table().query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_asof_query: {sql}: {error}");
+            1
+        }
+    }
+}
+
+/// Releases an as-of context and its temporary directory.
+///
+/// # Safety
+/// `context` must come from [`tallydb_asof_open`] and not have been
+/// closed already.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_asof_close(context: *mut AsOfContext) {
+    // SAFETY: caller contract — exactly one close per open.
+    let context = unsafe { Box::from_raw(context) };
+    let dir = context.dir.clone();
+    drop(context);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The mutation sequence the differential oracle replays in DuckDB.

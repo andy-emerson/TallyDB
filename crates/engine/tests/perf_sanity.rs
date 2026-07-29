@@ -7,9 +7,11 @@
 //! ```
 //!
 //! The numbers printed are Observed evidence (one machine, one run) —
-//! cite them with their run, never as stable facts. Real measurement
-//! (ratios against a named peer on the corpus) arrives with the corpus
-//! at M2.2.
+//! cite them with their run, never as stable facts. Measurement against
+//! named peers lives in `tests/m2_compute_latency_bench.py`, which
+//! reports ratios against both NumPy over TallyDB's own export and the
+//! DuckDB+NumPy stack; this file is only a smoke check that the shapes
+//! stay in their expected order of magnitude.
 
 use arrow_lite::{ColumnType, Field, Schema};
 use engine::{RowValue, Table};

@@ -403,11 +403,17 @@ refused with its own teaching error (the ordering key is not a
 uniqueness constraint — duplicates are first-class), while serving
 internally as the parser's carrier for the `ORDERING KEY` phrase.
 **Import** — CSV in the shell layer feeding the ordinary append path;
-the engine never parses CSV. **Code registration** — the explicit
-`.lua` dot-command only; `CREATE FUNCTION ... LANGUAGE LUA` is
-deliberately *not* SQL, so a SQL string is never a code-injection
-vector — the SQL form is a recorded decision for the served product's
-threat model, not before. Local security posture: an OS file lock
+the engine never parses CSV. **Code registration** — explicit
+dot-commands only, and there are three: `.lua` and `.luascalar`
+register kernels typed at the prompt, and `.run FILE` executes a
+driver script from a path the user names. What they share is the
+property that matters: code enters through a channel the user typed
+deliberately, never through data. `CREATE FUNCTION ... LANGUAGE LUA`
+is deliberately *not* SQL, so a SQL string — which may be built from
+user input — is never a code-injection vector; the SQL form is a
+recorded decision for the served product's threat model, not before.
+(`.run` reads a file, so it inherits the console's trust in the local
+filesystem, the same trust `.import` already needs.) Local security posture: an OS file lock
 (released by the OS on death — no stale locks) admits one process per
 directory; table names stay identifiers (they become directory names).
 
@@ -416,24 +422,97 @@ directory; table names stay identifiers (they become directory names).
 extension model before the desk: the 2026-07-28 review rulings touched
 M0–M3 design, and the back-end must settle before anything user-facing
 is built on it).** M3 ships *embed in your application* plus the
-console. **M4 (the extension model)** makes the 2026-07-28 rulings
-real and small: the `WindowAggregate` trait and `register_window`
-become public engine surface (the primary extension path); compute-lua
-becomes a non-default feature the console enables; the Lua-as-NumPy
-plan lands — the vocabulary invariant (anything SQL can call, Lua can
-call), the vectorized whole-column kernel slot wired (`eval_column`,
-built in M2.7 and never connected), the compose-don't-loop idiom
-documented, and promotion made mechanical (one registry name, Lua
-implementation swappable for a trait implementation with no query
-change); the vendored interpreter is finally validated against the
-upstream Lua test suite (#69); plus the accumulated low-hanging
-correctness work (#73 atomic mutations, #63 Miri in CI, the review
-pass's noted redundancies). **M5 (desk adoption)** then builds what
-the target user needs, chosen by the moat test: multi-factor curated
-compute (K > 2 — the recorded LAPACK-class-returns trigger firing,
-served by faer), the ordered-axis dividends (cross-sectional
-partitioning, time bucketing pending F1, `LAG`/`LEAD`, `RANGE` frames,
-`ASOF` #65, corrections pending F2), segment-lazy open (F3),
+console. **M4 (the extension model + corrections)** makes the
+2026-07-28 rulings real — the back-end settles before anything
+user-facing builds on it. The plan of record, approved 2026-07-28:
+
+- **M4.0 Trait exposure** — `WindowAggregate` and `Registry`
+  re-exported, `Table::register_window` + `Database::register_window`
+  public, the ~20-line embedder kernel as a doctest.
+- **M4.1 The feature gate** — compute-lua becomes a non-default
+  feature the console enables; CI builds and tests both legs;
+  sanitizer/apicheck jobs run in the on-leg only.
+- **M4.2 The Lua front-end** — Lua as a thin front-end over compiled
+  ops, on the architecture NumPy proved (a slow interpreter is fine
+  when the loops live in compiled code and scripts only compose): the
+  vocabulary invariant (every registered *window aggregate* is callable
+  from Lua by its SQL name — registry-driven, so future natives flow in
+  for free; column functions are a second namespace and do not cross,
+  see below), the vectorized
+  whole-column kernel slot wired (`eval_column`, built in M2.7 and
+  never connected; likely closes #53), the compose-don't-loop idiom
+  documented, promotion made mechanical (one registry name, Lua
+  implementation swappable for a trait implementation with no query
+  change).
+- **M4.3 The corrections design cycle — ruled 2026-07-28, closed.**
+  F2 is **(a) whole**, and its three sub-decisions are settled: the
+  ingest-sequence column is **default-on** for every table (one
+  solution for arrival order, the `AS OF` coordinate, and the
+  ready-at-hand stable id; the virtual-until-divergence design makes
+  it nearly free — store nothing while sequence == row id, materialize
+  delta-coded from the first divergence); the retention horizon is
+  **unbounded by default** with a per-table bound available; and **one
+  keyword — `ASOF` — with structure dispatching** (amended by ruling,
+  2026-07-28): followed by `JOIN` it is the event-time nearest-match
+  join (the DuckDB/ClickHouse/QuestDB/Snowflake spelling, unchanged);
+  followed by a sequence it is knowledge-time travel
+  (`FROM trades ASOF 41520`). Why one word: the join side has a
+  universal convention worth honoring while the travel side has none
+  (Oracle `AS OF SCN`, Delta `VERSION AS OF`, Snowflake `AT` — no
+  consensus to diverge from), and two-word `AS OF` collides with
+  SQL's alias grammar (`trades AS OF` = "trades renamed OF"). Riders:
+  the SQL:2011 long form `FOR SYSTEM_TIME AS OF n` stays accepted
+  (sqlparser parses it natively; it is the internal carrier), and a
+  textual teaching error catches two-word `AS OF <n>` before the
+  parser garbles it — the error message itself teaches the two axes
+  (join = event time on the ordering key; travel = knowledge time on
+  the ingest sequence). Mix-ups cannot yield wrong semantics: the two
+  uses need different surrounding syntax, so confusion is a loud
+  error, never a silently wrong answer.
+- **M4.4 The corrections build** — the hidden ingest-sequence column
+  (the permanent knowledge axis; delta-coded to almost nothing while
+  uncorrected), retaining compaction (history segments), the knowledge
+  mask (the live mask's analog), the `AS OF` predicate. Oracle: DuckDB
+  re-deriving as-of answers over an explicit history table — emulation
+  in the referee only, never in the product. Format additions ride the
+  one manifest revision shared with F3's zone-map lift (sections
+  reserved now, filled by whichever lands first).
+- **M4.5 The correctness batch** — #73 (the atomic mutation commit
+  record: old-or-new for crashes and readers, recovery
+  auto-completes), #63 (Miri in CI), #69 (the upstream Lua test
+  suite), the review-noted redundancies.
+- **The Lua trial** — ruled 2026-07-28, **pass** (see *The Lua
+  layer*): the Agent brought the evidence brief (#76), the Human
+  ruled Lua stays. The sunset clause dissolved.
+- **M4.6 SQL-in-Lua (#70)** — built on the pass: driver scripts
+  (`query`/`append` through the `ScriptHost` seam, the console's
+  `.run`), evidenced by an end-to-end SQL → Lua → SQL differential in
+  the CI Lua oracle.
+- **M4-close reviews (2026-07-28)** — three independent repo-wide code
+  reviewers, every finding reproduced before its fix. What they found
+  is worth recording, because it says where this milestone's risk
+  actually sat: two of the three correctness bugs were in *text
+  handling and routing*, not in the storage machinery the milestone
+  was about. The `ASOF` pre-pass reassembled statements by joining
+  tokens with spaces, so a `--` comment silently swallowed the rest of
+  a query — the precise failure the clause's own ruling said could not
+  happen; whether a query was accepted depended on how many segments
+  its rows occupied; two embedder-facing paths could abort the process
+  (an unreserved Lua stack push, and embedder code called without
+  `catch_unwind`); a supersession at coordinate 0 wrote commit evidence
+  indistinguishable from a plain delete; and absent zone maps
+  *falsified* pruning against the invariant stated in two other files.
+  The reviews also caught this document and several crate docs claiming
+  a vocabulary invariant wider than the code holds. Lesson taken:
+  hand-rolled pre-parse text manipulation deserves the same adversarial
+  testing as the format code, and a "sound over-approximation" needs a
+  test that a *missing* input cannot flip it.
+
+**M5 (desk adoption)** then builds what the target user needs, chosen
+by the moat test: multi-factor curated compute (K > 2 — the recorded
+LAPACK-class-returns trigger firing, served by faer), the ordered-axis
+dividends (cross-sectional partitioning, time bucketing pending F1,
+`LAG`/`LEAD`, `RANGE` frames, `ASOF` #65), segment-lazy open (F3),
 cross-process readers (F4), and reach (bulk Arrow ingest, a Python
 binding with host-callback NumPy kernels — distribution method open: a
 wheel is one form, not the ruling). **M6 (WASM parity)** adds *embed
@@ -1073,17 +1152,65 @@ hosts that have no language of their own:
    where fixed costs dominate). It is **not** the extensibility story;
    the trait is.
 
-**The sunset clause.** ~32k lines (vendored C + bindings) is not yet
-justified by that niche. Lua must demonstrate value before release
-1.0 — real console/browser kernel use, or the latency niche exercised
-in practice — or it is removed and tier 3 becomes query-only. If the
-sunset executes, the **no-coined-SQL-names principle reopens by its
-recorded trigger** (ruled 2026-07-28): with no scripting layer to
-carry novel compute names, SQL becomes their only home, and
-`eigen_max`-class naming must be re-decided there. The
-runaway-kernel guard (#61) is scoped by the same ruling: required
-before Lua ships in any surface serving untrusted input (the M7
-served product), optional for a local console.
+**The sunset clause — ruled 2026-07-28: the trial passed, the clause
+dissolved.** The clause (restructured earlier the same day) held that
+~32k lines of vendored C + bindings were not yet justified by Lua's
+niche, so Lua would stand trial at the end of M4, once its best case
+existed — the trait beneath it, the vocabulary invariant, the
+vectorized whole-column slot, the compose-don't-loop idiom, and the
+upstream test suite all built. The Agent brought the evidence brief
+(#76): the vendored sources byte-identical to upstream v5.4.7 with
+the full official suite + `ltests` torture harness green in CI, and —
+after the vectorized vocabulary (option A) landed — composed column
+kernels measured **ahead of the DuckDB+NumPy competitor stack**
+(~2–2.5× at 20k rows after the dense fast paths), with the honest
+behinds stated: element loops ~14× behind vectorized NumPy, composed
+shapes still behind NumPy riding the engine's own export. **The Human
+ruled Lua stays.** Consequences, all taken: SQL-in-Lua (#70) built as
+M4's closing increment — the second direction earned by the first —
+and the no-coined-SQL-names reopen trigger does **not** fire (the
+scripting layer remains the home for novel compute names). The
+rejected fail-branch stays recorded for its reopen value: removal
+whole (crate, feature flag, console `.lua`), tier 3 query-only, SQL
+naming re-decided. Interpreter swaps were examined for the element-
+loop gap and rejected on invariants, not taste: LuaJIT/Luau descend
+from Lua 5.1 — **no 64-bit integer subtype**, so the `i64` exactness
+contract breaks precisely where the ordering key lives (nanosecond
+timestamps exceed 2^53) — and neither targets wasm32; the recorded
+element-loop answer is vocabulary completeness (more registered ops,
+more rolling combinators), not a faster interpreter. The
+runaway-kernel guard (#61) keeps its scoping: required before Lua
+ships in any surface serving untrusted input (the M7 served product),
+optional for a local console.
+
+**The idiom: compose, don't loop (M4.2).** Lua's cost model has three
+tiers, and the documentation teaches the same discipline NumPy's
+culture teaches Python: (1) an element loop written in Lua pays an
+interpreted dispatch per element — the 13× tier, the code smell;
+(2) a kernel that *composes registered ops* (`return 2 * sumsq(x)`)
+runs compiled arithmetic with one interpreter entry per call; (3) the
+engine-driven paths (`evaluate_frames` for windows, `eval_column` for
+column functions) enter the interpreter once per *run or view*. The
+vocabulary invariant makes tier 2 grow for free — every registered
+window aggregate is callable from a kernel by its SQL name,
+registry-driven — and the vectorized column slot puts scripted per-row
+work in tier 3.
+
+**The invariant's edge, stated precisely (found by the M4-close code
+review, 2026-07-28).** It covers window aggregates, not *column*
+functions: the host-function seam a script calls through returns one
+value per call, while a column function returns a whole column, so
+there is no shape to install one under — `register_column_function`
+and the console's `.luascalar` are SQL-callable but resolve to nil
+inside a kernel. This is a real edge, not a wiring slip, and the docs
+claimed it closed until the review caught them. A script wanting
+whole-column work has the vectorized vocabulary (operators,
+`rolling_*`) instead; widening the invariant needs a column-shaped
+host seam, which is where the tranche-2 primitives (#77) would land.
+
+Promotion is mechanical:
+one registry name, a Lua implementation swappable for a trait
+implementation with no query change (both pinned by contract tests).
 
 **A history correction (same review).** The four curated statistics
 were *not* produced by promoting Lua prototypes — the regressions
@@ -1116,12 +1243,18 @@ engine and runs SQL. A third, the **data-only baseline** (staged
 falls out for free from being an embeddable library. These *exhaust* the
 in-process embed: direction — who calls whom — is the only axis, so there
 is no third role to invent. SQL-only queries and Lua-only computation are
-the degenerate cases (no crossing), not prohibitions. M2.7 builds
-**SQL-in-Lua first**, then the **Lua-in-SQL window slot** (#47, #53); the
-remaining Lua-in-SQL slots — scalar, table-valued, predicate — are
-deferred sub-scopes of that direction, not new roles. (These replace the
-earlier "Role 1 / Role 2" labels: Lua-in-SQL was Role 1, SQL-in-Lua was
-Role 2.)
+the degenerate cases (no crossing), not prohibitions. Both directions are
+built: **Lua-in-SQL** shipped its window slot in M2.7 (#47, #53) and its
+vectorized column slot in M4.2; **SQL-in-Lua** (#70, M4.6) is the driver
+seam — `query(sql)` returns result columns as the same zero-copy views
+kernels consume (several segments concatenate — the bounded copy — with
+per-segment key dictionaries merged), `append(table, row)` feeds derived
+rows back exactly, and both globals are live only inside a driving call
+(`LuaState::run_driver` / `Database::run_script` / the console's
+`.run`), so a kernel can never re-enter the engine mid-query. The
+remaining Lua-in-SQL slots — table-valued, predicate — are deferred
+sub-scopes of that direction, not new roles. (These replace the earlier
+"Role 1 / Role 2" labels: Lua-in-SQL was Role 1, SQL-in-Lua was Role 2.)
 
 **Decision record — NULL across the script boundary (2026-07-26).** NULL
 crosses to Lua as a distinct **sentinel value** — a `pd.NA`-style

@@ -110,7 +110,10 @@ pub mod tombstone;
 pub use codec::{Codec, CodecError};
 pub use format::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, Manifest,
+    ManifestSections,
 };
 pub use io::{FsBackend, IoError, LogWriter, MemBackend, StorageBackend};
-pub use mem::{RowValue, Segment, StorageError, WriteBuffer, ZoneMap};
-pub use store::{SegmentView, Store, StoreOptions, StoreReader, WalSync, DEFAULT_SEGMENT_ROWS};
+pub use mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};
+pub use store::{
+    KnowledgeSnapshot, SegmentView, Store, StoreOptions, StoreReader, WalSync, DEFAULT_SEGMENT_ROWS,
+};

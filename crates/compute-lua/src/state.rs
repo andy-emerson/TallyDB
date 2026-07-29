@@ -38,6 +38,7 @@
 //! *The Lua layer*), a kernel that proves hot graduates to a curated
 //! native op rather than the interpreter getting a JIT.
 
+use crate::driver::{self, DriverCall, DriverSlot, ScriptHost};
 use crate::ffi;
 use crate::host::{self, HostFunction, HostSlot};
 use crate::log::{self, LogSink, SinkSlot};
@@ -81,6 +82,9 @@ pub struct LuaState {
     /// Registered host functions, one stable box each (the closures'
     /// upvalues point at them); freed in `Drop`.
     host_functions: Vec<*mut HostSlot>,
+    /// The driver slot `query`/`append` reach — null except inside
+    /// [`LuaState::run_driver`]; freed in `Drop`.
+    driver: *mut DriverSlot,
     /// This interpreter's identity, stamped into every [`Chunk`] it
     /// compiles so a chunk cannot be run against another state.
     id: u64,
@@ -103,13 +107,17 @@ impl LuaState {
             ffi::luaL_requiref(raw, c"table".as_ptr(), ffi::luaopen_table, 1);
             ffi::lua_settop(raw, 0);
             let generation = values::install(raw);
+            crate::vector::install(raw);
             let sink = Box::into_raw(Box::new(SinkSlot(None)));
             log::install(raw, sink);
+            let driver_slot = Box::into_raw(Box::new(DriverSlot(std::ptr::null_mut())));
+            driver::install(raw, driver_slot);
             Ok(LuaState {
                 raw,
                 generation,
                 sink,
                 host_functions: Vec::new(),
+                driver: driver_slot,
                 id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 next_chunk: 0,
             })
@@ -222,11 +230,56 @@ impl LuaState {
     ) -> Result<(), String> {
         unsafe {
             debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
-            let result = self.bind_inputs(inputs).and_then(|()| {
-                values::bind_output(self.raw, self.generation, &mut output);
-                self.run(chunk, 0)
-            });
+            let result = self
+                .bind_inputs(inputs)
+                .and_then(|()| {
+                    values::bind_output(self.raw, self.generation, &mut output);
+                    self.run(chunk, 1)
+                })
+                .and_then(|()| crate::vector::read_column_result(self.raw));
+            let result = result.and_then(|column| write_column_result(column, &mut output));
             self.end_call();
+            result
+        }
+    }
+
+    /// Runs `chunk` as a **driver script** — the SQL-in-Lua shape
+    /// (#70): for this call only, the globals `query` and `append`
+    /// reach `host`, so the script issues SQL, receives result columns
+    /// as zero-copy views, and feeds derived rows back. Result views
+    /// (like input views everywhere else) are valid only inside this
+    /// call: the held result buffers drop after the generation bump
+    /// poisons them. Outside this method, `query`/`append` raise —
+    /// a window or scalar kernel cannot re-enter the engine.
+    pub fn run_driver(&mut self, chunk: &Chunk, host: &mut dyn ScriptHost) -> Result<(), String> {
+        unsafe {
+            debug_assert_eq!(ffi::lua_gettop(self.raw), 0);
+            // Erase the borrow's lifetime into the raw slot pointer:
+            // the pointer is reachable only while this frame is live —
+            // the slot is nulled again before this method returns.
+            let host: *mut (dyn ScriptHost + '_) = host;
+            let host: *mut dyn ScriptHost = std::mem::transmute(host);
+            let mut call = DriverCall {
+                host,
+                held: Vec::new(),
+                generation: self.generation,
+            };
+            // A guard, not a trailing statement: the slot must be nulled
+            // even if this frame unwinds, or a later call would follow a
+            // dangling pointer to `call`. Structural beats argued.
+            struct Disarm(*mut DriverSlot);
+            impl Drop for Disarm {
+                fn drop(&mut self) {
+                    unsafe { (*self.0).0 = std::ptr::null_mut() };
+                }
+            }
+            (*self.driver).0 = &mut call;
+            let disarm = Disarm(self.driver);
+            let result = self.run(chunk, 0);
+            drop(disarm);
+            self.end_call();
+            // `call` (host pointer, held results) drops here — after
+            // the bump, so no live view can reach a freed buffer.
             result
         }
     }
@@ -287,16 +340,124 @@ impl LuaState {
     }
 }
 
+/// Applies a `return <column>` result (the composed-kernel shape) to
+/// the output: the returned column replaces the output wholesale, with
+/// the F3 exact-or-loud coercion into a declared `i64` output. With no
+/// returned value, the script's `out[i]` writes stand.
+fn write_column_result(
+    column: crate::vector::ColumnResult,
+    output: &mut OutputColumn<'_>,
+) -> Result<(), String> {
+    let elements = match column {
+        crate::vector::ColumnResult::None => return Ok(()),
+        crate::vector::ColumnResult::Dense(dense) => {
+            // The bulk path: a NULL-free column copies straight in.
+            return match output {
+                OutputColumn::F64 { values, validity } => {
+                    if dense.len() != values.len() {
+                        return Err(format!(
+                            "result: returned column has {} elements for {} output rows",
+                            dense.len(),
+                            values.len()
+                        ));
+                    }
+                    values.copy_from_slice(&dense);
+                    (0..dense.len()).for_each(|offset| validity.set(offset, true));
+                    Ok(())
+                }
+                OutputColumn::I64 { values, validity } => {
+                    if dense.len() != values.len() {
+                        return Err(format!(
+                            "result: returned column has {} elements for {} output rows",
+                            dense.len(),
+                            values.len()
+                        ));
+                    }
+                    for (offset, value) in dense.into_iter().enumerate() {
+                        match crate::values::float_as_i64_exact(value) {
+                            Some(integer) => {
+                                values[offset] = integer;
+                                validity.set(offset, true);
+                            }
+                            None => {
+                                return Err(
+                                    "result: float element does not fit i64 exactly".to_owned()
+                                )
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                OutputColumn::Key { .. } => {
+                    Err("result: a returned column cannot fill a key output".to_owned())
+                }
+            };
+        }
+        crate::vector::ColumnResult::Elements(elements) => elements,
+    };
+    match output {
+        OutputColumn::F64 { values, validity } => {
+            if elements.len() != values.len() {
+                return Err(format!(
+                    "result: returned column has {} elements for {} output rows",
+                    elements.len(),
+                    values.len()
+                ));
+            }
+            for (offset, element) in elements.into_iter().enumerate() {
+                match element {
+                    Some(value) => {
+                        values[offset] = value;
+                        validity.set(offset, true);
+                    }
+                    None => validity.set(offset, false),
+                }
+            }
+            Ok(())
+        }
+        OutputColumn::I64 { values, validity } => {
+            if elements.len() != values.len() {
+                return Err(format!(
+                    "result: returned column has {} elements for {} output rows",
+                    elements.len(),
+                    values.len()
+                ));
+            }
+            for (offset, element) in elements.into_iter().enumerate() {
+                match element {
+                    Some(value) => match crate::values::float_as_i64_exact(value) {
+                        Some(integer) => {
+                            values[offset] = integer;
+                            validity.set(offset, true);
+                        }
+                        None => {
+                            return Err("result: float element does not fit i64 exactly".to_owned())
+                        }
+                    },
+                    None => validity.set(offset, false),
+                }
+            }
+            Ok(())
+        }
+        OutputColumn::Key { .. } => {
+            Err("result: a returned column cannot fill a key output".to_owned())
+        }
+    }
+}
+
 // SAFETY (the Send argument, written once and load-bearing):
 //
 // 1. `LuaState` uniquely owns its interpreter: the raw `lua_State` is
 //    created in `new`, closed in `Drop`, and the pointer is never
 //    copied out of the struct (`view_data_pointer` returns buffer
 //    pointers, not the state). `generation` points into that same
-//    interpreter's registry-anchored allocation; `sink` and each
-//    `host_functions` entry point into Boxes this struct alone owns
-//    (their `LogSink` / `HostFunction` contents are themselves `Send`
-//    by the traits' bounds), so all of it moves with it.
+//    interpreter's registry-anchored allocation; `sink`, `driver`, and
+//    each `host_functions` entry point into Boxes this struct alone
+//    owns (their `LogSink` / `HostFunction` contents are themselves
+//    `Send` by the traits' bounds; the driver slot holds only a null
+//    pointer between `run_driver` calls, and during one the frame it
+//    points at lives on the single calling thread's stack), so all of
+//    it moves with it.
 // 2. Every operation takes `&mut self`, so after a move to another
 //    thread exactly one thread touches the interpreter at a time.
 // 3. Vendored PUC Lua 5.4, compiled unmodified with the ANSI config,
@@ -320,6 +481,7 @@ impl Drop for LuaState {
             // After close nothing can reach the closures' upvalues; the
             // slots are safe to free.
             drop(Box::from_raw(self.sink));
+            drop(Box::from_raw(self.driver));
             for slot in self.host_functions.drain(..) {
                 drop(Box::from_raw(slot));
             }
@@ -1617,5 +1779,324 @@ mod tests {
             per_row.as_secs_f64() / vectorized.as_secs_f64(),
             vectorized.as_secs_f64() / native.as_secs_f64(),
         );
+    }
+
+    // ---- the vectorized vocabulary (M4, option A) ----
+
+    /// A composed kernel: one interpreter entry, native loops, and the
+    /// same IEEE arithmetic as the native expression slot — bit-exact.
+    #[test]
+    fn composed_operators_match_native_arithmetic_bit_for_bit() {
+        let a: Vec<f64> = (0..500).map(|i| f64::from(i) * 0.5 + 3.0).collect();
+        let b: Vec<f64> = (0..500)
+            .map(|i| f64::from(i).mul_add(-0.25, 40.0))
+            .collect();
+        let mut out = vec![0.0f64; 500];
+        let mut validity = Bitmap::new_unset(500);
+        let mut state = LuaState::new().unwrap();
+        eval_col(
+            &mut state,
+            "return (a - b) / b",
+            &[(c"a", f64s(&a)), (c"b", f64s(&b))],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
+        for i in 0..500 {
+            assert!(validity.get(i));
+            assert_eq!(out[i].to_bits(), ((a[i] - b[i]) / b[i]).to_bits());
+        }
+    }
+
+    /// The dense fast path and the general path are the same function:
+    /// integer-valued data fed as f64 views (fast) and as i64 views
+    /// (general — the per-element exactness check keeps it off the
+    /// fast path) produces bit-identical composed and rolling results.
+    #[test]
+    fn dense_fast_path_agrees_with_the_general_path() {
+        let ints: Vec<i64> = (0..300).map(|i| (i * 7 % 250) - 125).collect();
+        let floats: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
+        let offset: Vec<f64> = (0..300).map(|i| f64::from(i) + 0.5).collect();
+        let mut state = LuaState::new().unwrap();
+        for source in [
+            "return (x + y) * x - y / (x + 200)",
+            "return rolling_sum(x, 7) + rolling_dot(x, y, 13)",
+        ] {
+            let mut run = |x: ColumnView<'_>| -> Vec<f64> {
+                let mut out = vec![0.0f64; 300];
+                let mut validity = Bitmap::new_unset(300);
+                eval_col(
+                    &mut state,
+                    source,
+                    &[(c"x", x), (c"y", f64s(&offset))],
+                    OutputColumn::F64 {
+                        values: &mut out,
+                        validity: &mut validity,
+                    },
+                )
+                .unwrap();
+                assert_eq!(validity.count_set(), 300);
+                out
+            };
+            let fast = run(f64s(&floats));
+            let general = run(ColumnView::I64 {
+                values: &ints,
+                validity: None,
+            });
+            for (a, b) in fast.iter().zip(&general) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn scalars_broadcast_and_i64_views_convert_exactly() {
+        let ticks: Vec<i64> = (0..8).map(|i| 1_000_000 + i).collect();
+        let mut out = vec![0.0f64; 8];
+        let mut validity = Bitmap::new_unset(8);
+        let mut state = LuaState::new().unwrap();
+        eval_col(
+            &mut state,
+            "return (v - 1000000) * 2.5",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &ticks,
+                    validity: None,
+                },
+            )],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap();
+        for (i, value) in out.iter().enumerate() {
+            assert_eq!(*value, i as f64 * 2.5);
+        }
+        // An i64 element beyond 2^53 cannot cross into f64 arithmetic
+        // silently (F3).
+        let big: Vec<i64> = vec![(1 << 53) + 1];
+        let mut out = [0.0f64];
+        let mut validity = Bitmap::new_unset(1);
+        let error = eval_col(
+            &mut state,
+            "return v + 0.0",
+            &[(
+                c"v",
+                ColumnView::I64 {
+                    values: &big,
+                    validity: None,
+                },
+            )],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("does not fit f64 exactly"), "{error}");
+    }
+
+    #[test]
+    fn null_propagates_elementwise_through_operators() {
+        let a = [1.0f64, 2.0, 3.0];
+        let b = [10.0f64, 20.0, 30.0];
+        let a_validity = Bitmap::from_bools([true, false, true]);
+        let mut out = [0.0f64; 3];
+        let mut out_validity = Bitmap::new_unset(3);
+        let mut state = LuaState::new().unwrap();
+        eval_col(
+            &mut state,
+            "return a + b",
+            &[
+                (
+                    c"a",
+                    ColumnView::F64 {
+                        values: &a,
+                        validity: Some(&a_validity),
+                    },
+                ),
+                (c"b", f64s(&b)),
+            ],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut out_validity,
+            },
+        )
+        .unwrap();
+        assert!(out_validity.get(0) && !out_validity.get(1) && out_validity.get(2));
+        assert_eq!(out[0], 11.0);
+        assert_eq!(out[2], 33.0);
+        // The sentinel itself as an operand: every element NULL, in
+        // both operand orders (3VL, elementwise).
+        for chunk in ["return a * NULL", "return NULL * a"] {
+            let mut out = [0.0f64; 3];
+            let mut out_validity = Bitmap::new_unset(3);
+            eval_col(
+                &mut state,
+                chunk,
+                &[(c"a", f64s(&b))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut out_validity,
+                },
+            )
+            .unwrap();
+            assert!((0..3).all(|i| !out_validity.get(i)), "{chunk}");
+        }
+    }
+
+    #[test]
+    fn vector_misuse_is_loud() {
+        let a = [1.0f64, 2.0];
+        let b = [1.0f64, 2.0, 3.0];
+        let mut state = LuaState::new().unwrap();
+        let mut out = [0.0f64; 2];
+        let mut validity = Bitmap::new_unset(2);
+        let error = eval_col(
+            &mut state,
+            "return a + b",
+            &[(c"a", f64s(&a)), (c"b", f64s(&b))],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("different lengths"), "{error}");
+        // A returned column must fill the whole output.
+        let mut validity = Bitmap::new_unset(2);
+        let error = eval_col(
+            &mut state,
+            "return b + 0.0",
+            &[(c"a", f64s(&a)), (c"b", f64s(&b))],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("3 elements for 2 output rows"), "{error}");
+    }
+
+    #[test]
+    fn rolling_combinators_match_per_window_recompute() {
+        let n = 300;
+        let window = 7;
+        // Timestamp-scale offsets: the adversarial shape that breaks
+        // the cumsum idiom; the compensated sweep must hold ~1e-12
+        // relative to per-window recompute.
+        let x: Vec<f64> = (0..n)
+            .map(|i| 1.0e12 + f64::from(i as u32).sin() * 3.0)
+            .collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| 2.0e11 + f64::from(i as u32).cos() * 5.0)
+            .collect();
+        let mut state = LuaState::new().unwrap();
+        for (chunk, reference) in [
+            (
+                "return rolling_sum(x, 7)",
+                Box::new(|lo: usize, hi: usize| x[lo..hi].iter().sum::<f64>())
+                    as Box<dyn Fn(usize, usize) -> f64>,
+            ),
+            (
+                "return rolling_mean(x, 7)",
+                Box::new(|lo: usize, hi: usize| x[lo..hi].iter().sum::<f64>() / (hi - lo) as f64),
+            ),
+            (
+                "return rolling_dot(x, y, 7)",
+                Box::new(|lo: usize, hi: usize| (lo..hi).map(|i| x[i] * y[i]).sum::<f64>()),
+            ),
+        ] {
+            let mut out = vec![0.0f64; n];
+            let mut validity = Bitmap::new_unset(n);
+            eval_col(
+                &mut state,
+                chunk,
+                &[(c"x", f64s(&x)), (c"y", f64s(&y))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap();
+            for (i, got) in out.iter().enumerate() {
+                let lo = (i + 1).saturating_sub(window);
+                let expected = reference(lo, i + 1);
+                let scale = expected.abs().max(1.0);
+                assert!(
+                    ((got - expected) / scale).abs() < 1e-12,
+                    "{chunk}: row {i}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_combinators_refuse_nulls_and_bad_windows() {
+        let x = [1.0f64, 2.0, 3.0];
+        let x_validity = Bitmap::from_bools([true, false, true]);
+        let mut state = LuaState::new().unwrap();
+        let mut out = [0.0f64; 3];
+        let mut validity = Bitmap::new_unset(3);
+        let error = eval_col(
+            &mut state,
+            "return rolling_sum(x, 2)",
+            &[(
+                c"x",
+                ColumnView::F64 {
+                    values: &x,
+                    validity: Some(&x_validity),
+                },
+            )],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("non-null input"), "{error}");
+        let mut validity = Bitmap::new_unset(3);
+        let error = eval_col(
+            &mut state,
+            "return rolling_sum(x, 0)",
+            &[(c"x", f64s(&x))],
+            OutputColumn::F64 {
+                values: &mut out,
+                validity: &mut validity,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("positive integer"), "{error}");
+    }
+
+    #[test]
+    fn vectors_survive_calls_but_views_still_do_not() {
+        // Vectors own their data (GC-managed), so stashing one across
+        // calls is safe; views stay generation-poisoned — the lifetime
+        // discipline is unchanged.
+        let a = [5.0f64, 6.0];
+        let mut state = LuaState::new().unwrap();
+        let stash = state
+            .compile("stashed_vec = a + 0.0\nstashed_view = a\nreturn 0")
+            .unwrap();
+        state
+            .eval_scalar(&stash, &[(c"a", f64s(&a))], ReturnType::F64)
+            .unwrap();
+        let read_vector = state.compile("return stashed_vec[2]").unwrap();
+        assert_eq!(
+            state
+                .eval_scalar(&read_vector, &[], ReturnType::F64)
+                .unwrap(),
+            ScalarValue::F64(6.0)
+        );
+        let read_view = state.compile("return stashed_view[2]").unwrap();
+        let error = state
+            .eval_scalar(&read_view, &[], ReturnType::F64)
+            .unwrap_err();
+        assert!(error.contains("outside its call"), "{error}");
     }
 }

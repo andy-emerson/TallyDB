@@ -7,7 +7,8 @@
 //! multi-segment [`Store`], SQL through `query-lite`, the rolling
 //! regressions and pair statistics registered as the window functions
 //! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
-//! registered Lua window kernels via [`Table::register_lua_window`]
+//! registered Lua window kernels via `Table::register_lua_window`
+//! (behind the `lua` feature)
 //! (the `script` module). Appends and queries
 //! interleave freely: a query runs over a point-in-time snapshot of the
 //! store, and appends after it never disturb the result. Results leave as
@@ -26,10 +27,12 @@
 //! (peak-memory accounting in #56).
 
 use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+#[cfg(feature = "lua")]
 use compute_lua::LogSink;
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, recompute_frames, DeletePlan, Number, Plan,
-    QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan, WindowAggregate,
+    evaluate_predicate, execute, parse_statement, plan, recompute_frames, ColumnFunction,
+    DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan,
+    WindowAggregate,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -150,6 +153,7 @@ pub struct Table {
     /// Where Lua kernels' `log(...)` goes — `None` (the default) keeps
     /// `log` a no-op, per compute-lua's off-by-default contract. Applies
     /// to kernels registered *after* it is set.
+    #[cfg(feature = "lua")]
     lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
 }
 
@@ -298,6 +302,7 @@ impl Table {
             name: name.into(),
             store,
             registry: Arc::new(Mutex::new(Arc::new(registry))),
+            #[cfg(feature = "lua")]
             lua_log_sink: None,
         }
     }
@@ -324,6 +329,7 @@ impl Table {
         self.store.schema().fields()[self.store.ordering_key()].name()
     }
 
+    #[cfg(feature = "lua")]
     /// Installs the destination for Lua kernels' `log(...)` output.
     /// Until an embedder calls this, `log` is a no-op (compute-lua's
     /// off-by-default contract); afterwards, every *newly registered*
@@ -361,13 +367,31 @@ impl Table {
     /// Runs an already-planned query (the database handle plans once to
     /// route by table name, then calls this).
     pub(crate) fn execute_plan(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
-        let segments = self.store.snapshot()?;
+        let segments = match plan.as_of {
+            // Knowledge-time travel: the same executor over an as-of
+            // snapshot — the knowledge mask is just a live mask.
+            Some(cut) => self.store.knowledge_snapshot()?.as_of(cut),
+            None => self.store.snapshot()?,
+        };
         Ok(execute(
             self.store.schema(),
             &segments,
             plan,
             &self.current_registry(),
         )?)
+    }
+
+    /// The table's ingest-sequence watermark: the sequence the next
+    /// appended row will receive. Every knowledge coordinate the table
+    /// holds is `<=` it, so **`ASOF next_sequence()` reads the latest
+    /// state** whatever the table's mutation history. Record it before
+    /// a correction to keep a queryable before/after boundary.
+    ///
+    /// Not `next_sequence() - 1`: a `DELETE` stamps its kill at the
+    /// watermark without consuming it, so that cut still shows the
+    /// deleted rows (`Store::next_sequence` has the full note).
+    pub fn next_sequence(&self) -> u64 {
+        self.store.next_sequence()
     }
 
     /// Runs a join plan with `self` as the fact table (the database
@@ -562,6 +586,7 @@ impl Table {
         Ok(self.store.compact()?)
     }
 
+    #[cfg(feature = "lua")]
     /// Registers a Lua kernel as a SQL window function on this table —
     /// the Lua-in-SQL window slot (#41). `parameters` names the frame's
     /// column arguments, positionally, as the globals the kernel reads
@@ -632,17 +657,181 @@ impl Table {
         chunk: &str,
         output: ColumnType,
     ) -> Result<(), EngineError> {
-        if !crate::script::is_identifier(name) {
+        if !is_identifier(name) {
+            // Checked before compiling the chunk, so the name error is
+            // the first thing a bad registration hears.
             return Err(EngineError::Script(format!(
                 "function name '{name}' is not callable from SQL"
             )));
         }
-        let window =
-            crate::script::LuaWindow::new(parameters, chunk, output, self.lua_log_sink.clone())
+        // The kernel's vocabulary is the registry as of this moment —
+        // every native and every previously registered kernel, by name.
+        let ops = self.current_registry();
+        let window = crate::script::LuaWindow::new(
+            parameters,
+            chunk,
+            output,
+            self.lua_log_sink.clone(),
+            &ops,
+        )
+        .map_err(EngineError::Script)?;
+        self.register_kernel(name, Arc::new(window))
+    }
+
+    /// Registers a native window kernel — **the primary extension
+    /// path** (DESIGN.md, *the extension model*): implement
+    /// [`WindowAggregate`], register it, call it from SQL at native
+    /// speed. No interpreter is involved; the kernel is engine code,
+    /// compiled into the embedding application. The built-in
+    /// statistics (`regr_slope`, `covar_pop`, …) are ordinary
+    /// registrations of this same kind.
+    ///
+    /// Registering a name again **replaces** the previous
+    /// implementation — deliberately: that is the promotion path. A
+    /// kernel prototyped as a Lua script keeps its SQL name when an
+    /// embedder re-registers a native under it; every query and
+    /// script continues to work, now compiled. Snapshots taken before
+    /// a registration keep the function set they saw
+    /// (see [`Table::reader`]).
+    ///
+    /// ```
+    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::{RowValue, Table, WindowAggregate};
+    ///
+    /// // The whole extension surface: one trait, ~20 lines.
+    /// struct WeightedMean;
+    ///
+    /// impl WindowAggregate for WeightedMean {
+    ///     fn arity(&self) -> usize {
+    ///         2 // wmean(x, w)
+    ///     }
+    ///     fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+    ///         let (x, w) = (args[0], args[1]);
+    ///         let sw: f64 = w.iter().sum();
+    ///         Ok((sw != 0.0)
+    ///             .then(|| x.iter().zip(w).map(|(a, b)| a * b).sum::<f64>() / sw))
+    ///     }
+    /// }
+    ///
+    /// let schema = Schema::new(vec![
+    ///     Field::new("ts", ColumnType::I64, false),
+    ///     Field::new("x", ColumnType::F64, false),
+    ///     Field::new("w", ColumnType::F64, false),
+    /// ]);
+    /// let mut table = Table::new("t", schema, "ts").unwrap();
+    /// for i in 0..4i64 {
+    ///     table
+    ///         .append(&[
+    ///             RowValue::I64(i),
+    ///             RowValue::F64(i as f64),
+    ///             RowValue::F64(1.0),
+    ///         ])
+    ///         .unwrap();
+    /// }
+    /// table.register_window("wmean", WeightedMean).unwrap();
+    /// let output = table
+    ///     .query(
+    ///         "SELECT wmean(x, w) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+    ///          AND CURRENT ROW) AS m FROM t",
+    ///     )
+    ///     .unwrap();
+    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    ///     &output.batches[0].columns()[0]
+    /// else {
+    ///     panic!("expected f64")
+    /// };
+    /// // Unit weights: each two-row window's plain mean.
+    /// assert_eq!(m.values().as_slice(), &[0.0, 0.5, 1.5, 2.5]);
+    /// ```
+    pub fn register_window(
+        &mut self,
+        name: &str,
+        kernel: impl WindowAggregate + 'static,
+    ) -> Result<(), EngineError> {
+        self.register_kernel(name, Arc::new(kernel))
+    }
+
+    /// Registers a native **column function** — SQL's per-row (scalar)
+    /// extension slot, evaluated a whole column at a time: implement
+    /// [`ColumnFunction`], register it, and `SELECT f(x, y) FROM t`
+    /// calls it once per view over dense argument columns. Same naming
+    /// and replacement rules as [`Table::register_window`]; the output
+    /// is a nullable `f64` column.
+    pub fn register_column_function(
+        &mut self,
+        name: &str,
+        function: impl ColumnFunction + 'static,
+    ) -> Result<(), EngineError> {
+        self.register_column_kernel(name, Arc::new(function))
+    }
+
+    #[cfg(feature = "lua")]
+    /// Registers a Lua **column** kernel as a SQL scalar function —
+    /// the vectorized whole-column shape (#53). The parameters bind as
+    /// whole-column views (NULL is the `NULL` sentinel), the script
+    /// fills the preallocated `out` column (`out[i] = ...`; slots never
+    /// written come back NULL), and the interpreter is entered **once
+    /// per view**, never per row — which is what makes a scripted
+    /// per-row function viable in bulk. The compose-don't-loop idiom
+    /// still applies inside: prefer the registered vocabulary over
+    /// element loops where one fits.
+    ///
+    /// ```text
+    /// .luascalar spread(hi, lo) for i = 1, #hi do out[i] = hi[i] - lo[i] end
+    /// SELECT spread(hi, lo) FROM quotes
+    /// ```
+    pub fn register_lua_scalar(
+        &mut self,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+    ) -> Result<(), EngineError> {
+        if !is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let ops = self.current_registry();
+        let column =
+            crate::script::LuaColumn::new(parameters, chunk, self.lua_log_sink.clone(), &ops)
                 .map_err(EngineError::Script)?;
+        self.register_column_kernel(name, Arc::new(column))
+    }
+
+    /// [`Table::register_kernel`]'s column-function twin.
+    fn register_column_kernel(
+        &mut self,
+        name: &str,
+        function: Arc<dyn ColumnFunction>,
+    ) -> Result<(), EngineError> {
+        if !is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
         let mut guard = self.registry.lock().expect("registry lock poisoned");
         let mut next = (**guard).clone();
-        next.register(name, Arc::new(window));
+        next.register_column(name, function);
+        *guard = Arc::new(next);
+        Ok(())
+    }
+
+    /// The one registration mechanism both extension paths share: an
+    /// identifier check, then a copy-and-swap of the registry `Arc` so
+    /// existing snapshots keep the function set they were minted with.
+    fn register_kernel(
+        &mut self,
+        name: &str,
+        kernel: Arc<dyn WindowAggregate>,
+    ) -> Result<(), EngineError> {
+        if !is_identifier(name) {
+            return Err(EngineError::Script(format!(
+                "function name '{name}' is not callable from SQL"
+            )));
+        }
+        let mut guard = self.registry.lock().expect("registry lock poisoned");
+        let mut next = (**guard).clone();
+        next.register(name, kernel);
         *guard = Arc::new(next);
         Ok(())
     }
@@ -757,20 +946,15 @@ impl Table {
                 corrected.push(cells);
             }
         }
-        // Reappend the replacements first, then tombstone the originals
-        // — the one mutation mechanism, ordered for crash safety. The
-        // tombstone makes every superseding row durable (a WAL sync, or
-        // a flush without one) before committing its delete log, so on
-        // a persistent store the replacements always outlive the delete
-        // that supersedes the originals. A crash anywhere in between
-        // leaves originals and replacements both live (recoverable
-        // duplicates under the row-id identity rule), never the
-        // replacements lost.
-        for cells in &corrected {
-            let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
-            self.store.append(&row)?;
-        }
-        let affected = self.store.tombstone(&matched_ids)?;
+        // One knowledge event (issue #73): the replacements and the
+        // tombstones land together at a single ingest sequence —
+        // old-or-new under `AS OF` and across a crash alike, never a
+        // cut that sees both versions or a recovery that keeps half.
+        let rows: Vec<Vec<RowValue<'_>>> = corrected
+            .iter()
+            .map(|cells| cells.iter().map(OwnedValue::as_row_value).collect())
+            .collect();
+        let affected = self.store.supersede(&rows, &matched_ids)?;
         Ok(affected)
     }
 }
@@ -816,6 +1000,16 @@ impl OwnedValue {
             OwnedValue::Null => RowValue::Null,
         }
     }
+}
+
+/// Whether `name` is a plain identifier (ASCII letter or underscore,
+/// then letters, digits, underscores) — required of SQL function names
+/// so queries can actually call them, and of Lua parameter names so
+/// kernels can actually reference them.
+pub(crate) fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Resolves the declared ordering key to its column index.
@@ -900,11 +1094,11 @@ impl TableReader {
     /// exactly as of this call. Appends, mutations, compactions, and
     /// registrations after it never affect the returned snapshot.
     pub fn snapshot(&self) -> Result<TableSnapshot, EngineError> {
-        let views = self.store.snapshot()?;
+        let knowledge = self.store.knowledge_snapshot()?;
         Ok(TableSnapshot {
             name: self.name.clone(),
             schema: self.schema.clone(),
-            views,
+            knowledge,
             registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
         })
     }
@@ -924,12 +1118,16 @@ impl TableReader {
 pub struct TableSnapshot {
     name: String,
     schema: Schema,
-    views: Vec<SegmentView>,
+    /// The latest-knowledge views plus what an `AS OF` query needs —
+    /// history and pending kill stamps — captured at the same instant.
+    knowledge: storage_lite::KnowledgeSnapshot,
     registry: Arc<Registry>,
 }
 
 impl TableSnapshot {
-    /// Runs one SQL `SELECT` over this frozen view.
+    /// Runs one SQL `SELECT` over this frozen view. `ASOF n` works
+    /// here too: the snapshot carries the knowledge state of its
+    /// moment, so time travel is relative to what was known then.
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
         if plan.table != self.name {
@@ -938,7 +1136,15 @@ impl TableSnapshot {
                 got: plan.table,
             });
         }
-        Ok(execute(&self.schema, &self.views, &plan, &self.registry)?)
+        let views;
+        let segments = match plan.as_of {
+            Some(cut) => {
+                views = self.knowledge.as_of(cut);
+                &views
+            }
+            None => &self.knowledge.views,
+        };
+        Ok(execute(&self.schema, segments, &plan, &self.registry)?)
     }
 
     /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
@@ -1423,6 +1629,141 @@ mod tests {
             .collect()
     }
 
+    /// `ASOF next_sequence()` is the latest state in every mutation
+    /// shape. The tempting off-by-one — `next_sequence() - 1` — held
+    /// for appends and `UPDATE` but not for `DELETE`, which stamps its
+    /// kill at the watermark without consuming it; the docs claimed the
+    /// wrong one until this test was written.
+    #[test]
+    fn as_of_at_the_watermark_is_the_latest_state_after_any_mutation() {
+        let build = || {
+            let schema = Schema::new(vec![
+                Field::new("ts", ColumnType::I64, false),
+                Field::new("x", ColumnType::F64, false),
+            ]);
+            let mut table = Table::new("t", schema, "ts").unwrap();
+            for i in 0..5i64 {
+                table
+                    .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                    .unwrap();
+            }
+            table
+        };
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            ("appends only", vec![]),
+            ("update", vec!["UPDATE t SET x = 9.0 WHERE ts = 1"]),
+            ("delete", vec!["DELETE FROM t WHERE ts = 2"]),
+            (
+                "delete then update",
+                vec![
+                    "DELETE FROM t WHERE ts = 2",
+                    "UPDATE t SET x = 9.0 WHERE ts = 1",
+                ],
+            ),
+            (
+                "update then delete",
+                vec![
+                    "UPDATE t SET x = 9.0 WHERE ts = 1",
+                    "DELETE FROM t WHERE ts = 2",
+                ],
+            ),
+        ];
+        for (label, mutations) in cases {
+            let mut table = build();
+            for sql in &mutations {
+                table.mutate(sql).unwrap();
+            }
+            let latest = table.query("SELECT ts FROM t").unwrap().num_rows();
+            let watermark = table.next_sequence();
+            let at_watermark = table
+                .query(&format!("SELECT ts FROM t ASOF {watermark}"))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                at_watermark, latest,
+                "{label}: ASOF next_sequence() must read the latest state"
+            );
+        }
+    }
+
+    #[test]
+    fn as_of_reads_the_table_as_it_was_known() {
+        // The corrections model end to end: correct a row, then read
+        // both the corrected present and the uncorrected past — before
+        // and after compaction moves the superseded version to history.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::new("t", schema, "ts").unwrap();
+        for i in 0..4i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        // The correction: one knowledge event (issue #73) — the
+        // replacement is born and the original killed at the same
+        // coordinate, 4, and the mutation consumes exactly one
+        // sequence.
+        table.mutate("UPDATE t SET x = 100.0 WHERE ts = 1").unwrap();
+        assert_eq!(table.next_sequence(), 5);
+        let latest = "SELECT ts, x FROM t ORDER BY ts";
+        let past = "SELECT ts, x FROM t ASOF 3 ORDER BY ts";
+        let corrected = [Some(0.0), Some(100.0), Some(2.0), Some(3.0)];
+        let original = [Some(0.0), Some(1.0), Some(2.0), Some(3.0)];
+        assert_eq!(flatten(&table.query(latest).unwrap(), 1), corrected);
+        assert_eq!(flatten(&table.query(past).unwrap(), 1), original);
+        // The SQL:2011 spelling reads identically.
+        assert_eq!(
+            flatten(
+                &table
+                    .query("SELECT ts, x FROM t FOR SYSTEM_TIME AS OF 3 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            original
+        );
+        // ASOF 0: only the first row was known.
+        assert_eq!(table.query("SELECT x FROM t ASOF 0").unwrap().num_rows(), 1);
+        // Old-or-new on the knowledge axis: the cut at the mutation's
+        // coordinate is already the corrected state, and no cut
+        // anywhere sees both versions at once.
+        assert_eq!(
+            flatten(
+                &table
+                    .query("SELECT ts, x FROM t ASOF 4 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            corrected
+        );
+        for cut in 0..=5 {
+            let rows = table
+                .query(&format!("SELECT x FROM t ASOF {cut}"))
+                .unwrap()
+                .num_rows();
+            assert!(rows <= 4, "cut {cut} saw {rows} rows");
+        }
+        // Compaction retains the superseded version in history — the
+        // past answer does not move, and neither does the present.
+        table.compact().unwrap();
+        assert_eq!(flatten(&table.query(past).unwrap(), 1), original);
+        assert_eq!(flatten(&table.query(latest).unwrap(), 1), corrected);
+        // A detached snapshot carries its knowledge state with it.
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(flatten(&snapshot.query(past).unwrap(), 1), original);
+        assert_eq!(flatten(&snapshot.query(latest).unwrap(), 1), corrected);
+        // Aggregation over the past runs through the same executor.
+        assert_eq!(
+            flatten(&table.query("SELECT SUM(x) AS s FROM t ASOF 3").unwrap(), 0),
+            [Some(6.0)]
+        );
+        assert_eq!(
+            flatten(&table.query("SELECT SUM(x) AS s FROM t").unwrap(), 0),
+            [Some(105.0)]
+        );
+    }
+
     const REGRESSION_SQL: &str = "SELECT sym, regr_slope(y, x) OVER (PARTITION BY sym ORDER BY ts \
          ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS beta, \
          regr_intercept(y, x) OVER (PARTITION BY sym ORDER BY ts \
@@ -1834,7 +2175,7 @@ mod snapshot_concurrency {
     //! the generation swap — unchanged); one races freely as a smoke
     //! test; one pins the Send/Sync story at compile time.
 
-    use super::tests::{linear_row, m1_schema};
+    use super::tests::{flatten, linear_row, m1_schema};
     use super::*;
 
     /// COUNT over the snapshot — one number summarizing what it sees.
@@ -1922,15 +2263,68 @@ mod snapshot_concurrency {
     }
 
     #[test]
+    fn a_registered_column_function_runs_in_projection() {
+        // The native half of the vectorized scalar slot (#53): one
+        // call per view, dense arguments, NULL decided by the kernel.
+        struct SpreadPct;
+        impl ColumnFunction for SpreadPct {
+            fn arity(&self) -> usize {
+                2
+            }
+            fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+                let (x, xv) = args[0];
+                let (y, yv) = args[1];
+                Ok((0..x.len())
+                    .map(|i| (xv[i] && yv[i] && y[i] != 0.0).then(|| (x[i] - y[i]) / y[i]))
+                    .collect())
+            }
+        }
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 4).unwrap();
+        for i in 0..6i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        table
+            .register_column_function("spread_pct", SpreadPct)
+            .unwrap();
+        // Composes with expression arguments through the same machinery.
+        let output = table
+            .query("SELECT spread_pct(x + 1.0, x + 1.0) AS s FROM t WHERE ts >= 1")
+            .unwrap();
+        let values = flatten(&output, 0);
+        assert_eq!(values, vec![Some(0.0); 5]);
+        // Unknown names stay loud, at execution, by name.
+        let error = table
+            .query("SELECT nope(x) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nope"), "{error}");
+        // Wrong arity is loud too.
+        let error = table
+            .query("SELECT spread_pct(x) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("argument"), "{error}");
+    }
+
+    #[test]
     fn snapshots_pin_the_functions_of_their_moment() {
+        // A native kernel through the public trait path, so this test
+        // runs identically with and without the `lua` feature.
+        struct Twice;
+        impl WindowAggregate for Twice {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(2.0 * args[0].iter().map(|v| v * v).sum::<f64>()))
+            }
+        }
         let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 8).unwrap();
         for i in 0..4i64 {
             table.append(&linear_row(i)).unwrap();
         }
         let before = table.snapshot().unwrap();
-        table
-            .register_lua_window("twice", &["x"], "return 2 * dot(x, x)", ColumnType::F64)
-            .unwrap();
+        table.register_window("twice", Twice).unwrap();
         let after = table.snapshot().unwrap();
         let sql = "SELECT twice(x) OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING                    AND CURRENT ROW) AS d FROM t";
         assert!(

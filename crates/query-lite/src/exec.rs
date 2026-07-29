@@ -94,10 +94,31 @@ pub trait WindowAggregate: Send + Sync {
     }
 }
 
-/// The window-aggregate registry: SQL name → implementation.
+/// An embedder-registered per-row function (SQL calls these *scalar*
+/// functions), evaluated a whole column at a time — one call per view,
+/// vectorized, so an interpreter-backed implementation pays its entry
+/// cost once per batch instead of once per row. Appears in projection
+/// as an ordinary call: `SELECT f(x, y) FROM t`.
+pub trait ColumnFunction: Send + Sync {
+    /// How many arguments a call must pass.
+    fn arity(&self) -> usize;
+    /// One call per view: each argument arrives dense over the live
+    /// rows as `(values, validity)` (a `false` slot is SQL NULL; its
+    /// value is unspecified). Returns one result per row — `None` is
+    /// NULL. The output column is nullable `f64`; exact-`i64` and key
+    /// outputs are deferred surface (#40's exactness rules would bind
+    /// them).
+    fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String>;
+}
+
+/// The function registry: SQL name → implementation, window aggregates
+/// and column functions in separate namespaces (SQL resolves them from
+/// different positions — `OVER` calls the first, plain projection
+/// calls the second).
 #[derive(Clone, Default)]
 pub struct Registry {
     aggregates: HashMap<String, Arc<dyn WindowAggregate>>,
+    columns: HashMap<String, Arc<dyn ColumnFunction>>,
 }
 
 impl Registry {
@@ -111,19 +132,53 @@ impl Registry {
         self.aggregates.insert(name.to_lowercase(), aggregate);
     }
 
+    /// Registers `function` as a column function under `name`
+    /// (lower-cased; last one wins — the promotion path).
+    pub fn register_column(&mut self, name: &str, function: Arc<dyn ColumnFunction>) {
+        self.columns.insert(name.to_lowercase(), function);
+    }
+
+    /// Every registered **window aggregate** and its implementation, in
+    /// no particular order — what lets an embedding expose them to a
+    /// scripting layer under the same names SQL uses.
+    ///
+    /// Column functions ([`Registry::register_column`]) are a second
+    /// namespace and are *not* included: they return a whole column,
+    /// while the script-side host-function seam returns one value per
+    /// call, so there is no shape to install them under. Closing that
+    /// gap means a column-shaped host seam, not a wider iterator.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Arc<dyn WindowAggregate>)> {
+        self.aggregates
+            .iter()
+            .map(|(name, aggregate)| (name.as_str(), aggregate))
+    }
+
+    fn column(&self, name: &str) -> Option<&Arc<dyn ColumnFunction>> {
+        self.columns.get(name)
+    }
+
     fn get(&self, name: &str) -> Option<&Arc<dyn WindowAggregate>> {
         self.aggregates.get(name)
     }
 }
 
-/// A query's result: the output schema plus one batch per segment with
-/// live rows, in append order. The schema is carried explicitly so an
-/// empty table still yields a well-formed (zero-batch) result.
+/// A query's result: the output schema plus its batches. The schema is
+/// carried explicitly so an empty result is still well-formed (it has
+/// no batches at all).
+///
+/// **How many batches is not a contract.** The streaming shape — one
+/// batch per segment with live rows, in append order — is what a plain
+/// scan produces, but any stage that must see all rows at once
+/// (`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `HAVING`, `GROUP BY`)
+/// collapses the result to a single materialized batch. A consumer that
+/// needs one contiguous batch should say so with [`contiguous`] rather
+/// than test `batches.len() == 1`, and a consumer that wants to stream
+/// should handle any count.
 #[derive(Debug)]
 pub struct QueryOutput {
     /// Schema of every batch.
     pub schema: Schema,
-    /// One batch per segment with live rows.
+    /// The result's batches — see the type's note on how many.
     pub batches: Vec<RecordBatch>,
 }
 
@@ -539,7 +594,9 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
-            PlanItem::Computed { expr, name } => computed_column(schema, views, expr, name)?,
+            PlanItem::Computed { expr, name } => {
+                computed_column(schema, views, expr, name, registry)?
+            }
             PlanItem::WindowAgg {
                 function,
                 args,
@@ -585,7 +642,13 @@ fn filter_having(
     let full_schema = output.schema.clone();
     let mut picks: Vec<(usize, usize)> = Vec::new();
     for (batch_index, batch) in output.batches.iter().enumerate() {
-        let view = SegmentView::all_live(Arc::new(Segment::from_batch(batch.clone(), 0, false)));
+        // Query-lifetime scratch: the predicate is evaluated row-wise
+        // here, never zone-pruned, so computing maps would be waste.
+        let view = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(
+            batch.clone(),
+            0,
+            false,
+        )));
         let matched = evaluate_predicate(predicate, &full_schema, &view)?;
         for row in 0..batch.num_rows() {
             if matched.get(row) {
@@ -610,13 +673,126 @@ fn computed_column(
     views: &[&SegmentView],
     expr: &ScalarExpr,
     name: &str,
+    registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // A registered kernel must see the query's rows as ONE column:
+    // storage segmentation is an internal detail, and a kernel with
+    // window semantics (a rolling combinator) would otherwise reset at
+    // segment boundaries. Pure expressions stay on the per-view path —
+    // elementwise semantics don't care, and it copies nothing.
+    //
+    // The routing does NOT depend on how many segments the rows happen
+    // to occupy: whether a query is accepted must not turn on an
+    // internal detail, so a one-segment table takes the same path (and
+    // meets the same refusals) as a hundred-segment one.
+    if uses_registered(expr) {
+        return computed_column_whole(schema, views, expr, name, registry);
+    }
     let mut columns = Vec::with_capacity(views.len());
     for view in views {
-        let (values, validity) = evaluate_scalar(expr, schema, view)?;
+        let (values, validity) = evaluate_scalar(expr, schema, view, registry)?;
         columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
             values, validity,
         ))));
+    }
+    Ok((Field::new(name, ColumnType::F64, true), columns))
+}
+
+/// Whether the expression calls a registered kernel anywhere.
+fn uses_registered(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Registered { .. } => true,
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+        ScalarExpr::Negate(inner) => uses_registered(inner),
+        ScalarExpr::Binary { left, right, .. } => uses_registered(left) || uses_registered(right),
+        ScalarExpr::Call { args, .. } => args.iter().any(uses_registered),
+        ScalarExpr::Case { whens, otherwise } => {
+            whens.iter().any(|(_, value)| uses_registered(value))
+                || otherwise.as_deref().is_some_and(uses_registered)
+        }
+    }
+}
+
+/// Column names a registered-kernel expression reads. `CASE` is
+/// refused here — its predicates would need their own gather (keys
+/// included), which nothing motivates yet.
+fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), QueryError> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            out.push(name.clone());
+            Ok(())
+        }
+        ScalarExpr::Literal(_) => Ok(()),
+        ScalarExpr::Negate(inner) => registered_columns(inner, out),
+        ScalarExpr::Binary { left, right, .. } => {
+            registered_columns(left, out)?;
+            registered_columns(right, out)
+        }
+        ScalarExpr::Call { args, .. } | ScalarExpr::Registered { args, .. } => {
+            for arg in args {
+                registered_columns(arg, out)?;
+            }
+            Ok(())
+        }
+        ScalarExpr::Case { .. } => Err(QueryError::Unsupported(
+            "CASE combined with a registered function in one expression \
+             (lift the function out of the CASE)"
+                .to_owned(),
+        )),
+    }
+}
+
+/// The whole-query path: gather the used columns dense (live rows, in
+/// view order — a copy proportional to the queried rows, like the
+/// cross-segment window gathers, not bounded by a constant), evaluate
+/// the expression ONCE over a synthetic single view, and split the
+/// result back per view.
+fn computed_column_whole(
+    schema: &Schema,
+    views: &[&SegmentView],
+    expr: &ScalarExpr,
+    name: &str,
+    registry: &Registry,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let mut names = Vec::new();
+    registered_columns(expr, &mut names)?;
+    names.sort();
+    names.dedup();
+    let total: usize = views.iter().map(|view| view.live_rows()).sum();
+    // Column 0 is a synthetic i64 ordering key so the batch satisfies
+    // the segment shape; the expression never references it.
+    let mut fields = vec![Field::new("__row", ColumnType::I64, false)];
+    let row_ids: Buffer<i64> = (0..total as i64).collect();
+    let mut gathered: Vec<Column> = vec![Column::Numeric(NumericData::I64(
+        NumericColumn::new_non_null(row_ids),
+    ))];
+    for column_name in &names {
+        let mut values = Vec::with_capacity(total);
+        let mut validity = Vec::with_capacity(total);
+        for view in views {
+            let column = ScalarExpr::Column(column_name.clone());
+            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry)?;
+            values.append(&mut v);
+            validity.append(&mut m);
+        }
+        fields.push(Field::new(column_name.clone(), ColumnType::F64, true));
+        gathered.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values, validity,
+        ))));
+    }
+    let batch = RecordBatch::new(Schema::new(fields), gathered);
+    let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(batch, 0, false)));
+    let reduced = synthetic.segment.batch().schema().clone();
+    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry)?;
+    let mut columns = Vec::with_capacity(views.len());
+    let mut offset = 0;
+    for view in views {
+        let count = view.live_rows();
+        columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
+            values[offset..offset + count].to_vec(),
+            validity[offset..offset + count].to_vec(),
+        ))));
+        offset += count;
     }
     Ok((Field::new(name, ColumnType::F64, true), columns))
 }
@@ -627,6 +803,7 @@ fn evaluate_scalar(
     expr: &ScalarExpr,
     schema: &Schema,
     view: &SegmentView,
+    registry: &Registry,
 ) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
     let rows = view.live_rows();
     match expr {
@@ -635,6 +812,16 @@ fn evaluate_scalar(
             match &view.segment.batch().columns()[index] {
                 Column::Numeric(NumericData::F64(numeric)) => {
                     let raw = numeric.values().as_slice();
+                    // Bulk path: no tombstone mask means every row is
+                    // live in stored order — one memcpy, no per-row
+                    // filter loop.
+                    if view.live.is_none() {
+                        let validity = match numeric.validity() {
+                            None => vec![true; rows],
+                            Some(bitmap) => (0..rows).map(|row| bitmap.get(row)).collect(),
+                        };
+                        return Ok((raw.to_vec(), validity));
+                    }
                     let mut values = Vec::with_capacity(rows);
                     let mut validity = Vec::with_capacity(rows);
                     for row in live_rows(view) {
@@ -655,15 +842,15 @@ fn evaluate_scalar(
         }
         ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
         ScalarExpr::Negate(inner) => {
-            let (mut values, validity) = evaluate_scalar(inner, schema, view)?;
+            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry)?;
             for value in &mut values {
                 *value = -*value;
             }
             Ok((values, validity))
         }
         ScalarExpr::Binary { op, left, right } => {
-            let (lv, lval) = evaluate_scalar(left, schema, view)?;
-            let (rv, rval) = evaluate_scalar(right, schema, view)?;
+            let (lv, lval) = evaluate_scalar(left, schema, view, registry)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view, registry)?;
             let values = lv
                 .iter()
                 .zip(&rv)
@@ -681,7 +868,7 @@ fn evaluate_scalar(
         ScalarExpr::Call { function, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
             }
             let mut values = Vec::with_capacity(rows);
             let mut validity = Vec::with_capacity(rows);
@@ -710,11 +897,11 @@ fn evaluate_scalar(
             let mut arms = Vec::with_capacity(whens.len());
             for (predicate, arm) in whens {
                 conditions.push(evaluate_predicate(predicate, schema, view)?);
-                arms.push(evaluate_scalar(arm, schema, view)?);
+                arms.push(evaluate_scalar(arm, schema, view, registry)?);
             }
             let fallback = otherwise
                 .as_ref()
-                .map(|expr| evaluate_scalar(expr, schema, view))
+                .map(|expr| evaluate_scalar(expr, schema, view, registry))
                 .transpose()?;
             let mut values = vec![0.0f64; rows];
             let mut validity = vec![false; rows];
@@ -735,17 +922,67 @@ fn evaluate_scalar(
             }
             Ok((values, validity))
         }
+        ScalarExpr::Registered { name, args } => {
+            let Some(function) = registry.column(name) else {
+                return Err(QueryError::Unsupported(format!(
+                    "no registered column function '{name}' on this table \
+                     (a window function needs OVER; register column \
+                     functions through the table handle)"
+                )));
+            };
+            if args.len() != function.arity() {
+                return Err(QueryError::TypeError(format!(
+                    "{name} takes {} argument(s), got {}",
+                    function.arity(),
+                    args.len()
+                )));
+            }
+            // Arguments evaluate through this same machinery, so any
+            // scalar expression composes into a registered call; the
+            // kernel then runs once for the whole view.
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+            }
+            let dense: Vec<(&[f64], &[bool])> = evaluated
+                .iter()
+                .map(|(values, validity)| (values.as_slice(), validity.as_slice()))
+                .collect();
+            let results = function.evaluate(&dense).map_err(QueryError::Compute)?;
+            if results.len() != rows {
+                return Err(QueryError::Compute(format!(
+                    "{name} returned {} results for {rows} rows",
+                    results.len()
+                )));
+            }
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for result in results {
+                values.push(result.unwrap_or(0.0));
+                validity.push(result.is_some());
+            }
+            Ok((values, validity))
+        }
     }
 }
 
-/// Builds a nullable `f64` column from parallel values/validity.
-fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
-    let buffer = Buffer::from_slice(&values);
+/// Builds a numeric column from parallel values/validity — the one
+/// values-plus-bitmap assembly every output path shares. The bitmap
+/// exists only if some value is actually absent, same as storage.
+fn assemble_numeric<T: arrow_lite::Element>(
+    values: Buffer<T>,
+    validity: Vec<bool>,
+) -> NumericColumn<T> {
     if validity.iter().all(|&valid| valid) {
-        NumericColumn::new_non_null(buffer)
+        NumericColumn::new_non_null(values)
     } else {
-        NumericColumn::new_nullable(buffer, Bitmap::from_bools(validity))
+        NumericColumn::new_nullable(values, Bitmap::from_bools(validity))
     }
+}
+
+/// As [`assemble_numeric`], from a plain vector.
+fn assemble_f64_values(values: Vec<f64>, validity: Vec<bool>) -> NumericColumn<f64> {
+    assemble_numeric(Buffer::from_slice(&values), validity)
 }
 
 /// Looks up a column by name in the table schema.
@@ -1725,6 +1962,33 @@ fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> Que
     }
 }
 
+/// Every row of `output`, in order, as **one** batch — for consumers
+/// that need contiguity (the script driver hands result columns to Lua
+/// as single views, so it needs exactly this). A result already in one
+/// batch is moved out untouched; several batches pay one gather, with
+/// key columns re-encoded into a merged dictionary because per-segment
+/// dictionaries do not share codes. An empty result still yields
+/// correctly-typed empty columns.
+///
+/// This lives here, beside the row gather it delegates to, so the
+/// merge-and-remap rule has exactly one implementation in the
+/// workspace.
+pub fn contiguous(output: QueryOutput) -> RecordBatch {
+    let QueryOutput {
+        schema,
+        mut batches,
+    } = output;
+    if batches.len() == 1 {
+        return batches.pop().expect("length checked");
+    }
+    let picks: Vec<(usize, usize)> = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(batch, rows)| (0..rows.num_rows()).map(move |row| (batch, row)))
+        .collect();
+    take_rows(&schema, &batches, &picks)
+}
+
 /// Gathers `picks` (batch, row) into one batch. Key columns re-encode
 /// into a fresh dictionary — the sources' per-segment dictionaries don't
 /// share codes.
@@ -1791,52 +2055,31 @@ fn take_rows(schema: &Schema, batches: &[RecordBatch], picks: &[(usize, usize)])
 }
 
 fn assemble_numeric_f64(values: Buffer<f64>, validity: Vec<bool>) -> Column {
-    let column = if validity.iter().any(|&valid| !valid) {
-        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::F64(column))
+    Column::Numeric(NumericData::F64(assemble_numeric(values, validity)))
 }
 
 fn assemble_numeric_i64(values: Buffer<i64>, validity: Vec<bool>) -> Column {
-    let column = if validity.iter().any(|&valid| !valid) {
-        NumericColumn::new_nullable(values, Bitmap::from_bools(validity.iter().copied()))
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::I64(column))
+    Column::Numeric(NumericData::I64(assemble_numeric(values, validity)))
 }
 
 /// One view's output column: nullable f64, bitmap only if a window
 /// actually came back undefined.
 fn assemble_f64(results: Vec<Option<f64>>) -> Column {
-    let values = results.iter().map(|v| v.unwrap_or(0.0)).collect();
-    let column = if results.iter().any(Option::is_none) {
-        NumericColumn::new_nullable(
-            values,
-            Bitmap::from_bools(results.iter().map(Option::is_some)),
-        )
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::F64(column))
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<f64> = results.into_iter().map(|v| v.unwrap_or(0.0)).collect();
+    assemble_numeric_f64(values, validity)
 }
 
 /// Materializes an `i64` output column from integral `f64` results — the
 /// `COUNT`-window path (B5). Each present value is an exact integer count,
 /// so the cast is lossless.
 fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
-    let values = results.iter().map(|v| v.map_or(0, |x| x as i64)).collect();
-    let column = if results.iter().any(Option::is_none) {
-        NumericColumn::new_nullable(
-            values,
-            Bitmap::from_bools(results.iter().map(Option::is_some)),
-        )
-    } else {
-        NumericColumn::new_non_null(values)
-    };
-    Column::Numeric(NumericData::I64(column))
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<i64> = results
+        .into_iter()
+        .map(|v| v.map_or(0, |x| x as i64))
+        .collect();
+    assemble_numeric_i64(values, validity)
 }
 
 #[cfg(test)]

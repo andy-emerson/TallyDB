@@ -30,18 +30,19 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
-use crate::table::{PairKind, PairStatistic, RegressionOutput, RollingRegression};
-use arrow_lite::ColumnType;
+use arrow_lite::{Bitmap, ColumnType};
 use compute_linalg::{LinalgBackend, RustLinalg};
-use compute_lua::{Chunk, ColumnView, HostFunction, LogSink, LuaState, ReturnType, ScalarValue};
-use query_lite::WindowAggregate;
+use compute_lua::{
+    Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
+};
+use query_lite::{Registry, WindowAggregate};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
 /// One embedder-installed sink shared by every kernel of a table: each
 /// `LuaState` owns its sink box, so a shared destination crosses as an
 /// `Arc` behind this forwarding shim.
-struct SharedSink(Arc<dyn LogSink + Sync>);
+pub(crate) struct SharedSink(pub(crate) Arc<dyn LogSink + Sync>);
 
 impl LogSink for SharedSink {
     fn log(&self, message: &str) {
@@ -57,15 +58,7 @@ const RESERVED: &[&str] = &[
     "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "NULL",
 ];
 
-/// Whether `name` is a plain identifier (ASCII letter or underscore,
-/// then letters, digits, underscores) — required of Lua parameter names
-/// so kernels can actually reference them, and of SQL function names so
-/// queries can actually call them.
-pub(crate) fn is_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+use crate::table::is_identifier;
 
 /// `dot(x, y)` — the backend dot product as a script-callable op, the
 /// cheap end of the curated spread.
@@ -83,13 +76,13 @@ impl HostFunction for DotOp {
     }
 }
 
-/// Adapts a native window statistic to the host-function seam — the
-/// same argument shape (dense `f64` slices) and the same
+/// Adapts a registered window implementation to the host-function seam
+/// — the same argument shape (dense `f64` slices) and the same
 /// undefined-is-NULL convention, so one implementation serves both the
 /// SQL window registry and scripts.
-struct CuratedOp<A>(A);
+struct RegistryOp(Arc<dyn WindowAggregate>);
 
-impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
+impl HostFunction for RegistryOp {
     fn arity(&self) -> usize {
         self.0.arity()
     }
@@ -98,28 +91,29 @@ impl<A: WindowAggregate> HostFunction for CuratedOp<A> {
     }
 }
 
-/// Installs the curated compute spread into a kernel's state: `dot`
-/// (compute-linalg), `regr_slope` / `regr_intercept` (closed-form least squares),
-/// and
-/// `covar_pop` / `corr` / `eigen_max` (pair statistics) — the very
-/// implementations the SQL windows run, reading the same view buffers
-/// with no copy. This is the compute-without-copying surface inside a
-/// script: engine buffers, curated native ops, and the interpreter all
-/// share memory.
-fn install_curated_ops(state: &mut LuaState) -> Result<(), String> {
+/// Installs the registered **window aggregates** into a kernel's state
+/// — the vocabulary invariant as it actually holds: *every registered
+/// window aggregate is callable from a Lua kernel by its SQL name*,
+/// over the same view buffers with no copy. Registry-driven rather
+/// than a hardcoded list, so every future native (and every
+/// embedder-registered aggregate that exists at this registration)
+/// flows into scripts for free. `dot` (compute-linalg) rides along as
+/// the one op that lives outside the registry.
+///
+/// **Column functions do not cross** (M4.2's `register_column_function`
+/// and the console's `.luascalar`). The host-function seam returns one
+/// value per call; a column function returns a whole column, so there
+/// is no shape to install it under — a script wanting whole-column work
+/// uses the vectorized vocabulary (operators, `rolling_*`) instead.
+/// Widening the invariant to cover them needs a column-shaped host
+/// seam, which is the natural home for the tranche-2 primitives (#77),
+/// not a doc change here. This is
+/// the compute-without-copying surface inside a script: engine
+/// buffers, native ops, and the interpreter all share memory.
+fn install_vocabulary(state: &mut LuaState, ops: &Registry) -> Result<(), String> {
     state.register_host_function("dot", Box::new(DotOp(RustLinalg)))?;
-    for (name, output) in [
-        ("regr_slope", RegressionOutput::Slope),
-        ("regr_intercept", RegressionOutput::Intercept),
-    ] {
-        state.register_host_function(name, Box::new(CuratedOp(RollingRegression { output })))?;
-    }
-    for (name, kind) in [
-        ("covar_pop", PairKind::CovarPop),
-        ("corr", PairKind::Corr),
-        ("eigen_max", PairKind::EigenMax),
-    ] {
-        state.register_host_function(name, Box::new(CuratedOp(PairStatistic { kind })))?;
+    for (name, aggregate) in ops.entries() {
+        state.register_host_function(name, Box::new(RegistryOp(Arc::clone(aggregate))))?;
     }
     Ok(())
 }
@@ -149,6 +143,7 @@ impl LuaWindow {
         chunk: &str,
         output: ColumnType,
         log_sink: Option<Arc<dyn LogSink + Sync>>,
+        ops: &Registry,
     ) -> Result<LuaWindow, String> {
         if output == ColumnType::Key {
             return Err(
@@ -178,7 +173,7 @@ impl LuaWindow {
             names.push(name);
         }
         let mut state = LuaState::new()?;
-        install_curated_ops(&mut state)?;
+        install_vocabulary(&mut state, ops)?;
         if let Some(sink) = log_sink {
             state.set_log_sink(Box::new(SharedSink(sink)));
         }
@@ -244,6 +239,121 @@ impl WindowAggregate for LuaWindow {
             }
             ScalarValue::Null => Ok(None),
         }
+    }
+}
+
+/// An application-registered Lua *column* kernel behind the
+/// [`query_lite::ColumnFunction`] seam — the vectorized whole-column
+/// shape (#53): the arguments bind as whole-column views, the script
+/// fills the preallocated `out` column, and the interpreter is entered
+/// **once per view**, never per row. This is what makes a scripted
+/// per-row function viable in bulk: the loops the script writes run
+/// over columns already in memory, and the boundary is crossed once.
+pub(crate) struct LuaColumn {
+    /// The interpreter and its compiled kernel, serialized exactly as
+    /// [`LuaWindow`]'s (see the module's concurrency note).
+    state: Mutex<(LuaState, Chunk)>,
+    /// Positional argument names, bound as globals for each call.
+    parameters: Vec<CString>,
+}
+
+impl LuaColumn {
+    /// Builds the adapter with [`LuaWindow::new`]'s validation posture:
+    /// everything that can fail confusingly at query time fails loudly
+    /// here instead. The output is nullable `f64` (slots the script
+    /// never writes come back NULL); exact-`i64` and key outputs are
+    /// deferred surface.
+    pub(crate) fn new(
+        parameters: &[&str],
+        chunk: &str,
+        log_sink: Option<Arc<dyn LogSink + Sync>>,
+        ops: &Registry,
+    ) -> Result<LuaColumn, String> {
+        if parameters.is_empty() {
+            return Err("a lua column function takes at least one column argument".to_owned());
+        }
+        let mut names: Vec<CString> = Vec::with_capacity(parameters.len());
+        for &parameter in parameters {
+            if !is_identifier(parameter) {
+                return Err(format!(
+                    "parameter '{parameter}' is not a usable Lua identifier"
+                ));
+            }
+            if RESERVED.contains(&parameter) || parameter == "out" {
+                return Err(format!(
+                    "parameter '{parameter}' is reserved in Lua kernels"
+                ));
+            }
+            let name = CString::new(parameter).expect("identifier has no interior NUL");
+            if names.contains(&name) {
+                return Err(format!("parameter '{parameter}' appears twice"));
+            }
+            names.push(name);
+        }
+        let mut state = LuaState::new()?;
+        install_vocabulary(&mut state, ops)?;
+        if let Some(sink) = log_sink {
+            state.set_log_sink(Box::new(SharedSink(sink)));
+        }
+        let compiled = state.compile(chunk)?;
+        Ok(LuaColumn {
+            state: Mutex::new((state, compiled)),
+            parameters: names,
+        })
+    }
+}
+
+impl query_lite::ColumnFunction for LuaColumn {
+    fn arity(&self) -> usize {
+        self.parameters.len()
+    }
+
+    fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "lua column interpreter poisoned".to_owned())?;
+        let (state, chunk) = &mut *guard;
+        let rows = args.first().map_or(0, |(values, _)| values.len());
+        // NULL crosses as the sentinel (F1), carried by a validity
+        // bitmap built only where nulls actually exist.
+        let bitmaps: Vec<Option<Bitmap>> = args
+            .iter()
+            .map(|(_, validity)| {
+                if validity.iter().all(|&valid| valid) {
+                    None
+                } else {
+                    Some(Bitmap::from_bools(validity.iter().copied()))
+                }
+            })
+            .collect();
+        let inputs: Vec<(&CStr, ColumnView<'_>)> = self
+            .parameters
+            .iter()
+            .zip(args.iter().zip(&bitmaps))
+            .map(|(name, (&(values, _), bitmap))| {
+                (
+                    name.as_c_str(),
+                    ColumnView::F64 {
+                        values,
+                        validity: bitmap.as_ref(),
+                    },
+                )
+            })
+            .collect();
+        let mut values = vec![0.0f64; rows];
+        let mut validity = Bitmap::from_bools(std::iter::repeat_n(false, rows));
+        state.eval_column(
+            chunk,
+            &inputs,
+            OutputColumn::F64 {
+                values: &mut values,
+                validity: &mut validity,
+            },
+        )?;
+        Ok((0..rows)
+            .map(|row| validity.get(row).then(|| values[row]))
+            .collect())
     }
 }
 
@@ -330,6 +440,168 @@ mod tests {
         assert_eq!(messages.len(), 3, "one log per window");
         assert_eq!(messages[0], "rows\t1");
         assert_eq!(messages[1], "rows\t2");
+    }
+
+    #[test]
+    fn a_lua_scalar_kernel_runs_whole_columns_per_call() {
+        // The vectorized shape (#53): one interpreter entry per view,
+        // NULL in as the sentinel, NULL out by never writing the slot.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 3).unwrap();
+        for i in 0..7i64 {
+            let x = if i == 2 {
+                RowValue::Null
+            } else {
+                RowValue::F64(i as f64)
+            };
+            table.append(&[RowValue::I64(i), x]).unwrap();
+        }
+        table
+            .register_lua_scalar(
+                "double_or_skip",
+                &["x"],
+                "for i = 1, #x do\n\
+                 if x[i] ~= NULL then out[i] = 2 * x[i] end\n\
+                 end",
+            )
+            .unwrap();
+        let output = table.query("SELECT double_or_skip(x) AS d FROM t").unwrap();
+        let results: Vec<Option<f64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::F64(column)) = &batch.columns()[0] else {
+                    panic!("expected f64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                Some(0.0),
+                Some(2.0),
+                None, // NULL in, slot never written, NULL out
+                Some(6.0),
+                Some(8.0),
+                Some(10.0),
+                Some(12.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn anything_sql_can_call_lua_can_call() {
+        // The vocabulary invariant, registry-driven: a native
+        // registered through the public trait path is immediately
+        // callable from a Lua kernel by its SQL name — including
+        // natives that did not exist when the vocabulary was designed.
+        struct SumSq;
+        impl query_lite::WindowAggregate for SumSq {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                Ok(Some(args[0].iter().map(|v| v * v).sum()))
+            }
+        }
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        for i in 0..6i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::Key("A"), RowValue::F64(2.0)])
+                .unwrap();
+        }
+        table.register_window("sumsq", SumSq).unwrap();
+        table
+            .register_lua_window(
+                "twice_sumsq",
+                &["x"],
+                "return 2 * sumsq(x)",
+                ColumnType::F64,
+            )
+            .unwrap();
+        let output = table
+            .query(
+                "SELECT twice_sumsq(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+                 AND CURRENT ROW) AS s FROM t",
+            )
+            .unwrap();
+        // Full two-row frames of 2.0: 2 * (4 + 4) = 16.
+        assert_eq!(f64s(&output, 0)[1..], [Some(16.0); 5]);
+        // And every built-in statistic is reachable from a kernel by
+        // its SQL name — the registry is the single source of names.
+        for name in [
+            "regr_slope",
+            "regr_intercept",
+            "covar_pop",
+            "corr",
+            "eigen_max",
+        ] {
+            table
+                .register_lua_window(
+                    &format!("via_{name}"),
+                    &["y", "x"],
+                    &format!("return {name}(y, x)"),
+                    ColumnType::F64,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn promotion_swaps_a_lua_kernel_for_a_native_under_its_name() {
+        // The promotion path made mechanical: a kernel prototyped in
+        // Lua keeps its SQL name when a native lands under it — the
+        // query text never changes, and matching fold order gives
+        // matching results.
+        let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
+        let data = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        for (i, &x) in data.iter().enumerate() {
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(x),
+                ])
+                .unwrap();
+        }
+        let sql = "SELECT mean2(x) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING \
+                   AND CURRENT ROW) AS m FROM t";
+        table
+            .register_lua_window(
+                "mean2",
+                &["x"],
+                "local s = 0.0\nfor i = 1, #x do s = s + x[i] end\nreturn s / #x",
+                ColumnType::F64,
+            )
+            .unwrap();
+        let prototype = f64s(&table.query(sql).unwrap(), 0);
+        struct Mean;
+        impl query_lite::WindowAggregate for Mean {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+                let mut sum = 0.0;
+                for &value in args[0] {
+                    sum += value;
+                }
+                Ok(Some(sum / args[0].len() as f64))
+            }
+        }
+        table.register_window("mean2", Mean).unwrap();
+        let promoted = f64s(&table.query(sql).unwrap(), 0);
+        // Same fold order on both sides: bit-identical, not approximate.
+        assert_eq!(prototype, promoted);
     }
 
     #[test]
@@ -709,5 +981,59 @@ mod tests {
         assert!(db
             .register_lua_window("nope", "f", &["x"], "return 0", ColumnType::F64)
             .is_err());
+    }
+    #[test]
+    fn a_composed_kernel_matches_the_native_expression_bit_for_bit() {
+        // Option A's promise, pinned: one interpreter entry, operators
+        // vectorized over the whole column, the same IEEE arithmetic as
+        // the native scalar-expression slot — so promotion changes
+        // nothing but speed. The tiny segment threshold matters: the
+        // rolling combinator must be continuous across storage-segment
+        // boundaries (whole-query evaluation), never reset by them.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+            Field::new("y", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 16).unwrap();
+        for i in 0..50i64 {
+            let x = i as f64 * 0.5 + 3.0;
+            let y = (i as f64).mul_add(-0.25, 40.0);
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(x), RowValue::F64(y)])
+                .unwrap();
+        }
+        table
+            .register_lua_scalar("rel", &["a", "b"], "return (a - b) / b")
+            .unwrap();
+        let composed = f64s(&table.query("SELECT rel(x, y) AS r FROM t").unwrap(), 0);
+        let native = f64s(&table.query("SELECT (x - y) / y AS r FROM t").unwrap(), 0);
+        assert_eq!(composed.len(), 50);
+        assert_eq!(composed.len(), native.len());
+        for (c, n) in composed.iter().zip(&native) {
+            match (c, n) {
+                (Some(c), Some(n)) => assert_eq!(c.to_bits(), n.to_bits()),
+                (c, n) => assert_eq!(c, n),
+            }
+        }
+        // The rolling combinator against a per-window recompute over
+        // the WHOLE column — windows straddle the 16-row segments.
+        table
+            .register_lua_scalar("rdot", &["a", "b"], "return rolling_dot(a, b, 5)")
+            .unwrap();
+        let rolled = f64s(&table.query("SELECT rdot(x, y) AS r FROM t").unwrap(), 0);
+        let raw = table.query("SELECT ts, x, y FROM t").unwrap();
+        let x = f64s(&raw, 1);
+        let y = f64s(&raw, 2);
+        for (i, got) in rolled.iter().enumerate() {
+            let lo = (i + 1).saturating_sub(5);
+            let expected: f64 = (lo..=i).map(|j| x[j].unwrap() * y[j].unwrap()).sum();
+            let got = got.unwrap();
+            let scale = expected.abs().max(1.0);
+            assert!(
+                ((got - expected) / scale).abs() < 1e-12,
+                "row {i}: {got} vs {expected}"
+            );
+        }
     }
 }

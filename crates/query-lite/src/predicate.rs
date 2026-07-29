@@ -490,7 +490,17 @@ fn leaf_result(rows: usize, verdict: impl Fn(usize) -> (bool, bool)) -> ThreeVal
 /// (key predicates and NOT are always "maybe"); a numeric column with no
 /// zone map holds no valid, comparable values, so a comparison on it
 /// matches nothing.
+///
+/// A segment carrying no zone maps at all (a query-lifetime scratch
+/// segment — [`Segment::from_batch_unpruned`]) prunes nothing: absent
+/// maps mean nothing is known, which is the opposite of an absent map
+/// for one column of a segment that has them.
+///
+/// [`Segment::from_batch_unpruned`]: storage_lite::Segment::from_batch_unpruned
 pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> bool {
+    if !view.segment.zone_maps_present() {
+        return true;
+    }
     match predicate {
         Predicate::Compare { column, op, value } => {
             let Some(index) = schema

@@ -12,7 +12,8 @@
 //!
 //! ```text
 //! magic        8B  "TALLYSEG"
-//! version      u16 (this module writes 1)
+//! version      u16 (1, or 2 when a trailer follows the columns — see
+//!                  [`VERSION_TRAILERED`])
 //! reserved     u16 (zero)
 //! crc32c       u32 — CRC-32C (Castagnoli) of every byte after this
 //!                  field; chosen over IEEE CRC-32 because it is the
@@ -50,7 +51,7 @@
 //! the append-only registry discipline, and not worth speculative bytes
 //! today.
 //!
-//! ## The manifest format, version 1
+//! ## The manifest format, versions 1 and 2
 //!
 //! The table manifest is its own small record (it used to be an encoded
 //! empty segment whose `base_row_id` field smuggled the generation — a
@@ -61,7 +62,9 @@
 //!
 //! ```text
 //! magic        8B  "TALLYMFT"
-//! version      u16 (this module writes 1)
+//! version      u16 (1 while no section carries content; 2 once one
+//!                   does — a table that never corrects keeps
+//!                   byte-identical v1 bytes)
 //! reserved     u16 (zero)
 //! crc32c       u32 — CRC-32C of every byte after this field
 //! generation   u64 — the committed compaction generation
@@ -70,10 +73,17 @@
 //! then per column (the segment format's schema prefix, same registries):
 //!   name_len u16, name bytes (UTF-8)
 //!   column_type u8, nullable u8, logical u8 tag + u8 payload
+//! then (v2 only) the sections, each: tag u16, length u32, payload
+//!   tag 2 — the ingest-sequence watermark
+//!   tag 3 — the history segments' names
 //! ```
+//!
+//! Sections are additive and skippable: a decoder ignores tags it does
+//! not know, which is what lets the knowledge axis and F3's zone-map
+//! lift share one revision.
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
-use crate::mem::{RowValue, Segment, ZoneMap};
+use crate::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
     NumericData, RecordBatch, Schema,
@@ -82,8 +92,28 @@ use std::fmt;
 
 /// First bytes of every segment file.
 pub const MAGIC: [u8; 8] = *b"TALLYSEG";
-/// The format version this module writes.
+/// The format version this module writes for segments whose sequences
+/// are virtual (`sequence == row id` — every segment of a never-diverged
+/// table). Byte-identical to the original golden-locked format, so
+/// tables that never retain history never see a version bump.
 pub const VERSION: u16 = 1;
+/// The trailered segment version (M4.4, issue #75): v1's exact layout,
+/// then — after the last column — the same section scheme the manifest
+/// uses: `section_count: u16`, then per section `tag: u16, length: u32,
+/// payload`. Readers skip unknown tags. Only diverged tables ever write
+/// v2 segments. Assigned trailer tags (a registry separate from the
+/// manifest's): 1 = birth sequences (see [`crate::mem::SequenceInfo`]) —
+/// a state byte (1 contiguous, 2 explicit), then for contiguous the
+/// `u64` base, for explicit the delta-of-delta-coded per-row array;
+/// 2 = kill coordinates (history segments only) — the delta-of-delta-
+/// coded per-row array of sequences at which each row's tombstone
+/// landed (see [`crate::mem::Segment::superseded`]).
+pub const VERSION_TRAILERED: u16 = 2;
+
+const TRAILER_SEQUENCE: u16 = 1;
+const TRAILER_SUPERSEDED: u16 = 2;
+const SEQUENCE_CONTIGUOUS: u8 = 1;
+const SEQUENCE_EXPLICIT: u8 = 2;
 
 /// Why segment bytes could not be decoded.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -160,12 +190,18 @@ fn crc32c(bytes: &[u8]) -> u32 {
 const CRC_OFFSET: usize = 12;
 const PAYLOAD_OFFSET: usize = 16;
 
-/// Encodes a segment into its v1 bytes.
+/// Encodes a segment: byte-identical v1 while its sequences are virtual
+/// (the golden-locked layout every never-diverged table keeps forever),
+/// the trailered v2 once sequence data must be carried.
 pub fn encode_segment(segment: &Segment) -> Vec<u8> {
+    let version = match (segment.sequence_info(), segment.superseded()) {
+        (SequenceInfo::RowIds, None) => VERSION,
+        _ => VERSION_TRAILERED,
+    };
     let batch = segment.batch();
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
     out.extend_from_slice(&segment.base_row_id().to_le_bytes());
@@ -190,6 +226,41 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
             segment.zone_map(index),
         );
     }
+    if version == VERSION_TRAILERED {
+        let mut sections: Vec<(u16, Vec<u8>)> = Vec::new();
+        match segment.sequence_info() {
+            // A history segment can carry kill coordinates while its
+            // births are virtual only in principle; in practice every
+            // trailered segment of a diverged table has sequence data,
+            // and a RowIds state simply writes no sequence section.
+            SequenceInfo::RowIds => {}
+            SequenceInfo::Contiguous { base } => {
+                let mut payload = Vec::with_capacity(9);
+                payload.push(SEQUENCE_CONTIGUOUS);
+                payload.extend_from_slice(&base.to_le_bytes());
+                sections.push((TRAILER_SEQUENCE, payload));
+            }
+            SequenceInfo::Explicit(values) => {
+                // Sequences are u64; the codec is i64 with wrapping
+                // arithmetic throughout, so the bit-preserving cast
+                // round-trips every value exactly.
+                let signed: Vec<i64> = values.iter().map(|&value| value as i64).collect();
+                let mut payload = encode_delta_of_delta(&signed);
+                payload.insert(0, SEQUENCE_EXPLICIT);
+                sections.push((TRAILER_SEQUENCE, payload));
+            }
+        }
+        if let Some(superseded) = segment.superseded() {
+            let signed: Vec<i64> = superseded.iter().map(|&value| value as i64).collect();
+            sections.push((TRAILER_SUPERSEDED, encode_delta_of_delta(&signed)));
+        }
+        out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
+        for (tag, payload) in sections {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
+    }
     let crc = crc32c(&out[PAYLOAD_OFFSET..]);
     out[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out
@@ -208,14 +279,10 @@ fn writer_codec(segment: &Segment, column: &Column, is_ordering_key: bool) -> Co
     }
 }
 
-fn encode_column(
-    out: &mut Vec<u8>,
-    segment: &Segment,
-    field: &Field,
-    column: &Column,
-    is_ordering_key: bool,
-    zone_map: Option<&ZoneMap>,
-) {
+/// The field prefix both containers share — name, type, nullability,
+/// logical annotation — written identically by segments (per column)
+/// and manifests (per schema field).
+fn encode_field(out: &mut Vec<u8>, field: &Field) {
     out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
     out.extend_from_slice(field.name().as_bytes());
     out.push(field.column_type() as u8);
@@ -230,6 +297,39 @@ fn encode_column(
             out.extend_from_slice(&[logical.tag(), payload]);
         }
     }
+}
+
+/// Decodes the shared field prefix (the inverse of [`encode_field`]).
+fn decode_field(reader: &mut Reader<'_>) -> Result<Field, FormatError> {
+    let name_len = reader.u16()? as usize;
+    let name = std::str::from_utf8(reader.take(name_len)?)
+        .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
+        .to_owned();
+    let column_type = ColumnType::from_tag(reader.u8()?)
+        .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
+    let nullable = reader.u8()? != 0;
+    let logical_tag = reader.u8()?;
+    let logical_payload = reader.u8()?;
+    let mut field = Field::new(name.clone(), column_type, nullable);
+    if logical_tag != 0 {
+        field = field.with_logical(
+            LogicalType::from_parts(logical_tag, logical_payload).ok_or_else(|| {
+                FormatError::Corrupt(format!("unknown logical type {logical_tag} for '{name}'"))
+            })?,
+        );
+    }
+    Ok(field)
+}
+
+fn encode_column(
+    out: &mut Vec<u8>,
+    segment: &Segment,
+    field: &Field,
+    column: &Column,
+    is_ordering_key: bool,
+    zone_map: Option<&ZoneMap>,
+) {
+    encode_field(out, field);
     let codec = writer_codec(segment, column, is_ordering_key);
     out.push(codec.tag());
     encode_zone_map(out, zone_map);
@@ -358,14 +458,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decodes v1 segment bytes, verifying magic, version, and checksum.
+/// Decodes segment bytes (v1 or trailered v2), verifying magic,
+/// version, and checksum.
 pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != MAGIC {
         return Err(FormatError::BadMagic);
     }
     let version = reader.u16()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_TRAILERED {
         return Err(FormatError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -399,10 +500,42 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         columns.push(column);
         zone_maps.push(zone_map);
     }
+    let mut sequence = SequenceInfo::RowIds;
+    let mut superseded = None;
+    if version == VERSION_TRAILERED {
+        let section_count = reader.u16()?;
+        for _ in 0..section_count {
+            let tag = reader.u16()?;
+            let length = reader.u32()? as usize;
+            let payload = reader.take(length)?;
+            match tag {
+                TRAILER_SEQUENCE => {
+                    sequence = decode_sequence_section(payload, row_count)?;
+                }
+                TRAILER_SUPERSEDED => {
+                    let signed = decode_delta_of_delta(payload, row_count)?;
+                    superseded = Some(
+                        signed
+                            .into_iter()
+                            .map(|value| value as u64)
+                            .collect::<Vec<u64>>(),
+                    );
+                }
+                // Unknown trailer tags are skipped whole — the same
+                // forward-compatibility contract as manifest sections.
+                _ => {}
+            }
+        }
+    }
     if reader.position != bytes.len() {
         return Err(FormatError::Corrupt(format!(
-            "{} bytes remain after the last column",
-            bytes.len() - reader.position
+            "{} bytes remain after the last {}",
+            bytes.len() - reader.position,
+            if version == VERSION_TRAILERED {
+                "trailer section"
+            } else {
+                "column"
+            }
         )));
     }
     let batch = RecordBatch::new(Schema::new(fields), columns);
@@ -412,13 +545,81 @@ pub fn decode_segment(bytes: &[u8]) -> Result<Segment, FormatError> {
         ordered,
         base_row_id,
         zone_maps,
+        sequence,
+        superseded,
     ))
+}
+
+/// Decodes a v2 segment's sequence trailer section.
+fn decode_sequence_section(payload: &[u8], rows: usize) -> Result<SequenceInfo, FormatError> {
+    match payload.first() {
+        Some(&SEQUENCE_CONTIGUOUS) => {
+            let base: [u8; 8] = payload[1..]
+                .try_into()
+                .map_err(|_| FormatError::Corrupt("contiguous sequence base is 8 bytes".into()))?;
+            Ok(SequenceInfo::Contiguous {
+                base: u64::from_le_bytes(base),
+            })
+        }
+        Some(&SEQUENCE_EXPLICIT) => {
+            let signed = decode_delta_of_delta(&payload[1..], rows)?;
+            Ok(SequenceInfo::Explicit(
+                signed.into_iter().map(|value| value as u64).collect(),
+            ))
+        }
+        Some(&state) => Err(FormatError::Corrupt(format!(
+            "unknown sequence state byte {state}"
+        ))),
+        None => Err(FormatError::Corrupt("empty sequence section".into())),
+    }
 }
 
 /// First bytes of every manifest file.
 pub const MANIFEST_MAGIC: [u8; 8] = *b"TALLYMFT";
-/// The manifest format version this module writes.
+/// The manifest format version this module writes for tables with no
+/// section content — byte-identical to the original format, so
+/// untouched tables never see a version bump.
 pub const MANIFEST_VERSION: u16 = 1;
+/// The sectioned manifest version (M4.4): v1's exact layout, then
+/// `section_count: u16` followed by `tag: u16, length: u32, payload`
+/// per section. Readers skip unknown tags, so sections fill in over
+/// time without another version bump. Assigned tags: 1 = per-segment
+/// zone maps (reserved for the segment-lazy work, never yet written),
+/// 2 = knowledge state (the `u64` ingest-sequence watermark — see
+/// [`ManifestSections::next_sequence`]), 3 = history segments.
+pub const MANIFEST_VERSION_SECTIONED: u16 = 2;
+
+/// Manifest section content beyond the v1 core. `Default` is the
+/// empty state, which encodes as plain v1.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ManifestSections {
+    /// The ingest-sequence watermark: the sequence the next appended
+    /// row will receive. `Some` exactly when the table has diverged —
+    /// run a retaining compaction that broke sequence == row id — and
+    /// the counter must advance independently of reassigned row ids
+    /// (ids compact downward; birth sequences never reuse). `None`
+    /// while virtual: the next sequence *is* the next row id, derived,
+    /// nothing stored.
+    pub next_sequence: Option<u64>,
+    /// Segments holding superseded row versions: excluded from
+    /// latest-knowledge scans, entered only under `ASOF`.
+    pub history: Vec<String>,
+}
+
+impl ManifestSections {
+    /// Whether encoding needs the sectioned version at all.
+    pub fn is_empty(&self) -> bool {
+        self.next_sequence.is_none() && self.history.is_empty()
+    }
+
+    /// Whether the table has ever diverged (sequence != row id).
+    pub fn diverged(&self) -> bool {
+        self.next_sequence.is_some()
+    }
+}
+
+const SECTION_KNOWLEDGE: u16 = 2;
+const SECTION_HISTORY: u16 = 3;
 
 /// A decoded table manifest: what reopen verifies against and the
 /// generation the backend is committed to.
@@ -430,32 +631,54 @@ pub struct Manifest {
     pub ordering_key: usize,
     /// The committed compaction generation.
     pub generation: u64,
+    /// Section content (v2); empty for v1 manifests.
+    pub sections: ManifestSections,
 }
 
-/// Encodes a manifest into its v1 bytes.
-pub fn encode_manifest(schema: &Schema, ordering_key: usize, generation: u64) -> Vec<u8> {
+/// Encodes a manifest: byte-identical v1 while `sections` is empty
+/// (the golden-locked layout untouched tables keep forever), the
+/// sectioned v2 once any section has content.
+pub fn encode_manifest(
+    schema: &Schema,
+    ordering_key: usize,
+    generation: u64,
+    sections: &ManifestSections,
+) -> Vec<u8> {
+    let version = if sections.is_empty() {
+        MANIFEST_VERSION
+    } else {
+        MANIFEST_VERSION_SECTIONED
+    };
     let mut out = Vec::new();
     out.extend_from_slice(&MANIFEST_MAGIC);
-    out.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&(ordering_key as u32).to_le_bytes());
     out.extend_from_slice(&(schema.fields().len() as u32).to_le_bytes());
     for field in schema.fields() {
-        out.extend_from_slice(&(field.name().len() as u16).to_le_bytes());
-        out.extend_from_slice(field.name().as_bytes());
-        out.push(field.column_type() as u8);
-        out.push(u8::from(field.nullable()));
-        match field.logical() {
-            None => out.extend_from_slice(&[0, 0]),
-            Some(logical) => {
-                let payload = match logical {
-                    LogicalType::Decimal64 { scale } => scale,
-                    LogicalType::TimestampNs => 0,
-                };
-                out.extend_from_slice(&[logical.tag(), payload]);
+        encode_field(&mut out, field);
+    }
+    if version == MANIFEST_VERSION_SECTIONED {
+        let mut section_bytes: Vec<(u16, Vec<u8>)> = Vec::new();
+        if let Some(next_sequence) = sections.next_sequence {
+            section_bytes.push((SECTION_KNOWLEDGE, next_sequence.to_le_bytes().to_vec()));
+        }
+        if !sections.history.is_empty() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(sections.history.len() as u32).to_le_bytes());
+            for name in &sections.history {
+                payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
             }
+            section_bytes.push((SECTION_HISTORY, payload));
+        }
+        out.extend_from_slice(&(section_bytes.len() as u16).to_le_bytes());
+        for (tag, payload) in section_bytes {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
         }
     }
     let crc = crc32c(&out[PAYLOAD_OFFSET..]);
@@ -463,14 +686,15 @@ pub fn encode_manifest(schema: &Schema, ordering_key: usize, generation: u64) ->
     out
 }
 
-/// Decodes v1 manifest bytes, verifying magic, version, and checksum.
+/// Decodes manifest bytes of either version, verifying magic, version,
+/// and checksum; unknown v2 section tags are skipped, not refused.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != MANIFEST_MAGIC {
         return Err(FormatError::BadMagic);
     }
     let version = reader.u16()?;
-    if version != MANIFEST_VERSION {
+    if version != MANIFEST_VERSION && version != MANIFEST_VERSION_SECTIONED {
         return Err(FormatError::UnsupportedVersion(version));
     }
     if reader.u16()? != 0 {
@@ -493,35 +717,66 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
     }
     let mut fields = Vec::with_capacity(column_count);
     for _ in 0..column_count {
-        let name_len = reader.u16()? as usize;
-        let name = std::str::from_utf8(reader.take(name_len)?)
-            .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
-            .to_owned();
-        let column_type = ColumnType::from_tag(reader.u8()?)
-            .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
-        let nullable = reader.u8()? != 0;
-        let logical_tag = reader.u8()?;
-        let logical_payload = reader.u8()?;
-        let mut field = Field::new(name.clone(), column_type, nullable);
-        if logical_tag != 0 {
-            field = field.with_logical(
-                LogicalType::from_parts(logical_tag, logical_payload).ok_or_else(|| {
-                    FormatError::Corrupt(format!("unknown logical type {logical_tag} for '{name}'"))
-                })?,
-            );
+        fields.push(decode_field(&mut reader)?);
+    }
+    let mut sections = ManifestSections::default();
+    if version == MANIFEST_VERSION_SECTIONED {
+        let section_count = reader.u16()? as usize;
+        for _ in 0..section_count {
+            let tag = reader.u16()?;
+            let length = reader.u32()? as usize;
+            let payload = reader.take(length)?;
+            match tag {
+                SECTION_KNOWLEDGE => {
+                    let watermark: [u8; 8] = payload.try_into().map_err(|_| {
+                        FormatError::Corrupt("knowledge section is 8 bytes".to_owned())
+                    })?;
+                    sections.next_sequence = Some(u64::from_le_bytes(watermark));
+                }
+                SECTION_HISTORY => {
+                    let mut inner = Reader {
+                        bytes: payload,
+                        position: 0,
+                    };
+                    let count = inner.u32()? as usize;
+                    for _ in 0..count {
+                        let len = inner.u16()? as usize;
+                        let name = std::str::from_utf8(inner.take(len)?)
+                            .map_err(|_| {
+                                FormatError::Corrupt("history segment name is not UTF-8".to_owned())
+                            })?
+                            .to_owned();
+                        sections.history.push(name);
+                    }
+                    if inner.position != payload.len() {
+                        return Err(FormatError::Corrupt(
+                            "trailing bytes in the history section".to_owned(),
+                        ));
+                    }
+                }
+                // Unknown tags (zone maps to come, and anything newer
+                // than this reader) are skipped whole — that is the
+                // sectioned format's forward-compatibility contract.
+                _ => {}
+            }
         }
-        fields.push(field);
     }
     if reader.position != bytes.len() {
         return Err(FormatError::Corrupt(format!(
-            "{} bytes remain after the last column",
-            bytes.len() - reader.position
+            "{} bytes remain after the last {}",
+            bytes.len() - reader.position,
+            if version == MANIFEST_VERSION_SECTIONED {
+                "section"
+            } else {
+                "column"
+            }
         )));
     }
     Ok(Manifest {
         schema: Schema::new(fields),
         ordering_key,
         generation,
+        sections,
     })
 }
 
@@ -529,23 +784,9 @@ fn decode_column(
     reader: &mut Reader<'_>,
     rows: usize,
 ) -> Result<(Field, Column, Option<ZoneMap>), FormatError> {
-    let name_len = reader.u16()? as usize;
-    let name = std::str::from_utf8(reader.take(name_len)?)
-        .map_err(|_| FormatError::Corrupt("column name is not UTF-8".to_owned()))?
-        .to_owned();
-    let column_type = ColumnType::from_tag(reader.u8()?)
-        .ok_or_else(|| FormatError::Corrupt(format!("unknown column type for '{name}'")))?;
-    let nullable = reader.u8()? != 0;
-    let logical_tag = reader.u8()?;
-    let logical_payload = reader.u8()?;
-    let logical = match logical_tag {
-        0 => None,
-        tag => Some(
-            LogicalType::from_parts(tag, logical_payload).ok_or_else(|| {
-                FormatError::Corrupt(format!("unknown logical type {tag} for '{name}'"))
-            })?,
-        ),
-    };
+    let field = decode_field(reader)?;
+    let name = field.name().to_owned();
+    let column_type = field.column_type();
     let codec = Codec::from_tag(reader.u8()?)
         .ok_or_else(|| FormatError::Corrupt(format!("unknown codec for '{name}'")))?;
     let presence = reader.u8()?;
@@ -655,10 +896,6 @@ fn decode_column(
             })
         }
     };
-    let mut field = Field::new(name, column_type, nullable);
-    if let Some(logical) = logical {
-        field = field.with_logical(logical);
-    }
     Ok((field, column, zone_map))
 }
 
@@ -728,15 +965,17 @@ fn decode_dictionary(reader: &mut Reader<'_>, name: &str) -> Result<Dictionary, 
 /// the segment format (whose bytes stay locked by the committed
 /// golden), and it exists only between flushes — truncated whenever the
 /// rows it guards become segment-durable.
-pub const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
-/// WAL format version.
-pub const WAL_VERSION: u16 = 1;
+pub(crate) const WAL_MAGIC: [u8; 8] = *b"TALLYWAL";
+/// WAL format version. Version 2 (M4.5, issue #73) added one control
+/// record — the supersession bracket — to the record grammar; v1 logs
+/// (which cannot contain control records) still replay.
+pub(crate) const WAL_VERSION: u16 = 2;
 /// The header's encoded size: magic (8) + version (2) + generation (8)
 /// plus base row id (8) plus their CRC-32C (4) — the header carries a
 /// checksum like every other structure in the format. A log file
 /// shorter than this holds no acknowledged record (records follow the
 /// header in the same file) and reads as an empty log, not corruption.
-pub const WAL_HEADER_LEN: usize = 30;
+pub(crate) const WAL_HEADER_LEN: usize = 30;
 
 /// Encodes the WAL header: magic, version, generation, and the row id
 /// of the first record — replay skips records already covered by
@@ -744,7 +983,7 @@ pub const WAL_HEADER_LEN: usize = 30;
 /// leaves such a prefix) and refuses logs from another generation
 /// (compaction reassigns row ids, so cross-generation replay would be
 /// in the wrong id space).
-pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
+pub(crate) fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(WAL_HEADER_LEN);
     out.extend_from_slice(&WAL_MAGIC);
     out.extend_from_slice(&WAL_VERSION.to_le_bytes());
@@ -759,7 +998,10 @@ pub fn encode_wal_header(generation: u64, base_row_id: u64) -> Vec<u8> {
 /// presence-tagged cell per schema column), `u32` CRC-32C of the
 /// payload. A record whose length, payload, or CRC cannot be read
 /// whole is a torn tail — the crash boundary — never an error.
-pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
+///
+/// Cell presence tags are 0..=3; a payload whose first byte is `0xFF`
+/// is a **control record** instead (see [`encode_wal_supersession`]).
+pub(crate) fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16 * row.len());
     for cell in row {
         match cell {
@@ -786,9 +1028,30 @@ pub fn encode_wal_record(row: &[RowValue<'_>]) -> Vec<u8> {
     out
 }
 
+/// The supersession bracket (issue #73): announces that the next
+/// `replacements` row records belong to one mutation whose every row is
+/// born at `sequence` — the single knowledge coordinate at which the
+/// mutation's victims also die. The bracket's *commit evidence* is the
+/// delete log carrying `superseding == sequence`; replay finding the
+/// bracket at the log's clean tail without that evidence drops the
+/// bracketed rows whole, which is what makes a crashed `UPDATE`
+/// old-or-new instead of torn.
+pub(crate) fn encode_wal_supersession(sequence: u64, replacements: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18);
+    payload.push(0xFF);
+    payload.push(1); // control tag: begin supersession
+    payload.extend_from_slice(&sequence.to_le_bytes());
+    payload.extend_from_slice(&replacements.to_le_bytes());
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&crc32c(&payload).to_le_bytes());
+    out
+}
+
 /// A WAL row, owned (`RowValue` borrows; replay needs owned cells).
 #[derive(Debug, PartialEq)]
-pub enum WalCell {
+pub(crate) enum WalCell {
     Null,
     I64(i64),
     F64(f64),
@@ -807,27 +1070,37 @@ impl WalCell {
     }
 }
 
+/// One replayable WAL entry.
+#[derive(Debug, PartialEq)]
+pub(crate) enum WalEntry {
+    /// An ordinary appended row.
+    Row(Vec<WalCell>),
+    /// A supersession bracket: the next `replacements` rows share the
+    /// birth coordinate `sequence` (see [`encode_wal_supersession`]).
+    Supersession { sequence: u64, replacements: u64 },
+}
+
 /// A decoded WAL: where its records start in the row-id space, and the
-/// clean-prefix rows that survived.
-pub struct WalContents {
+/// clean-prefix entries that survived.
+pub(crate) struct WalContents {
     pub generation: u64,
     pub base_row_id: u64,
-    pub rows: Vec<Vec<WalCell>>,
+    pub entries: Vec<WalEntry>,
 }
 
 /// Decodes a WAL file. Header corruption is an error (the file is not a
 /// WAL); a torn or corrupt *record* ends the clean prefix silently —
 /// that is the crash boundary working as designed, and everything
 /// before it is intact (each record carries its own CRC).
-pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatError> {
+pub(crate) fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != WAL_MAGIC {
         return Err(FormatError::Corrupt("not a WAL file".to_owned()));
     }
     let version = reader.u16()?;
-    if version != WAL_VERSION {
+    if version != 1 && version != WAL_VERSION {
         return Err(FormatError::Corrupt(format!(
-            "WAL version {version} is not {WAL_VERSION}"
+            "WAL version {version} is not readable (this build reads 1 and {WAL_VERSION})"
         )));
     }
     let generation = reader.u64()?;
@@ -838,18 +1111,28 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
             "WAL header checksum mismatch".to_owned(),
         ));
     }
-    let mut rows = Vec::new();
-    loop {
-        let record_start = reader.position;
-        let Ok(length) = reader.u32() else { break };
-        let _ = record_start; // records are self-delimiting; a failed
-                              // read below simply ends the clean prefix
+    let mut entries = Vec::new();
+    // Records are self-delimiting, so a failed read simply ends the
+    // clean prefix — no start offset needs remembering.
+    while let Ok(length) = reader.u32() {
         let Ok(payload) = reader.take(length as usize) else {
             break;
         };
         let Ok(stored_crc) = reader.u32() else { break };
         if crc32c(payload) != stored_crc {
             break; // torn or corrupt record: the clean prefix ends here
+        }
+        if payload.first() == Some(&0xFF) {
+            // A control record. Unknown control tags or malformed
+            // payloads end the clean prefix like any other damage.
+            if payload.len() != 18 || payload[1] != 1 {
+                break;
+            }
+            entries.push(WalEntry::Supersession {
+                sequence: u64::from_le_bytes(payload[2..10].try_into().unwrap()),
+                replacements: u64::from_le_bytes(payload[10..18].try_into().unwrap()),
+            });
+            continue;
         }
         let mut cells = Reader {
             bytes: payload,
@@ -901,11 +1184,11 @@ pub fn decode_wal(bytes: &[u8], columns: usize) -> Result<WalContents, FormatErr
         if !clean || row.len() != columns {
             break; // CRC passed but shape is wrong: stop, don't guess
         }
-        rows.push(row);
+        entries.push(WalEntry::Row(row));
     }
     Ok(WalContents {
         generation,
         base_row_id,
-        rows,
+        entries,
     })
 }

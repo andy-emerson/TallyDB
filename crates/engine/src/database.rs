@@ -32,6 +32,10 @@ use storage_lite::RowValue;
 #[derive(Default)]
 pub struct Database {
     tables: HashMap<String, Table>,
+    /// The `log(...)` destination for driver scripts (`run_script`);
+    /// kernels use their table's sink.
+    #[cfg(feature = "lua")]
+    script_log_sink: Option<std::sync::Arc<dyn compute_lua::LogSink + Sync>>,
 }
 
 impl Database {
@@ -151,8 +155,24 @@ impl Database {
             .mutate(sql)
     }
 
+    /// Registers a native window kernel on the named table — the
+    /// primary extension path (see [`Table::register_window`] for the
+    /// full contract and the ~20-line example).
+    pub fn register_window(
+        &mut self,
+        table: &str,
+        name: &str,
+        kernel: impl query_lite::WindowAggregate + 'static,
+    ) -> Result<(), EngineError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
+            .register_window(name, kernel)
+    }
+
     /// Registers a Lua kernel as a SQL window function on the named
     /// table (see [`Table::register_lua_window`]).
+    #[cfg(feature = "lua")]
     pub fn register_lua_window(
         &mut self,
         table: &str,
@@ -165,6 +185,59 @@ impl Database {
             .get_mut(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
             .register_lua_window(name, parameters, chunk, output)
+    }
+
+    /// Registers a Lua column kernel as a SQL scalar function on the
+    /// named table (see [`Table::register_lua_scalar`]).
+    #[cfg(feature = "lua")]
+    pub fn register_lua_scalar(
+        &mut self,
+        table: &str,
+        name: &str,
+        parameters: &[&str],
+        chunk: &str,
+    ) -> Result<(), EngineError> {
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
+            .register_lua_scalar(name, parameters, chunk)
+    }
+
+    /// Runs `source` as a **driver script** — SQL-in-Lua (#70): the
+    /// script's `query(sql)` and `append(table, row)` globals reach
+    /// this database, so it can issue SQL, receive result columns as
+    /// views (a one-batch result passes through untouched; several
+    /// batches pay one gather, proportional to the result), and feed
+    /// derived rows back exactly. Each call runs in a fresh
+    /// interpreter: no state crosses between scripts.
+    ///
+    /// Every result a script queries stays live until the script
+    /// returns — that is what keeps its views valid, and it means a
+    /// driver looping one `query` per row holds them all. Write
+    /// drivers that query in bulk and compute over columns.
+    ///
+    /// See the `driver` module docs for what each statement kind means
+    /// here.
+    #[cfg(feature = "lua")]
+    pub fn run_script(&mut self, source: &str) -> Result<(), EngineError> {
+        let mut state = compute_lua::LuaState::new().map_err(EngineError::Script)?;
+        if let Some(sink) = &self.script_log_sink {
+            state.set_log_sink(Box::new(crate::script::SharedSink(std::sync::Arc::clone(
+                sink,
+            ))));
+        }
+        let chunk = state.compile(source).map_err(EngineError::Script)?;
+        let mut host = crate::driver::DatabaseHost { database: self };
+        state
+            .run_driver(&chunk, &mut host)
+            .map_err(EngineError::Script)
+    }
+
+    /// Installs the destination for driver scripts' `log(...)` output
+    /// (see [`Database::run_script`]); off (a no-op) until set.
+    #[cfg(feature = "lua")]
+    pub fn set_script_log_sink(&mut self, sink: std::sync::Arc<dyn compute_lua::LogSink + Sync>) {
+        self.script_log_sink = Some(sink);
     }
 
     /// Compacts the named table (see [`Table::compact`]).

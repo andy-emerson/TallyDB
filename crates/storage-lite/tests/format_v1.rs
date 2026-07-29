@@ -1,5 +1,6 @@
-//! The v1 segment format's spec tests: round-trips, corruption handling,
-//! and the golden byte lock.
+//! The segment format's spec tests: round-trips, corruption handling,
+//! the golden byte lock for v1, and the sectioned/trailered v2 additions
+//! (manifest sections and sequence trailers, M4.4).
 //!
 //! Per the design's blast-radius ranking, storage bytes are the highest
 //! evidence priority: corruption is silent and the format entrenches the
@@ -9,8 +10,8 @@
 
 use arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
 use storage_lite::{
-    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, RowValue,
-    Segment, WriteBuffer,
+    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError,
+    ManifestSections, RowValue, Segment, SequenceInfo, WriteBuffer,
 };
 
 /// A fixture exercising every format feature: all three column types, a
@@ -144,7 +145,12 @@ fn fixture_manifest() -> (Schema, usize, u64) {
 #[test]
 fn manifest_round_trips_exactly() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     let manifest = decode_manifest(&bytes).unwrap();
     assert_eq!(manifest.schema, schema);
     assert_eq!(manifest.ordering_key, ordering_key);
@@ -154,7 +160,12 @@ fn manifest_round_trips_exactly() {
 #[test]
 fn every_manifest_truncation_is_an_error_never_a_panic() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     for len in 0..bytes.len() {
         assert!(
             decode_manifest(&bytes[..len]).is_err(),
@@ -166,7 +177,12 @@ fn every_manifest_truncation_is_an_error_never_a_panic() {
 #[test]
 fn every_manifest_single_byte_corruption_is_caught() {
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     for position in 0..bytes.len() {
         let mut corrupt = bytes.clone();
         corrupt[position] ^= 0x40;
@@ -185,7 +201,12 @@ fn manifest_rejects_segment_bytes_and_vice_versa() {
         Err(FormatError::BadMagic)
     ));
     assert!(matches!(
-        decode_segment(&encode_manifest(&schema, ordering_key, generation)),
+        decode_segment(&encode_manifest(
+            &schema,
+            ordering_key,
+            generation,
+            &ManifestSections::default()
+        )),
         Err(FormatError::BadMagic)
     ));
 }
@@ -198,7 +219,12 @@ fn manifest_golden_bytes_are_locked() {
         .join("golden")
         .join("manifest_v1.bin");
     let (schema, ordering_key, generation) = fixture_manifest();
-    let bytes = encode_manifest(&schema, ordering_key, generation);
+    let bytes = encode_manifest(
+        &schema,
+        ordering_key,
+        generation,
+        &ManifestSections::default(),
+    );
     if !path.exists() && std::env::var_os("TALLYDB_BLESS_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &bytes).unwrap();
@@ -331,4 +357,176 @@ fn decoded_columns_read_correctly() {
         batch.schema().fields()[0].logical(),
         Some(LogicalType::TimestampNs)
     );
+}
+
+#[test]
+fn sectioned_manifest_round_trips_and_v1_stays_byte_identical() {
+    // M4.4: empty sections encode plain v1 (the golden above already
+    // locks those bytes); content switches to v2, round-trips, and a
+    // v1 reader's world is untouched until a table actually diverges.
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("x", ColumnType::F64, true),
+    ]);
+    let empty = ManifestSections::default();
+    let v1 = encode_manifest(&schema, 0, 3, &empty);
+    assert_eq!(&v1[8..10], &1u16.to_le_bytes(), "empty sections stay v1");
+    let sections = ManifestSections {
+        next_sequence: Some(7_000),
+        history: vec!["seg-g0000000001-00000000000000000000.tlyseg".to_owned()],
+    };
+    let v2 = encode_manifest(&schema, 0, 3, &sections);
+    assert_eq!(&v2[8..10], &2u16.to_le_bytes(), "content is v2");
+    let decoded = decode_manifest(&v2).unwrap();
+    assert_eq!(decoded.generation, 3);
+    assert_eq!(decoded.sections, sections);
+    // A v1 manifest decodes with empty sections.
+    assert_eq!(decode_manifest(&v1).unwrap().sections, empty);
+}
+
+#[test]
+fn unknown_manifest_sections_are_skipped_whole() {
+    // The forward-compatibility contract: a reader ignores tags it
+    // does not know (zone maps arrive later under tag 1), so sections
+    // fill in over time without a version bump.
+    let schema = Schema::new(vec![Field::new("ts", ColumnType::I64, false)]);
+    let sections = ManifestSections {
+        next_sequence: Some(41_520),
+        history: Vec::new(),
+    };
+    let mut bytes = encode_manifest(&schema, 0, 0, &sections);
+    // Append one unknown section (tag 999, 4-byte payload) by hand,
+    // bump the count, and re-stamp the checksum the way the encoder
+    // lays it out: crc32c over everything past the 16-byte header.
+    let count_offset = bytes.len() - (2 + 2 + 4 + 8); // count + known section
+    let count = u16::from_le_bytes([bytes[count_offset], bytes[count_offset + 1]]);
+    bytes[count_offset..count_offset + 2].copy_from_slice(&(count + 1).to_le_bytes());
+    bytes.extend_from_slice(&999u16.to_le_bytes());
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&[0xAA; 4]);
+    let crc = crc32c_reference(&bytes[16..]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+    let decoded = decode_manifest(&bytes).unwrap();
+    assert_eq!(
+        decoded.sections.next_sequence,
+        Some(41_520),
+        "known section still read"
+    );
+}
+
+#[test]
+fn trailered_segments_round_trip_and_virtual_stays_v1() {
+    // M4.4 step 2: a segment whose sequences are virtual encodes plain
+    // v1 (the golden above already locks those bytes); attached
+    // sequence data switches to v2 and round-trips exactly.
+    let segment = fixture_segment();
+    let v1 = encode_segment(&segment);
+    assert_eq!(&v1[8..10], &1u16.to_le_bytes(), "virtual stays v1");
+    assert_eq!(
+        segment.sequence_at(2),
+        12_347,
+        "virtual: sequence == row id"
+    );
+
+    let contiguous = fixture_segment().with_sequence(SequenceInfo::Contiguous { base: 500_000 });
+    let bytes = encode_segment(&contiguous);
+    assert_eq!(&bytes[8..10], &2u16.to_le_bytes(), "sequence data is v2");
+    let decoded = decode_segment(&bytes).unwrap();
+    assert_eq!(
+        decoded.sequence_info(),
+        &SequenceInfo::Contiguous { base: 500_000 }
+    );
+    assert_eq!(decoded.sequence_at(4), 500_004);
+    assert_segments_equal(&contiguous, &decoded);
+
+    // Explicit: the non-contiguous shape a retaining compaction
+    // produces — merge order follows the ordering key, sequences
+    // follow ingest. u64::MAX proves the i64 codec cast is exact.
+    let sequences = vec![3, u64::MAX, 4, 1_000_000, 5];
+    let explicit = fixture_segment().with_sequence(SequenceInfo::Explicit(sequences.clone()));
+    let decoded = decode_segment(&encode_segment(&explicit)).unwrap();
+    assert_eq!(decoded.sequence_info(), &SequenceInfo::Explicit(sequences));
+    assert_eq!(decoded.sequence_at(3), 1_000_000);
+    assert_segments_equal(&explicit, &decoded);
+}
+
+#[test]
+fn every_trailered_truncation_and_corruption_is_caught() {
+    // The v1 sweeps above never reach a trailer; the same two loops
+    // over a v2 segment give its bytes the same defense.
+    let segment = fixture_segment().with_sequence(SequenceInfo::Explicit(vec![9, 2, 3, 8, 1]));
+    let bytes = encode_segment(&segment);
+    for len in 0..bytes.len() {
+        assert!(
+            decode_segment(&bytes[..len]).is_err(),
+            "prefix of {len} bytes decoded"
+        );
+    }
+    for position in 0..bytes.len() {
+        let mut corrupt = bytes.clone();
+        corrupt[position] ^= 0x40;
+        assert!(
+            decode_segment(&corrupt).is_err(),
+            "flipped byte {position} decoded"
+        );
+    }
+}
+
+#[test]
+fn unknown_segment_trailer_sections_are_skipped_whole() {
+    // The trailer shares the manifest's forward-compatibility contract:
+    // unknown tags are skipped whole.
+    let segment = fixture_segment().with_sequence(SequenceInfo::Contiguous { base: 77 });
+    let mut bytes = encode_segment(&segment);
+    // Bump the section count, append an unknown section by hand, and
+    // re-stamp the checksum (crc32c over everything past byte 16).
+    let count_offset = bytes.len() - (2 + 2 + 4 + 9); // count + sequence section
+    let count = u16::from_le_bytes([bytes[count_offset], bytes[count_offset + 1]]);
+    bytes[count_offset..count_offset + 2].copy_from_slice(&(count + 1).to_le_bytes());
+    bytes.extend_from_slice(&999u16.to_le_bytes());
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&[0xAA; 4]);
+    let crc = crc32c_reference(&bytes[16..]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+    let decoded = decode_segment(&bytes).unwrap();
+    assert_eq!(
+        decoded.sequence_info(),
+        &SequenceInfo::Contiguous { base: 77 },
+        "known section still read"
+    );
+}
+
+#[test]
+fn unknown_sequence_state_byte_is_an_error() {
+    // The state byte is a frozen registry like every other tag here:
+    // an unknown value is a data error to surface, never guess around.
+    let segment = fixture_segment().with_sequence(SequenceInfo::Contiguous { base: 77 });
+    let mut bytes = encode_segment(&segment);
+    let state_offset = bytes.len() - 9; // state byte + u64 base
+    assert_eq!(bytes[state_offset], 1, "contiguous state byte");
+    bytes[state_offset] = 99;
+    let crc = crc32c_reference(&bytes[16..]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+    assert!(matches!(
+        decode_segment(&bytes),
+        Err(FormatError::Corrupt(_))
+    ));
+}
+
+/// An independent CRC-32C (Castagnoli, reflected 0x82F63B78) so the
+/// unknown-section test re-stamps checksums without borrowing the
+/// implementation under test.
+fn crc32c_reference(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }

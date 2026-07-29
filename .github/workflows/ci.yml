@@ -30,6 +30,12 @@ jobs:
         run: cargo build --workspace
       - name: Test (includes doctests and the arrow-rs oracle)
         run: cargo test --workspace
+      - name: Engine without Lua (the default embedder build — the
+          feature is opt-in, so the off-leg must stay green on its own)
+        run: |
+          cargo clippy -p engine --all-targets -- -D warnings
+          cargo test -p engine
+          RUSTDOCFLAGS="-D warnings" cargo doc -p engine --no-deps
       - name: Docs
         run: cargo doc --workspace --no-deps
       - name: PyArrow oracle (issue #15)
@@ -46,19 +52,52 @@ jobs:
         run: python3 crates/engine/tests/m2_mutation_oracle.py target/debug/libengine.so
       - name: M2.4 differential harness — generated queries vs DuckDB (issue #36)
         run: python3 crates/engine/tests/m2_differential_oracle.py target/debug/libengine.so
-      - name: M2.7 Lua-window oracle — NumPy differential (issue #41)
+      - name: Lua families oracle — NumPy differential (kernels #41, driver #70)
         run: python3 crates/engine/tests/m2_lua_window_oracle.py target/debug/libengine.so
+      - name: M4.4 as-of oracle — DuckDB over an explicit history table (issue #75)
+        run: python3 crates/engine/tests/m4_asof_oracle.py target/debug/libengine.so
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
         run: cargo test -p compute-lua --features apicheck
+
+  # The unsafe core under Miri (issue #63): arrow-lite concentrates the
+  # workspace's unsafe (aligned buffers, bitmaps, the C Data Interface),
+  # and Miri checks it for undefined behavior on every change instead of
+  # by hand. Isolation is disabled because proptest touches the
+  # filesystem; the case count is trimmed to keep the interpreter's
+  # ~50x cost inside a few minutes.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly toolchain with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+      - name: Miri over arrow-lite
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+          PROPTEST_CASES: "4"
+        run: cargo +nightly miri test -p arrow-lite --lib
+
+  # The official Lua 5.4.7 test suite over the vendored interpreter
+  # (issue #69): the release's own ltests instrumentation compiled in
+  # (tracing allocator with failure injection, stack/GC consistency
+  # asserts, the T library), built from the exact sources the engine
+  # embeds — byte-identical to the upstream v5.4.7 tag; see
+  # crates/compute-lua/upstream-tests/PROVENANCE.md.
+  lua-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: readline headers (main.lua's transcripts assume readline)
+        run: sudo apt-get update && sudo apt-get install -y libreadline-dev
+      - name: Build the instrumented interpreter, run all.lua
+        run: crates/compute-lua/upstream-tests/run.sh
 
   # The C boundary under the sanitizers: the vendored interpreter and the
   # binding's C accessors compiled with ASan (leaks included — the
   # longjmp-over-destructor discipline is exactly a leak generator when
   # violated) and UBSan in trap mode. Nightly because sanitizers are -Z
-  # flags. The remaining hardening (#69) — ltests.c torture and the official
-  # Lua suite over the vendored build — needs files this repo does not
-  # carry (the vendor tree is deliberately the embedding set, no lua.c);
-  # they land when the suite can be vendored with provenance.
+  # flags. The ltests torture and official suite (#69) run in the
+  # lua-suite job above.
   sanitize:
     runs-on: ubuntu-latest
     steps:

@@ -193,6 +193,16 @@ pub enum ScalarExpr {
         /// The ELSE arm.
         otherwise: Option<Box<ScalarExpr>>,
     },
+    /// A call to an embedder-registered column function (the vectorized
+    /// per-row extension slot, #53). The name resolves against the
+    /// registry at execution — a name registered on one table is loudly
+    /// unknown on another — so plan time carries it verbatim.
+    Registered {
+        /// The registered name, lower-cased.
+        name: String,
+        /// Arguments, in call order — any scalar expressions.
+        args: Vec<ScalarExpr>,
+    },
 }
 
 /// A standard SQL aggregate function.
@@ -328,6 +338,11 @@ pub struct Plan {
     pub limit: Option<usize>,
     /// `OFFSET`.
     pub offset: Option<usize>,
+    /// Knowledge-time travel: `ASOF n` / `FOR SYSTEM_TIME AS OF n` —
+    /// read the table as it was known at ingest sequence `n`. The
+    /// embedder resolves it to an as-of snapshot instead of the latest
+    /// one; the executor itself never looks at this field.
+    pub as_of: Option<u64>,
 }
 
 /// A value the right side of `SET column = ...` may hold.
@@ -702,7 +717,167 @@ fn is_create_table(sql: &str) -> bool {
     )
 }
 
+/// Splits the knowledge-time clause out of the SQL text before parsing:
+/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
+/// keyword followed by `JOIN` and is left alone) and the SQL:2011
+/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
+/// as known at ingest sequence n". Returns the SQL with the clause
+/// spliced out (`None` when the text held no clause — untouched input is
+/// never rewritten) and the cut it named. The two-word near-miss
+/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
+/// alias named OF), so it gets a teaching error instead of a puzzle.
+fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
+    // Shallow tokenization, recording each token's byte span: quoted runs
+    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
+    // string literal can look like a clause; comments are skipped whole so
+    // nothing inside one does either; hugging punctuation splits off so
+    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
+    // ORIGINAL text (below), never reassembled from tokens — reassembly
+    // would collapse the newline that terminates a `--` comment and
+    // silently comment out the rest of the statement.
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut chars = sql.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek().is_some_and(|&(_, next)| next == '-') {
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().is_some_and(|&(_, next)| next == '*') {
+            chars.next();
+            let mut previous = '\0';
+            for (_, c) in chars.by_ref() {
+                if previous == '*' && c == '/' {
+                    break;
+                }
+                previous = c;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            let mut end = sql.len();
+            while let Some((i, c)) = chars.next() {
+                if c == ch {
+                    if ch == '\'' && chars.peek().is_some_and(|&(_, next)| next == '\'') {
+                        chars.next();
+                        continue;
+                    }
+                    end = i + c.len_utf8();
+                    break;
+                }
+            }
+            tokens.push(&sql[start..end]);
+            spans.push((start, end));
+            continue;
+        }
+        if "(),;".contains(ch) {
+            let end = start + ch.len_utf8();
+            tokens.push(&sql[start..end]);
+            spans.push((start, end));
+            continue;
+        }
+        let mut end = sql.len();
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_whitespace() || c == '\'' || c == '"' || "(),;".contains(c) {
+                end = i;
+                break;
+            }
+            chars.next();
+        }
+        tokens.push(&sql[start..end]);
+        spans.push((start, end));
+    }
+    let lower: Vec<String> = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    let parse_cut = |token: &str| -> Result<u64, QueryError> {
+        token.parse::<u64>().map_err(|_| {
+            QueryError::Unsupported(format!(
+                "ASOF expects a non-negative integer ingest-sequence literal, got '{token}' \
+                 (ASOF is a clause keyword here, so it cannot also name a column)"
+            ))
+        })
+    };
+    let mut cut: Option<u64> = None;
+    let mut removed: Option<(usize, usize)> = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let matched = if index + 4 < tokens.len()
+            && lower[index] == "for"
+            && lower[index + 1] == "system_time"
+            && lower[index + 2] == "as"
+            && lower[index + 3] == "of"
+        {
+            Some((parse_cut(tokens[index + 4])?, 5))
+        } else if lower[index] == "asof" && lower.get(index + 1).map(String::as_str) != Some("join")
+        {
+            let Some(argument) = tokens.get(index + 1) else {
+                return Err(QueryError::Unsupported(
+                    "ASOF at the end of the statement — it takes an \
+                     ingest-sequence literal: ASOF <n>"
+                        .to_owned(),
+                ));
+            };
+            Some((parse_cut(argument)?, 2))
+        } else {
+            if index + 2 < tokens.len()
+                && lower[index] == "as"
+                && lower[index + 1] == "of"
+                && tokens[index + 2].parse::<u64>().is_ok()
+                && (index == 0 || lower[index - 1] != "system_time")
+            {
+                return Err(QueryError::Unsupported(
+                    "AS OF <n> — SQL's alias grammar claims the two-word form; \
+                     write ASOF <n> (one word), or the standard \
+                     FOR SYSTEM_TIME AS OF <n>"
+                        .to_owned(),
+                ));
+            }
+            None
+        };
+        match matched {
+            Some((value, width)) => {
+                if cut.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "one AS OF per statement".to_owned(),
+                    ));
+                }
+                cut = Some(value);
+                removed = Some((spans[index].0, spans[index + width - 1].1));
+                index += width;
+            }
+            None => index += 1,
+        }
+    }
+    // Splice the clause out of the original text: every other byte —
+    // newlines, comments, string literals, spacing — reaches the parser
+    // exactly as the caller wrote it.
+    let Some((start, end)) = removed else {
+        return Ok((None, None));
+    };
+    let mut cleaned = String::with_capacity(sql.len() - (end - start));
+    cleaned.push_str(&sql[..start]);
+    cleaned.push_str(&sql[end..]);
+    Ok((Some(cleaned), cut))
+}
+
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    let stripped;
+    let (sql, as_of) = match extract_as_of(sql)? {
+        (Some(cleaned), cut) => {
+            stripped = cleaned;
+            (stripped.as_str(), cut)
+        }
+        (None, cut) => (sql, cut),
+    };
     let rewritten;
     let sql = if is_create_table(sql) {
         rewritten = rewrite_ordering_key(sql)?;
@@ -718,8 +893,26 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
             statements.len()
         )));
     };
+    if as_of.is_some() && !matches!(statement, ast::Statement::Query(_)) {
+        return Err(QueryError::Unsupported(
+            "AS OF applies to SELECT — mutations and DDL always act on latest knowledge".to_owned(),
+        ));
+    }
     match statement {
-        ast::Statement::Query(query) => Ok(Statement::Select(Box::new(lower_query(query)?))),
+        ast::Statement::Query(query) => {
+            let mut plan = lower_query(query)?;
+            if as_of.is_some() {
+                if plan.join.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "AS OF with JOIN — the clause binds to one table's sequence \
+                         space and the join lowering does not carry it yet"
+                            .to_owned(),
+                    ));
+                }
+                plan.as_of = as_of;
+            }
+            Ok(Statement::Select(Box::new(plan)))
+        }
         ast::Statement::Update(update) => Ok(Statement::Update(lower_update(update)?)),
         ast::Statement::Delete(delete) => Ok(Statement::Delete(lower_delete(delete)?)),
         ast::Statement::CreateTable(create) => {
@@ -1055,6 +1248,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
         order_by: None,
         limit: None,
         offset: None,
+        as_of: None,
     })
 }
 
@@ -1442,9 +1636,6 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                     "a window call inside a scalar expression".to_owned(),
                 ));
             }
-            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
-                return Err(QueryError::Unsupported(format!("scalar function '{name}'")));
-            };
             let ast::FunctionArguments::List(list) = &function.args else {
                 return Err(QueryError::Unsupported(format!(
                     "{name} without an argument list"
@@ -1459,6 +1650,18 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                 };
                 args.push(lower_scalar_expr(expr)?);
             }
+            let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
+                if AggFunction::from_name(&name).is_some() {
+                    return Err(QueryError::Unsupported(format!(
+                        "aggregate {name} inside a scalar expression"
+                    )));
+                }
+                // Not a built-in: an embedder-registered column
+                // function, resolved against the registry at execution
+                // (which is where the registry lives) — unknown names
+                // stay loud, just later.
+                return Ok(ScalarExpr::Registered { name, args });
+            };
             if args.len() != arity {
                 return Err(QueryError::Unsupported(format!(
                     "{name} takes {arity} argument(s), got {}",
@@ -1701,6 +1904,68 @@ mod tests {
     }
 
     #[test]
+    fn the_knowledge_time_clause_is_extracted_in_both_spellings() {
+        // One-word ASOF — the engine's spelling.
+        let plan_asof = plan("SELECT x FROM t ASOF 41520 WHERE x > 1").expect("plans");
+        assert_eq!(plan_asof.as_of, Some(41_520));
+        assert!(plan_asof.predicate.is_some(), "the rest of the query holds");
+        // The SQL:2011 carrier, same meaning.
+        let standard = plan("SELECT x FROM t FOR SYSTEM_TIME AS OF 41520 WHERE x > 1").unwrap();
+        assert_eq!(standard.as_of, Some(41_520));
+        // Without a clause, nothing is touched.
+        assert_eq!(plan("SELECT x FROM t WHERE x > 1").unwrap().as_of, None);
+        // Inside a string literal the words are inert.
+        let inert = plan("SELECT x FROM t WHERE sym = 'ASOF 5'").unwrap();
+        assert_eq!(inert.as_of, None);
+    }
+
+    /// Extraction splices the clause out of the original text rather
+    /// than reassembling tokens. Reassembly collapsed every newline,
+    /// which let a `--` comment swallow the rest of the statement — a
+    /// silently wrong answer, exactly what the clause's ruling forbids.
+    #[test]
+    fn extraction_preserves_the_rest_of_the_statement_verbatim() {
+        // A line comment still ends at its newline.
+        let commented =
+            plan("SELECT x FROM t ASOF 5 -- pick the tail\nWHERE x > 1").expect("plans");
+        assert_eq!(commented.as_of, Some(5));
+        assert!(
+            commented.predicate.is_some(),
+            "the WHERE after a comment must survive extraction"
+        );
+        // And the clause is inert *inside* a comment: comments are
+        // skipped whole, so nothing in one is ever read as a clause.
+        let in_comment = plan("SELECT x FROM t -- ASOF 5\nWHERE x > 1").expect("plans");
+        assert_eq!(in_comment.as_of, None);
+        let block = plan("SELECT x FROM t /* ASOF 5 */ WHERE x > 1").expect("plans");
+        assert_eq!(block.as_of, None);
+        // A clause elsewhere in a commented statement still extracts.
+        let both = plan("SELECT x FROM t ASOF 7 /* note */ WHERE x > 1").expect("plans");
+        assert_eq!(both.as_of, Some(7));
+        assert!(both.predicate.is_some());
+    }
+
+    #[test]
+    fn knowledge_time_misuses_are_taught() {
+        for (sql, needle) in [
+            // The two-word form collides with SQL's alias grammar.
+            ("SELECT x FROM t AS OF 3", "ASOF <n> (one word)"),
+            ("SELECT x FROM t ASOF now", "ingest-sequence literal"),
+            ("SELECT x FROM t ASOF", "takes an ingest-sequence"),
+            ("SELECT x FROM t ASOF 1 WHERE x > 0 ASOF 2", "one AS OF"),
+            (
+                "SELECT t.x FROM t ASOF 1 JOIN d ON t.k = d.k",
+                "AS OF with JOIN",
+            ),
+            ("DELETE FROM t ASOF 1 WHERE x > 0", "latest knowledge"),
+            ("UPDATE t ASOF 1 SET x = 0", "latest knowledge"),
+        ] {
+            let error = format!("{}", parse_statement(sql).unwrap_err());
+            assert!(error.contains(needle), "{sql}: {error}");
+        }
+    }
+
+    #[test]
     fn rejections_name_the_construct() {
         for (sql, needle) in [
             ("SELECT * FROM t", "wildcard"),
@@ -1726,7 +1991,9 @@ mod tests {
                 "plain key columns",
             ),
             ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
-            ("SELECT nope_agg(x) FROM t", "nope_agg"),
+            // (an unknown plain call like nope_agg(x) now lowers to a
+            // Registered column function and is refused by name at
+            // execution, where the registry lives — tested in engine)
             ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
             (
                 "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",

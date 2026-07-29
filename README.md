@@ -132,8 +132,9 @@ boundary, not our own foresight.
   no separate database to administer. (A standalone single-file CLI
   binary per release — the `sqlite3`-shell shape, still no server — ships
   with M3: `tallydb <dir>` opens a console with line editing, `CREATE
-  TABLE`/`INSERT`/CSV import, the full query surface, and `.lua` kernel
-  registration; see `DESIGN.md`, *Deployment shapes*.)
+  TABLE`/`INSERT`/CSV import, the full query surface, `.lua` kernel
+  registration, and `.run FILE` to execute a driver script; see
+  `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded
@@ -238,7 +239,8 @@ backend returns only when an op needs more than two parameters or
 dimensions, where no closed form exists — see `DESIGN.md`, *Curated
 compute: what the engine calls, and why*. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
-are the bounded copies, as recorded in the crate docs. `compute-linalg`
+are copies proportional to the rows they cover — not bounded by a
+constant, as the crate docs record. `compute-linalg`
 provides the multiplication-class kernels behind the same
 capability-negotiating trait shape (`dot`, matrix–vector, matrix–matrix
 — checked against hand computations; not yet called from query inner
@@ -286,20 +288,34 @@ engine rejected for correctness, so the peer buys its speed with wrong
 answers exactly where the ordering key lives. That accuracy contract is
 enforced in CI on every change by a compensated-reference guard over
 adversarial corpora, covering both the per-window and incremental
-paths. The Lua kernels remain interpreter-bound (~12–14× behind
-vectorized NumPy in bulk) — their measured value is interactive
-kernel registration at the console and the newest-window latency
-shape, where fixed costs dominate and they reach parity with NumPy
-over the engine's own export. The four statistics above are native
-implementations; the promotion ladder (prototype a kernel, then
-graduate it to native) is the intended path for future statistics,
-not how these four arrived. The extension model is ruled
+paths. The Lua story split into tiers and earned its keep: an
+*element loop* written in Lua remains interpreter-bound (~14× behind
+vectorized NumPy in bulk — the documented code smell), but a kernel
+written in the **vectorized vocabulary** — whole-column operators and
+rolling combinators running native under one interpreter entry, the
+NumPy model — measures **~2–2.5× ahead of the DuckDB+NumPy stack**
+(m2_compute_latency_bench, run 2026-07-28, 20k rows: composed
+`(a-b)/b` 0.9ms and `rolling_dot(64)` 1.1ms vs 1.8–2.4ms), while the
+newest-window latency shape reaches parity with NumPy over the
+engine's own export. The vendored interpreter is byte-identical to
+upstream PUC Lua v5.4.7 (verified file-by-file; the full official
+suite and `ltests` torture harness run in CI). The four statistics
+above are native implementations; the promotion ladder (prototype a
+kernel, then graduate it to native) is the intended path for future
+statistics, not how these four arrived. The extension model is ruled
 (2026-07-28): the Rust `WindowAggregate` trait is the primary
 extension path, Python composes from outside over the same Arrow
-buffers (never embedded), and Lua becomes an opt-in feature owned by
-the console — kept under a sunset clause, to prove its value before
-1.0 or leave. The zero-copy property itself is pointer-verified and
-stands.
+buffers (never embedded), and Lua is an opt-in feature owned by the
+console — its sunset clause stood trial on that evidence and
+**dissolved (ruled 2026-07-28: Lua stays)**. With the verdict in,
+the embed became bidirectional: **SQL-in-Lua** landed — a driver
+script runs `query(sql)` and receives result columns as the same
+zero-copy views kernels consume, computes with the vectorized
+vocabulary, and feeds derived rows back exactly through
+`append(table, row)` (`Database::run_script`; `.run FILE` at the
+console) — with the end-to-end SQL → Lua → SQL pipeline re-derived
+by NumPy in CI. The zero-copy property itself is pointer-verified
+and stands.
 `lua.wasm` (the one WASM compute
 dependency still to come, for later) is a real, working, MIT-licensed
 project already in progress by the same author — tracked as a future
