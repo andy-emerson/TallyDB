@@ -381,7 +381,7 @@ pub unsafe extern "C" fn tallydb_driver_pipeline_stream(out: *mut ArrowArrayStre
     let mut database = Database::new();
     database.add_table(fixture_table()).expect("fixture adds");
     let script = format!(
-        "query(\"CREATE TABLE derived (ts BIGINT ORDERING KEY, sym KEY NOT NULL, \
+        "query(\"CREATE TABLE derived (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, \
          x DOUBLE, y DOUBLE, rel DOUBLE, rdot DOUBLE)\")\n\
          local r, n = query(\"SELECT ts, sym, x, y FROM trades\")\n\
          local rel = (r.x - r.y) / r.y\n\

@@ -9,7 +9,7 @@
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
 //! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
 //! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
-//! CREATE TABLE t (col BIGINT|DOUBLE|KEY [NOT NULL|ORDERING KEY], ...);
+//! CREATE TABLE t (col BIGINT|DOUBLE|SYMBOL [NOT NULL|ORDERING KEY], ...);
 //! INSERT INTO t [(columns)] VALUES (literals), ...;
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];
@@ -528,7 +528,7 @@ pub enum Statement {
 pub struct ColumnSpec {
     /// The column name.
     pub name: String,
-    /// `"BIGINT"`, `"DOUBLE"`, or `"KEY"` — resolved to the engine's
+    /// `"BIGINT"`, `"DOUBLE"`, or `"SYMBOL"` — resolved to the engine's
     /// column types by the embedder (query-lite stays schema-agnostic).
     pub type_name: String,
     /// `NOT NULL` present (the ordering key implies it).
@@ -539,7 +539,10 @@ pub struct ColumnSpec {
 
 /// A lowered `CREATE TABLE`: the DDL surface of the stdlib table (#49,
 /// ruled 2026-07-27) — standard names where standard exists (`BIGINT`,
-/// `DOUBLE`), the coined `KEY` for dictionary keys, the ordering key
+/// `DOUBLE`), `SYMBOL` for dictionary-encoded labels (kdb+ and
+/// QuestDB spell it that way; TallyDB adopted it 2026-07-29, when the
+/// older `KEY` proved to name two different things beside `ORDERING
+/// KEY`), the ordering key
 /// declared like a constraint. `VARCHAR`/`TEXT` are refused with a
 /// teaching error: keys are interned labels, not text values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -595,8 +598,18 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
             ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => {
                 "DOUBLE"
             }
+            ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("symbol") => {
+                "SYMBOL"
+            }
+            // The type was spelled KEY until 2026-07-29. Name the new
+            // spelling rather than listing the type set: a reader who
+            // typed KEY knows what they meant.
             ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("key") => {
-                "KEY"
+                return Err(QueryError::Unsupported(format!(
+                    "column '{}': the label type is spelled SYMBOL (KEY named two \
+                     different things beside ORDERING KEY)",
+                    ident(&column.name)
+                )))
             }
             ast::DataType::Varchar(_)
             | ast::DataType::Text
@@ -605,13 +618,13 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
                 return Err(QueryError::Unsupported(format!(
                     "column '{}': strings are not a column type here — keys are \
                      interned labels used for filtering, grouping, and joining; \
-                     declare it KEY",
+                     declare it SYMBOL",
                     ident(&column.name)
                 )))
             }
             other => {
                 return Err(QueryError::Unsupported(format!(
-                    "column type '{other}' (BIGINT, DOUBLE, or KEY)"
+                    "column type '{other}' (BIGINT, DOUBLE, or SYMBOL)"
                 )))
             }
         };
@@ -817,8 +830,12 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
                 .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
         };
         let start_ok = index == 0 || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_';
-        // A column *definition* also starts `word KEY` — `ordering KEY,`
-        // declares a key column named `ordering`. A constraint never
+        // A column *definition* could also start `word KEY` — when the
+        // label type was spelled KEY, `ordering KEY,` declared a column
+        // named `ordering`. `SYMBOL` retired that reading, but the
+        // guard stays: without it the same text rewrites to
+        // `(PRIMARY KEY,` and the reader gets a parse error instead of
+        // the refusal that names the new spelling. A constraint never
         // opens a definition, so the phrase only counts when the
         // preceding token is not `(` or `,` (nor the statement start,
         // where no column list is open yet).
@@ -2206,18 +2223,26 @@ mod tests {
 
     #[test]
     fn a_column_named_ordering_is_not_the_constraint() {
-        // `ordering KEY` after `(` or `,` declares a key column named
-        // `ordering`; only the constraint position rewrites.
+        // Only the constraint position rewrites: a column may still be
+        // named `ordering`, and a name that merely starts like the
+        // phrase is not it.
         let Ok(Statement::CreateTable(plan)) = parse_statement(
-            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY, primary_ish DOUBLE)",
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering SYMBOL, primary_ish DOUBLE)",
         ) else {
             panic!("parses as CREATE TABLE")
         };
         assert_eq!(plan.columns.len(), 3);
         assert_eq!(plan.columns[1].name, "ordering");
-        assert_eq!(plan.columns[1].type_name, "KEY");
+        assert_eq!(plan.columns[1].type_name, "SYMBOL");
         assert!(!plan.columns[1].ordering_key);
         assert!(plan.columns[0].ordering_key);
+        // And `ordering KEY` — a column definition under the retired
+        // spelling — still reaches the refusal that names the new one,
+        // rather than being rewritten into a parse error.
+        let error = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY)")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("spelled SYMBOL"), "{error}");
     }
 
     #[test]

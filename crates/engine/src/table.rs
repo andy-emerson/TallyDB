@@ -549,7 +549,7 @@ impl Table {
                         },
                         ColumnType::Key => {
                             return Err(EngineError::Query(QueryError::TypeError(format!(
-                                "number into KEY column '{}' (keys take strings)",
+                                "number into SYMBOL column '{}' (labels take strings)",
                                 field.name()
                             ))))
                         }
@@ -1054,7 +1054,7 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 }
 
 /// Maps a lowered `CREATE TABLE` (the #49 DDL grammar: `BIGINT`,
-/// `DOUBLE`, the coined `KEY`, one `ORDERING KEY` column) onto the
+/// `DOUBLE`, `SYMBOL`, one `ORDERING KEY` column) onto the
 /// engine's schema types. Returns the schema and the ordering-key
 /// column name. Shared by every SQL surface — shell, and later the
 /// server and workbench — so the mapping cannot fork.
@@ -1067,7 +1067,7 @@ pub fn schema_from_create(
         let column_type = match column.type_name.as_str() {
             "BIGINT" => ColumnType::I64,
             "DOUBLE" => ColumnType::F64,
-            "KEY" => ColumnType::Key,
+            "SYMBOL" => ColumnType::Key,
             other => {
                 return Err(EngineError::Query(QueryError::Unsupported(format!(
                     "column type '{other}'"
@@ -1097,7 +1097,7 @@ pub fn type_name(column_type: ColumnType) -> &'static str {
     match column_type {
         ColumnType::I64 => "BIGINT",
         ColumnType::F64 => "DOUBLE",
-        ColumnType::Key => "KEY",
+        ColumnType::Key => "SYMBOL",
     }
 }
 
@@ -2216,7 +2216,7 @@ mod ddl_and_insert {
         assert!(table
             .mutate("INSERT INTO t VALUES (1.5, 'A', 1.0, 1.0)")
             .is_err());
-        // Number into KEY: loud.
+        // Number into a SYMBOL column: loud.
         assert!(table
             .mutate("INSERT INTO t VALUES (1, 7, 1.0, 1.0)")
             .is_err());
@@ -2260,7 +2260,7 @@ mod ddl_and_insert {
 
     #[test]
     fn the_ddl_grammar_maps_onto_engine_types() {
-        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym KEY NOT NULL, px DOUBLE)";
+        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, px DOUBLE)";
         let Statement::CreateTable(plan) = parse_statement(sql).unwrap() else {
             panic!("parses as CREATE TABLE")
         };
@@ -2287,7 +2287,13 @@ mod ddl_and_insert {
             parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, name VARCHAR)").unwrap_err();
         let message = error.to_string();
         assert!(message.contains("interned labels"), "{message}");
-        assert!(message.contains("KEY"), "{message}");
+        assert!(message.contains("SYMBOL"), "{message}");
+        // And the retired spelling names its replacement rather than
+        // reciting the type list.
+        let message = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, sym KEY)")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("spelled SYMBOL"), "{message}");
         // No ordering key: loud, with guidance.
         let error = parse_statement("CREATE TABLE t (a BIGINT, b DOUBLE)").unwrap_err();
         assert!(error.to_string().contains("ORDERING KEY"), "{}", error);

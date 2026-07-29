@@ -520,7 +520,7 @@ pub const HELP: &str = "\
 Statements end with ';' and may span lines. SQL surface: SELECT (WHERE,
 GROUP BY/HAVING, ORDER BY [NULLS FIRST|LAST], LIMIT, DISTINCT, window
 functions, scalar expressions, CASE, LIKE on keys), INSERT, UPDATE,
-DELETE, CREATE TABLE (BIGINT | DOUBLE | KEY, one ORDERING KEY column).
+DELETE, CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
 
 Commands:
   .help                     this text
@@ -577,7 +577,7 @@ mod tests {
             let mut console = Console::open(&dir).unwrap();
             note(
                 &mut console,
-                "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym KEY NOT NULL, px DOUBLE);",
+                "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, px DOUBLE);",
             );
             assert_eq!(
                 note(
@@ -597,7 +597,7 @@ mod tests {
         assert!(rendered.contains('2'), "{rendered}");
         let schema = note(&mut console, ".schema ticks");
         assert!(schema.contains("ts BIGINT ORDERING KEY"), "{schema}");
-        assert!(schema.contains("sym KEY NOT NULL"), "{schema}");
+        assert!(schema.contains("sym SYMBOL NOT NULL"), "{schema}");
         // Round-trippable: the rendered definition recreates an
         // equivalent table in a fresh database.
         drop(console);
@@ -633,7 +633,7 @@ mod tests {
         let mut console = Console::open(&dir).unwrap();
         note(
             &mut console,
-            "CREATE TABLE t (ts BIGINT ORDERING KEY, sym KEY NOT NULL, x DOUBLE);",
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, x DOUBLE);",
         );
         let csv_path = dir.join("data.csv");
         std::fs::write(&csv_path, "sym,ts,x\nAAPL,1,1.5\nMSFT,2,\n\"A,B\",3,2.25\n").unwrap();
