@@ -132,8 +132,9 @@ boundary, not our own foresight.
   no separate database to administer. (A standalone single-file CLI
   binary per release — the `sqlite3`-shell shape, still no server — ships
   with M3: `tallydb <dir>` opens a console with line editing, `CREATE
-  TABLE`/`INSERT`/CSV import, the full query surface, and `.lua` kernel
-  registration; see `DESIGN.md`, *Deployment shapes*.)
+  TABLE`/`INSERT`/CSV import, the full query surface, `.lua` kernel
+  registration, and `.run FILE` to execute a driver script; see
+  `DESIGN.md`, *Deployment shapes*.)
 - Query results come back in an Arrow-compatible columnar layout, directly
   usable by NumPy or other Arrow-aware tooling — no conversion step.
 - For anything the built-in SQL functions don't cover, drop into embedded
@@ -238,7 +239,8 @@ backend returns only when an op needs more than two parameters or
 dimensions, where no closed form exists — see `DESIGN.md`, *Curated
 compute: what the engine calls, and why*. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
-are the bounded copies, as recorded in the crate docs. `compute-linalg`
+are copies proportional to the rows they cover — not bounded by a
+constant, as the crate docs record. `compute-linalg`
 provides the multiplication-class kernels behind the same
 capability-negotiating trait shape (`dot`, matrix–vector, matrix–matrix
 — checked against hand computations; not yet called from query inner

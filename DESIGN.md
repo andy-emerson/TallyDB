@@ -403,11 +403,17 @@ refused with its own teaching error (the ordering key is not a
 uniqueness constraint — duplicates are first-class), while serving
 internally as the parser's carrier for the `ORDERING KEY` phrase.
 **Import** — CSV in the shell layer feeding the ordinary append path;
-the engine never parses CSV. **Code registration** — the explicit
-`.lua` dot-command only; `CREATE FUNCTION ... LANGUAGE LUA` is
-deliberately *not* SQL, so a SQL string is never a code-injection
-vector — the SQL form is a recorded decision for the served product's
-threat model, not before. Local security posture: an OS file lock
+the engine never parses CSV. **Code registration** — explicit
+dot-commands only, and there are three: `.lua` and `.luascalar`
+register kernels typed at the prompt, and `.run FILE` executes a
+driver script from a path the user names. What they share is the
+property that matters: code enters through a channel the user typed
+deliberately, never through data. `CREATE FUNCTION ... LANGUAGE LUA`
+is deliberately *not* SQL, so a SQL string — which may be built from
+user input — is never a code-injection vector; the SQL form is a
+recorded decision for the served product's threat model, not before.
+(`.run` reads a file, so it inherits the console's trust in the local
+filesystem, the same trust `.import` already needs.) Local security posture: an OS file lock
 (released by the OS on death — no stale locks) admits one process per
 directory; table names stay identifiers (they become directory names).
 
@@ -429,8 +435,10 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
 - **M4.2 The Lua front-end** — Lua as a thin front-end over compiled
   ops, on the architecture NumPy proved (a slow interpreter is fine
   when the loops live in compiled code and scripts only compose): the
-  vocabulary invariant (anything SQL can call, Lua can call —
-  registry-driven, so future natives flow in for free), the vectorized
+  vocabulary invariant (every registered *window aggregate* is callable
+  from Lua by its SQL name — registry-driven, so future natives flow in
+  for free; column functions are a second namespace and do not cross,
+  see below), the vectorized
   whole-column kernel slot wired (`eval_column`, built in M2.7 and
   never connected; likely closes #53), the compose-don't-loop idiom
   documented, promotion made mechanical (one registry name, Lua
@@ -480,6 +488,25 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
   (`query`/`append` through the `ScriptHost` seam, the console's
   `.run`), evidenced by an end-to-end SQL → Lua → SQL differential in
   the CI Lua oracle.
+- **M4-close reviews (2026-07-28)** — three independent repo-wide code
+  reviewers, every finding reproduced before its fix. What they found
+  is worth recording, because it says where this milestone's risk
+  actually sat: two of the three correctness bugs were in *text
+  handling and routing*, not in the storage machinery the milestone
+  was about. The `ASOF` pre-pass reassembled statements by joining
+  tokens with spaces, so a `--` comment silently swallowed the rest of
+  a query — the precise failure the clause's own ruling said could not
+  happen; whether a query was accepted depended on how many segments
+  its rows occupied; two embedder-facing paths could abort the process
+  (an unreserved Lua stack push, and embedder code called without
+  `catch_unwind`); a supersession at coordinate 0 wrote commit evidence
+  indistinguishable from a plain delete; and absent zone maps
+  *falsified* pruning against the invariant stated in two other files.
+  The reviews also caught this document and several crate docs claiming
+  a vocabulary invariant wider than the code holds. Lesson taken:
+  hand-rolled pre-parse text manipulation deserves the same adversarial
+  testing as the format code, and a "sound over-approximation" needs a
+  test that a *missing* input cannot flip it.
 
 **M5 (desk adoption)** then builds what the target user needs, chosen
 by the moat test: multi-factor curated compute (K > 2 — the recorded
@@ -1164,9 +1191,24 @@ interpreted dispatch per element — the 13× tier, the code smell;
 runs compiled arithmetic with one interpreter entry per call; (3) the
 engine-driven paths (`evaluate_frames` for windows, `eval_column` for
 column functions) enter the interpreter once per *run or view*. The
-vocabulary invariant makes tier 2 grow for free — anything SQL can
-call, a kernel can call, registry-driven — and the vectorized column
-slot puts scripted per-row work in tier 3. Promotion is mechanical:
+vocabulary invariant makes tier 2 grow for free — every registered
+window aggregate is callable from a kernel by its SQL name,
+registry-driven — and the vectorized column slot puts scripted per-row
+work in tier 3.
+
+**The invariant's edge, stated precisely (found by the M4-close code
+review, 2026-07-28).** It covers window aggregates, not *column*
+functions: the host-function seam a script calls through returns one
+value per call, while a column function returns a whole column, so
+there is no shape to install one under — `register_column_function`
+and the console's `.luascalar` are SQL-callable but resolve to nil
+inside a kernel. This is a real edge, not a wiring slip, and the docs
+claimed it closed until the review caught them. A script wanting
+whole-column work has the vectorized vocabulary (operators,
+`rolling_*`) instead; widening the invariant needs a column-shaped
+host seam, which is where the tranche-2 primitives (#77) would land.
+
+Promotion is mechanical:
 one registry name, a Lua implementation swappable for a trait
 implementation with no query change (both pinned by contract tests).
 

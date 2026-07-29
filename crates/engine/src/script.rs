@@ -91,13 +91,23 @@ impl HostFunction for RegistryOp {
     }
 }
 
-/// Installs the whole registered vocabulary into a kernel's state —
-/// **the vocabulary invariant: anything SQL can call, a Lua kernel can
-/// call**, by the same name, over the same view buffers with no copy.
-/// Registry-driven rather than a hardcoded list, so every future
-/// native (and every embedder-registered kernel that exists at this
-/// registration) flows into scripts for free. `dot` (compute-linalg)
-/// rides along as the one op that lives outside the registry. This is
+/// Installs the registered **window aggregates** into a kernel's state
+/// — the vocabulary invariant as it actually holds: *every registered
+/// window aggregate is callable from a Lua kernel by its SQL name*,
+/// over the same view buffers with no copy. Registry-driven rather
+/// than a hardcoded list, so every future native (and every
+/// embedder-registered aggregate that exists at this registration)
+/// flows into scripts for free. `dot` (compute-linalg) rides along as
+/// the one op that lives outside the registry.
+///
+/// **Column functions do not cross** (M4.2's `register_column_function`
+/// and the console's `.luascalar`). The host-function seam returns one
+/// value per call; a column function returns a whole column, so there
+/// is no shape to install it under — a script wanting whole-column work
+/// uses the vectorized vocabulary (operators, `rolling_*`) instead.
+/// Widening the invariant to cover them needs a column-shaped host
+/// seam, which is the natural home for the tranche-2 primitives (#77),
+/// not a doc change here. This is
 /// the compute-without-copying surface inside a script: engine
 /// buffers, native ops, and the interpreter all share memory.
 fn install_vocabulary(state: &mut LuaState, ops: &Registry) -> Result<(), String> {

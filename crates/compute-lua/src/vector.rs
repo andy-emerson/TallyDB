@@ -582,9 +582,10 @@ unsafe fn rolling_sweep<F: Fn(usize) -> Result<f64, ()> + Copy>(
 // Reading a returned column (the `return <vector>` kernel shape)
 // ---------------------------------------------------------------------
 
-/// A `Copy` description of a column-shaped script result: a vector or
-/// a numeric input view at `idx`, or `None` for nil (the script wrote
-/// `out[i]` instead). Anything else is an error.
+/// A column-shaped script result, read out of the interpreter: the
+/// elements of a returned vector or numeric view, or nothing at all
+/// (the script wrote `out[i]` instead). Anything else is an error.
+/// Dense results skip the per-element `Option`.
 pub(crate) enum ColumnResult {
     /// The script returned nothing; its `out[i]` writes stand.
     None,

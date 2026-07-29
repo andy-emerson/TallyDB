@@ -138,9 +138,15 @@ impl Registry {
         self.columns.insert(name.to_lowercase(), function);
     }
 
-    /// Every registered name and its implementation, in no particular
-    /// order — what lets an embedding expose the whole vocabulary to a
-    /// scripting layer (anything SQL can call, a script can call).
+    /// Every registered **window aggregate** and its implementation, in
+    /// no particular order — what lets an embedding expose them to a
+    /// scripting layer under the same names SQL uses.
+    ///
+    /// Column functions ([`Registry::register_column`]) are a second
+    /// namespace and are *not* included: they return a whole column,
+    /// while the script-side host-function seam returns one value per
+    /// call, so there is no shape to install them under. Closing that
+    /// gap means a column-shaped host seam, not a wider iterator.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &Arc<dyn WindowAggregate>)> {
         self.aggregates
             .iter()
@@ -156,14 +162,23 @@ impl Registry {
     }
 }
 
-/// A query's result: the output schema plus one batch per segment with
-/// live rows, in append order. The schema is carried explicitly so an
-/// empty table still yields a well-formed (zero-batch) result.
+/// A query's result: the output schema plus its batches. The schema is
+/// carried explicitly so an empty result is still well-formed (it has
+/// no batches at all).
+///
+/// **How many batches is not a contract.** The streaming shape — one
+/// batch per segment with live rows, in append order — is what a plain
+/// scan produces, but any stage that must see all rows at once
+/// (`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `HAVING`, `GROUP BY`)
+/// collapses the result to a single materialized batch. A consumer that
+/// needs one contiguous batch should say so with [`contiguous`] rather
+/// than test `batches.len() == 1`, and a consumer that wants to stream
+/// should handle any count.
 #[derive(Debug)]
 pub struct QueryOutput {
     /// Schema of every batch.
     pub schema: Schema,
-    /// One batch per segment with live rows.
+    /// The result's batches — see the type's note on how many.
     pub batches: Vec<RecordBatch>,
 }
 
@@ -728,9 +743,10 @@ fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), Qu
 }
 
 /// The whole-query path: gather the used columns dense (live rows, in
-/// view order — a bounded copy, like the cross-segment window
-/// gathers), evaluate the expression ONCE over a synthetic single
-/// view, and split the result back per view.
+/// view order — a copy proportional to the queried rows, like the
+/// cross-segment window gathers, not bounded by a constant), evaluate
+/// the expression ONCE over a synthetic single view, and split the
+/// result back per view.
 fn computed_column_whole(
     schema: &Schema,
     views: &[&SegmentView],

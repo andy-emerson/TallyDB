@@ -51,7 +51,7 @@
 //! the append-only registry discipline, and not worth speculative bytes
 //! today.
 //!
-//! ## The manifest format, version 1
+//! ## The manifest format, versions 1 and 2
 //!
 //! The table manifest is its own small record (it used to be an encoded
 //! empty segment whose `base_row_id` field smuggled the generation — a
@@ -62,7 +62,9 @@
 //!
 //! ```text
 //! magic        8B  "TALLYMFT"
-//! version      u16 (this module writes 1)
+//! version      u16 (1 while no section carries content; 2 once one
+//!                   does — a table that never corrects keeps
+//!                   byte-identical v1 bytes)
 //! reserved     u16 (zero)
 //! crc32c       u32 — CRC-32C of every byte after this field
 //! generation   u64 — the committed compaction generation
@@ -71,7 +73,14 @@
 //! then per column (the segment format's schema prefix, same registries):
 //!   name_len u16, name bytes (UTF-8)
 //!   column_type u8, nullable u8, logical u8 tag + u8 payload
+//! then (v2 only) the sections, each: tag u16, length u32, payload
+//!   tag 2 — the ingest-sequence watermark
+//!   tag 3 — the history segments' names
 //! ```
+//!
+//! Sections are additive and skippable: a decoder ignores tags it does
+//! not know, which is what lets the knowledge axis and F3's zone-map
+//! lift share one revision.
 
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
 use crate::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
@@ -677,7 +686,8 @@ pub fn encode_manifest(
     out
 }
 
-/// Decodes v1 manifest bytes, verifying magic, version, and checksum.
+/// Decodes manifest bytes of either version, verifying magic, version,
+/// and checksum; unknown v2 section tags are skipped, not refused.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
     let mut reader = Reader { bytes, position: 0 };
     if reader.take(8)? != MANIFEST_MAGIC {

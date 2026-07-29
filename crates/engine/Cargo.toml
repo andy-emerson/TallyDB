@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-# cdylib exists solely for the M1 end-to-end oracle script, which drives
-# the `oracle-harness` hooks through ctypes (tests/m1_slice_oracle.py).
+# cdylib exists solely for the Python oracle scripts, which drive the
+# `oracle-harness` hooks through ctypes (tests/*.py — the M1 slice, the
+# mutation and differential families, the Lua-window and SQL-in-Lua
+# families, the as-of sweep, and the latency benchmark).
 crate-type = ["lib", "cdylib"]
 
 [features]

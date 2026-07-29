@@ -1,18 +1,23 @@
-//! `extern "C"` hooks for the M1 end-to-end oracle script (dev/CI only).
+//! `extern "C"` hooks for the Python oracle scripts (dev/CI only).
 //!
-//! Compiled only under the `oracle-harness` feature so
-//! `tests/m1_slice_oracle.py` can drive the whole vertical slice from
-//! Python: build with `cargo build -p engine --features oracle-harness`,
-//! then run the script against `target/debug/libengine.so`.
+//! Compiled only under the `oracle-harness` feature so the scripts in
+//! `tests/` can drive the engine from Python: build with `cargo build
+//! -p engine --features oracle-harness`, then run a script against
+//! `target/debug/libengine.so`. Every hook here is called by name from
+//! one of them — `m1_slice_oracle`, `m2_mutation_oracle`,
+//! `m2_differential_oracle`, `m2_lua_window_oracle` (which also covers
+//! the SQL-in-Lua driver pipeline), `m4_asof_oracle`, and the latency
+//! benchmark — so nothing in this module is reachable from Rust.
 //!
-//! Both hooks build the *same* deterministic table (a fixed
-//! linear-congruential generator — no ambient randomness, so every run
-//! and both hooks see identical data), append its rows one at a time
-//! through the real ingest path, run real SQL, and export through the
-//! real `ArrowArrayStream` doorway. The script then recomputes every
-//! window with `np.linalg.lstsq` (and DuckDB's `regr_slope`, when
-//! available) and diffs. That external recomputation — not this crate's
-//! own tests — is what earns M1's "compute proven" cross-check.
+//! The fixtures are deterministic (a fixed linear-congruential
+//! generator — no ambient randomness, so every run and every hook sees
+//! identical data). Rows are appended one at a time through the real
+//! ingest path; queries run real SQL; results leave through the real
+//! `ArrowArrayStream` doorway; and the persistent fixtures are closed
+//! and reopened from disk first, so a cross-check covers the storage
+//! round trip too. The scripts then recompute independently — NumPy,
+//! DuckDB — and diff. That external recomputation, not this crate's own
+//! tests, is what earns the cross-check claims.
 
 use crate::database::Database;
 use crate::table::Table;

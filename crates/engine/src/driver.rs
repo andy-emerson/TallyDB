@@ -7,12 +7,16 @@
 //!
 //! ## What a script's statements mean here
 //!
-//! - `SELECT` runs through [`Database::query`]. A single-segment
-//!   result lends its views straight off the stored batch — zero-copy,
-//!   like every kernel view. A multi-segment result is concatenated
-//!   first (values, validity, and for key columns a merged dictionary
-//!   with remapped codes): the bounded copy `query-lite`'s docs assign
-//!   to whoever wants contiguity.
+//! - `SELECT` runs through [`Database::query`] and is made contiguous
+//!   ([`query_lite::contiguous`]), because a script sees each result
+//!   column as one view. A result that already arrived in one batch is
+//!   moved through untouched, so its views point straight at the
+//!   buffers the query produced; several batches pay one gather, with
+//!   key columns re-encoded into a merged dictionary. That copy is
+//!   proportional to the result, not bounded by a constant — the price
+//!   of contiguity, paid by whoever asks for it. Note that "one batch"
+//!   does not imply "stored buffers": `ORDER BY` and friends already
+//!   materialize a fresh batch upstream.
 //! - `INSERT`/`UPDATE`/`DELETE` run through [`Database::mutate`].
 //! - `CREATE TABLE` creates an **in-memory** table on this handle
 //!   (scratch space for a pipeline's derived data). Persistence is the

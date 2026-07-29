@@ -12,16 +12,21 @@
 //! The executor (turning a parsed AST into results over `storage-lite`
 //! data) is our own code — DataFusion's executor is deliberately NOT
 //! vendored, because its useful parts are coupled to its own general
-//! planner (see DESIGN.md). Instead: DuckDB (primary) and DataFusion
-//! (secondary) are used as a **differential correctness oracle** in this
-//! crate's test suite — run the same query against the oracle and against
-//! this executor, diff the output. DuckDB is primary because it has the
-//! broadest standard analytic-SQL semantics (windows, statistical
-//! aggregates) and runs in-process inside `cargo test`; DataFusion as
-//! secondary also covers InfluxDB-compatible semantics directly, since
-//! Influx v3's SQL engine is DataFusion. That's the primary correctness
-//! strategy for this crate. Write tests this way from the start, not as an
-//! afterthought.
+//! planner (see DESIGN.md). Instead, DuckDB is used as a **differential
+//! correctness oracle**: the same query runs against the oracle and
+//! against this executor, and the outputs are diffed. DuckDB earns
+//! primary because it has the broadest standard analytic-SQL semantics
+//! (windows, statistical aggregates).
+//!
+//! That differential does **not** live in this crate. It runs from
+//! Python against the `engine` cdylib — `crates/engine/tests/
+//! m2_differential_oracle.py` and its siblings — because an oracle
+//! should exercise the whole vertical slice (storage round trip, Arrow
+//! export) rather than this crate's internals, and because keeping
+//! DuckDB out of the dependency graph entirely is a deliberate choice,
+//! not an oversight. This crate's own tests cover planning and
+//! execution units; the cross-checks are external, and that split is
+//! the correctness strategy.
 //!
 //! ## SQL surface — inclusion principle
 //! Any standard SQL function or verb is in scope as long as it (a) doesn't

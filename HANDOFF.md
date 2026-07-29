@@ -36,7 +36,7 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-28, late M4: trial passed, #70 built; merge prep next)
+## Snapshot (2026-07-28, M4 complete: reviews done, ready for the Human's merge)
 
 - **M3 merged** to `main` (PR #74); M0–M3 milestones closed.
 - **Current milestone: M4 — the extension model + corrections.**
@@ -67,13 +67,32 @@ constraints change only when the Human says so.
   and a driver-pipeline family in the CI Lua oracle (NumPy
   re-derivation over the persistent multi-segment fixture). #70 can
   be closed by the Human at the merge.
-- **Full gate green** (2026-07-28, this session): fmt, clippy both
-  legs, 23 workspace suites + off-leg, rustdoc both legs, all six
-  oracle scripts (the Lua oracle now prints the driver-pipeline PASS).
-- **In flight next:** the time-series library design brief (hybrid:
-  native tranche-2 primitives incl. faer-backed matrix ops + a thin
-  shipped Lua prelude) — for the Human's review before any build;
-  then M4-close repo-wide reviews → merge proposal.
+- **M4-close reviews DONE** (2026-07-28): three independent repo-wide
+  code reviewers, every finding reproduced before its fix and dead
+  after it. Fixed: the `ASOF` pre-pass silently swallowing a statement
+  after a `--` comment (it now splices by byte span and skips comments
+  whole); acceptance depending on segment count; two process-abort
+  paths at the Lua C boundary (unreserved stack push in `log()`,
+  embedder `ResultColumns` called without `catch_unwind`); a
+  supersession at coordinate 0 losing acknowledged rows (refused
+  loudly — the presence-flag format revision is deferred, reason
+  recorded); absent zone maps falsifying pruning. Plus the duplication
+  all three flagged: `query-lite::contiguous` is now the one batch
+  concatenation, and engine's driver lost ~100 duplicated lines.
+  The documentation review then corrected the vocabulary-invariant
+  claim (it covers window aggregates, NOT column functions — a real
+  edge, recorded in DESIGN with what closing it would take), the
+  `ASOF next_sequence() - 1` idiom (wrong after DELETE; the true idiom
+  is `ASOF next_sequence()`, now test-pinned across all five mutation
+  shapes), `QueryOutput`'s batch-count contract, query-lite's claim of
+  an in-crate DuckDB oracle, and several stale module docs.
+- **Full gate green after both passes**: fmt, clippy both legs, 23
+  workspace suites + off-leg, rustdoc both legs, all six oracle
+  scripts. Note CI on GitHub runs on pull-request events, so the
+  branch's latest commits get their CI run when the PR opens.
+- **Next after the merge:** the Human's rulings (#77's four decisions,
+  #58, #75's `_seq`), then the M5 opening set — #42, #46, #52, #56,
+  #57, #62, #65, #77 — sized at roughly 7-10 sessions.
 - **Open decision (Human closes):** the sequence column's SQL
   exposure surface — brief with recommendation (pseudocolumn `_seq`)
   on #75. Nothing in flight entrenches an answer.

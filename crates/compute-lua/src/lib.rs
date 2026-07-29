@@ -33,11 +33,12 @@
 //!   layer*). Binding discipline is checked with Lua's own enforcement
 //!   and the sanitizers, both in CI on every change: `LUA_USE_APICHECK`
 //!   test builds (the `apicheck` feature) and an ASan/UBSan job with
-//!   the vendored C compiled sanitized. Still planned, under #69:
-//!   `ltests.c` GC/allocation torture and the official Lua test suite
-//!   over the vendored build — both need files the deliberately
-//!   embedding-set-only vendor tree does not carry, vendored with
-//!   provenance when a network path allows. No binding dependency,
+//!   the vendored C compiled sanitized. The official Lua test suite and
+//!   the `ltests.c` GC/allocation torture harness run in CI too (#69,
+//!   closed): `upstream-tests/` carries them with provenance —
+//!   `PROVENANCE.md` records the origin and the checksum-database
+//!   verification, and the vendored sources are proven byte-identical
+//!   to the tagged v5.4.7 tree, file by file. No binding dependency,
 //!   shipped or dev.
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — also Lua 5.4, so both targets

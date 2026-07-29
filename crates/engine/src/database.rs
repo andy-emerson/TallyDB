@@ -206,11 +206,18 @@ impl Database {
     /// Runs `source` as a **driver script** — SQL-in-Lua (#70): the
     /// script's `query(sql)` and `append(table, row)` globals reach
     /// this database, so it can issue SQL, receive result columns as
-    /// views (single-segment results zero-copy; several segments
-    /// concatenate — the bounded copy), and feed derived rows back
-    /// exactly. Each call runs in a fresh interpreter: no state
-    /// crosses between scripts. See `driver` module docs for what
-    /// each statement kind means here.
+    /// views (a one-batch result passes through untouched; several
+    /// batches pay one gather, proportional to the result), and feed
+    /// derived rows back exactly. Each call runs in a fresh
+    /// interpreter: no state crosses between scripts.
+    ///
+    /// Every result a script queries stays live until the script
+    /// returns — that is what keeps its views valid, and it means a
+    /// driver looping one `query` per row holds them all. Write
+    /// drivers that query in bulk and compute over columns.
+    ///
+    /// See the `driver` module docs for what each statement kind means
+    /// here.
     #[cfg(feature = "lua")]
     pub fn run_script(&mut self, source: &str) -> Result<(), EngineError> {
         let mut state = compute_lua::LuaState::new().map_err(EngineError::Script)?;
