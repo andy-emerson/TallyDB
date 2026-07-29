@@ -425,7 +425,7 @@ impl KnowledgeSnapshot {
             } else {
                 SegmentView {
                     segment,
-                    live: Some(Bitmap::from_bools(mask.into_iter())),
+                    live: Some(Bitmap::from_bools(mask)),
                 }
             });
         }
