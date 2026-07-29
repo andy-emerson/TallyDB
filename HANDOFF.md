@@ -44,9 +44,14 @@ merge (fmt, clippy both legs, 362 tests/23 suites + off-leg, rustdoc
 both legs, six oracles, apicheck, ASan/UBSan). Reminder: GitHub CI runs
 on pull-request events only.
 
-**A full ruling session followed the merge (2026-07-29). Everything
-below is RULED BY THE HUMAN and lives ONLY here until the doc pass
-writes it into DESIGN.md. The doc pass is the mandatory next act.**
+**A full ruling session followed the merge (2026-07-29), and the doc
+pass is DONE (pre-compaction, at the Human's direction): the ledger
+below is recorded in DESIGN.md (*The M5 ruling batch*) with surgical
+stdlib-table/roadmap/settled-no edits; issues updated (#65, #77, #42,
+#57 incl. the option-f sketch); #58 and #75 closed as ruled. README
+deliberately untouched — it describes built state, and these rulings
+are unbuilt. Post-compaction execution begins at STEP 2 (the fruit
+table). The ledger stays here as the working reference.**
 
 ### The ruling ledger (write ALL of this into DESIGN.md)
 

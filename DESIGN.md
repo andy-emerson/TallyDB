@@ -350,7 +350,10 @@ compaction resolves tombstones and merges segments. This means:
 > library (the design center, unchanged), and — from M3 — as a
 > standalone single-file binary attached to each release: a CLI shell
 > over the same `engine::Database` doorway, the `sqlite3`/`duckdb`
-> precedent. Installation is copying one file. This is not a move
+> precedent. Installation is copying one file. (Ruled 2026-07-29: a
+> third channel arrives with M5.5 — the Python binding as wheels on
+> PyPI. Python-specific by design; the engine and console never
+> depend on it.) This is not a move
 > toward general purpose: the shell exposes exactly the library's SQL
 > surface, and the three assumptions bound it the same way.
 >
@@ -511,11 +514,13 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
 **M5 (desk adoption)** then builds what the target user needs, chosen
 by the moat test: multi-factor curated compute (K > 2 — the recorded
 LAPACK-class-returns trigger firing, served by faer), the ordered-axis
-dividends (cross-sectional partitioning, time bucketing pending F1,
-`LAG`/`LEAD`, `RANGE` frames, `ASOF` #65), segment-lazy open (F3),
-cross-process readers (F4), and reach (bulk Arrow ingest, a Python
-binding with host-callback NumPy kernels — distribution method open: a
-wheel is one form, not the ruling). **M6 (WASM parity)** adds *embed
+dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
+2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
+`LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — design ruled, see *The
+M5 ruling batch*), segment-lazy open (F3), cross-process readers (F4),
+and reach (bulk Arrow ingest, a Python binding with host-callback
+NumPy kernels — distribution ruled 2026-07-29: wheels on PyPI for the
+binding; the console stays a Python-free single binary). **M6 (WASM parity)** adds *embed
 in a browser*: the compute stack already compiles for wasm32; the
 remaining work is a browser `StorageBackend` (OPFS/IndexedDB behind
 the existing trait — written knowing an HTTP-fetch sibling comes
@@ -869,29 +874,146 @@ DuckDB differential family; the shell's help cites this table.
 |---|---|---|
 | `SELECT` projection, aliases | in, built | |
 | `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
-| regex on keys | in, later | needs a dependency ruling (#57) |
+| regex on keys | deferred by ruling (2026-07-29) | menu incl. the Lua-pattern house option on #57 |
+| `IS NULL` / `IS NOT NULL` | in, later | one predicate arm over the validity bitmap |
 | `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
+| `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, ruled (F1 = d), M5.3 | streams O(1); `FIRST`/`LAST` naming pending |
 | `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
 | `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
 | scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
 | `CASE WHEN` | in, built | conditions are WHERE grammar; UNKNOWN falls through |
-| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention) |
+| `ORDER BY` one column, `NULLS FIRST/LAST` | in, built | default nulls-last both directions (oracle's convention); on symbol columns: ruled OUT 2026-07-29 (#58 = B, unordered labels) — refusal pending build |
 | multi-column `ORDER BY` | in, later | additive lowering |
 | `LIMIT`/`OFFSET` | in, built | |
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
 | `RANGE` frames | in, later | needs ordering-key-typed ranges |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule |
-| `ASOF` / ordered-merge joins | in, later | #65 |
+| `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
-| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `ORDERING KEY` constraint; `VARCHAR` and `PRIMARY KEY` refused with teaching errors |
+| DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `ORDERING KEY` constraint; `VARCHAR` and `PRIMARY KEY` refused with teaching errors; type spelling `KEY` → `SYMBOL` ruled 2026-07-29, rename pending |
 | non-correlated subqueries / CTEs | in, later | named subplans |
 | `UNION ALL` (then `UNION`) | in, later | low priority |
 | correlated subqueries | **out** | the road to a cost-based optimizer — settled no |
 | string production (`CONCAT`, `CAST AS VARCHAR`, …) | **out** | numeric-or-key invariant |
 | `DISTINCT` over window/aggregate projections | out until asked | refused loudly today |
 
+## The M5 ruling batch (all ruled by the Human, 2026-07-29)
+
+Thirteen decisions closed in one sitting, recorded here as one dated
+block so none of them lives only in a conversation. Each is design;
+none is built unless its row in the stdlib table says so.
+
+1. **Time bucketing (F1) = monotone integer arithmetic on the ordering
+   key.** `GROUP BY ts / 60` (bucket index) and `GROUP BY (ts / 60) * 60`
+   (bucket start) are admitted — the planner proves monotonicity
+   structurally (ordering key, positive integer literal, `/` or `*`),
+   so grouping streams with O(1) state and no hash table. No `bucket()`
+   function is coined; unit sugar, if ever, is a later question.
+   Everything else in `GROUP BY` keeps the teaching error. Rejected:
+   general expressions (kills the streaming dividend, drags in
+   float-equality group identity); refusal (concedes the workload's
+   most common query). `FIRST`/`LAST` aggregates (OHLC's open/close)
+   surface a naming sub-ruling when M5.3 builds this.
+2. **The as-of join (#65) — the hybrid.** Grammar from ClickHouse,
+   authority from the schema: the single `ASOF` token is lifted
+   pre-parse (byte-span splice, comments skipped — the hardened
+   mechanism), and the remainder parses as a plain join. `ON` only, no
+   `USING`. The time axis is the two tables' **declared ordering
+   keys** — implicit by default; an explicit inequality is permitted
+   and **validated, not obeyed** (naming anything else is a teaching
+   error; the operator selects `>=` vs `>`). **Bare `ASOF JOIN` is
+   refused**: write `ASOF LEFT JOIN` (keep unmatched facts,
+   null-padded) or `ASOF INNER JOIN` (drop them). Recorded principle,
+   reusable: *where vendors agree, follow convention; where vendors
+   genuinely diverge (bare as-of semantics do), refuse and make the
+   user say it.* `TOLERANCE` is cut — expressible today via
+   `CASE`/`WHERE` arithmetic; reopens as sugar if desks ask. Parser
+   facts (verified 2026-07-29): sqlparser 0.62 parses only Snowflake's
+   `MATCH_CONDITION` form; DuckDB accepts only its `ON` form; the sets
+   are disjoint — hence the lift-and-plain-join design. Evidence when
+   built: the DuckDB differential (the harness *generates* DuckDB's
+   spelling from structure) plus a vanilla-SQL definitional reference
+   (the row with `MAX(ts) <=` the fact's), which checks the definition
+   rather than another vendor's implementation. The executor is an
+   ordered co-walk gated on `is_ordered()` for **both** sides.
+3. **Library naming (#77.1): SQL exposes only operations bearing
+   standard names.** `var_pop`, `stddev_pop`, `LAG`/`LEAD` pass into
+   SQL freely; EWMA, `diff`, multi-factor regression have no standard
+   SQL spelling and stay script-side until individually named by the
+   Human. The rule is mechanical — no per-op judgment.
+4. **Matrix-valued results (#77.2): scalar reductions only in SQL**
+   (R², residual, fitted value); full vectors/matrices flow through
+   the API and scripts, which receive them from one evaluation.
+   Per-component SQL functions rejected; multi-output projection
+   plumbing deliberately unbuilt until demanded.
+5. **The prelude (#77.3): compiled into the binary**, `.prelude`
+   prints the source — single-file deployment holds; read-copy-modify
+   is preserved by printing, not by an editable side file.
+6. **Library build order (#77.4): streaming tier first**, matrix tier
+   second (scheduling default, delegated).
+7. **`DELETE` consumes a knowledge coordinate.** Decided on
+   *stability*: an unconsumed kill coordinate is shared with the next
+   append, so the delete's effect has no cut of its own — a recorded
+   boundary drifts as data arrives. Consuming makes every knowledge
+   event own one coordinate and makes `ASOF next_sequence() - 1` the
+   universally stable "latest" idiom. Cost accepted: a table's first
+   `DELETE` diverges it (the sequence column materializes;
+   delta-codes to almost nothing).
+8. **The sequence column's SQL surface (#75): a fixed-name
+   pseudocolumn, `_seq`.** Never declared, refused in `CREATE TABLE`,
+   resolvable wherever an `i64` column can appear. Chosen by the
+   visibility rule: the engine refuses `SELECT *`, so the column is
+   never seen unbidden — the short system-side name wins over the
+   spelled-out one. Kill-coordinate exposure deferred until asked.
+9. **`SYMBOL` replaces `KEY` as the column type's DDL spelling.**
+   kdb+/QuestDB lineage the audience reads on sight, and it ends the
+   word KEY serving two grammatical roles in one statement (`ts BIGINT
+   ORDERING KEY, sym KEY`). Spelling only: the stored format and the
+   internal type are unchanged.
+10. **Symbol columns are officially unordered labels (#58 = B).**
+    `ORDER BY` on a symbol column becomes a teaching-error refusal.
+    The deciding facts: codes are per-segment first-appearance ranks
+    (no usable inherent order exists), and byte-order "alphabetical"
+    is honest only for ASCII — an engine that refuses to produce a
+    string does not rank them. Identities are never ordered: the
+    arithmetic refusal and this one are the same rule. Differential
+    families stop using `ORDER BY sym`; the referee sorts rows before
+    diffing. The `WHERE sym > '…'` question and the collation
+    question both dissolve.
+11. **Compression (#42): ALP and ALP-RD together**, plus the integer
+    sibling sharing the same backend — frame-of-reference +
+    bit-packing for non-key `i64` columns and `u32` symbol codes.
+    Corpus tick-size realism is step 0.
+12. **Arrow-boundary booleans: refused loudly at ingest** (the
+    teaching error names `df.astype({'flag': 'int64'})`). Recorded
+    with the Human's explicit flag: *ruled wrong on purpose* — a
+    standing revisit covers a real boolean type **and** the
+    logical-annotation mechanism itself (`TimestampNs`-style
+    "physically i64, logically X"). Storage fact settled for that
+    revisit: a nullable boolean is 2 bits/row (value bit + validity
+    bit) — the cost was never storage, it is the seam sweep.
+13. **Python distribution (M5.5): wheels on PyPI** — for the Python
+    binding only. The console remains a single Python-free native
+    binary; the engine and console depend on nothing.
+
+Also recorded from the same sitting: regex on symbols (#57) is
+**deferred by ruling** — the menu on the issue now includes the house
+option (registered single-symbol Lua-pattern predicates in `WHERE`,
+evaluated once per distinct dictionary value); and `IS NULL` /
+`IS NOT NULL` was found missing from the predicate fragment — standard
+SQL, in scope, tracked as the smallest open todo.
+
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
+- **A boolean column type — no for now, with the Human's explicit
+  revisit flag (2026-07-29: "ruled wrong on purpose").** Flags are
+  `BIGINT` 0/1; predicates never materialize; Arrow booleans are
+  refused at ingest with a teaching error naming the one-line cast.
+  Not a performance or WASM question — a type multiplies against every
+  seam (formats, value map, predicates, aggregates, oracles) and buys
+  nothing 0/1 lacks. The standing revisit covers the type AND the
+  logical-annotation mechanism (`TimestampNs`-style); storage is
+  pre-settled for it: a nullable boolean is 2 bits/row.
 - **Compiled Lua C extensions** (`package.loadlib`). Pure-Lua libraries are
   fine and need no special handling. (See *The Lua layer* below for the full
   reasoning.)
