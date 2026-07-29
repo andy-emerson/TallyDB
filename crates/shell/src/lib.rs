@@ -45,7 +45,12 @@ pub struct Console {
     sink: Arc<dyn LogSink + Sync>,
     /// The advisory process lock: an OS file lock, released by the OS
     /// even if the process dies — no stale-lock cleanup ever needed.
-    _lock: std::fs::File,
+    /// `None` for a read-only console (F4), which coexists with the
+    /// writer instead of excluding it.
+    _lock: Option<std::fs::File>,
+    /// A read-only console (F4): every table opened read-only, no
+    /// lock taken; `.refresh` re-reads what the writer has flushed.
+    read_only: bool,
 }
 
 /// What one executed line produces.
@@ -63,22 +68,42 @@ impl Console {
     /// Opens (creating if needed) the storage directory, takes the
     /// process lock, and opens every table found inside.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Console, String> {
+        Console::open_inner(dir.into(), false)
+    }
+
+    /// Opens the directory **read-only** (F4): no lock, so this console
+    /// coexists with a writer process (and other readers) over the same
+    /// database. Mutating statements refuse loudly; `.refresh` re-reads
+    /// what the writer has flushed — the beta shape's console half.
+    pub fn open_read_only(dir: impl Into<PathBuf>) -> Result<Console, String> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("creating {}: {error}", dir.display()))?;
-        let lock_path = dir.join(".tallydb.lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| format!("opening lock {}: {error}", lock_path.display()))?;
-        if let Err(error) = lock.try_lock() {
-            return Err(format!(
-                "another process holds {} ({error}); one writer per database",
-                dir.display()
-            ));
+        if !dir.is_dir() {
+            return Err(format!("{} is not a database directory", dir.display()));
         }
+        Console::open_inner(dir, true)
+    }
+
+    fn open_inner(dir: PathBuf, read_only: bool) -> Result<Console, String> {
+        let lock = if read_only {
+            None
+        } else {
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("creating {}: {error}", dir.display()))?;
+            let lock_path = dir.join(".tallydb.lock");
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|error| format!("opening lock {}: {error}", lock_path.display()))?;
+            if let Err(error) = lock.try_lock() {
+                return Err(format!(
+                    "another process holds {} ({error}); one writer per database",
+                    dir.display()
+                ));
+            }
+            Some(lock)
+        };
         let mut database = Database::new();
         // One options value serves both the tables opened here and the
         // ones `CREATE TABLE` makes later — two separate defaults would
@@ -97,8 +122,12 @@ impl Console {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("unreadable table directory {}", path.display()))?
                 .to_owned();
-            let mut table = Table::open(&name, &path, options)
-                .map_err(|error| format!("opening table '{name}': {error}"))?;
+            let mut table = if read_only {
+                Table::open_read_only(&name, &path)
+            } else {
+                Table::open(&name, &path, options)
+            }
+            .map_err(|error| format!("opening table '{name}': {error}"))?;
             table.set_lua_log_sink(Arc::clone(&sink));
             database
                 .add_table(table)
@@ -111,7 +140,50 @@ impl Console {
             options,
             sink,
             _lock: lock,
+            read_only,
         })
+    }
+
+    /// Re-reads every table's durable state, and opens tables the
+    /// writer created since (read-only consoles only): the polling
+    /// half of the cross-process story — the reader decides when to
+    /// look, the engine never pushes.
+    pub fn refresh(&mut self) -> Result<usize, String> {
+        if !self.read_only {
+            return Err("refresh is the read-only console's command".to_owned());
+        }
+        let mut refreshed = 0usize;
+        for name in self.database.table_names() {
+            let table = self.database.table_mut(&name).expect("listed above");
+            table.refresh().map_err(|error| error.to_string())?;
+            refreshed += 1;
+        }
+        // Tables the writer created after this console opened.
+        let known = self.database.table_names();
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+            .map_err(|error| format!("reading {}: {error}", self.dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir() && path.join("table.tlym").is_file())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("unreadable table directory {}", path.display()))?
+                .to_owned();
+            if known.contains(&name) {
+                continue;
+            }
+            let mut table = Table::open_read_only(&name, &path)
+                .map_err(|error| format!("opening table '{name}': {error}"))?;
+            table.set_lua_log_sink(Arc::clone(&self.sink));
+            self.database
+                .add_table(table)
+                .map_err(|error| error.to_string())?;
+            refreshed += 1;
+        }
+        Ok(refreshed)
     }
 
     /// The open tables, sorted.
@@ -186,6 +258,28 @@ impl Console {
         match command {
             "help" => Ok(Outcome::Note(HELP.to_owned())),
             "quit" | "exit" => Ok(Outcome::Quit),
+            "refresh" => {
+                let refreshed = self.refresh()?;
+                Ok(Outcome::Note(format!(
+                    "{refreshed} table(s) re-read from the writer's durable state"
+                )))
+            }
+            "flush" => {
+                // The writer's publish verb: buffered rows become
+                // durable segments — the boundary read-only consoles
+                // (and crash recovery) see.
+                if self.read_only {
+                    return Err("a read-only console has nothing to flush".to_owned());
+                }
+                for name in self.database.table_names() {
+                    self.database
+                        .table_mut(&name)
+                        .expect("listed above")
+                        .flush()
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(Outcome::Note("flushed".to_owned()))
+            }
             "tables" => Ok(Outcome::Note(self.tables().join("\n"))),
             "schema" => {
                 let names = if argument.is_empty() {
@@ -525,6 +619,10 @@ SYMBOL, one ORDERING KEY column).
 
 Commands:
   .help                     this text
+  .flush                    make buffered rows durable segments now —
+                            the boundary readers and recovery see
+  .refresh                  (read-only console) re-read what the writer
+                            has flushed; picks up new tables too
   .tables                   list tables
   .schema [TABLE]           show table definitions
   .import FILE TABLE        import a CSV (header row maps columns by name)
@@ -625,6 +723,61 @@ mod tests {
         assert!(error.contains("one writer per database"), "{error}");
         drop(first);
         Console::open(&dir).unwrap(); // released with the process's file
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_console_rides_alongside_the_writer() {
+        // The beta shape (F4): one writer process feeds; a read-only
+        // console coexists, sees flushed data, refuses mutation, and
+        // .refresh advances it — new tables included.
+        let dir = scratch("readonly");
+        let mut writer = Console::open(&dir).unwrap();
+        writer
+            .execute("CREATE TABLE t (ts BIGINT ORDERING KEY, x DOUBLE);")
+            .unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (1, 1.5), (2, 2.5);")
+            .unwrap();
+
+        let mut reader = Console::open_read_only(&dir).unwrap();
+        assert_eq!(reader.tables(), ["t"]);
+        // INSERT runs through the mutation path, which flushes to the
+        // WAL — but rows reach readers at the segment boundary. Make
+        // them durable from the writer side, then look again.
+        let Outcome::Table(rendered) = reader.execute("SELECT ts, x FROM t ORDER BY ts").unwrap()
+        else {
+            panic!("select renders a table")
+        };
+        let before_rows = rendered.lines().count();
+        writer.execute(".flush").unwrap(); // the writer's publish verb
+
+        reader.execute(".refresh").unwrap();
+        let Outcome::Table(rendered) = reader.execute("SELECT ts, x FROM t ORDER BY ts").unwrap()
+        else {
+            panic!("select renders a table")
+        };
+        assert!(
+            rendered.lines().count() >= before_rows,
+            "refresh never loses rows"
+        );
+        assert!(
+            rendered.contains("1.5") && rendered.contains("2.5"),
+            "{rendered}"
+        );
+        // Mutation refuses loudly, naming the writer.
+        let error = reader
+            .execute("INSERT INTO t VALUES (3, 3.5);")
+            .unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        // The writer creates a table the reader discovers on refresh.
+        writer
+            .execute("CREATE TABLE u (ts BIGINT ORDERING KEY, y DOUBLE);")
+            .unwrap();
+        reader.execute(".refresh").unwrap();
+        assert_eq!(reader.tables(), ["t", "u"]);
+        // And a writer console refuses .refresh — it sees its own state.
+        assert!(writer.execute(".refresh").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

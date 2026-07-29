@@ -243,6 +243,33 @@ impl Table {
         ))
     }
 
+    /// Opens an existing persistent table **read-only** (F4): the
+    /// cross-process reader — a console or binding process watching a
+    /// directory another process writes. Takes no directory lock, so
+    /// any number of readers coexist with the one writer; every
+    /// mutation refuses loudly. The view is the durable prefix — the
+    /// flushed segments and committed deletes, consistent per mutation
+    /// (see `Store::open_read_only` for the exact contract) — and
+    /// [`Table::refresh`] re-reads it.
+    pub fn open_read_only(
+        name: impl Into<String>,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Table, EngineError> {
+        let backend = FsBackend::open_read_only(dir.as_ref()).map_err(StorageError::from)?;
+        Ok(Table::from_store(
+            name,
+            Store::open_read_only(Arc::new(backend))?,
+        ))
+    }
+
+    /// Re-reads the durable state (read-only tables only): rows the
+    /// writer has flushed since the open, deletes it has committed, a
+    /// new generation after its compaction. Registered functions
+    /// survive a refresh; snapshots minted before one stay valid.
+    pub fn refresh(&mut self) -> Result<(), EngineError> {
+        Ok(self.store.refresh()?)
+    }
+
     /// As [`Table::persistent`], with an explicit segment-row threshold.
     pub fn persistent_with_segment_rows(
         name: impl Into<String>,
@@ -2140,6 +2167,58 @@ mod tests {
             Table::persistent("trades", wrong, "ts", &dir),
             Err(EngineError::Storage(StorageError::SchemaMismatch { .. }))
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_table_rides_alongside_the_writer() {
+        // F4 at the engine seam: two Table handles over one directory —
+        // the writer appends and corrects, the reader queries the
+        // durable prefix through ordinary SQL and refresh advances it.
+        let dir = std::env::temp_dir().join(format!("tallydb-f4-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut writer = Table::persistent_with_segment_rows("t", schema, "ts", &dir, 100).unwrap();
+        for i in 0..4i64 {
+            writer
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let mut reader = Table::open_read_only("t", &dir).unwrap();
+        assert_eq!(reader.query("SELECT ts FROM t").unwrap().num_rows(), 4);
+        // The reader speaks the whole SQL surface, AS OF included.
+        writer.mutate("UPDATE t SET x = 99.0 WHERE ts = 1").unwrap();
+        writer.flush().unwrap();
+        reader.refresh().unwrap();
+        assert_eq!(
+            flatten(&reader.query("SELECT ts, x FROM t ORDER BY ts").unwrap(), 1),
+            [Some(0.0), Some(99.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(
+            flatten(
+                &reader
+                    .query("SELECT ts, x FROM t ASOF 3 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
+        );
+        // Mutation through the reader refuses at the storage seam.
+        let error = reader
+            .mutate("DELETE FROM t WHERE ts = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only"), "{error}");
+        assert!(reader
+            .append(&[RowValue::I64(9), RowValue::F64(9.0)])
+            .is_err());
+        // A writer refuses refresh — it sees its own state already.
+        assert!(writer.refresh().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

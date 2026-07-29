@@ -109,14 +109,20 @@ pub struct FsBackend {
     dir: PathBuf,
     /// Distinguishes concurrent writes' temp files (R6).
     write_counter: AtomicU64,
-    /// The advisory process lock; released when the backend drops (or
-    /// the process dies — no stale-lock cleanup ever needed).
-    _lock: std::fs::File,
+    /// The advisory process lock — `Some` for the writer (released when
+    /// the backend drops, or the process dies: no stale-lock cleanup
+    /// ever needed), `None` for read-only backends, which coexist with
+    /// the writer and with each other.
+    _lock: Option<std::fs::File>,
+    /// A read-only backend refuses every mutating operation, so a bug
+    /// in a reader process can never corrupt the writer's directory.
+    read_only: bool,
 }
 
 impl FsBackend {
     /// A backend over `dir`, created if absent; fails if another
-    /// process (or another backend in this one) holds the directory.
+    /// **writer** (another process, or another backend in this one)
+    /// holds the directory. Read-only backends do not conflict.
     pub fn new(dir: impl Into<PathBuf>) -> Result<FsBackend, IoError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
@@ -132,15 +138,48 @@ impl FsBackend {
             })?;
         if let Err(error) = lock.try_lock() {
             return Err(IoError::Backend(format!(
-                "another process holds {} ({error}); one accessor per store directory",
+                "another process holds {} ({error}); one writer per store directory",
                 dir.display()
             )));
         }
         Ok(FsBackend {
             dir,
             write_counter: AtomicU64::new(0),
-            _lock: lock,
+            _lock: Some(lock),
+            read_only: false,
         })
+    }
+
+    /// A **read-only** backend over an existing `dir` (F4): takes no
+    /// lock, so any number of reader processes coexist with the one
+    /// writer — and refuses every mutating operation, so a reader can
+    /// never corrupt the directory it watches. Fails if `dir` does not
+    /// exist: a reader has nothing to create.
+    pub fn open_read_only(dir: impl Into<PathBuf>) -> Result<FsBackend, IoError> {
+        let dir = dir.into();
+        if !dir.is_dir() {
+            return Err(IoError::Backend(format!(
+                "{} is not a store directory",
+                dir.display()
+            )));
+        }
+        Ok(FsBackend {
+            dir,
+            write_counter: AtomicU64::new(0),
+            _lock: None,
+            read_only: true,
+        })
+    }
+
+    fn refuse_write(&self, what: &str) -> Result<(), IoError> {
+        if self.read_only {
+            return Err(IoError::Backend(format!(
+                "read-only backend over {} refuses to {what} — the writer \
+                 process owns mutation",
+                self.dir.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -167,6 +206,7 @@ impl LogWriter for FsLogWriter {
 
 impl StorageBackend for FsBackend {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
+        self.refuse_write("write")?;
         // A **unique** temp path per write (R6): the trait promises
         // `Sync` + atomic publish, so two threads writing the same object
         // name must not share `.tmp-{name}` — one would truncate the
@@ -240,6 +280,7 @@ impl StorageBackend for FsBackend {
     }
 
     fn open_log(&self, name: &str) -> Result<Box<dyn LogWriter>, IoError> {
+        self.refuse_write("open a log")?;
         let path = self.dir.join(name);
         let file = match std::fs::OpenOptions::new().append(true).open(&path) {
             Ok(file) => file,
@@ -257,6 +298,7 @@ impl StorageBackend for FsBackend {
     }
 
     fn remove(&self, name: &str) -> Result<(), IoError> {
+        self.refuse_write("remove")?;
         let path = self.dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -422,23 +464,33 @@ mod tests {
     }
 
     #[test]
-    fn the_directory_lock_admits_one_backend() {
-        // Two library embedders opening one store directory would
-        // silently clobber each other's segments; the lock makes the
-        // second open loud instead. Released with the file handle — by
-        // the OS even on a crash, so no stale-lock cleanup exists.
+    fn the_directory_lock_admits_one_writer_and_any_readers() {
+        // Two library embedders opening one store directory as writers
+        // would silently clobber each other's segments; the lock makes
+        // the second open loud instead. Released with the file handle —
+        // by the OS even on a crash, so no stale-lock cleanup exists.
+        // Read-only backends (F4) take no lock: they coexist with the
+        // writer and each other, and refuse mutation instead.
         let dir = std::env::temp_dir().join(format!("tallydb-io-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let first = FsBackend::new(&dir).unwrap();
         let Err(error) = FsBackend::new(&dir) else {
-            panic!("second accessor must be refused");
+            panic!("second writer must be refused");
         };
         assert!(
-            error.to_string().contains("one accessor"),
+            error.to_string().contains("one writer"),
             "unexpected error: {error}"
         );
+        // Readers open alongside the writer, and refuse to mutate.
+        let reader = FsBackend::open_read_only(&dir).unwrap();
+        let _second_reader = FsBackend::open_read_only(&dir).unwrap();
+        assert!(reader.write("x", b"nope").is_err());
+        assert!(reader.remove("x").is_err());
+        assert!(reader.open_log("x").is_err());
         drop(first);
         drop(FsBackend::new(&dir).unwrap()); // released with the handle
+                                             // A reader over a directory that never existed is refused.
+        assert!(FsBackend::open_read_only(dir.join("absent")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

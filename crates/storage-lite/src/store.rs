@@ -36,7 +36,7 @@
 use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_segment};
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer};
-use crate::tombstone::{decode_tombstones, encode_tombstones};
+use crate::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -215,6 +215,10 @@ pub struct Store {
     wal: Option<Box<dyn crate::LogWriter>>,
     wal_sync: WalSync,
     last_wal_sync: std::time::Instant,
+    /// A read-only handle (F4): opened over a directory another process
+    /// writes. Every mutating operation refuses; [`Store::refresh`]
+    /// re-reads the durable state.
+    read_only: bool,
     /// The reader-visible state, shared with every [`StoreReader`]. The
     /// lock is held only to read or swap it — never across encoding,
     /// backend I/O, or compaction's merge — so a reader's `snapshot()`
@@ -575,6 +579,7 @@ impl Store {
         assert!(segment_rows >= 1, "segment_rows must be at least 1");
         let buffer = WriteBuffer::new(schema.clone(), ordering_key)?;
         Ok(Store {
+            read_only: false,
             schema,
             ordering_key,
             segment_rows,
@@ -648,6 +653,181 @@ impl Store {
         let schema = manifest.schema.clone();
         let ordering_key = manifest.ordering_key;
         Store::persistent_inner(backend, schema, ordering_key, options, Some(manifest))
+    }
+
+    /// Opens an existing persistent store **read-only** (F4): the
+    /// cross-process reader half of the beta shape — one feed-writer
+    /// process, any number of console or binding readers over the same
+    /// directory. Takes no directory lock and refuses every mutation.
+    ///
+    /// **What a reader sees: the durable prefix, consistently.** The
+    /// view is built from the manifest, the flushed segments, and the
+    /// delete logs — never the writer's WAL or write buffer — so it
+    /// lags the writer by at most the flush boundary, and it is
+    /// old-or-new per mutation, never a torn middle: a supersession's
+    /// delete log whose replacement rows have not been flushed yet is
+    /// skipped *whole* (kill and replacements both invisible — the
+    /// pre-mutation state), which is decidable from the log itself:
+    /// replacements born at coordinate `c` are flushed exactly when
+    /// some flushed row carries a sequence past `c`, because rows
+    /// reach segments in row-id order. Plain deletes need no such
+    /// test — their victims are flushed before the log commits.
+    ///
+    /// **Compaction races retry.** The writer's compaction publishes a
+    /// whole new generation and then removes the old one's objects; a
+    /// reader that catches the middle sees a named file vanish, and
+    /// the open retries from the manifest (bounded), which is atomic.
+    ///
+    /// Refresh by [`Store::refresh`]; today that re-reads and
+    /// re-decodes the whole state (segment-lazy open is F3, tracked).
+    pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        for _ in 0..8 {
+            match Store::load_read_only(backend.clone()) {
+                Ok(store) => return Ok(store),
+                // A compaction moved the generation mid-scan: a named
+                // object vanished. The next manifest read names the
+                // complete new generation — go again.
+                Err(StorageError::Io(IoError::NotFound(_))) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StorageError::Misuse(
+            "read-only open kept racing generation changes; retry".to_owned(),
+        ))
+    }
+
+    /// Re-reads the durable state (read-only stores only): new flushed
+    /// segments, new delete logs, a new generation after compaction.
+    /// Snapshots minted before a refresh stay valid — their segments
+    /// are immutable and decoded in memory.
+    pub fn refresh(&mut self) -> Result<(), StorageError> {
+        if !self.read_only {
+            return Err(StorageError::Misuse(
+                "refresh is the read-only handle's doorway; the writer sees \
+                 its own state"
+                    .to_owned(),
+            ));
+        }
+        let backend = self
+            .backend
+            .clone()
+            .expect("read-only stores are persistent");
+        *self = Store::open_read_only(backend)?;
+        Ok(())
+    }
+
+    /// Every mutating doorway starts here: a read-only handle mutates
+    /// nothing, ever — the writer process owns the directory.
+    fn refuse_read_only(&self) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::Misuse(
+                "this handle opened the store read-only; the writer process \
+                 owns mutation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
+        let schema = manifest.schema.clone();
+        let ordering_key = manifest.ordering_key;
+        let generation = manifest.generation;
+        let mut store = Store::with_segment_rows(schema, ordering_key, DEFAULT_SEGMENT_ROWS)?;
+        store.read_only = true;
+        store.manifest_sections = manifest.sections;
+        let mut segments = Vec::new();
+        // Delete logs are held back until the segment watermark is
+        // known: the supersession-visibility rule needs it.
+        let mut logs: Vec<DeleteLog> = Vec::new();
+        for name in backend.list()? {
+            if name
+                .strip_prefix(&delete_log_prefix(generation))
+                .and_then(|rest| rest.strip_suffix(".tlyd"))
+                .is_some()
+            {
+                logs.push(decode_tombstones(&backend.read(&name)?)?);
+                continue;
+            }
+            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+                continue;
+            }
+            let segment = decode_segment(&backend.read(&name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!("segment '{name}' was written under a different schema"),
+                });
+            }
+            segments.push(Arc::new(segment));
+        }
+        segments.sort_by_key(|segment| segment.base_row_id());
+        let mut expected_base = 0u64;
+        for segment in &segments {
+            if segment.base_row_id() != expected_base {
+                return Err(StorageError::MissingRows { expected_base });
+            }
+            expected_base += segment.batch().num_rows() as u64;
+        }
+        // The flushed watermark, from segments alone — the test the
+        // visibility rule runs against.
+        let flushed = segments
+            .iter()
+            .map(|segment| segment.sequence_end())
+            .fold(0, u64::max);
+        let mut tombstones = BTreeMap::new();
+        for log in &logs {
+            // A supersession whose replacements are still in the
+            // writer's WAL: applying its kill without them would show
+            // the one middle state that loses rows. Skip it whole —
+            // the reader sees the pre-mutation state until the flush.
+            if log.superseding != 0 && flushed <= log.superseding {
+                continue;
+            }
+            tombstones.extend(log.ids.iter().map(|&id| (id, log.stamped_at)));
+        }
+        // A tombstone past the durable rows would be a torn write; on
+        // the reader it may simply be a race — surface it as one.
+        if tombstones.keys().any(|&id| id >= expected_base) {
+            return Err(StorageError::Io(IoError::NotFound(
+                "a delete log ran ahead of its rows; retrying".to_owned(),
+            )));
+        }
+        let mut history = Vec::with_capacity(store.manifest_sections.history.len());
+        for name in &store.manifest_sections.history.clone() {
+            let segment = decode_segment(&backend.read(name)?)?;
+            history.push(Arc::new(segment));
+        }
+        let recorded = store.manifest_sections.next_sequence;
+        let killed_at = tombstones.values().copied().max().unwrap_or(0);
+        let diverged = recorded.is_some()
+            || killed_at > 0
+            || segments
+                .iter()
+                .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
+        let watermark = diverged.then(|| {
+            let spent = if killed_at > 0 { killed_at + 1 } else { 0 };
+            segments
+                .iter()
+                .map(|segment| segment.sequence_end())
+                .fold(recorded.unwrap_or(0).max(spent), u64::max)
+        });
+        {
+            let mut shared = lock(&store.shared);
+            shared.segments = segments;
+            shared.buffer_base = expected_base;
+            shared.knowledge = watermark.map(|next| Knowledge {
+                next,
+                buffer_base: next,
+                explicit: None,
+            });
+            shared.tombstones = tombstones;
+            shared.history = history;
+        }
+        store.rows = expected_base;
+        store.generation = generation;
+        store.backend = Some(backend);
+        Ok(store)
     }
 
     /// As [`Store::persistent`], with explicit [`StoreOptions`] — the
@@ -1115,6 +1295,7 @@ impl Store {
     /// Appends one row and returns its internal row id. Flushes
     /// automatically when the buffer reaches the segment-row threshold.
     pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         // Validate before logging: a rejected row must leave neither
         // buffer nor WAL changed. Logged-then-rejected would plant a
         // phantom record that ends replay's clean prefix early (dropping
@@ -1144,6 +1325,7 @@ impl Store {
     /// is registered, so a failure at any point leaves both the backend
     /// and the buffer — rows included — exactly as they were.
     pub fn flush(&mut self) -> Result<(), StorageError> {
+        self.refuse_read_only()?;
         // Copy the buffer under the brief lock; encode and publish with
         // the lock released. Readers between the two locks still see the
         // rows — in the buffer, where they were — so every snapshot is
@@ -1206,6 +1388,7 @@ impl Store {
     /// truncated at the deletion, every replayed row is one that arrived
     /// after it, so recovery cannot renumber rows across the gap.
     pub fn tombstone(&mut self, ids: &[u64]) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         if let Some(&bad) = ids.iter().find(|&&id| id >= self.rows) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
@@ -1296,6 +1479,7 @@ impl Store {
         replacements: &[Vec<RowValue<'_>>],
         victims: &[u64],
     ) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         // Validate everything up front: a refused mutation changes
         // nothing anywhere.
         if victims.is_empty() {
@@ -1409,6 +1593,7 @@ impl Store {
     /// release `UPDATE`/`DELETE` debt, so it runs precisely when the table
     /// is already inflated (interacts with #43/#44, #56).
     pub fn compact(&mut self) -> Result<(), StorageError> {
+        self.refuse_read_only()?;
         // The ingest-sequence watermark as recorded so far, plus the
         // kill stamps and prior history, captured before the merge: a
         // diverged table's compaction must carry all three through —
