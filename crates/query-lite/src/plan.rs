@@ -1276,6 +1276,8 @@ fn strip_qualifiers(expr: &ast::Expr, known: &[&str]) -> Result<ast::Expr, Query
             }
         },
         ast::Expr::Nested(inner) => ast::Expr::Nested(Box::new(recurse(inner)?)),
+        ast::Expr::IsNull(inner) => ast::Expr::IsNull(Box::new(recurse(inner)?)),
+        ast::Expr::IsNotNull(inner) => ast::Expr::IsNotNull(Box::new(recurse(inner)?)),
         ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
             op: *op,
             expr: Box::new(recurse(expr)?),
@@ -1529,6 +1531,12 @@ fn extract_having_calls(
     Ok(match expr {
         ast::Expr::Nested(inner) => {
             ast::Expr::Nested(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::IsNull(inner) => {
+            ast::Expr::IsNull(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::IsNotNull(inner) => {
+            ast::Expr::IsNotNull(Box::new(extract_having_calls(inner, hidden)?))
         }
         ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
             op: *op,

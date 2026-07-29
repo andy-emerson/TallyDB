@@ -115,6 +115,17 @@ impl NumericData {
             NumericData::I64(c) => c.validity(),
         }
     }
+
+    /// Whether row `index` holds a value (always true without a bitmap).
+    ///
+    /// # Panics
+    /// If `index >= len`.
+    pub fn is_valid(&self, index: usize) -> bool {
+        match self {
+            NumericData::F64(c) => c.is_valid(index),
+            NumericData::I64(c) => c.is_valid(index),
+        }
+    }
 }
 
 /// A column: numeric or key. There is no third variant, by design.
@@ -167,6 +178,32 @@ impl Column {
         match self {
             Column::Numeric(n) => n.null_count(),
             Column::Key(k) => k.null_count(),
+        }
+    }
+
+    /// Whether row `index` holds a value — the presence bit, whatever
+    /// the column's variant. This is what `IS NULL` asks about, and the
+    /// only question that can be put to a numeric and a key column
+    /// alike.
+    ///
+    /// # Panics
+    /// If `index >= len`.
+    ///
+    /// ```
+    /// use arrow_lite::{Buffer, Column, NumericColumn, NumericData, Bitmap};
+    ///
+    /// let values = Buffer::from_slice(&[1.0, 2.0]);
+    /// let validity = Bitmap::from_bools(vec![true, false]);
+    /// let column = Column::Numeric(NumericData::F64(
+    ///     NumericColumn::new_nullable(values, validity),
+    /// ));
+    /// assert!(column.is_valid(0));
+    /// assert!(!column.is_valid(1));
+    /// ```
+    pub fn is_valid(&self, index: usize) -> bool {
+        match self {
+            Column::Numeric(n) => n.is_valid(index),
+            Column::Key(k) => k.is_valid(index),
         }
     }
 

@@ -167,6 +167,22 @@ def families() -> list[str]:
         "SELECT sym, avg(x) AS a FROM corpus GROUP BY sym HAVING NOT (avg(x) > 100) "
         "ORDER BY sym",
     ]
+    # IS [NOT] NULL: the total test, which no value comparison can
+    # stand in for. The corpus's y column carries the nulls; ts, x and
+    # sym are NOT NULL, so their arms are the constant answers.
+    queries += [
+        "SELECT ts, y FROM corpus WHERE y IS NULL ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE y IS NOT NULL ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE NOT (y IS NULL) ORDER BY ts",
+        "SELECT ts, sym, x, y FROM corpus WHERE y IS NULL AND x > 100 ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE y IS NULL OR y > 140 ORDER BY ts",
+        "SELECT ts, x FROM corpus WHERE ts IS NOT NULL AND sym IS NOT NULL ORDER BY ts",
+        "SELECT ts, x FROM corpus WHERE x IS NULL ORDER BY ts",
+        "SELECT ts, CASE WHEN y IS NULL THEN 0 ELSE y END AS filled FROM corpus ORDER BY ts",
+        "SELECT sym, count(*) AS n FROM corpus WHERE y IS NULL GROUP BY sym ORDER BY sym",
+        "SELECT sym, count(*) AS n FROM corpus GROUP BY sym HAVING avg(y) IS NOT NULL "
+        "ORDER BY sym",
+    ]
     return queries
 
 

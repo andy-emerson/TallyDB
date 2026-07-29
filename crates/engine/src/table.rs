@@ -2364,6 +2364,61 @@ mod mutation_tests {
     }
 
     #[test]
+    fn is_null_selects_rows_for_mutation() {
+        // The predicate's other consumer: DELETE/UPDATE reach the same
+        // evaluator, and a wrong bitmap here destroys data rather than
+        // returning the wrong page. Nulls span segments (size 3).
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 3).unwrap();
+        for i in 0..10i64 {
+            let y = if i % 3 == 0 {
+                RowValue::Null
+            } else {
+                RowValue::F64(i as f64)
+            };
+            table
+                .append(&[RowValue::I64(i), RowValue::Key("A"), y])
+                .unwrap();
+        }
+        // ts 0, 3, 6, 9 are null.
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NULL ORDER BY ts")
+                .unwrap()
+                .num_rows(),
+            4
+        );
+        // UPDATE finds exactly those rows, and they stop being null.
+        // (0 is a value no other row carries — y is `i` elsewhere.)
+        assert_eq!(
+            table.mutate("UPDATE t SET y = 0 WHERE y IS NULL").unwrap(),
+            4
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NULL")
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NOT NULL")
+                .unwrap()
+                .num_rows(),
+            10
+        );
+        // DELETE takes the rows the UPDATE just wrote, and only those.
+        assert_eq!(table.mutate("DELETE FROM t WHERE y = 0").unwrap(), 4);
+        let survivors = table.query("SELECT ts FROM t ORDER BY ts").unwrap();
+        assert_eq!(survivors.num_rows(), 6);
+    }
+
+    #[test]
     fn update_is_tombstone_plus_reappend() {
         let mut table = small_table();
         let affected = table
