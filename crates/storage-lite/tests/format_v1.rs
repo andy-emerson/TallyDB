@@ -267,41 +267,60 @@ fn format_errors_are_specific() {
 }
 
 #[test]
-fn ordering_key_compresses_and_f64_does_not() {
-    // The writer policy in observable form: the ordered ordering key's
-    // varints undercut raw by a wide margin, while f64 stays raw
-    // byte-for-byte (the #30 interim ruling made visible).
+fn every_column_kind_compresses_under_the_writer_policy() {
+    // The writer policy in observable form, post-#42: the ordered
+    // ordering key's varints, ALP on the decimal f64, FOR+bit-packing
+    // on the symbol codes — the whole segment lands far below raw.
     let schema = Schema::new(vec![
         Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
         Field::new("x", ColumnType::F64, false),
     ]);
     let mut buffer = WriteBuffer::new(schema, 0).unwrap();
-    let rows = 10_000;
+    let rows = 10_000i64;
     for i in 0..rows {
         buffer
-            .append(&[RowValue::I64(1_000 * i), RowValue::F64(i as f64)])
+            .append(&[
+                RowValue::I64(1_000 * i),
+                RowValue::Key(["A", "B", "C", "D"][(i % 4) as usize]),
+                RowValue::F64(100.0 + (i % 700) as f64 * 0.01), // pennies
+            ])
             .unwrap();
     }
     let bytes = encode_segment(&buffer.freeze().unwrap());
-    // Raw would be ~16 bytes per row for the two columns; the encoded
-    // file must sit far below the i64-raw half and above the f64 half.
+    // Raw would be ~20 bytes per row (8 ts + 4 code + 8 x); the whole
+    // encoded segment must undercut the f64 column's raw bytes alone.
     let f64_raw = rows as usize * 8;
-    assert!(bytes.len() > f64_raw, "{}", bytes.len());
-    assert!(bytes.len() < f64_raw + rows as usize * 2, "{}", bytes.len());
+    assert!(bytes.len() < f64_raw, "{}", bytes.len());
 }
 
-/// The golden lock. `segment_v1.bin` is committed; these bytes freezing
-/// IS the format freezing.
+/// The golden lock, in two halves since the #42 codecs (the first
+/// deliberate encoder revision):
 ///
-/// If this test fails, the format changed: that is a behavioral change,
-/// not a refactor. Bless it deliberately — delete the file, rerun with
+/// `segment_v1.bin` is the **decode-compat** lock — bytes written by
+/// the pre-#42 encoder (uncompressed f64 and codes), committed forever.
+/// The append-only codec registry promises old files always decode;
+/// this is that promise, executable. The file is never re-blessed.
+#[test]
+fn v1_golden_bytes_still_decode() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+        .join("segment_v1.bin");
+    let golden = std::fs::read(&path).unwrap_or_else(|_| panic!("missing {path:?}"));
+    assert_segments_equal(&decode_segment(&golden).unwrap(), &fixture_segment());
+}
+
+/// `segment_v2.bin` locks the **current encoder's** bytes. If this test
+/// fails, the format changed: that is a behavioral change, not a
+/// refactor. Bless it deliberately — delete the file, rerun with
 /// `TALLYDB_BLESS_GOLDEN=1`, commit the new bytes, and say so in review.
 #[test]
 fn golden_bytes_are_locked() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("golden")
-        .join("segment_v1.bin");
+        .join("segment_v2.bin");
     let bytes = encode_segment(&fixture_segment());
     if !path.exists() && std::env::var_os("TALLYDB_BLESS_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

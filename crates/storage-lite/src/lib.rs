@@ -100,6 +100,7 @@
 //! type decisions — that's `engine`. No linear algebra/Lua — that's the compute
 //! crates.
 
+pub mod alp;
 pub mod codec;
 pub mod format;
 pub mod io;

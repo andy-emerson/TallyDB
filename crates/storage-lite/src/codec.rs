@@ -34,6 +34,13 @@ pub enum Codec {
     Uncompressed = 0,
     /// Delta-of-delta with zigzag + LEB128 varints, for `i64` columns.
     DeltaOfDeltaI64 = 1,
+    /// ALP with the RD and raw per-chunk fallbacks, for `f64` columns
+    /// (#42; see [`crate::alp`]).
+    AlpF64 = 2,
+    /// Frame-of-reference + bit-packing for non-clock `i64` columns.
+    ForI64 = 3,
+    /// Frame-of-reference + bit-packing for `u32` symbol codes.
+    ForU32 = 4,
 }
 
 impl Codec {
@@ -48,6 +55,9 @@ impl Codec {
         match tag {
             0 => Some(Codec::Uncompressed),
             1 => Some(Codec::DeltaOfDeltaI64),
+            2 => Some(Codec::AlpF64),
+            3 => Some(Codec::ForI64),
+            4 => Some(Codec::ForU32),
             _ => None,
         }
     }
@@ -62,6 +72,10 @@ pub enum CodecError {
     VarintTooLong,
     /// Bytes remained after the expected number of values.
     TrailingBytes { extra: usize },
+    /// A structural field holds an impossible value (a bit width over
+    /// the word, an exponent past the table, a mode byte outside the
+    /// registry) — data corruption, named.
+    Invalid(&'static str),
 }
 
 impl fmt::Display for CodecError {
@@ -72,6 +86,7 @@ impl fmt::Display for CodecError {
             CodecError::TrailingBytes { extra } => {
                 write!(f, "{extra} bytes remain after the last value")
             }
+            CodecError::Invalid(what) => write!(f, "invalid encoding: {what}"),
         }
     }
 }
@@ -186,9 +201,15 @@ mod tests {
     fn registry_is_frozen() {
         assert_eq!(Codec::Uncompressed.tag(), 0);
         assert_eq!(Codec::DeltaOfDeltaI64.tag(), 1);
+        assert_eq!(Codec::AlpF64.tag(), 2);
+        assert_eq!(Codec::ForI64.tag(), 3);
+        assert_eq!(Codec::ForU32.tag(), 4);
         assert_eq!(Codec::from_tag(0), Some(Codec::Uncompressed));
         assert_eq!(Codec::from_tag(1), Some(Codec::DeltaOfDeltaI64));
-        assert_eq!(Codec::from_tag(2), None);
+        assert_eq!(Codec::from_tag(2), Some(Codec::AlpF64));
+        assert_eq!(Codec::from_tag(3), Some(Codec::ForI64));
+        assert_eq!(Codec::from_tag(4), Some(Codec::ForU32));
+        assert_eq!(Codec::from_tag(5), None);
         assert_eq!(Codec::from_tag(255), None);
     }
 
