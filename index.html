@@ -9,11 +9,945 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=Newsreader:opsz,wght@6..72,400..600&amp;display=swap">
-<link rel="stylesheet" href="assets/site.css">
+<style>
+/* Organized in page order: tokens, base, shared patterns, then one block per
+   section of the markup below. */
+
+/* ── Design tokens ─────────────────────────────────────────────── */
+
+:root {
+  --paper: #f2e9dc;
+  --paper-2: #ebdfcd;
+  --card: #f8f2e8;
+  --line: #d9c9ae;
+  --ink: #2e2419;
+  --ink-2: #5c4b38;
+  --ink-3: #8a7757;
+  --accent: #8c4a1e;
+  --accent-soft: #e6d2b6;
+  --code-bg: #ece0c9;
+  --band: #2e2419;
+  --band-ink: #f2e9dc;
+}
+
+html[data-theme="dark"] {
+  --paper: #191512;
+  --paper-2: #211b16;
+  --card: #221c17;
+  --line: #3b322a;
+  --ink: #eee2cd;
+  --ink-2: #c3b295;
+  --ink-3: #8d7d64;
+  --accent: #d99a5b;
+  --accent-soft: #3a2e21;
+  --code-bg: #120f0d;
+  --band: #0f0d0b;
+  --band-ink: #eee2cd;
+}
+
+/* ── Base ──────────────────────────────────────────────────────── */
+
+* { box-sizing: border-box; }
+
+html {
+  background: var(--paper);
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-wrap: pretty;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover { color: var(--ink); }
+
+h1, h2, h3 {
+  font-family: Newsreader, Georgia, serif;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+
+code, pre { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+
+pre { min-width: 0; }
+
+::selection { background: color-mix(in oklab, var(--accent) 30%, transparent); }
+
+/* ── Shared patterns ───────────────────────────────────────────── */
+
+/* Centered column. Vertical padding belongs to the section that uses it. */
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-inline: clamp(16px, 3vw, 28px);
+}
+
+/* Responsive card grid. Callers set --min (column floor) and --gap. */
+.autogrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--min, 280px), 1fr));
+  gap: var(--gap, 20px);
+}
+
+.section { padding-block: clamp(56px, 7vw, 84px) 0; }
+.section--last { padding-block: clamp(56px, 7vw, 84px); }
+
+/* Section opener: heading plus lead paragraph, held to a readable measure. The
+   gap to the section body varies a little by section; see those blocks below. */
+.sec-head {
+  max-width: 62ch;
+  margin-bottom: 36px;
+}
+
+.sec-head h2 {
+  font-size: clamp(28px, 3.4vw, 38px);
+  line-height: 1.15;
+  margin-bottom: 12px;
+}
+
+.sec-head p {
+  margin: 0;
+  font-size: 17.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+/* Sub-opener: mono eyebrow, serif heading, one paragraph. */
+.sub-head {
+  max-width: 66ch;
+  margin-bottom: 24px;
+}
+
+.sub-head h3 {
+  font-size: clamp(22px, 2.4vw, 27px);
+  line-height: 1.2;
+  margin-bottom: 10px;
+}
+
+/* The eyebrow is also a <p> here, and carries its own type — exclude it rather
+   than relying on source order to break the specificity tie. */
+.sub-head p:not(.eyebrow) {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+.sub-head p code { font-size: 15px; }
+
+.eyebrow {
+  margin: 0 0 10px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* Running prose below a card grid. */
+.prose {
+  margin-top: 24px;
+  max-width: 74ch;
+  display: grid;
+  gap: 16px;
+}
+
+.prose p {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+.prose p.aside { color: var(--ink-3); }
+
+.rule {
+  height: 1px;
+  background: var(--line);
+  margin: clamp(40px, 5vw, 60px) 0;
+}
+
+/* The quill glyph, painted as a mask so it takes the current palette. The
+   image is named once and referenced by both properties. */
+.mark {
+  --quill: url("data:image/png;base64,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");
+  flex: none;
+  display: block;
+  background: var(--ink);
+  mask: var(--quill) center / contain no-repeat;
+  -webkit-mask: var(--quill) center / contain no-repeat;
+}
+
+.wordmark {
+  font-family: Newsreader, Georgia, serif;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.wordmark i {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.wordmark b {
+  font-weight: inherit;
+  color: var(--ink);
+}
+
+.btn {
+  display: inline-block;
+  font-weight: 500;
+  border-radius: 8px;
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.btn--outline {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
+}
+
+.btn--on-band {
+  border: 1px solid color-mix(in oklab, var(--band-ink) 30%, transparent);
+  color: var(--band-ink);
+}
+
+.btn--s { font-size: 14px; padding: 8px 14px; }
+.btn--m { font-size: 14px; padding: 9px 16px; }
+.btn--l { font-size: 15.5px; padding: 14px 24px; }
+.btn--l-narrow { font-size: 15.5px; padding: 14px 22px; }
+
+/* Spans inside <pre> blocks: de-emphasized comments, emphasized input. */
+.cmt { color: var(--ink-3); }
+.hi { color: var(--ink); }
+.acc { color: var(--accent); }
+
+/* ── Header ────────────────────────────────────────────────────── */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+
+.site-header .wrap {
+  padding-block: 10px;
+  min-height: 64px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 28px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink);
+  flex: none;
+}
+
+.brand .mark {
+  width: 28px;
+  height: 28px;
+}
+
+.brand .wordmark { font-size: 27px; }
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  font-size: 14.5px;
+  color: var(--ink-2);
+  flex: 1 1 200px;
+}
+
+.site-nav a { color: inherit; }
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  flex: 0 1 auto;
+  margin-left: auto;
+}
+
+.theme-toggle {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+  font: 500 13px/1 "IBM Plex Mono", monospace;
+}
+
+.theme-toggle:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+/* ── Hero ──────────────────────────────────────────────────────── */
+
+.hero {
+  --min: 340px;
+  --gap: 48px;
+  padding-block: clamp(48px, 7vw, 88px) 64px;
+  align-items: center;
+}
+
+.hero-brand {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 2vw, 22px);
+  margin-bottom: 22px;
+}
+
+.hero-brand .mark {
+  width: clamp(52px, 7vw, 76px);
+  height: clamp(52px, 7vw, 76px);
+}
+
+.hero-brand .wordmark {
+  font-size: clamp(46px, 7vw, 82px);
+  letter-spacing: -0.03em;
+}
+
+.pill {
+  margin: 0 0 18px;
+  display: inline-block;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 7px 11px;
+  border-radius: 999px;
+}
+
+.hero h1 {
+  font-size: clamp(36px, 5.2vw, 60px);
+  line-height: 1.04;
+  margin-bottom: 20px;
+}
+
+.hero-lead {
+  font-size: 19.5px;
+  line-height: 1.55;
+  color: var(--ink-2);
+  margin: 0 0 16px;
+  max-width: 48ch;
+}
+
+.hero-sub {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-3);
+  margin: 0 0 30px;
+  max-width: 52ch;
+}
+
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 26px;
+}
+
+.install-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 12px 12px 16px;
+  max-width: 460px;
+}
+
+.install-line__prompt {
+  color: var(--ink-3);
+  font: 400 14px/1 "IBM Plex Mono", monospace;
+}
+
+.install-line code {
+  flex: 1;
+  font-size: 14px;
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.copy-btn {
+  flex: none;
+  font: 500 11px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.copy-btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+/* Hero terminal transcript. */
+.term {
+  min-width: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 18px 40px -28px rgba(46, 36, 25, 0.5);
+}
+
+.term__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  font: 400 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.term__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: block;
+}
+
+.term pre {
+  margin: 0;
+  padding: 22px 20px;
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--ink-2);
+  overflow-x: auto;
+}
+
+/* ── Stat band ─────────────────────────────────────────────────── */
+
+.statband {
+  background: var(--band);
+  color: var(--band-ink);
+}
+
+.statband .wrap {
+  --min: 200px;
+  --gap: 32px;
+  padding-block: 40px;
+}
+
+.stat__n {
+  margin: 0 0 6px;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 34px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.stat__what {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  opacity: 0.82;
+}
+
+/* ── Benchmarks ────────────────────────────────────────────────── */
+
+.panel {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: clamp(20px, 3vw, 34px);
+}
+
+.panel__axis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  align-items: center;
+  margin-bottom: 24px;
+  font: 400 12.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.bars {
+  display: grid;
+  gap: 26px;
+}
+
+.bar__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.bar__label {
+  font-size: 15.5px;
+  color: var(--ink);
+}
+
+.bar__tag {
+  font: 500 14px/1 "IBM Plex Mono", monospace;
+  color: var(--accent);
+}
+
+.bar__rows {
+  display: grid;
+  gap: 7px;
+}
+
+.bar__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.bar__who {
+  flex: 0 1 auto;
+  min-width: 62px;
+  width: clamp(62px, 14vw, 132px);
+  font: 500 12px/1 "IBM Plex Mono", monospace;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.bar__track {
+  flex: 1 1 auto;
+  min-width: 100px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--paper-2);
+}
+
+/* Width is per-measurement data and is set inline on the element. */
+.bar__fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+}
+
+.bar__pace {
+  flex: 0 1 auto;
+  min-width: 66px;
+  width: clamp(66px, 12vw, 116px);
+  text-align: right;
+  font: 500 13px/1 "IBM Plex Mono", monospace;
+  color: var(--ink);
+}
+
+.bar__row--peer .bar__who { color: var(--ink-3); }
+
+.bar__row--peer .bar__fill {
+  background: var(--ink-3);
+  opacity: 0.45;
+}
+
+.bar__row--peer .bar__pace {
+  font-weight: 400;
+  color: var(--ink-3);
+}
+
+.panel__foot {
+  --min: 260px;
+  --gap: 24px;
+  margin-top: 28px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+
+.panel__foot h3 {
+  font-size: 17px;
+  margin-bottom: 7px;
+}
+
+.panel__foot p {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+}
+
+/* ── The three assumptions ─────────────────────────────────────── */
+
+.principles {
+  --min: 280px;
+  --gap: 20px;
+}
+
+.principle {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 26px 24px;
+}
+
+.principle__num {
+  margin: 0 0 12px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+
+.principle h3 {
+  font-size: 21px;
+  margin-bottom: 9px;
+}
+
+/* Excludes the number, which is also a <p>. */
+.principle p:not(.principle__num) {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--ink-2);
+}
+
+.principle code { font-size: 13.5px; }
+
+/* ── Comparison table ─────────────────────────────────────────── */
+
+.tablewrap {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+.ctable {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.ctable thead tr { background: var(--paper-2); }
+
+.ctable th,
+.ctable td {
+  padding: 15px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.ctable th { text-align: left; }
+
+.ctable th.ctable__dim {
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.ctable th.ctable__ours {
+  font-family: Newsreader, Georgia, serif;
+  font-size: 17px;
+  color: var(--accent);
+}
+
+.ctable th.ctable__peer {
+  font: 500 13px/1 "IBM Plex Sans", sans-serif;
+  color: var(--ink-2);
+}
+
+.ctable td { color: var(--ink-2); }
+
+.ctable td.ctable__ours {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* ── Fit / misfit cards ───────────────────────────────────────── */
+
+.fits {
+  --min: 300px;
+  --gap: 20px;
+  margin-top: 24px;
+}
+
+.fit {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  background: var(--card);
+}
+
+.fit--alt { background: var(--paper-2); }
+
+.fit h3 {
+  font-size: 19px;
+  margin-bottom: 9px;
+}
+
+.fit p {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--ink-2);
+}
+
+/* ── Install cards ────────────────────────────────────────────── */
+
+#install .sec-head { margin-bottom: 40px; }
+
+.icards {
+  --min: 320px;
+  --gap: 20px;
+}
+
+.icard {
+  min-width: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.icard__head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.icard__head h3 {
+  font-size: 19px;
+  margin-bottom: 4px;
+}
+
+.icard__head p {
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-3);
+}
+
+.icard pre {
+  margin: 0;
+  padding: 20px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink);
+  background: var(--code-bg);
+  overflow-x: auto;
+}
+
+/* ── Docs tabs ────────────────────────────────────────────────── */
+
+#docs .sec-head { margin-bottom: 32px; }
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.tab {
+  font-size: 14.5px;
+  font-weight: 500;
+  padding: 10px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.tabpanel {
+  --min: 320px;
+  --gap: 24px;
+  align-items: start;
+}
+
+/* Beats .autogrid's display:grid, which would otherwise defeat [hidden]. */
+.tabpanel[hidden] { display: none; }
+
+/* The prose half of a tab. Kept a class of its own so these rules cannot reach
+   into the code sample beside it, whose label is also a <p>. */
+.tab-prose h3 {
+  font-size: 23px;
+  margin-bottom: 10px;
+}
+
+.tab-prose p {
+  margin: 0 0 14px;
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+.tab-prose p.aside {
+  margin: 0;
+  font-size: 15px;
+  color: var(--ink-3);
+}
+
+.tab-prose code { font-size: 14px; }
+
+/* Labelled code sample beside each tab's prose. */
+.snippet {
+  min-width: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.snippet__label {
+  margin: 0;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.snippet pre {
+  margin: 0;
+  padding: 22px 20px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--ink);
+  overflow-x: auto;
+}
+
+/* ── Closing call to action ───────────────────────────────────── */
+
+.cta {
+  --min: 280px;
+  --gap: 36px;
+  background: var(--band);
+  color: var(--band-ink);
+  border-radius: 14px;
+  padding: clamp(32px, 5vw, 56px);
+  align-items: center;
+}
+
+.cta h2 {
+  font-size: clamp(26px, 3.2vw, 34px);
+  line-height: 1.15;
+  margin-bottom: 12px;
+}
+
+.cta p {
+  margin: 0;
+  font-size: 16.5px;
+  line-height: 1.6;
+  opacity: 0.82;
+}
+
+.cta__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Stretched to the column's full width, so the label needs centering. */
+.cta__actions .btn { text-align: center; }
+
+/* ── Footer ───────────────────────────────────────────────────── */
+
+.site-footer {
+  border-top: 1px solid var(--line);
+  background: var(--paper-2);
+}
+
+.site-footer > .wrap {
+  --min: 180px;
+  --gap: 32px;
+  padding-block: 44px;
+}
+
+.footer-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.footer-brand .mark {
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+}
+
+.footer-brand .wordmark { font-size: 25px; }
+
+.footer-tag {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+
+.footer-label {
+  margin: 0 0 12px;
+  font: 500 11.5px/1 "IBM Plex Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.footer-links {
+  display: grid;
+  gap: 9px;
+  font-size: 14.5px;
+}
+
+.footer-links a { color: var(--ink-2); }
+
+.legal { border-top: 1px solid var(--line); }
+
+.legal .wrap {
+  padding-block: 18px;
+  font-size: 13.5px;
+  color: var(--ink-3);
+}
+</style>
 
 <script>
   /* Set the palette before first paint so the page never flashes the wrong
-     one. The toggle in assets/site.js takes over from here. */
+     one. The toggle at the end of the body takes over from here. */
   (function () {
     var theme;
     try { theme = localStorage.getItem("tallydb-theme"); } catch (e) {}
@@ -583,6 +1517,69 @@ log(("wrote %d rows"):format(#sig))</pre>
   </div>
 </footer>
 
-<script src="assets/site.js" defer></script>
+<script>
+/* The three interactive pieces of the page: the sepia light/dark toggle, the
+   copy button on the install line, and the docs tab strip. The theme itself is
+   applied by the script in <head>, before first paint, so the page never
+   flashes the wrong palette; this only handles clicks. */
+
+(function () {
+  "use strict";
+
+  var root = document.documentElement;
+
+  /* ── Theme toggle ───────────────────────────────────────────── */
+
+  var toggle = document.querySelector(".theme-toggle");
+
+  function applyTheme(theme) {
+    root.setAttribute("data-theme", theme);
+    toggle.textContent = theme === "dark" ? "☀" : "☾";
+    try {
+      localStorage.setItem("tallydb-theme", theme);
+    } catch (e) {
+      /* Private browsing, or storage disabled: the toggle still works. */
+    }
+  }
+
+  applyTheme(root.getAttribute("data-theme") === "dark" ? "dark" : "light");
+
+  toggle.addEventListener("click", function () {
+    applyTheme(root.getAttribute("data-theme") === "dark" ? "light" : "dark");
+  });
+
+  /* ── Copy the install command ───────────────────────────────── */
+
+  var copy = document.querySelector(".copy-btn");
+
+  copy.addEventListener("click", function () {
+    var text = document.getElementById(copy.getAttribute("aria-controls"));
+    try {
+      navigator.clipboard.writeText(text.textContent);
+    } catch (e) {
+      /* No clipboard permission: fall through to the label change anyway. */
+    }
+    copy.textContent = "Copied";
+    setTimeout(function () {
+      copy.textContent = "Copy";
+    }, 1600);
+  });
+
+  /* ── Docs tabs ──────────────────────────────────────────────── */
+
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      tabs.forEach(function (other) {
+        var selected = other === tab;
+        other.setAttribute("aria-selected", selected ? "true" : "false");
+        document.getElementById(other.getAttribute("aria-controls")).hidden =
+          !selected;
+      });
+    });
+  });
+})();
+</script>
 </body>
 </html>
