@@ -514,7 +514,41 @@ fn execute_single(
     // Views with no live rows contribute nothing; dropping them up front
     // means "one batch per segment" below never emits an empty batch.
     let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
+    // Standard SQL orders by columns the query does not project:
+    // `SELECT x FROM t ORDER BY ts`. The sort resolves against the
+    // output schema, so such a column is carried as a hidden last item
+    // — projected, sorted by, dropped — the same trick HAVING's hidden
+    // columns use. Only for row-per-row projections: under DISTINCT
+    // the hidden column would leak into what "distinct" means, and
+    // under GROUP BY an ungrouped column has no per-row value — both
+    // shapes keep today's refusal, as standard SQL refuses them.
+    let hidden_order = match (&plan.projection, plan.distinct, &plan.order_by) {
+        (Projection::Items(items), false, Some(order_by)) => !items.iter().any(|item| {
+            let output_name = match item {
+                PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
+                PlanItem::Computed { name, .. } => name,
+                PlanItem::WindowAgg {
+                    function, alias, ..
+                } => alias.as_deref().unwrap_or(function),
+            };
+            output_name == order_by.column
+        }),
+        _ => false,
+    };
     let mut output = match &plan.projection {
+        Projection::Items(items) if hidden_order => {
+            let mut extended = items.clone();
+            extended.push(PlanItem::Column {
+                name: plan
+                    .order_by
+                    .as_ref()
+                    .expect("checked above")
+                    .column
+                    .clone(),
+                alias: None,
+            });
+            project_items(schema, &views, &extended, registry)?
+        }
         Projection::Items(items) => project_items(schema, &views, items, registry)?,
         Projection::Aggregate {
             keys,
@@ -542,6 +576,17 @@ fn execute_single(
     }
     if plan.limit.is_some() || plan.offset.is_some() {
         output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
+    }
+    if hidden_order {
+        // The carried sort column was never part of the answer.
+        let visible = output.schema.fields().len() - 1;
+        let schema = Schema::new(output.schema.fields()[..visible].to_vec());
+        let batches = output
+            .batches
+            .iter()
+            .map(|batch| RecordBatch::new(schema.clone(), batch.columns()[..visible].to_vec()))
+            .collect();
+        output = QueryOutput { schema, batches };
     }
     Ok(output)
 }
@@ -2633,6 +2678,47 @@ mod tests {
                 assert_eq!(window, expected, "{order} LIMIT {limit} OFFSET {offset}");
             }
         }
+    }
+
+    #[test]
+    fn order_by_a_column_the_query_does_not_project() {
+        // Standard SQL: the sort key need not be in the SELECT list.
+        // It is carried as a hidden column and dropped, so the output
+        // schema is exactly what the query asked for.
+        let views = segmented(
+            &[
+                (3, "A", 30.0),
+                (1, "B", 10.0),
+                (2, "A", 20.0),
+                (4, "B", 40.0),
+            ],
+            2,
+        );
+        let output = run(&views, "SELECT x FROM t ORDER BY ts").unwrap();
+        assert_eq!(output.schema.fields().len(), 1);
+        assert_eq!(output.schema.fields()[0].name(), "x");
+        assert_eq!(
+            flatten(&output, 0),
+            [Some(10.0), Some(20.0), Some(30.0), Some(40.0)]
+        );
+        // Riding top-k: the bound applies to the hidden sort too.
+        let output = run(&views, "SELECT x FROM t ORDER BY ts DESC LIMIT 2").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(40.0), Some(30.0)]);
+        // A computed projection ordered by a stored column it ignores.
+        let output = run(&views, "SELECT x * 2 AS d FROM t ORDER BY ts LIMIT 1").unwrap();
+        assert_eq!(output.schema.fields()[0].name(), "d");
+        assert_eq!(flatten(&output, 0), [Some(20.0)]);
+        // An alias that shadows the stored name refers to the OUTPUT
+        // column, standard SQL's precedence — no hidden column then.
+        let output = run(&views, "SELECT x AS ts FROM t ORDER BY ts LIMIT 1").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(10.0)]); // smallest x, not ts
+                                                       // The symbol refusal still holds when the column is hidden.
+        let error = run(&views, "SELECT x FROM t ORDER BY sym")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unordered labels"), "{error}");
+        // And a name that exists nowhere is still unknown.
+        assert!(run(&views, "SELECT x FROM t ORDER BY nope").is_err());
     }
 
     #[test]

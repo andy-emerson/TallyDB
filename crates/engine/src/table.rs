@@ -2571,6 +2571,38 @@ mod mutation_tests {
     }
 
     #[test]
+    fn set_accepts_a_negative_literal_like_where_does() {
+        // A negative number parses as unary minus over a literal; WHERE
+        // unwrapped it, SET did not — so a value could be filtered on
+        // but not assigned. Both sides now accept the same spellings.
+        let mut table = small_table();
+        assert_eq!(
+            table.mutate("UPDATE t SET y = -1.5 WHERE ts = 2").unwrap(),
+            1
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y = -1.5")
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        // Exact through the integer path too: -3 into an f64 column.
+        assert_eq!(table.mutate("UPDATE t SET y = -3 WHERE ts = 4").unwrap(), 1);
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y = -3")
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        // A minus that is not a number stays refused.
+        assert!(table
+            .mutate("UPDATE t SET sym = -'A' WHERE ts = 0")
+            .is_err());
+    }
+
+    #[test]
     fn update_is_tombstone_plus_reappend() {
         let mut table = small_table();
         let affected = table

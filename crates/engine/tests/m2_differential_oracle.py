@@ -109,12 +109,22 @@ def families() -> list[str]:
     """Query families with a deterministic total order (unique ts, or a
     grouped key). Grows with the SQL surface."""
     queries = []
-    # Passthrough with ordering and paging.
+    # Passthrough with ordering and paging — including ORDER BY on a
+    # column the query does not project (standard SQL: carried hidden,
+    # sorted by, dropped), alone and under LIMIT/OFFSET, and where an
+    # alias shadows the stored name (the alias wins, per standard
+    # output-name precedence).
     queries += [
         "SELECT ts, sym, x, y FROM corpus ORDER BY ts",
         "SELECT ts, x FROM corpus ORDER BY ts DESC LIMIT 100",
         "SELECT ts, x FROM corpus ORDER BY x LIMIT 50 OFFSET 25",
         "SELECT ts, y FROM corpus ORDER BY y DESC LIMIT 40",
+        "SELECT sym, x FROM corpus ORDER BY ts",
+        "SELECT x FROM corpus ORDER BY ts DESC LIMIT 60",
+        "SELECT ts FROM corpus ORDER BY x LIMIT 30 OFFSET 10",
+        "SELECT x * 2 AS d FROM corpus ORDER BY ts LIMIT 25",
+        "SELECT ts, x AS y FROM corpus ORDER BY y LIMIT 35",
+        "SELECT ts, x FROM corpus WHERE sym = 'K003' ORDER BY y DESC LIMIT 20",
     ]
     # WHERE: numeric boundaries, key membership, boolean structure.
     for predicate in [

@@ -1148,17 +1148,34 @@ fn lower_assignment(assignment: &ast::Assignment) -> Result<Assignment, QueryErr
         ));
     };
     let column = object_name(name)?;
-    let ast::Expr::Value(value) = &assignment.value else {
+    // A negative number parses as unary minus over a literal — the same
+    // unwrap the WHERE grammar does, so `SET x = -1` and `WHERE x = -1`
+    // accept exactly the same spellings.
+    let (negated, rhs) = match &assignment.value {
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        other => (false, other),
+    };
+    let ast::Expr::Value(value) = rhs else {
         return Err(QueryError::Unsupported(format!(
             "SET {column} = '{}' — literals only for now",
             assignment.value
         )));
     };
-    let value = match &value.value {
-        ast::Value::Number(text, _) => SetValue::Number(parse_number(text)?),
-        ast::Value::SingleQuotedString(text) => SetValue::String(text.clone()),
-        ast::Value::Null => SetValue::Null,
-        other => {
+    let value = match (&value.value, negated) {
+        (ast::Value::Number(text, _), negated) => {
+            let number = match (parse_number(text)?, negated) {
+                (number, false) => number,
+                (Number::Int(value), true) => Number::Int(-value),
+                (Number::Float(value), true) => Number::Float(-value),
+            };
+            SetValue::Number(number)
+        }
+        (ast::Value::SingleQuotedString(text), false) => SetValue::String(text.clone()),
+        (ast::Value::Null, false) => SetValue::Null,
+        (other, _) => {
             return Err(QueryError::Unsupported(format!(
                 "SET {column} = {other} — numbers, strings, and NULL only"
             )))

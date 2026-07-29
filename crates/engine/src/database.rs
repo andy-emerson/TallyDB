@@ -455,6 +455,26 @@ mod join_tests {
     }
 
     #[test]
+    fn hidden_order_by_reaches_a_dimension_column_through_the_pushdown() {
+        // ORDER BY on an unprojected dimension attribute: the used-set
+        // walker must count the sort column, or the pushdown would
+        // drop exactly the column the hidden sort then needs.
+        let db = database();
+        let output = db
+            .query(
+                "SELECT ts FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY weight DESC LIMIT 2",
+            )
+            .unwrap();
+        assert_eq!(output.schema.fields().len(), 1);
+        let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {
+            panic!("ts type")
+        };
+        // weight 2.5 is B: fact rows ts 1 and 4, in input order.
+        assert_eq!(ts.values().as_slice(), &[1, 4]);
+    }
+
+    #[test]
     fn join_against_empty_dimension_does_not_panic() {
         // B2 regression: an empty dimension has no views to sniff a column
         // type from. The gather must take each column's type from the
