@@ -88,8 +88,10 @@ fn a_bounded_order_by_pays_for_k_not_for_n() {
         sorted.saturating_sub(plain)
     };
 
-    // An f64 sort key. The full sort holds an entry per row and then
-    // materializes a sorted copy of the whole result; ten rows hold ten.
+    // The full sort holds an entry per row and then materializes a
+    // sorted copy of the whole result; ten rows hold ten. (Only
+    // numbers can be sorted by — symbol columns are unordered labels,
+    // #58 — so an f64 key is the shape to measure.)
     let unbounded = sort_cost(
         "SELECT ts, x FROM t ORDER BY x",
         "SELECT ts, x FROM t LIMIT 10",
@@ -105,25 +107,6 @@ fn a_bounded_order_by_pays_for_k_not_for_n() {
     assert!(
         bounded < 8_192,
         "a ten-row answer's sort allocated {bounded} bytes"
-    );
-
-    // A key column: the sort's cell is an owned string, so the full
-    // sort interns one per row. Same shape, larger constant.
-    let keys_unbounded = sort_cost(
-        "SELECT ts, sym FROM t ORDER BY sym",
-        "SELECT ts, sym FROM t LIMIT 10",
-    );
-    let keys_bounded = sort_cost(
-        "SELECT ts, sym FROM t ORDER BY sym LIMIT 10",
-        "SELECT ts, sym FROM t LIMIT 10",
-    );
-    assert!(
-        keys_unbounded > 4_000_000,
-        "sorting a key column should cost megabytes, measured {keys_unbounded}"
-    );
-    assert!(
-        keys_bounded < 8_192,
-        "a ten-row answer's key sort allocated {keys_bounded} bytes"
     );
 
     // k is what moves it, and n is not: a thousand rows costs more than

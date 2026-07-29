@@ -1918,12 +1918,13 @@ fn assemble_aggregate<'a>(
     }
 }
 
-/// A sortable view of one output cell.
-#[derive(Clone, PartialEq, PartialOrd)]
+/// A sortable view of one output cell. Numbers only: symbol columns
+/// are unordered labels (#58, ruled 2026-07-29), so nothing else can
+/// reach the sort.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum SortCell {
     I64(i64),
     F64(f64),
-    Text(String),
 }
 
 /// One row's place in the sort: its key cell, where the row lives, and
@@ -1945,12 +1946,27 @@ type SortEntry = (Option<SortCell>, (usize, usize), usize);
 /// million-row sort. Both paths return the same rows in the same
 /// order; the tie-breaking position is what makes that exact rather
 /// than merely equivalent.
+///
+/// A symbol column is refused (#58 = B, ruled 2026-07-29): its codes
+/// are per-segment first-appearance ranks, so they carry no order to
+/// sort by, and the alternative — ranking the labels as text — asks an
+/// engine that refuses to *produce* a string to rank strings, in a byte
+/// order that is only "alphabetical" for ASCII. Identities are not
+/// ordered; the arithmetic refusal and this one are the same rule.
 fn sort_output(
     output: QueryOutput,
     order_by: &OrderBy,
     keep: Option<usize>,
 ) -> Result<QueryOutput, QueryError> {
-    let (column_index, _) = resolve(&output.schema, &order_by.column)?;
+    let (column_index, field) = resolve(&output.schema, &order_by.column)?;
+    if field.column_type() == ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "ORDER BY '{}': symbol columns are unordered labels, not ordered text \
+             — group or filter by them, and order by a number (their codes are \
+             per-segment, so they rank nothing)",
+            order_by.column
+        )));
+    }
     let cell = |batch: &RecordBatch, row: usize| -> Option<SortCell> {
         match &batch.columns()[column_index] {
             Column::Numeric(NumericData::F64(numeric)) => numeric
@@ -1959,9 +1975,7 @@ fn sort_output(
             Column::Numeric(NumericData::I64(numeric)) => numeric
                 .is_valid(row)
                 .then(|| SortCell::I64(numeric.values().as_slice()[row])),
-            Column::Key(keys) => keys
-                .value_at(row)
-                .map(|value| SortCell::Text(value.to_owned())),
+            Column::Key(_) => unreachable!("symbol columns are refused above"),
         }
     };
     // Nulls last in both directions unless the query says otherwise
@@ -2588,12 +2602,7 @@ mod tests {
                 })
                 .collect()
         };
-        for order in [
-            "ORDER BY x",
-            "ORDER BY x DESC",
-            "ORDER BY sym",
-            "ORDER BY ts DESC",
-        ] {
+        for order in ["ORDER BY x", "ORDER BY x DESC", "ORDER BY ts DESC"] {
             let full = ts_of(&run(&views, &format!("SELECT ts, sym, x FROM t {order}")).unwrap());
             for k in [0usize, 1, 3, 9, 39, 40, 100] {
                 let bounded = ts_of(
@@ -2624,6 +2633,32 @@ mod tests {
                 assert_eq!(window, expected, "{order} LIMIT {limit} OFFSET {offset}");
             }
         }
+    }
+
+    #[test]
+    fn symbol_columns_cannot_be_ordered_by() {
+        // #58 = B: labels are identities, and identities have no order
+        // — not through their codes (per-segment first-appearance
+        // ranks) and not through their text (an engine that refuses to
+        // produce a string does not rank strings).
+        let views = segmented(&[(1, "C", 1.0), (2, "A", 2.0), (3, "B", 3.0)], 2);
+        for sql in [
+            "SELECT sym, x FROM t ORDER BY sym",
+            "SELECT sym, x FROM t ORDER BY sym DESC",
+            "SELECT sym, x FROM t ORDER BY sym LIMIT 1",
+            // Through an alias, and through a grouped projection —
+            // wherever the output column is a symbol.
+            "SELECT sym AS label, x FROM t ORDER BY label",
+            "SELECT sym, count(*) AS n FROM t GROUP BY sym ORDER BY sym",
+        ] {
+            let error = run(&views, sql).unwrap_err().to_string();
+            assert!(error.contains("unordered labels"), "{sql}: {error}");
+        }
+        // The rest of the surface is untouched: group by them, filter
+        // by them, order by a number.
+        assert!(run(&views, "SELECT sym, x FROM t ORDER BY x").is_ok());
+        assert!(run(&views, "SELECT sym, count(*) AS n FROM t GROUP BY sym").is_ok());
+        assert!(run(&views, "SELECT ts FROM t WHERE sym = 'A'").is_ok());
     }
 
     #[test]
@@ -2876,7 +2911,7 @@ mod query1_tests {
             let output = run(
                 &views,
                 "SELECT sym, count(*) AS n, sum(x) AS total, avg(x) AS mean_x, \
-                 min(x) AS low, max(x) AS high FROM t GROUP BY sym ORDER BY sym",
+                 min(x) AS low, max(x) AS high FROM t GROUP BY sym",
             )
             .unwrap();
             assert_eq!(output.batches.len(), 1);
@@ -2884,16 +2919,24 @@ mod query1_tests {
             let Column::Key(sym) = &batch.columns()[0] else {
                 panic!("sym type")
             };
-            assert_eq!(sym.value_at(0), Some("A"));
-            assert_eq!(sym.value_at(1), Some("B"));
+            // Group order is arbitrary — a symbol column cannot be
+            // ordered by (#58) — so the groups are read by label. Here
+            // first appearance happens to be A then B.
+            let labels: Vec<&str> = (0..batch.num_rows())
+                .map(|row| sym.value_at(row).expect("no null group"))
+                .collect();
+            let a = labels.iter().position(|&label| label == "A").expect("A");
+            let b = labels.iter().position(|&label| label == "B").expect("B");
             let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
                 panic!("count type")
             };
-            assert_eq!(n.values().as_slice(), &[3, 2]);
-            assert_eq!(f64_column(batch, 2).values().as_slice(), &[9.0, 30.0]);
-            assert_eq!(f64_column(batch, 3).values().as_slice(), &[3.0, 15.0]);
-            assert_eq!(f64_column(batch, 4).values().as_slice(), &[1.0, 10.0]);
-            assert_eq!(f64_column(batch, 5).values().as_slice(), &[6.0, 20.0]);
+            assert_eq!([n.values().as_slice()[a], n.values().as_slice()[b]], [3, 2]);
+            let column =
+                |index: usize, row: usize| f64_column(batch, index).values().as_slice()[row];
+            assert_eq!([column(2, a), column(2, b)], [9.0, 30.0]);
+            assert_eq!([column(3, a), column(3, b)], [3.0, 15.0]);
+            assert_eq!([column(4, a), column(4, b)], [1.0, 10.0]);
+            assert_eq!([column(5, a), column(5, b)], [6.0, 20.0]);
         }
     }
 
@@ -2998,13 +3041,12 @@ mod query1_tests {
             assert_eq!(flatten(&output, 1), [Some(5.0), Some(4.0)]);
             let output = run(&views, "SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1").unwrap();
             assert_eq!(flatten(&output, 0), [Some(2.0), Some(3.0)]);
-            // Keys sort by rendered value, not by dictionary code.
-            let output = run(&views, "SELECT sym, x FROM t ORDER BY sym").unwrap();
-            let Column::Key(sym) = &output.batches[0].columns()[0] else {
-                panic!("sym type")
-            };
-            let values: Vec<&str> = (0..5).map(|row| sym.value_at(row).unwrap()).collect();
-            assert_eq!(values, ["A", "A", "B", "B", "C"]);
+            // Symbols are unordered labels: ORDER BY refuses them
+            // rather than ranking codes or rendering text (#58).
+            let error = run(&views, "SELECT sym, x FROM t ORDER BY sym")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unordered labels"), "{error}");
             // LIMIT without ORDER BY keeps ingest order.
             let output = run(&views, "SELECT ts FROM t LIMIT 3").unwrap();
             let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {

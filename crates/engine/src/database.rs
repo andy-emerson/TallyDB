@@ -520,24 +520,35 @@ mod join_tests {
         let db = database();
         // WHERE on a dimension attribute, GROUP BY it, aggregate a fact
         // column — the star-schema query shape.
+        // Groups come back in no particular order — a symbol column
+        // cannot be ordered by (#58) — so they are read by label.
         let output = db
             .query(
                 "SELECT sector, count(*) AS n, sum(x) AS s FROM trades \
                  JOIN symbols ON trades.sym = symbols.sym \
-                 WHERE weight > 1 GROUP BY sector ORDER BY sector",
+                 WHERE weight > 1 GROUP BY sector",
             )
             .unwrap();
         let batch = &output.batches[0];
         let Column::Key(sector) = &batch.columns()[0] else {
             panic!("sector type")
         };
-        assert_eq!(sector.value_at(0), Some("energy")); // A: ts 0, 5
-        assert_eq!(sector.value_at(1), Some("tech")); // B only (weight 2.5): ts 1, 4
         let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
             panic!("count type")
         };
-        assert_eq!(n.values().as_slice(), &[2, 2]);
-        assert_eq!(f64s(&output, 2), [Some(5.0), Some(5.0)]);
+        let sums = f64s(&output, 2);
+        let mut groups: Vec<(&str, i64, Option<f64>)> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    sector.value_at(row).expect("no null sector"),
+                    n.values().as_slice()[row],
+                    sums[row],
+                )
+            })
+            .collect();
+        groups.sort_by_key(|group| group.0);
+        // energy is A (ts 0, 5); tech is B only, weight 2.5 (ts 1, 4).
+        assert_eq!(groups, [("energy", 2, Some(5.0)), ("tech", 2, Some(5.0))]);
         // Windows run over the joined intermediate too.
         let output = db
             .query(
