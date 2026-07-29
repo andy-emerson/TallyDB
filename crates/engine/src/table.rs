@@ -390,13 +390,17 @@ impl Table {
 
     /// The table's ingest-sequence watermark: the sequence the next
     /// appended row will receive. Every knowledge coordinate the table
-    /// holds is `<=` it, so **`ASOF next_sequence()` reads the latest
-    /// state** whatever the table's mutation history. Record it before
-    /// a correction to keep a queryable before/after boundary.
+    /// holds is `<` it, so **`ASOF next_sequence() - 1` reads the
+    /// latest state** whatever the table's mutation history — and keeps
+    /// reading it, because the coordinate has been spent and no later
+    /// arrival can join it. `ASOF next_sequence()` reads the same state
+    /// today but addresses a coordinate that is still unspent, so its
+    /// answer moves with the next append. Prefer the spent one; record
+    /// it before a correction to keep a queryable before/after boundary.
     ///
-    /// Not `next_sequence() - 1`: a `DELETE` stamps its kill at the
-    /// watermark without consuming it, so that cut still shows the
-    /// deleted rows (`Store::next_sequence` has the full note).
+    /// Zero rows means zero spent coordinates: there is nothing below
+    /// the watermark to cut at, and every `AS OF` reads an empty table
+    /// anyway.
     pub fn next_sequence(&self) -> u64 {
         self.store.next_sequence()
     }
@@ -1724,10 +1728,12 @@ mod tests {
     }
 
     /// `ASOF next_sequence()` is the latest state in every mutation
-    /// shape. The tempting off-by-one — `next_sequence() - 1` — held
-    /// for appends and `UPDATE` but not for `DELETE`, which stamps its
-    /// kill at the watermark without consuming it; the docs claimed the
-    /// wrong one until this test was written.
+    /// shape — and, since a `DELETE` consumes its coordinate (ruled
+    /// 2026-07-29), so is `ASOF next_sequence() - 1`. The second form
+    /// is the one worth having: it names a coordinate that has actually
+    /// been spent, so the cut keeps its meaning as ingest continues,
+    /// while the watermark is a moving address. Before the ruling this
+    /// test existed to record that `- 1` was *wrong* after a delete.
     #[test]
     fn as_of_at_the_watermark_is_the_latest_state_after_any_mutation() {
         let build = || {
@@ -1776,6 +1782,30 @@ mod tests {
             assert_eq!(
                 at_watermark, latest,
                 "{label}: ASOF next_sequence() must read the latest state"
+            );
+            // Every mutation now consumes a coordinate, so the last
+            // spent one is the latest state too — the stable idiom.
+            let at_last_spent = table
+                .query(&format!("SELECT ts FROM t ASOF {}", watermark - 1))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                at_last_spent, latest,
+                "{label}: ASOF next_sequence() - 1 must read the latest state"
+            );
+            // And it stays that answer: a later arrival is born above
+            // the cut, which is exactly what the watermark cannot
+            // promise (it addresses the arrival too).
+            table
+                .append(&[RowValue::I64(99), RowValue::F64(99.0)])
+                .unwrap();
+            let after_arrival = table
+                .query(&format!("SELECT ts FROM t ASOF {}", watermark - 1))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                after_arrival, latest,
+                "{label}: a spent coordinate's answer must not drift"
             );
         }
     }
