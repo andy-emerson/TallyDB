@@ -9,7 +9,7 @@
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
 //! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
 //! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
-//! CREATE TABLE t (col BIGINT|DOUBLE|KEY [NOT NULL|ORDERING KEY], ...);
+//! CREATE TABLE t (col BIGINT|DOUBLE|SYMBOL [NOT NULL|ORDERING KEY], ...);
 //! INSERT INTO t [(columns)] VALUES (literals), ...;
 //! UPDATE table SET column = literal, ... [WHERE predicate];
 //! DELETE FROM table [WHERE predicate];
@@ -345,6 +345,127 @@ pub struct Plan {
     pub as_of: Option<u64>,
 }
 
+impl Plan {
+    /// Every stored-column name this plan reads, by any route: the
+    /// projection (plain, computed, window), `GROUP BY`, `HAVING`, and
+    /// the `WHERE` predicate. Deliberately over-inclusive — output
+    /// aliases and hidden `__having` names come along, and a name that
+    /// matches no column simply never matches anything.
+    ///
+    /// The join uses it to gather only the dimension columns a query
+    /// actually needs (#81). That makes completeness load-bearing:
+    /// omitting a route here would drop a column the query then cannot
+    /// resolve. It fails loudly rather than silently — the column is
+    /// absent, not null-filled — but it fails, so every variant above
+    /// must be walked, and a new one has to be added here too.
+    pub fn referenced_columns(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        if let Some(predicate) = &self.predicate {
+            predicate_columns(predicate, &mut names);
+        }
+        if let Some(order_by) = &self.order_by {
+            // Resolved against the *output* schema, so this is only
+            // ever an alias — harmless, and free insurance for the
+            // unaliased case where the two names coincide.
+            names.insert(order_by.column.clone());
+        }
+        match &self.projection {
+            Projection::Items(items) => {
+                for item in items {
+                    match item {
+                        PlanItem::Column { name, .. } => {
+                            names.insert(name.clone());
+                        }
+                        PlanItem::Computed { expr, .. } => scalar_columns(expr, &mut names),
+                        PlanItem::WindowAgg {
+                            args,
+                            partition_by,
+                            order_by,
+                            ..
+                        } => {
+                            names.extend(args.iter().cloned());
+                            names.extend(partition_by.iter().cloned());
+                            names.insert(order_by.clone());
+                        }
+                    }
+                }
+            }
+            Projection::Aggregate {
+                keys,
+                items,
+                having,
+            } => {
+                names.extend(keys.iter().cloned());
+                let agg_item =
+                    |item: &AggItem, names: &mut std::collections::HashSet<String>| match item {
+                        AggItem::Key { name, .. } => {
+                            names.insert(name.clone());
+                        }
+                        AggItem::Call(call) => names.extend(call.argument.iter().cloned()),
+                    };
+                for item in items {
+                    agg_item(item, &mut names);
+                }
+                if let Some(having) = having {
+                    for item in &having.items {
+                        agg_item(item, &mut names);
+                    }
+                    predicate_columns(&having.predicate, &mut names);
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Every column name a predicate tests.
+fn predicate_columns(predicate: &Predicate, names: &mut std::collections::HashSet<String>) {
+    match predicate {
+        Predicate::Compare { column, .. }
+        | Predicate::KeyEquals { column, .. }
+        | Predicate::KeyLike { column, .. }
+        | Predicate::KeyIn { column, .. }
+        | Predicate::IsNull { column, .. } => {
+            names.insert(column.clone());
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_columns(left, names);
+            predicate_columns(right, names);
+        }
+        Predicate::Not(inner) => predicate_columns(inner, names),
+    }
+}
+
+/// Every column name a scalar expression reads, `CASE` conditions
+/// included.
+fn scalar_columns(expr: &ScalarExpr, names: &mut std::collections::HashSet<String>) {
+    match expr {
+        ScalarExpr::Column(name) => {
+            names.insert(name.clone());
+        }
+        ScalarExpr::Literal(_) => {}
+        ScalarExpr::Negate(inner) => scalar_columns(inner, names),
+        ScalarExpr::Binary { left, right, .. } => {
+            scalar_columns(left, names);
+            scalar_columns(right, names);
+        }
+        ScalarExpr::Call { args, .. } | ScalarExpr::Registered { args, .. } => {
+            for argument in args {
+                scalar_columns(argument, names);
+            }
+        }
+        ScalarExpr::Case { whens, otherwise } => {
+            for (condition, value) in whens {
+                predicate_columns(condition, names);
+                scalar_columns(value, names);
+            }
+            if let Some(otherwise) = otherwise {
+                scalar_columns(otherwise, names);
+            }
+        }
+    }
+}
+
 /// A value the right side of `SET column = ...` may hold.
 #[derive(Clone, PartialEq, Debug)]
 pub enum SetValue {
@@ -407,7 +528,7 @@ pub enum Statement {
 pub struct ColumnSpec {
     /// The column name.
     pub name: String,
-    /// `"BIGINT"`, `"DOUBLE"`, or `"KEY"` — resolved to the engine's
+    /// `"BIGINT"`, `"DOUBLE"`, or `"SYMBOL"` — resolved to the engine's
     /// column types by the embedder (query-lite stays schema-agnostic).
     pub type_name: String,
     /// `NOT NULL` present (the ordering key implies it).
@@ -418,7 +539,10 @@ pub struct ColumnSpec {
 
 /// A lowered `CREATE TABLE`: the DDL surface of the stdlib table (#49,
 /// ruled 2026-07-27) — standard names where standard exists (`BIGINT`,
-/// `DOUBLE`), the coined `KEY` for dictionary keys, the ordering key
+/// `DOUBLE`), `SYMBOL` for dictionary-encoded labels (kdb+ and
+/// QuestDB spell it that way; TallyDB adopted it 2026-07-29, when the
+/// older `KEY` proved to name two different things beside `ORDERING
+/// KEY`), the ordering key
 /// declared like a constraint. `VARCHAR`/`TEXT` are refused with a
 /// teaching error: keys are interned labels, not text values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -474,8 +598,18 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
             ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => {
                 "DOUBLE"
             }
+            ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("symbol") => {
+                "SYMBOL"
+            }
+            // The type was spelled KEY until 2026-07-29. Name the new
+            // spelling rather than listing the type set: a reader who
+            // typed KEY knows what they meant.
             ast::DataType::Custom(name, _) if object_name(name)?.eq_ignore_ascii_case("key") => {
-                "KEY"
+                return Err(QueryError::Unsupported(format!(
+                    "column '{}': the label type is spelled SYMBOL (KEY named two \
+                     different things beside ORDERING KEY)",
+                    ident(&column.name)
+                )))
             }
             ast::DataType::Varchar(_)
             | ast::DataType::Text
@@ -484,13 +618,13 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
                 return Err(QueryError::Unsupported(format!(
                     "column '{}': strings are not a column type here — keys are \
                      interned labels used for filtering, grouping, and joining; \
-                     declare it KEY",
+                     declare it SYMBOL",
                     ident(&column.name)
                 )))
             }
             other => {
                 return Err(QueryError::Unsupported(format!(
-                    "column type '{other}' (BIGINT, DOUBLE, or KEY)"
+                    "column type '{other}' (BIGINT, DOUBLE, or SYMBOL)"
                 )))
             }
         };
@@ -531,6 +665,14 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
                 column.name
             )));
         }
+        // The pseudocolumn is the engine's to define; a declared one
+        // would shadow it and mean something else entirely.
+        if column.name == SEQUENCE_COLUMN {
+            return Err(QueryError::Unsupported(format!(
+                "column '{SEQUENCE_COLUMN}' is reserved — it is the ingest-sequence \
+                 pseudocolumn every table already has"
+            )));
+        }
     }
     match columns.iter().filter(|column| column.ordering_key).count() {
         1 => Ok(CreateTablePlan { table, columns }),
@@ -542,6 +684,34 @@ fn lower_create_table(create: &ast::CreateTable) -> Result<CreateTablePlan, Quer
         _ => Err(QueryError::Unsupported(
             "more than one ORDERING KEY column".to_owned(),
         )),
+    }
+}
+
+/// The ingest-sequence pseudocolumn's fixed name (#75, ruled
+/// 2026-07-29). Every row has a birth sequence — the coordinate `AS OF`
+/// addresses — and this is how SQL reads it back. It is never declared:
+/// `CREATE TABLE` refuses a column of this name, so the pseudocolumn
+/// can never be shadowed, and since `SELECT *` is refused nobody meets
+/// it unbidden.
+///
+/// The short underscore spelling (over a spelled-out
+/// `ingest_sequence`) follows from that invisibility: a name users do
+/// not normally see is better short and unlikely to collide than
+/// long and self-explaining.
+pub const SEQUENCE_COLUMN: &str = "_seq";
+
+/// The error for a name that is not a column of the schema — with the
+/// pseudocolumn's own answer, since every resolver that reaches here has
+/// already passed the one place `_seq` exists (projection).
+pub(crate) fn no_such_column(name: &str) -> QueryError {
+    if name == SEQUENCE_COLUMN {
+        QueryError::Unsupported(format!(
+            "'{SEQUENCE_COLUMN}' can be selected, not filtered or grouped on \
+             (project it, then order or page by it; `AS OF` is how a coordinate \
+             filters)"
+        ))
+    } else {
+        QueryError::UnknownColumn(name.to_owned())
     }
 }
 
@@ -660,8 +830,12 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
                 .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
         };
         let start_ok = index == 0 || !chars[index - 1].is_alphanumeric() && chars[index - 1] != '_';
-        // A column *definition* also starts `word KEY` — `ordering KEY,`
-        // declares a key column named `ordering`. A constraint never
+        // A column *definition* could also start `word KEY` — when the
+        // label type was spelled KEY, `ordering KEY,` declared a column
+        // named `ordering`. `SYMBOL` retired that reading, but the
+        // guard stays: without it the same text rewrites to
+        // `(PRIMARY KEY,` and the reader gets a parse error instead of
+        // the refusal that names the new spelling. A constraint never
         // opens a definition, so the phrase only counts when the
         // preceding token is not `(` or `,` (nor the statement start,
         // where no column list is open yet).
@@ -974,17 +1148,34 @@ fn lower_assignment(assignment: &ast::Assignment) -> Result<Assignment, QueryErr
         ));
     };
     let column = object_name(name)?;
-    let ast::Expr::Value(value) = &assignment.value else {
+    // A negative number parses as unary minus over a literal — the same
+    // unwrap the WHERE grammar does, so `SET x = -1` and `WHERE x = -1`
+    // accept exactly the same spellings.
+    let (negated, rhs) = match &assignment.value {
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        other => (false, other),
+    };
+    let ast::Expr::Value(value) = rhs else {
         return Err(QueryError::Unsupported(format!(
             "SET {column} = '{}' — literals only for now",
             assignment.value
         )));
     };
-    let value = match &value.value {
-        ast::Value::Number(text, _) => SetValue::Number(parse_number(text)?),
-        ast::Value::SingleQuotedString(text) => SetValue::String(text.clone()),
-        ast::Value::Null => SetValue::Null,
-        other => {
+    let value = match (&value.value, negated) {
+        (ast::Value::Number(text, _), negated) => {
+            let number = match (parse_number(text)?, negated) {
+                (number, false) => number,
+                (Number::Int(value), true) => Number::Int(-value),
+                (Number::Float(value), true) => Number::Float(-value),
+            };
+            SetValue::Number(number)
+        }
+        (ast::Value::SingleQuotedString(text), false) => SetValue::String(text.clone()),
+        (ast::Value::Null, false) => SetValue::Null,
+        (other, _) => {
             return Err(QueryError::Unsupported(format!(
                 "SET {column} = {other} — numbers, strings, and NULL only"
             )))
@@ -1276,6 +1467,8 @@ fn strip_qualifiers(expr: &ast::Expr, known: &[&str]) -> Result<ast::Expr, Query
             }
         },
         ast::Expr::Nested(inner) => ast::Expr::Nested(Box::new(recurse(inner)?)),
+        ast::Expr::IsNull(inner) => ast::Expr::IsNull(Box::new(recurse(inner)?)),
+        ast::Expr::IsNotNull(inner) => ast::Expr::IsNotNull(Box::new(recurse(inner)?)),
         ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
             op: *op,
             expr: Box::new(recurse(expr)?),
@@ -1529,6 +1722,12 @@ fn extract_having_calls(
     Ok(match expr {
         ast::Expr::Nested(inner) => {
             ast::Expr::Nested(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::IsNull(inner) => {
+            ast::Expr::IsNull(Box::new(extract_having_calls(inner, hidden)?))
+        }
+        ast::Expr::IsNotNull(inner) => {
+            ast::Expr::IsNotNull(Box::new(extract_having_calls(inner, hidden)?))
         }
         ast::Expr::UnaryOp { op, expr } => ast::Expr::UnaryOp {
             op: *op,
@@ -2041,18 +2240,26 @@ mod tests {
 
     #[test]
     fn a_column_named_ordering_is_not_the_constraint() {
-        // `ordering KEY` after `(` or `,` declares a key column named
-        // `ordering`; only the constraint position rewrites.
+        // Only the constraint position rewrites: a column may still be
+        // named `ordering`, and a name that merely starts like the
+        // phrase is not it.
         let Ok(Statement::CreateTable(plan)) = parse_statement(
-            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY, primary_ish DOUBLE)",
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, ordering SYMBOL, primary_ish DOUBLE)",
         ) else {
             panic!("parses as CREATE TABLE")
         };
         assert_eq!(plan.columns.len(), 3);
         assert_eq!(plan.columns[1].name, "ordering");
-        assert_eq!(plan.columns[1].type_name, "KEY");
+        assert_eq!(plan.columns[1].type_name, "SYMBOL");
         assert!(!plan.columns[1].ordering_key);
         assert!(plan.columns[0].ordering_key);
+        // And `ordering KEY` — a column definition under the retired
+        // spelling — still reaches the refusal that names the new one,
+        // rather than being rewritten into a parse error.
+        let error = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, ordering KEY)")
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("spelled SYMBOL"), "{error}");
     }
 
     #[test]
@@ -2063,6 +2270,20 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(error.contains("declared twice"), "{error}");
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_cannot_be_declared() {
+        // Declaring `_seq` would shadow the pseudocolumn with something
+        // else entirely — the name is the engine's.
+        for ddl in [
+            "CREATE TABLE t (ts BIGINT ORDERING KEY, _seq BIGINT)",
+            "CREATE TABLE t (_seq BIGINT ORDERING KEY, x DOUBLE)",
+        ] {
+            let error = parse_statement(ddl).expect_err("refused").to_string();
+            assert!(error.contains("reserved"), "{error}");
+            assert!(error.contains("ingest-sequence"), "{error}");
+        }
     }
 
     #[test]

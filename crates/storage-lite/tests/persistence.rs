@@ -284,6 +284,43 @@ fn tombstones_survive_reopen() {
     });
 }
 
+// A delete consumes a knowledge coordinate (ruled 2026-07-29), and no
+// row carries it — so on a table whose only mutation was a delete, the
+// delete log is the sole evidence that the coordinate is spent. If
+// reopen did not fold the stamps in, the watermark would rewind and the
+// next appended row would be born at the same coordinate the deletion
+// was stamped with: two knowledge events, one address, and an `AS OF`
+// answer that changes retroactively.
+#[test]
+fn a_consumed_coordinate_survives_reopen() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+            append_n(&mut store, 0..5); // sequences 0..4, watermark 5
+            assert_eq!(store.next_sequence(), 5);
+            assert_eq!(store.tombstone(&[1]).unwrap(), 1);
+            assert_eq!(store.next_sequence(), 6, "the kill spent coordinate 5");
+        }
+        let mut store = Store::persistent(backend.clone(), schema(), 0).unwrap();
+        assert_eq!(store.next_sequence(), 6, "and the reopen knows it");
+        append_n(&mut store, 5..6);
+        store.flush().unwrap();
+        // The new row is born above the kill, not beside it.
+        let knowledge = store.knowledge_snapshot().unwrap();
+        let live_at = |cut: u64| -> usize {
+            knowledge
+                .as_of(cut)
+                .iter()
+                .map(storage_lite::SegmentView::live_rows)
+                .sum()
+        };
+        assert_eq!(live_at(4), 5, "before the kill: five rows, none dead");
+        assert_eq!(live_at(5), 4, "at the kill: four rows, the new one unborn");
+        assert_eq!(live_at(6), 5, "after it: four survivors plus the arrival");
+    });
+}
+
 #[test]
 fn tombstone_bounds_are_checked() {
     let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();

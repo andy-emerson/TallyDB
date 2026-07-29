@@ -2,8 +2,9 @@
 //!
 //! Built for `UPDATE`/`DELETE` first (M2.3) and deliberately shaped as
 //! the layer `SELECT ... WHERE` will reuse (M2.4): a small predicate
-//! tree — numeric comparisons, key string equality and `IN`, `AND` /
-//! `OR` / `NOT` — evaluated per segment into a row bitmap.
+//! tree — numeric comparisons, key string equality, `IN` and `LIKE`,
+//! `IS [NOT] NULL`, `AND` / `OR` / `NOT` — evaluated per segment into a
+//! row bitmap.
 //!
 //! String predicates follow the design's rule for keys: the string test
 //! runs **once per distinct dictionary value**, producing a set of
@@ -161,6 +162,16 @@ pub enum Predicate {
         /// `true` for `NOT LIKE`.
         negated: bool,
     },
+    /// `column IS [NOT] NULL`, on a column of either kind. Alone among
+    /// the leaves this one is **total**: it asks about presence, not
+    /// about a value, so every row comes back TRUE or FALSE and none is
+    /// UNKNOWN — which is exactly why SQL needs it.
+    IsNull {
+        /// The column, numeric or key.
+        column: String,
+        /// `true` for `IS NOT NULL`.
+        negated: bool,
+    },
     /// `column [NOT] IN ('a', 'b', ...)` on a key column.
     KeyIn {
         /// The key column.
@@ -187,6 +198,14 @@ pub fn lower_predicate(expr: &ast::Expr) -> Result<Predicate, QueryError> {
             op: ast::UnaryOperator::Not,
             expr,
         } => Ok(Predicate::Not(Box::new(lower_predicate(expr)?))),
+        ast::Expr::IsNull(inner) => Ok(Predicate::IsNull {
+            column: null_test_column(inner)?,
+            negated: false,
+        }),
+        ast::Expr::IsNotNull(inner) => Ok(Predicate::IsNull {
+            column: null_test_column(inner)?,
+            negated: true,
+        }),
         ast::Expr::Like {
             negated,
             expr,
@@ -262,7 +281,20 @@ pub fn lower_predicate(expr: &ast::Expr) -> Result<Predicate, QueryError> {
             })
         }
         other => Err(QueryError::Unsupported(format!(
-            "predicate '{other}' (comparisons, IN, AND/OR/NOT only)"
+            "predicate '{other}' (comparisons, IN, LIKE, IS NULL, AND/OR/NOT only)"
+        ))),
+    }
+}
+
+/// The operand of `IS [NOT] NULL`: a plain column. Nulls are a property
+/// of stored cells, so there is nothing else to ask the question of —
+/// an expression's nullness is the nullness of the columns it reads.
+fn null_test_column(expr: &ast::Expr) -> Result<String, QueryError> {
+    match expr {
+        ast::Expr::Nested(inner) => null_test_column(inner),
+        ast::Expr::Identifier(column) => Ok(column.value.clone()),
+        other => Err(QueryError::Unsupported(format!(
+            "IS NULL on '{other}' (a plain column only)"
         ))),
     }
 }
@@ -438,6 +470,17 @@ fn evaluate_3vl(
                 ))),
             }
         }
+        Predicate::IsNull { column, negated } => {
+            let index = column_index(schema, column)?;
+            let values = &batch.columns()[index];
+            // Total, not three-valued: `valid` is a fact about every
+            // row, so the verdict is never UNKNOWN. Passing `true` as
+            // the validity here is not a shortcut — it says the test
+            // itself always has an answer.
+            Ok(leaf_result(rows, |row| {
+                (true, values.is_valid(row) == *negated)
+            }))
+        }
         Predicate::KeyEquals {
             column,
             value,
@@ -571,10 +614,31 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
         Predicate::Or(left, right) => {
             can_match(left, schema, view) || can_match(right, schema, view)
         }
+        // `IS NOT NULL` prunes on the one null fact a zone map carries:
+        // a numeric column with no map holds no valid value at all, so
+        // nothing in the segment is non-null. `IS NULL` never prunes —
+        // maps count values, not their absences.
+        Predicate::IsNull {
+            column,
+            negated: true,
+        } => {
+            let Some(index) = schema
+                .fields()
+                .iter()
+                .position(|field| field.name() == column)
+            else {
+                return true; // let evaluate report the unknown column
+            };
+            if schema.fields()[index].column_type() == ColumnType::Key {
+                return true; // keys have no zone map either way
+            }
+            view.segment.zone_map(index).is_some()
+        }
         // Key membership and NOT don't prune: dictionaries aren't ranges,
         // and negating an interval fact soundly needs exact bounds
         // semantics this test deliberately doesn't attempt.
-        Predicate::KeyEquals { .. }
+        Predicate::IsNull { .. }
+        | Predicate::KeyEquals { .. }
         | Predicate::KeyIn { .. }
         | Predicate::KeyLike { .. }
         | Predicate::Not(_) => true,
@@ -653,7 +717,7 @@ fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
         .fields()
         .iter()
         .position(|field| field.name() == name)
-        .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
+        .ok_or_else(|| crate::plan::no_such_column(name))
 }
 
 #[cfg(test)]
@@ -867,6 +931,46 @@ mod tests {
     }
 
     #[test]
+    fn is_null_asks_about_presence_not_value() {
+        // Row 1 is the only null y. IS NULL is total: the two arms
+        // partition the rows, which no value comparison does.
+        assert_eq!(matched("y IS NULL"), [1]);
+        assert_eq!(matched("y IS NOT NULL"), [0, 2, 3]);
+        // NOT over a total test stays total — no row falls through the
+        // UNKNOWN gap that `NOT (y > 0)` leaves.
+        assert_eq!(matched("NOT (y IS NULL)"), [0, 2, 3]);
+        assert_eq!(matched("NOT (y IS NOT NULL)"), [1]);
+        // Composition with an ordinary comparison, both ways round.
+        assert_eq!(matched("y IS NULL OR y > 20"), [1, 2]);
+        assert_eq!(matched("y IS NOT NULL AND ts <= 3"), [0, 2]);
+        // A NOT NULL column and a key column both answer it.
+        assert_eq!(matched("ts IS NOT NULL"), [0, 1, 2, 3]);
+        assert_eq!(matched("x IS NULL"), Vec::<usize>::new());
+        assert_eq!(matched("sym IS NOT NULL"), [0, 1, 2, 3]);
+        // The paren-wrapped and qualifier-free operand rule.
+        assert_eq!(matched("(y) IS NULL"), [1]);
+    }
+
+    #[test]
+    fn is_null_rejects_what_it_cannot_answer() {
+        let sql = "SELECT ts FROM t WHERE x + 1 IS NULL";
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                .unwrap();
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("not a query")
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select")
+        };
+        let error = lower_predicate(select.selection.as_ref().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IS NULL on"), "{error}");
+        assert!(error.contains("a plain column only"), "{error}");
+    }
+
+    #[test]
     fn not_composes_in_three_valued_logic() {
         // B1 regression. `NOT (a AND b)` with a FALSE and b UNKNOWN:
         // FALSE AND UNKNOWN = FALSE, NOT FALSE = TRUE — the row matches.
@@ -1074,5 +1178,47 @@ mod pruning_tests {
             &schema,
             &view
         ));
+    }
+
+    #[test]
+    fn is_not_null_prunes_the_all_null_segment() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("y", ColumnType::F64, true),
+            Field::new("sym", ColumnType::Key, false),
+        ]);
+        let segment = |values: &[Option<f64>]| {
+            let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+            for (ts, &y) in values.iter().enumerate() {
+                buffer
+                    .append(&[
+                        RowValue::I64(ts as i64),
+                        y.map_or(RowValue::Null, RowValue::F64),
+                        RowValue::Key("A"),
+                    ])
+                    .unwrap();
+            }
+            SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()))
+        };
+        let is_null = |negated| Predicate::IsNull {
+            column: "y".into(),
+            negated,
+        };
+        // No valid value anywhere: nothing can be non-null.
+        let all_null = segment(&[None, None]);
+        assert!(!can_match(&is_null(true), &schema, &all_null));
+        // ... but nulls are what the segment is made of.
+        assert!(can_match(&is_null(false), &schema, &all_null));
+        // One value is enough to keep IS NOT NULL alive, and IS NULL
+        // never prunes: zone maps count values, not absences.
+        let mixed = segment(&[None, Some(1.0)]);
+        assert!(can_match(&is_null(true), &schema, &mixed));
+        assert!(can_match(&is_null(false), &schema, &mixed));
+        // Key columns carry no zone map, so neither arm prunes them.
+        let keys = Predicate::IsNull {
+            column: "sym".into(),
+            negated: true,
+        };
+        assert!(can_match(&keys, &schema, &all_null));
     }
 }

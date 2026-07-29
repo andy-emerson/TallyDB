@@ -23,8 +23,9 @@ Interval model (must match the engine's knowledge axis):
   born at the pre-mutation watermark w0 and every victim killed at w0,
   and the mutation consumes exactly one sequence — no cut can see both
   versions;
-- a DELETE kills its matches at the current watermark without consuming
-  a sequence.
+- a DELETE is also ONE knowledge event (ruled 2026-07-29): its matches
+  are killed at the pre-mutation watermark w0 and it consumes that
+  coordinate, so nothing born later can share it.
 
 Usage: m4_asof_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
@@ -204,9 +205,9 @@ def main() -> None:
             changed = lib.tallydb_asof_mutate(
                 context, f"DELETE FROM trades WHERE {predicate}".encode()
             )
-            # Count before stamping: kill stamps may legitimately
-            # collide across statements (they mark, not consume, the
-            # watermark), so counting by stamp would over-count.
+            # Count before stamping: a delete that matches nothing
+            # consumes nothing, so the engine's count is what decides
+            # whether the watermark should have moved.
             oracle_changed = connection.execute(
                 f"SELECT COUNT(*) FROM versions WHERE kill IS NULL AND ({predicate})"
             ).fetchone()[0]
@@ -218,9 +219,14 @@ def main() -> None:
                     f"FAIL delete '{predicate}': engine changed {changed}, "
                     f"oracle {oracle_changed}"
                 )
-            # A delete stamps the watermark without consuming it.
-            if lib.tallydb_asof_next_sequence(context) != w0:
-                sys.exit("FAIL delete moved the watermark")
+            # A delete consumes exactly one coordinate when it kills
+            # anything, and none when it does not.
+            spent = 1 if oracle_changed else 0
+            if lib.tallydb_asof_next_sequence(context) != w0 + spent:
+                sys.exit(
+                    f"FAIL delete '{predicate}' spent the wrong number of "
+                    "coordinates"
+                )
         else:
             (_, predicate, column, value) = step
             matched = connection.execute(

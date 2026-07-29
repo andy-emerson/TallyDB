@@ -5,9 +5,10 @@ The generated side of the differential harness: this script owns query
 generation (there is no second list to keep in sync in Rust — the SQL
 travels over the C ABI), runs every query against both TallyDB's corpus
 fixture and a DuckDB replica of the same rows, and diffs the results.
-Every query carries ORDER BY over the unique `ts` (or over the grouped
-key), so both engines agree on a total order and the diff is
-row-for-row.
+Ordered families carry ORDER BY over the unique `ts`, so both engines
+agree on a total order and the diff is row-for-row. Grouped and
+DISTINCT results carry no such order — a symbol column cannot be
+ordered by (#58) — so the REFEREE sorts both sides before diffing.
 
 Known, deliberate divergences the generator avoids:
   - SUM over an i64 column: DuckDB promotes to HUGEINT; TallyDB keeps
@@ -15,6 +16,8 @@ Known, deliberate divergences the generator avoids:
     columns only.
   - DuckDB encodes undefined regressions as NaN where TallyDB (and
     NumPy) use NULL; window comparisons normalize NaN to None.
+  - `ORDER BY <symbol column>`: DuckDB sorts, TallyDB refuses (#58 = B).
+    Checked as a refusal rather than avoided.
 
 Usage: m2_differential_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
@@ -62,6 +65,34 @@ def tallydb_query(lib, sql: str) -> pa.Table:
     return pa.RecordBatchReader._import_from_c(ptr).read_all()
 
 
+def tallydb_refuses(lib, sql: str) -> bool:
+    """Whether the engine rejects `sql` — a refusal is an answer too."""
+    c_stream = ffi.new("struct ArrowArrayStream*")
+    ptr = int(ffi.cast("uintptr_t", c_stream))
+    return (
+        lib.tallydb_corpus_query_stream(
+            ctypes.c_char_p(sql.encode()), ctypes.c_void_p(ptr)
+        )
+        != 0
+    )
+
+
+def sorted_rows(table: pa.Table, columns: list[str] | None = None) -> list[tuple]:
+    """A table's rows under a total python-side order — the referee's
+    own sort, for results whose row order neither engine promises.
+    None ranks after every value; pyarrow cannot sort dictionary
+    columns, which is why this is done in python."""
+    names = table.column_names
+    values = [table[name].to_pylist() for name in names]
+    rows = list(zip(*values))
+    order = [names.index(name) for name in (columns or names)]
+
+    def rank(cell):
+        return (1, 0) if cell is None else (0, cell)
+
+    return sorted(rows, key=lambda row: tuple(rank(row[index]) for index in order))
+
+
 def close(a, b) -> bool:
     if a is None or b is None:
         return a is b
@@ -78,12 +109,22 @@ def families() -> list[str]:
     """Query families with a deterministic total order (unique ts, or a
     grouped key). Grows with the SQL surface."""
     queries = []
-    # Passthrough with ordering and paging.
+    # Passthrough with ordering and paging — including ORDER BY on a
+    # column the query does not project (standard SQL: carried hidden,
+    # sorted by, dropped), alone and under LIMIT/OFFSET, and where an
+    # alias shadows the stored name (the alias wins, per standard
+    # output-name precedence).
     queries += [
         "SELECT ts, sym, x, y FROM corpus ORDER BY ts",
         "SELECT ts, x FROM corpus ORDER BY ts DESC LIMIT 100",
         "SELECT ts, x FROM corpus ORDER BY x LIMIT 50 OFFSET 25",
         "SELECT ts, y FROM corpus ORDER BY y DESC LIMIT 40",
+        "SELECT sym, x FROM corpus ORDER BY ts",
+        "SELECT x FROM corpus ORDER BY ts DESC LIMIT 60",
+        "SELECT ts FROM corpus ORDER BY x LIMIT 30 OFFSET 10",
+        "SELECT x * 2 AS d FROM corpus ORDER BY ts LIMIT 25",
+        "SELECT ts, x AS y FROM corpus ORDER BY y LIMIT 35",
+        "SELECT ts, x FROM corpus WHERE sym = 'K003' ORDER BY y DESC LIMIT 20",
     ]
     # WHERE: numeric boundaries, key membership, boolean structure.
     for predicate in [
@@ -108,11 +149,28 @@ def families() -> list[str]:
         "ON corpus.sym = sensors.sym ORDER BY ts",
         "SELECT ts, x, calib FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
         "WHERE calib > 1 AND x < 101 ORDER BY ts",
-        "SELECT site, count(*) AS n, avg(x) AS a FROM corpus JOIN sensors "
-        "ON corpus.sym = sensors.sym GROUP BY site ORDER BY site",
         "SELECT ts, sum(calib) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING "
         "AND CURRENT ROW) AS w FROM corpus JOIN sensors "
         "ON corpus.sym = sensors.sym ORDER BY ts",
+    ]
+    # Join projection pushdown (#81): only the dimension columns a
+    # query reads are gathered, so the queries that matter are the ones
+    # reading a dimension column WITHOUT projecting it — a wrong
+    # used-set computation shows up here and nowhere else.
+    queries += [
+        "SELECT ts, x FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE site = 'north' ORDER BY ts",
+        "SELECT ts, x FROM corpus JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE calib > 1.0 AND site <> 'east' ORDER BY ts",
+        "SELECT ts, x * calib AS scaled FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, CASE WHEN site = 'north' THEN x ELSE 0 END AS northern "
+        "FROM corpus JOIN sensors ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, sum(x) OVER (PARTITION BY site ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus JOIN sensors "
+        "ON corpus.sym = sensors.sym ORDER BY ts",
+        "SELECT ts, x FROM corpus LEFT JOIN sensors ON corpus.sym = sensors.sym "
+        "WHERE calib IS NULL ORDER BY ts",
     ]
     # The full window surface: standard aggregates as windows, mixed
     # frames, several windows in one query.
@@ -134,13 +192,6 @@ def families() -> list[str]:
         "SELECT sum(x) AS s, avg(x) AS a, min(x) AS lo, max(x) AS hi FROM corpus",
         "SELECT avg(y) AS a, min(y) AS lo, max(y) AS hi FROM corpus",
         "SELECT min(ts) AS lo, max(ts) AS hi, count(*) AS n FROM corpus",
-        "SELECT sym, count(*) AS n FROM corpus GROUP BY sym ORDER BY sym",
-        "SELECT sym, count(y) AS n, avg(y) AS a FROM corpus GROUP BY sym ORDER BY sym",
-        "SELECT sym, sum(x) AS s, min(x) AS lo, max(x) AS hi FROM corpus "
-        "GROUP BY sym ORDER BY sym",
-        "SELECT sym, count(*) AS n FROM corpus WHERE x > 100 GROUP BY sym ORDER BY sym",
-        "SELECT sym, avg(x) AS a FROM corpus WHERE sym IN ('K000', 'K002', 'K004') "
-        "GROUP BY sym ORDER BY sym",
         "SELECT count(*) AS n FROM corpus WHERE x > 1e12",
     ]
     # The M3.4 IN-tier (#49): computed projections, CASE, LIKE on keys,
@@ -160,22 +211,68 @@ def families() -> list[str]:
         "SELECT ts, sym, x FROM corpus WHERE sym LIKE 'K00%' ORDER BY ts",
         "SELECT ts, sym, x FROM corpus WHERE sym LIKE '_00_' ORDER BY ts",
         "SELECT ts, sym, x FROM corpus WHERE sym NOT LIKE '%3' ORDER BY ts",
-        "SELECT DISTINCT sym FROM corpus ORDER BY sym",
-        "SELECT sym, sum(x) AS s FROM corpus GROUP BY sym HAVING sum(x) > 100 ORDER BY sym",
-        "SELECT sym, count(y) AS n FROM corpus GROUP BY sym "
-        "HAVING count(y) >= 1 AND sym <> 'K001' ORDER BY sym",
-        "SELECT sym, avg(x) AS a FROM corpus GROUP BY sym HAVING NOT (avg(x) > 100) "
-        "ORDER BY sym",
+    ]
+    # IS [NOT] NULL: the total test, which no value comparison can
+    # stand in for. The corpus's y column carries the nulls; ts, x and
+    # sym are NOT NULL, so their arms are the constant answers.
+    queries += [
+        "SELECT ts, y FROM corpus WHERE y IS NULL ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE y IS NOT NULL ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE NOT (y IS NULL) ORDER BY ts",
+        "SELECT ts, sym, x, y FROM corpus WHERE y IS NULL AND x > 100 ORDER BY ts",
+        "SELECT ts, y FROM corpus WHERE y IS NULL OR y > 140 ORDER BY ts",
+        "SELECT ts, x FROM corpus WHERE ts IS NOT NULL AND sym IS NOT NULL ORDER BY ts",
+        "SELECT ts, x FROM corpus WHERE x IS NULL ORDER BY ts",
+        "SELECT ts, CASE WHEN y IS NULL THEN 0 ELSE y END AS filled FROM corpus ORDER BY ts",
     ]
     return queries
+
+
+# Queries whose rows come back in no engine-guaranteed order, because
+# the only column that could have ordered them is a symbol — and symbol
+# columns are unordered labels (#58 = B, ruled 2026-07-29). The REFEREE
+# sorts both sides before diffing, which is better hygiene anyway: a
+# grouped result is a set, and asking the engine to order it was always
+# borrowing a total order from an ORDER BY the query did not need.
+UNORDERED_FAMILIES = [
+    "SELECT sym, count(*) AS n FROM corpus GROUP BY sym",
+    "SELECT sym, count(y) AS n, avg(y) AS a FROM corpus GROUP BY sym",
+    "SELECT sym, sum(x) AS s, min(x) AS lo, max(x) AS hi FROM corpus GROUP BY sym",
+    "SELECT sym, count(*) AS n FROM corpus WHERE x > 100 GROUP BY sym",
+    "SELECT sym, avg(x) AS a FROM corpus WHERE sym IN ('K000', 'K002', 'K004') "
+    "GROUP BY sym",
+    "SELECT DISTINCT sym FROM corpus",
+    "SELECT sym, sum(x) AS s FROM corpus GROUP BY sym HAVING sum(x) > 100",
+    "SELECT sym, count(y) AS n FROM corpus GROUP BY sym "
+    "HAVING count(y) >= 1 AND sym <> 'K001'",
+    "SELECT sym, avg(x) AS a FROM corpus GROUP BY sym HAVING NOT (avg(x) > 100)",
+    "SELECT sym, count(*) AS n FROM corpus WHERE y IS NULL GROUP BY sym",
+    "SELECT sym, count(*) AS n FROM corpus GROUP BY sym HAVING avg(y) IS NOT NULL",
+    "SELECT site, count(*) AS n, avg(x) AS a FROM corpus JOIN sensors "
+    "ON corpus.sym = sensors.sym GROUP BY site",
+    "SELECT site, count(*) AS n FROM corpus JOIN sensors "
+    "ON corpus.sym = sensors.sym WHERE calib > 1.0 GROUP BY site",
+    "SELECT site, avg(x) AS a FROM corpus JOIN sensors "
+    "ON corpus.sym = sensors.sym GROUP BY site HAVING sum(calib) > 100",
+]
+
+# Deliberate divergence: DuckDB sorts these, TallyDB refuses them.
+# Symbol codes are per-segment first-appearance ranks, so they rank
+# nothing, and ranking the labels as text would ask an engine that
+# refuses to *produce* a string to order strings. The refusal is part
+# of the surface, so it is checked like any other answer.
+REFUSED_QUERIES = [
+    "SELECT ts, sym FROM corpus ORDER BY sym",
+    "SELECT ts, sym, x FROM corpus WHERE x > 100 ORDER BY sym DESC",
+    "SELECT sym, count(*) AS n FROM corpus GROUP BY sym ORDER BY sym",
+    "SELECT DISTINCT sym FROM corpus ORDER BY sym",
+]
 
 
 # (sql, canonical sort columns): ORDER BY columns with ties — verified
 # by checking the sort column's sequence, then diffing under a total
 # python-side re-sort, because tie order is engine-arbitrary.
 TIE_QUERIES = [
-    ("SELECT ts, sym FROM corpus ORDER BY sym", ["sym", "ts"]),
-    ("SELECT ts, sym, x FROM corpus WHERE x > 100 ORDER BY sym DESC", ["sym", "ts"]),
     # NULLS FIRST/LAST: the null rows tie on the sort key, so their
     # internal order is engine-arbitrary; placement is what's checked.
     ("SELECT ts, y FROM corpus ORDER BY y NULLS FIRST", ["y", "ts"]),
@@ -310,6 +407,24 @@ def main() -> None:
         oracle = connection.execute(sql).to_arrow_table()
         compare_tables(sql, engine, oracle, window=False)
         passed += 1
+    for sql in UNORDERED_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(sql).to_arrow_table()
+        if engine.column_names != oracle.column_names:
+            sys.exit(
+                f"FAIL {sql}\n  columns: engine {engine.column_names} "
+                f"vs duckdb {oracle.column_names}"
+            )
+        # Floats are compared exactly here; the aggregates in these
+        # families are sums and counts over the same rows in the same
+        # per-group order, so the two engines produce identical bits.
+        if sorted_rows(engine) != sorted_rows(oracle):
+            sys.exit(f"FAIL {sql}\n  row multisets differ")
+        passed += 1
+    for sql in REFUSED_QUERIES:
+        if not tallydb_refuses(lib, sql):
+            sys.exit(f"FAIL {sql}\n  ORDER BY on a symbol column must be refused")
+        passed += 1
     for sql, canonical in TIE_QUERIES:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(sql).to_arrow_table()
@@ -326,19 +441,9 @@ def main() -> None:
         expected = nones + values if nulls_first else values + nones
         if sequence != expected:
             sys.exit(f"FAIL {sql}\n  engine '{order_column}' not in order")
-        # ...and the row multisets must agree, under a total re-sort
-        # (python-side: pyarrow cannot sort dictionary columns; None
-        # sorts via an explicit is-None rank).
-        def rows_of(table: pa.Table) -> list[tuple]:
-            columns = [table[c].to_pylist() for c in table.column_names]
-            rows = list(zip(*columns))
-            order = [table.column_names.index(c) for c in canonical]
-            def rank(cell):
-                return (1, 0) if cell is None else (0, cell)
-            return sorted(
-                rows, key=lambda row: tuple(rank(row[i]) for i in order)
-            )
-        if rows_of(engine) != rows_of(oracle):
+        # ...and the row multisets must agree, under the referee's own
+        # total re-sort.
+        if sorted_rows(engine, canonical) != sorted_rows(oracle, canonical):
             sys.exit(f"FAIL {sql}\n  row multisets differ")
         passed += 1
     for sql in WINDOW_QUERIES:

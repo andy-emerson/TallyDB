@@ -36,7 +36,7 @@
 use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_segment};
 use crate::io::{IoError, StorageBackend};
 use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer};
-use crate::tombstone::{decode_tombstones, encode_tombstones};
+use crate::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -215,6 +215,10 @@ pub struct Store {
     wal: Option<Box<dyn crate::LogWriter>>,
     wal_sync: WalSync,
     last_wal_sync: std::time::Instant,
+    /// A read-only handle (F4): opened over a directory another process
+    /// writes. Every mutating operation refuses; [`Store::refresh`]
+    /// re-reads the durable state.
+    read_only: bool,
     /// The reader-visible state, shared with every [`StoreReader`]. The
     /// lock is held only to read or swap it — never across encoding,
     /// backend I/O, or compaction's merge — so a reader's `snapshot()`
@@ -279,6 +283,34 @@ impl Shared {
             knowledge.next += 1;
         }
         Ok(())
+    }
+
+    /// Consumes one knowledge coordinate without a row: a `DELETE`'s
+    /// kill (ruled 2026-07-29). Consuming is what makes a delete a
+    /// knowledge event of its own — the next append lands *above* it,
+    /// so the cut that shows the deletion is a stable one no later
+    /// arrival can join. It also diverges a virtual table on the spot:
+    /// there is now a coordinate no row carries.
+    fn consume_sequence(&mut self, virtual_watermark: u64) {
+        let buffered = self.buffer.len() as u64;
+        let knowledge = self.knowledge.get_or_insert_with(|| Knowledge {
+            next: virtual_watermark,
+            buffer_base: virtual_watermark - buffered,
+            explicit: None,
+        });
+        knowledge.next += 1;
+        if buffered == 0 {
+            // Nothing to describe: the empty buffer simply restarts at
+            // the new watermark, as it does after a flush.
+            knowledge.buffer_base = knowledge.next;
+            knowledge.explicit = None;
+        } else if knowledge.explicit.is_none() {
+            // The buffer straddles the gap — its rows were born below
+            // the consumed coordinate, later ones will be born above —
+            // so contiguity is gone and births go per row.
+            let base = knowledge.buffer_base;
+            knowledge.explicit = Some((0..buffered).map(|offset| base + offset).collect());
+        }
     }
 
     /// Appends one row born at `shared_sequence` — a supersession's
@@ -393,7 +425,7 @@ impl KnowledgeSnapshot {
             } else {
                 SegmentView {
                     segment,
-                    live: Some(Bitmap::from_bools(mask.into_iter())),
+                    live: Some(Bitmap::from_bools(mask)),
                 }
             });
         }
@@ -547,6 +579,7 @@ impl Store {
         assert!(segment_rows >= 1, "segment_rows must be at least 1");
         let buffer = WriteBuffer::new(schema.clone(), ordering_key)?;
         Ok(Store {
+            read_only: false,
             schema,
             ordering_key,
             segment_rows,
@@ -620,6 +653,189 @@ impl Store {
         let schema = manifest.schema.clone();
         let ordering_key = manifest.ordering_key;
         Store::persistent_inner(backend, schema, ordering_key, options, Some(manifest))
+    }
+
+    /// Opens an existing persistent store **read-only** (F4): the
+    /// cross-process reader half of the beta shape — one feed-writer
+    /// process, any number of console or binding readers over the same
+    /// directory. Takes no directory lock and refuses every mutation.
+    ///
+    /// **What a reader sees: the durable prefix, consistently.** The
+    /// view is built from the manifest, the flushed segments, and the
+    /// delete logs — never the writer's WAL or write buffer — so it
+    /// lags the writer by at most the flush boundary, and it is
+    /// old-or-new per mutation, never a torn middle: a supersession's
+    /// delete log whose replacement rows have not been flushed yet is
+    /// skipped *whole* (kill and replacements both invisible — the
+    /// pre-mutation state), which is decidable from the log itself:
+    /// replacements born at coordinate `c` are flushed exactly when
+    /// some flushed row carries a sequence past `c`, because rows
+    /// reach segments in row-id order. Plain deletes need no such
+    /// test — their victims are flushed before the log commits.
+    ///
+    /// **Compaction races retry.** The writer's compaction publishes a
+    /// whole new generation and then removes the old one's objects; a
+    /// reader that catches the middle sees a named file vanish, and
+    /// the open retries from the manifest (bounded), which is atomic.
+    ///
+    /// Refresh by [`Store::refresh`]; today that re-reads and
+    /// re-decodes the whole state (segment-lazy open is F3, tracked).
+    pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        for _ in 0..8 {
+            match Store::load_read_only(backend.clone()) {
+                Ok(store) => return Ok(store),
+                // A compaction moved the generation mid-scan: a named
+                // object vanished. The next manifest read names the
+                // complete new generation — go again.
+                Err(StorageError::Io(IoError::NotFound(_))) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StorageError::Misuse(
+            "read-only open kept racing generation changes; retry".to_owned(),
+        ))
+    }
+
+    /// Re-reads the durable state (read-only stores only): new flushed
+    /// segments, new delete logs, a new generation after compaction.
+    /// Snapshots minted before a refresh stay valid — their segments
+    /// are immutable and decoded in memory.
+    pub fn refresh(&mut self) -> Result<(), StorageError> {
+        if !self.read_only {
+            return Err(StorageError::Misuse(
+                "refresh is the read-only handle's doorway; the writer sees \
+                 its own state"
+                    .to_owned(),
+            ));
+        }
+        let backend = self
+            .backend
+            .clone()
+            .expect("read-only stores are persistent");
+        *self = Store::open_read_only(backend)?;
+        Ok(())
+    }
+
+    /// Every mutating doorway starts here: a read-only handle mutates
+    /// nothing, ever — the writer process owns the directory.
+    fn refuse_read_only(&self) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::Misuse(
+                "this handle opened the store read-only; the writer process \
+                 owns mutation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
+        let schema = manifest.schema.clone();
+        let ordering_key = manifest.ordering_key;
+        let generation = manifest.generation;
+        let mut store = Store::with_segment_rows(schema, ordering_key, DEFAULT_SEGMENT_ROWS)?;
+        store.read_only = true;
+        store.manifest_sections = manifest.sections;
+        let mut segments = Vec::new();
+        // Delete logs are held back until the segment watermark is
+        // known: the supersession-visibility rule needs it.
+        let mut logs: Vec<DeleteLog> = Vec::new();
+        for name in backend.list()? {
+            if name
+                .strip_prefix(&delete_log_prefix(generation))
+                .and_then(|rest| rest.strip_suffix(".tlyd"))
+                .is_some()
+            {
+                logs.push(decode_tombstones(&backend.read(&name)?)?);
+                continue;
+            }
+            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+                continue;
+            }
+            let segment = decode_segment(&backend.read(&name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!("segment '{name}' was written under a different schema"),
+                });
+            }
+            segments.push(Arc::new(segment));
+        }
+        segments.sort_by_key(|segment| segment.base_row_id());
+        let mut expected_base = 0u64;
+        for segment in &segments {
+            if segment.base_row_id() != expected_base {
+                return Err(StorageError::MissingRows { expected_base });
+            }
+            expected_base += segment.batch().num_rows() as u64;
+        }
+        // The flushed watermark, from segments alone — the test the
+        // visibility rule runs against.
+        let flushed = segments
+            .iter()
+            .map(|segment| segment.sequence_end())
+            .fold(0, u64::max);
+        let mut tombstones = BTreeMap::new();
+        for log in &logs {
+            // A supersession whose replacements are still in the
+            // writer's WAL: applying its kill without them would show
+            // the one middle state that loses rows. Skip it whole —
+            // the reader sees the pre-mutation state until the flush.
+            if log.superseding != 0 && flushed <= log.superseding {
+                continue;
+            }
+            tombstones.extend(log.ids.iter().map(|&id| (id, log.stamped_at)));
+        }
+        // A tombstone past the durable rows would be a torn write; on
+        // the reader it may simply be a race — surface it as one.
+        if tombstones.keys().any(|&id| id >= expected_base) {
+            return Err(StorageError::Io(IoError::NotFound(
+                "a delete log ran ahead of its rows; retrying".to_owned(),
+            )));
+        }
+        let history_names = store.manifest_sections.history.clone();
+        let mut history = Vec::with_capacity(history_names.len());
+        for name in &history_names {
+            let segment = decode_segment(&backend.read(name)?)?;
+            if segment.batch().schema() != &store.schema {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!(
+                        "history segment '{name}' was written under a different schema"
+                    ),
+                });
+            }
+            history.push(Arc::new(segment));
+        }
+        let recorded = store.manifest_sections.next_sequence;
+        let killed_at = tombstones.values().copied().max().unwrap_or(0);
+        let diverged = recorded.is_some()
+            || killed_at > 0
+            || segments
+                .iter()
+                .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
+        let watermark = diverged.then(|| {
+            let spent = if killed_at > 0 { killed_at + 1 } else { 0 };
+            segments
+                .iter()
+                .map(|segment| segment.sequence_end())
+                .fold(recorded.unwrap_or(0).max(spent), u64::max)
+        });
+        {
+            let mut shared = lock(&store.shared);
+            shared.segments = segments;
+            shared.buffer_base = expected_base;
+            shared.knowledge = watermark.map(|next| Knowledge {
+                next,
+                buffer_base: next,
+                explicit: None,
+            });
+            shared.tombstones = tombstones;
+            shared.history = history;
+        }
+        store.rows = expected_base;
+        store.generation = generation;
+        store.backend = Some(backend);
+        Ok(store)
     }
 
     /// As [`Store::persistent`], with explicit [`StoreOptions`] — the
@@ -774,16 +990,27 @@ impl Store {
         // crash, since assignment is deterministic in append order.
         // (History needs no fold: it only changes at compaction, where
         // the manifest catches up.)
+        //
+        // Delete logs join the fold for the same reason: a kill
+        // consumes its coordinate, so a stamp is evidence of a
+        // coordinate one past it — and on a table whose only mutation
+        // was a delete, the stamp is the *only* evidence, since no row
+        // carries the consumed sequence. (A stamp of 0 is a v1 log's
+        // "unknown", never a real kill: coordinate 0 can only be spent
+        // by a delete on a table with no rows to delete.)
         let recorded = store.manifest_sections.next_sequence;
+        let killed_at = tombstones.values().copied().max().unwrap_or(0);
         let diverged = recorded.is_some()
+            || killed_at > 0
             || segments
                 .iter()
                 .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
         let watermark = diverged.then(|| {
+            let spent = if killed_at > 0 { killed_at + 1 } else { 0 };
             segments
                 .iter()
                 .map(|segment| segment.sequence_end())
-                .fold(recorded.unwrap_or(0), u64::max)
+                .fold(recorded.unwrap_or(0).max(spent), u64::max)
         });
         {
             let mut shared = lock(&store.shared);
@@ -849,18 +1076,16 @@ impl Store {
     }
 
     /// The ingest-sequence watermark: the sequence the next appended
-    /// row will receive. Every knowledge coordinate the table holds is
-    /// `<=` this, so **`AS OF next_sequence()` is the latest state** —
-    /// in every mutation shape. Equal to [`Store::len`] until the table
-    /// diverges.
+    /// row will receive. Every coordinate the table has spent is `<`
+    /// this, so **`AS OF next_sequence() - 1` is the latest state** — in
+    /// every mutation shape, since appends, supersessions and kills all
+    /// consume exactly one coordinate (the delete-consumes ruling,
+    /// 2026-07-29). Equal to [`Store::len`] until the table diverges.
     ///
-    /// `next_sequence() - 1` is *not* the idiom: a `DELETE` stamps its
-    /// kill at the current watermark without consuming it (see
-    /// [`Store::tombstone`]), so after one, the cut one below the
-    /// watermark still shows the deleted rows. Whether a delete should
-    /// instead consume its own coordinate — making every knowledge
-    /// event totally ordered, at the cost of a coordinate per delete —
-    /// is an open question for the design, not settled here.
+    /// That form is the idiom rather than `next_sequence()` itself
+    /// because it addresses a coordinate that has been *spent*: its
+    /// answer is fixed forever, while the watermark is the address the
+    /// next arrival will take, so a cut there silently absorbs it.
     pub fn next_sequence(&self) -> u64 {
         lock(&self.shared).watermark(self.rows)
     }
@@ -1078,6 +1303,7 @@ impl Store {
     /// Appends one row and returns its internal row id. Flushes
     /// automatically when the buffer reaches the segment-row threshold.
     pub fn append(&mut self, row: &[RowValue<'_>]) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         // Validate before logging: a rejected row must leave neither
         // buffer nor WAL changed. Logged-then-rejected would plant a
         // phantom record that ends replay's clean prefix early (dropping
@@ -1107,6 +1333,7 @@ impl Store {
     /// is registered, so a failure at any point leaves both the backend
     /// and the buffer — rows included — exactly as they were.
     pub fn flush(&mut self) -> Result<(), StorageError> {
+        self.refuse_read_only()?;
         // Copy the buffer under the brief lock; encode and publish with
         // the lock released. Readers between the two locks still see the
         // rows — in the buffer, where they were — so every snapshot is
@@ -1156,59 +1383,57 @@ impl Store {
     /// (idempotent); ids never assigned are an error. Returns how many
     /// rows died. The physical rows remain until [`Store::compact`]
     /// resolves them.
+    ///
+    /// A delete **consumes a knowledge coordinate** (ruled 2026-07-29):
+    /// the kill is stamped at the current watermark and the watermark
+    /// then advances, so no later append can share the deletion's
+    /// coordinate. That is what makes the deletion addressable — `AS OF`
+    /// the stamp is the table with those rows gone, permanently, rather
+    /// than a cut whose meaning drifts as ingest continues. The price is
+    /// that the first delete **diverges** the table (a coordinate no row
+    /// carries is precisely `sequence != row id`), and that on a
+    /// persistent store the buffer is flushed first: with the WAL
+    /// truncated at the deletion, every replayed row is one that arrived
+    /// after it, so recovery cannot renumber rows across the gap.
     pub fn tombstone(&mut self, ids: &[u64]) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         if let Some(&bad) = ids.iter().find(|&&id| id >= self.rows) {
             return Err(StorageError::TombstoneOutOfRange { id: bad });
         }
-        let (newly, buffer_base, stamp) = {
+        let newly: BTreeSet<u64> = {
             let shared = lock(&self.shared);
-            let newly: BTreeSet<u64> = ids
-                .iter()
+            ids.iter()
                 .copied()
                 .filter(|id| !shared.tombstones.contains_key(id))
-                .collect();
-            // The kill's coordinate on the knowledge axis: the current
-            // watermark. It is not consumed — the next appended row
-            // takes the same sequence, and `AS OF n` applies both ("all
-            // knowledge with coordinate <= n"); a flush below moves the
-            // buffer without moving the watermark, so the stamp holds.
-            let stamp = shared.watermark(self.rows);
-            (newly, shared.buffer_base, stamp)
+                .collect()
         };
         if newly.is_empty() {
             return Ok(0);
         }
-        // A delete log must never name a row that is not yet durable. Any
-        // id in the current write buffer (>= buffer_base) is in-memory
-        // only, so flush before writing the log: this makes every
-        // tombstoned row — and any replacement rows a mutation appended
-        // ahead of the tombstone — durable first. Without it, a crash
-        // after the (synced) delete log but before a flush would apply a
-        // delete against a row that never reached disk, and reopen would
-        // carry a tombstone for a row id it then reissues (silent
-        // shadow-kill of future rows).
-        if self.backend.is_some() && newly.iter().any(|&id| id >= buffer_base) {
+        // Two rules meet in this flush. A delete log must never name a
+        // row that is not yet durable: an id in the write buffer is
+        // in-memory only, and a crash after the (synced) log would apply
+        // a delete against a row that never reached disk, leaving reopen
+        // with a tombstone for an id it then reissues (silent
+        // shadow-kill of future rows). And because the kill consumes a
+        // coordinate, everything born *below* it must be out of the WAL
+        // before it lands — replay assigns buffered rows their
+        // sequences positionally from the watermark, which after
+        // recovery already counts the gap. Flushing unconditionally
+        // satisfies both, and costs nothing when the buffer is empty.
+        if self.backend.is_some() {
             self.flush()?;
         }
-        // The companion rule: no delete log may commit ahead of the
-        // rows that *supersede* its victims. UPDATE appends its
-        // replacements before tombstoning the originals, and the delete
-        // log below is synced immediately — so if the replacements were
-        // still riding an unsynced WAL tail (or, under `Off`, the
-        // buffer), a crash here would recover the deletion without the
-        // replacements: the one middle state that loses data forever.
-        // Sync the log (cheap) — or without one, flush — first.
-        if self.backend.is_some() {
-            if let Some(wal) = self.wal.as_mut() {
-                wal.sync().map_err(StorageError::from)?;
-                self.last_wal_sync = std::time::Instant::now();
-            } else {
-                let buffered = !lock(&self.shared).buffer.is_empty();
-                if buffered {
-                    self.flush()?;
-                }
-            }
-        }
+        // The kill's coordinate: the current watermark, consumed below
+        // once the log that records it has committed.
+        let stamp = lock(&self.shared).watermark(self.rows);
+        // A delete log must also never commit ahead of rows that
+        // *supersede* its victims — recovering the kill without the
+        // replacement is the one middle state that loses data forever.
+        // The flush above discharges that rule too: every row the store
+        // holds is segment-durable before the log is written, so there
+        // is no unsynced tail left to lose. ([`Store::supersede`] keeps
+        // its own WAL bracket; it does not come through here.)
         if let Some(backend) = &self.backend {
             backend.write(
                 &delete_log_name(self.generation, self.delete_log_sequence),
@@ -1217,9 +1442,15 @@ impl Store {
             self.delete_log_sequence += 1;
         }
         let count = newly.len() as u64;
-        lock(&self.shared)
-            .tombstones
-            .extend(newly.into_iter().map(|id| (id, stamp)));
+        {
+            let mut shared = lock(&self.shared);
+            shared
+                .tombstones
+                .extend(newly.into_iter().map(|id| (id, stamp)));
+            // Committed: the coordinate is spent, and the table has
+            // diverged if it had not already.
+            shared.consume_sequence(self.rows);
+        }
         Ok(count)
     }
 
@@ -1256,6 +1487,7 @@ impl Store {
         replacements: &[Vec<RowValue<'_>>],
         victims: &[u64],
     ) -> Result<u64, StorageError> {
+        self.refuse_read_only()?;
         // Validate everything up front: a refused mutation changes
         // nothing anywhere.
         if victims.is_empty() {
@@ -1369,6 +1601,7 @@ impl Store {
     /// release `UPDATE`/`DELETE` debt, so it runs precisely when the table
     /// is already inflated (interacts with #43/#44, #56).
     pub fn compact(&mut self) -> Result<(), StorageError> {
+        self.refuse_read_only()?;
         // The ingest-sequence watermark as recorded so far, plus the
         // kill stamps and prior history, captured before the merge: a
         // diverged table's compaction must carry all three through —
@@ -1866,8 +2099,10 @@ mod tests {
                 .append(&[RowValue::I64(ts), RowValue::Key("A"), RowValue::F64(0.0)])
                 .unwrap();
         }
-        // Kill ts=1 (row id 1, sequence 11).
+        // Kill ts=1 (row id 1, sequence 11). The kill consumes the
+        // watermark, 13 — a coordinate no row will ever carry.
         store.tombstone(&[1]).unwrap();
+        assert_eq!(store.next_sequence(), 14);
         store.compact().unwrap();
         let views = store.snapshot().unwrap();
         // Merge order is ts 3, 5 — sequences 12, 10, explicit because
@@ -1877,16 +2112,50 @@ mod tests {
             &SequenceInfo::Explicit(vec![12, 10])
         );
         assert_eq!(views[0].segment.base_row_id(), 0);
-        // The next append's sequence follows the dead row's, not the
-        // compacted row count: 13, never 12 again.
+        // The next append's sequence follows the dead row's *and* the
+        // kill's, not the compacted row count: 14, never 12 again.
         store
             .append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)])
             .unwrap();
         let views = store.snapshot().unwrap();
         assert_eq!(
             views[1].segment.sequence_info(),
-            &SequenceInfo::Contiguous { base: 13 }
+            &SequenceInfo::Contiguous { base: 14 }
         );
+    }
+
+    #[test]
+    fn a_delete_consumes_a_coordinate_mid_buffer() {
+        // The awkward shape for an in-memory store: the kill lands
+        // while the rows it splits are still in the write buffer, so
+        // the buffer straddles the gap — births below it, later
+        // arrivals above — and contiguity is gone.
+        let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..3);
+        assert_eq!(store.next_sequence(), 3);
+        store.tombstone(&[1]).unwrap();
+        assert_eq!(store.next_sequence(), 4, "the kill spent coordinate 3");
+        append_n(&mut store, 3..4);
+        assert_eq!(store.next_sequence(), 5);
+        let views = store.snapshot().unwrap();
+        assert_eq!(
+            views[0].segment.sequence_info(),
+            &SequenceInfo::Explicit(vec![0, 1, 2, 4]),
+            "the arrival is born above the kill, not beside it"
+        );
+        // And the cut at the kill is the deletion, with nothing else in
+        // it — the property the whole ruling was about.
+        let knowledge = store.knowledge_snapshot().unwrap();
+        let live_at = |cut: u64| -> usize {
+            knowledge
+                .as_of(cut)
+                .iter()
+                .map(crate::SegmentView::live_rows)
+                .sum()
+        };
+        assert_eq!(live_at(2), 3);
+        assert_eq!(live_at(3), 2);
+        assert_eq!(live_at(4), 3);
     }
 
     #[test]

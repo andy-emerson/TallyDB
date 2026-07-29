@@ -64,11 +64,21 @@ pub struct Spec {
     pub disorder_fraction: f64,
     /// Probability that `aux` is null on any given row.
     pub null_density: f64,
+    /// Price granularity: `value` and `aux` are rounded to multiples of
+    /// this (`0.0` = continuous). Real prices are decimals — a trade
+    /// prints at 101.37, not at 101.370000184 — and a corpus that skips
+    /// this misrepresents exactly the workload a decimal-aware codec
+    /// (ALP, #42) is for. The rounding is done the way real values
+    /// arrive: `(x / tick).round() * tick`, so each value is the
+    /// nearest-representable double to a decimal, not an exact binary
+    /// fraction.
+    pub tick_size: f64,
 }
 
 impl Spec {
     /// Trade-tick shape: irregular bursty gaps, 32 symbols, fully
-    /// ordered, no nulls.
+    /// ordered, no nulls, penny-priced (tick size 0.01 — prices are
+    /// decimals; see [`Spec::tick_size`]).
     pub fn ticks(rows: usize, seed: u64) -> Spec {
         Spec {
             rows,
@@ -79,6 +89,7 @@ impl Spec {
             jitter: 999_999,                  // near-fully irregular
             disorder_fraction: 0.0,
             null_density: 0.0,
+            tick_size: 0.01,
         }
     }
 
@@ -94,6 +105,10 @@ impl Spec {
             jitter: 5_000_000,      // ±5ms
             disorder_fraction: 0.01,
             null_density: 0.02,
+            // Sensor readings are continuous reals, deliberately NOT
+            // tick-rounded: this family is the non-decimal workload
+            // (ALP's RD fallback), as ticks is the decimal one.
+            tick_size: 0.0,
         }
     }
 
@@ -119,12 +134,22 @@ impl Spec {
             let key = rng.next_range(u64::from(self.key_cardinality)) as u32;
             let walk = &mut walks[key as usize];
             *walk += (rng.next_f64() - 0.5) * 2.0;
-            let value = *walk;
+            // The walk itself stays continuous — rounding the *stored*
+            // value, not the state, is how real prices behave (the
+            // unrounded mid moves; the print lands on a tick).
+            let round = |x: f64| {
+                if self.tick_size > 0.0 {
+                    (x / self.tick_size).round() * self.tick_size
+                } else {
+                    x
+                }
+            };
+            let value = round(*walk);
             let aux = if rng.next_f64() < self.null_density {
                 None
             } else {
                 // aux ≈ 1.5·value − 20, with noise: recoverable signal.
-                Some(1.5 * value - 20.0 + (rng.next_f64() - 0.5) * 4.0)
+                Some(round(1.5 * value - 20.0 + (rng.next_f64() - 0.5) * 4.0))
             };
             rows.push(Row {
                 ts,
@@ -190,6 +215,22 @@ mod tests {
         assert!(rows.windows(2).all(|pair| pair[0].ts <= pair[1].ts));
         assert!(rows.iter().all(|row| row.aux.is_some()));
         assert!(rows.iter().all(|row| row.key < 32));
+    }
+
+    #[test]
+    fn ticks_prices_are_decimals_and_telemetry_stays_continuous() {
+        // The #42 prerequisite: tick prices land exactly on the grid
+        // (bit-identical to re-rounding), so a decimal-aware codec
+        // meets the workload it exists for — while telemetry keeps
+        // continuous reals, the fallback's workload.
+        let on_grid = |x: f64| ((x / 0.01).round() * 0.01).to_bits() == x.to_bits();
+        let ticks = Spec::ticks(5_000, 7).generate();
+        assert!(ticks
+            .iter()
+            .all(|row| on_grid(row.value) && row.aux.is_some_and(on_grid)));
+        let telemetry = Spec::telemetry(5_000, 7).generate();
+        let continuous = telemetry.iter().filter(|row| !on_grid(row.value)).count();
+        assert!(continuous > 4_000, "{continuous}");
     }
 
     #[test]

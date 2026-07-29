@@ -289,11 +289,13 @@ fn a_corrupt_header_is_loud_not_silent() {
 #[test]
 fn a_delete_log_never_commits_ahead_of_superseding_rows() {
     // UPDATE's shape at the storage layer: replacements appended first,
-    // then the originals tombstoned. The delete log is synced the
-    // moment it is written — so the replacements must be made durable
-    // *before* it commits, or a crash in the group window recovers the
-    // deletion without the replacements: originals gone, replacements
-    // gone, the one middle state that loses data forever.
+    // then the originals tombstoned. The delete log commits the moment
+    // it is written — so the replacements must be made durable *before*
+    // it does, or a crash in the group window recovers the deletion
+    // without the replacements: originals gone, replacements gone, the
+    // one middle state that loses data forever. (The tombstone's
+    // unconditional flush is what discharges this now; it used to be a
+    // WAL sync, which held only while nothing was buffered.)
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     {
         let mut store = open(
@@ -317,7 +319,8 @@ fn a_delete_log_never_commits_ahead_of_superseding_rows() {
 fn a_delete_log_never_commits_ahead_of_buffered_rows_under_off() {
     // The same invariant without a WAL: under `Off` the replacements
     // live only in the write buffer, so the tombstone must flush them
-    // into a segment before its delete log commits.
+    // into a segment before its delete log commits — the same flush,
+    // reached by a path that never had a log to sync.
     let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
     {
         let mut store = open(backend.clone(), WalSync::Off);
@@ -330,6 +333,51 @@ fn a_delete_log_never_commits_ahead_of_buffered_rows_under_off() {
     let store = open(backend, WalSync::Off);
     assert_eq!(store.len(), 8);
     assert_eq!(ts_values(&store), vec![100, 101, 102, 103]);
+}
+
+/// A delete consumes a coordinate, and replay assigns buffered rows
+/// their sequences positionally from the recovered watermark — which
+/// already counts the gap. So nothing born *below* the kill may still
+/// be in the log when it lands, or recovery would renumber those rows
+/// above it. The tombstone's flush is what guarantees that; this is
+/// the shape that would catch its absence: rows buffered when a kill
+/// lands on a row that is already durable.
+#[test]
+fn replay_across_a_consumed_coordinate_keeps_births_below_it() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    {
+        let mut store = open(
+            backend.clone(),
+            WalSync::Group(std::time::Duration::from_secs(3600)),
+        );
+        append_n(&mut store, 0..4); // sequences 0..3
+        store.flush().unwrap(); // durable, and the WAL is truncated
+        append_n(&mut store, 100..103); // sequences 4..6, logged only
+        store.tombstone(&[0]).unwrap(); // kills a durable row, spends 7
+        assert_eq!(store.next_sequence(), 8);
+        std::mem::forget(store); // power loss
+    }
+    let store = open(backend, WalSync::Full);
+    // The spent coordinate is recovered from the delete log alone: no
+    // row carries 7, and no later row may be issued below 8.
+    assert_eq!(store.next_sequence(), 8);
+    // The three rows that arrived before the kill are back — the
+    // tombstone's flush made them durable — and still carry sequences
+    // below it, rather than being renumbered above the gap.
+    assert_eq!(ts_values(&store), vec![1, 2, 3, 100, 101, 102]);
+    let births: Vec<u64> = store
+        .snapshot()
+        .unwrap()
+        .iter()
+        .flat_map(|view| {
+            let segment = &view.segment;
+            (0..segment.batch().num_rows())
+                .filter(|&row| view.is_live(row))
+                .map(|row| segment.sequence_at(row))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(births, vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[test]

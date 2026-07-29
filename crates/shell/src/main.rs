@@ -6,20 +6,24 @@
 use std::io::{IsTerminal, Read};
 use tallydb_shell::{only_comments, split_statements, Console, Outcome};
 
-const USAGE: &str = "usage: tallydb DIR [-c \"sql\"]\n\
+const USAGE: &str = "usage: tallydb DIR [--read-only] [-c \"sql\"]\n\
   DIR         the database directory (created if absent)\n\
+  --read-only open alongside a writer process: queries only, .refresh\n\
+              re-reads what the writer has flushed\n\
   -c \"sql\"    run statements and exit (repeatable); also reads piped stdin";
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
     let mut dir = None;
     let mut batch: Vec<String> = Vec::new();
+    let mut read_only = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-c" => match arguments.next() {
                 Some(sql) => batch.push(sql),
                 None => exit_usage("-c needs a SQL argument"),
             },
+            "--read-only" => read_only = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -31,7 +35,12 @@ fn main() {
     let Some(dir) = dir else {
         exit_usage("missing DIR");
     };
-    let mut console = match Console::open(&dir) {
+    let opened = if read_only {
+        Console::open_read_only(&dir)
+    } else {
+        Console::open(&dir)
+    };
+    let mut console = match opened {
         Ok(console) => console,
         Err(error) => {
             eprintln!("error: {error}");

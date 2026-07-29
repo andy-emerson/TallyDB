@@ -82,6 +82,9 @@
 //! not know, which is what lets the knowledge axis and F3's zone-map
 //! lift share one revision.
 
+use crate::alp::{
+    decode_alp_f64, decode_for_i64, decode_for_u32, encode_alp_f64, encode_for_i64, encode_for_u32,
+};
 use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
 use crate::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
 use arrow_lite::{
@@ -267,15 +270,20 @@ pub fn encode_segment(segment: &Segment) -> Vec<u8> {
 }
 
 /// The codec the writer chooses for a column — the one place that
-/// policy lives. Decision #29: the ordering key of an ordered segment is
-/// clock-like and takes delta-of-delta; everything else (including every
-/// `f64` column, per the #30 interim ruling) is uncompressed.
+/// policy lives. Decision #29: the ordering key of an ordered segment
+/// is clock-like and takes delta-of-delta. Decision #42 (2026-07-29):
+/// `f64` columns take ALP (with its RD and raw per-chunk fallbacks —
+/// the codec can never bloat, so the policy needs no size check here),
+/// and the non-clock integers — `i64` columns off the ordering key,
+/// `u32` symbol codes — take frame-of-reference + bit-packing.
 fn writer_codec(segment: &Segment, column: &Column, is_ordering_key: bool) -> Codec {
     match column {
         Column::Numeric(NumericData::I64(_)) if is_ordering_key && segment.is_ordered() => {
             Codec::DeltaOfDeltaI64
         }
-        _ => Codec::Uncompressed,
+        Column::Numeric(NumericData::I64(_)) => Codec::ForI64,
+        Column::Numeric(NumericData::F64(_)) => Codec::AlpF64,
+        Column::Key(_) => Codec::ForU32,
     }
 }
 
@@ -340,16 +348,23 @@ fn encode_column(
     encode_validity(out, validity);
     match column {
         Column::Numeric(NumericData::F64(numeric)) => {
-            let mut bytes = Vec::with_capacity(numeric.len() * 8);
-            for value in numeric.values().as_slice() {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
+            let bytes = match codec {
+                Codec::AlpF64 => encode_alp_f64(numeric.values().as_slice()),
+                _ => {
+                    let mut bytes = Vec::with_capacity(numeric.len() * 8);
+                    for value in numeric.values().as_slice() {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    bytes
+                }
+            };
             push_values(out, &bytes);
         }
         Column::Numeric(NumericData::I64(numeric)) => {
             let bytes = match codec {
                 Codec::DeltaOfDeltaI64 => encode_delta_of_delta(numeric.values().as_slice()),
-                Codec::Uncompressed => {
+                Codec::ForI64 => encode_for_i64(numeric.values().as_slice()),
+                _ => {
                     let mut bytes = Vec::with_capacity(numeric.len() * 8);
                     for value in numeric.values().as_slice() {
                         bytes.extend_from_slice(&value.to_le_bytes());
@@ -360,10 +375,16 @@ fn encode_column(
             push_values(out, &bytes);
         }
         Column::Key(keys) => {
-            let mut bytes = Vec::with_capacity(keys.len() * 4);
-            for code in keys.codes().as_slice() {
-                bytes.extend_from_slice(&code.to_le_bytes());
-            }
+            let bytes = match codec {
+                Codec::ForU32 => encode_for_u32(keys.codes().as_slice()),
+                _ => {
+                    let mut bytes = Vec::with_capacity(keys.len() * 4);
+                    for code in keys.codes().as_slice() {
+                        bytes.extend_from_slice(&code.to_le_bytes());
+                    }
+                    bytes
+                }
+            };
             push_values(out, &bytes);
             let dictionary = keys.dictionary();
             out.extend_from_slice(&(dictionary.len() as u32).to_le_bytes());
@@ -842,12 +863,15 @@ fn decode_column(
     let values = reader.take(values_len)?;
     let column = match column_type {
         ColumnType::F64 => {
-            if codec != Codec::Uncompressed {
-                return Err(FormatError::Corrupt(format!(
-                    "f64 column '{name}' uses an i64 codec"
-                )));
-            }
-            let buffer = decode_f64(values, rows, &name)?;
+            let buffer = match codec {
+                Codec::Uncompressed => decode_f64(values, rows, &name)?,
+                Codec::AlpF64 => Buffer::from_slice(&decode_alp_f64(values, rows)?),
+                other => {
+                    return Err(FormatError::Corrupt(format!(
+                        "f64 column '{name}' carries codec {other:?}"
+                    )))
+                }
+            };
             Column::Numeric(NumericData::F64(match validity {
                 Some(bitmap) => NumericColumn::new_nullable(buffer, bitmap),
                 None => NumericColumn::new_non_null(buffer),
@@ -857,6 +881,12 @@ fn decode_column(
             let buffer = match codec {
                 Codec::Uncompressed => decode_i64(values, rows, &name)?,
                 Codec::DeltaOfDeltaI64 => Buffer::from_slice(&decode_delta_of_delta(values, rows)?),
+                Codec::ForI64 => Buffer::from_slice(&decode_for_i64(values, rows)?),
+                other => {
+                    return Err(FormatError::Corrupt(format!(
+                        "i64 column '{name}' carries codec {other:?}"
+                    )))
+                }
             };
             Column::Numeric(NumericData::I64(match validity {
                 Some(bitmap) => NumericColumn::new_nullable(buffer, bitmap),
@@ -864,22 +894,28 @@ fn decode_column(
             }))
         }
         ColumnType::Key => {
-            if codec != Codec::Uncompressed {
-                return Err(FormatError::Corrupt(format!(
-                    "key column '{name}' uses an i64 codec"
-                )));
-            }
-            if values.len() != rows * 4 {
-                return Err(FormatError::Corrupt(format!(
-                    "key column '{name}' holds {} bytes of codes, expected {}",
-                    values.len(),
-                    rows * 4
-                )));
-            }
-            let mut codes = Buffer::with_capacity(rows);
-            for chunk in values.chunks_exact(4) {
-                codes.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-            }
+            let codes = match codec {
+                Codec::ForU32 => Buffer::from_slice(&decode_for_u32(values, rows)?),
+                Codec::Uncompressed => {
+                    if values.len() != rows * 4 {
+                        return Err(FormatError::Corrupt(format!(
+                            "key column '{name}' holds {} bytes of codes, expected {}",
+                            values.len(),
+                            rows * 4
+                        )));
+                    }
+                    let mut codes = Buffer::with_capacity(rows);
+                    for chunk in values.chunks_exact(4) {
+                        codes.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                    }
+                    codes
+                }
+                other => {
+                    return Err(FormatError::Corrupt(format!(
+                        "key column '{name}' carries codec {other:?}"
+                    )))
+                }
+            };
             let dictionary = decode_dictionary(reader, &name)?;
             for (row, &code) in codes.as_slice().iter().enumerate() {
                 let in_range = (code as usize) < dictionary.len();

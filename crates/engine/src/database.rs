@@ -417,6 +417,64 @@ mod join_tests {
     }
 
     #[test]
+    fn the_sequence_pseudocolumn_survives_the_join() {
+        // Joining widens rows without adding, dropping or reordering
+        // them, so a fact row's birth coordinate is the same one it had
+        // unjoined. If the joined segment lost its sequences, `_seq`
+        // would quietly become the row's position instead.
+        let db = database();
+        let seqs = |sql: &str| -> Vec<i64> {
+            let output = db.query(sql).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("_seq is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        // INNER drops the two D rows (ingest coordinates 3 and 6).
+        assert_eq!(
+            seqs(
+                "SELECT _seq, ts FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts"
+            ),
+            [0, 1, 2, 4, 5, 7]
+        );
+        // LEFT keeps them, still carrying their own coordinates.
+        assert_eq!(
+            seqs(
+                "SELECT _seq, ts FROM trades LEFT JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY ts"
+            ),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn hidden_order_by_reaches_a_dimension_column_through_the_pushdown() {
+        // ORDER BY on an unprojected dimension attribute: the used-set
+        // walker must count the sort column, or the pushdown would
+        // drop exactly the column the hidden sort then needs.
+        let db = database();
+        let output = db
+            .query(
+                "SELECT ts FROM trades JOIN symbols \
+                 ON trades.sym = symbols.sym ORDER BY weight DESC LIMIT 2",
+            )
+            .unwrap();
+        assert_eq!(output.schema.fields().len(), 1);
+        let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {
+            panic!("ts type")
+        };
+        // weight 2.5 is B: fact rows ts 1 and 4, in input order.
+        assert_eq!(ts.values().as_slice(), &[1, 4]);
+    }
+
+    #[test]
     fn join_against_empty_dimension_does_not_panic() {
         // B2 regression: an empty dimension has no views to sniff a column
         // type from. The gather must take each column's type from the
@@ -482,24 +540,35 @@ mod join_tests {
         let db = database();
         // WHERE on a dimension attribute, GROUP BY it, aggregate a fact
         // column — the star-schema query shape.
+        // Groups come back in no particular order — a symbol column
+        // cannot be ordered by (#58) — so they are read by label.
         let output = db
             .query(
                 "SELECT sector, count(*) AS n, sum(x) AS s FROM trades \
                  JOIN symbols ON trades.sym = symbols.sym \
-                 WHERE weight > 1 GROUP BY sector ORDER BY sector",
+                 WHERE weight > 1 GROUP BY sector",
             )
             .unwrap();
         let batch = &output.batches[0];
         let Column::Key(sector) = &batch.columns()[0] else {
             panic!("sector type")
         };
-        assert_eq!(sector.value_at(0), Some("energy")); // A: ts 0, 5
-        assert_eq!(sector.value_at(1), Some("tech")); // B only (weight 2.5): ts 1, 4
         let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
             panic!("count type")
         };
-        assert_eq!(n.values().as_slice(), &[2, 2]);
-        assert_eq!(f64s(&output, 2), [Some(5.0), Some(5.0)]);
+        let sums = f64s(&output, 2);
+        let mut groups: Vec<(&str, i64, Option<f64>)> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    sector.value_at(row).expect("no null sector"),
+                    n.values().as_slice()[row],
+                    sums[row],
+                )
+            })
+            .collect();
+        groups.sort_by_key(|group| group.0);
+        // energy is A (ts 0, 5); tech is B only, weight 2.5 (ts 1, 4).
+        assert_eq!(groups, [("energy", 2, Some(5.0)), ("tech", 2, Some(5.0))]);
         // Windows run over the joined intermediate too.
         let output = db
             .query(

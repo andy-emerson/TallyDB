@@ -38,7 +38,7 @@
 
 use crate::plan::{
     AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
-    ScalarExpr, ScalarFunction,
+    ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
@@ -47,7 +47,7 @@ use arrow_lite::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use storage_lite::{Segment, SegmentView};
+use storage_lite::{Segment, SegmentView, SequenceInfo};
 
 /// One window-aggregate implementation, registered by the embedder.
 pub trait WindowAggregate: Send + Sync {
@@ -272,15 +272,22 @@ pub fn execute_join(
             }
         }
     }
-    // The joined schema: fact columns, then dimension columns minus its
-    // key (it duplicates the fact key), all nullable (LEFT produces
-    // nulls; INNER's placeholders sit under the dead mask).
+    // The joined schema: fact columns, then the dimension columns the
+    // query actually reads (#81) minus its key (which duplicates the
+    // fact key), all nullable (LEFT produces nulls; INNER's
+    // placeholders sit under the dead mask). Gathering an unread
+    // attribute would cost a full fact-cardinality column for nothing —
+    // dimensions are wide and queries are narrow.
+    let referenced = plan.referenced_columns();
     let mut fields: Vec<Field> = fact_schema.fields().to_vec();
     let mut dimension_columns: Vec<usize> = Vec::new();
     for (index, field) in dimension_schema.fields().iter().enumerate() {
         if index == dimension_key_index {
             continue;
         }
+        // The name clash is refused whether or not the query reads the
+        // column: which query runs must not decide whether a schema
+        // pairing is legal.
         if fact_schema
             .fields()
             .iter()
@@ -291,6 +298,9 @@ pub fn execute_join(
                  distinct attribute names",
                 field.name()
             )));
+        }
+        if !referenced.contains(field.name()) {
+            continue;
         }
         dimension_columns.push(index);
         fields.push(Field::new(field.name(), field.column_type(), true));
@@ -337,11 +347,24 @@ pub fn execute_join(
             ));
         }
         let joined = RecordBatch::new(joined_schema.clone(), columns);
+        // Joining widens rows, it never adds, drops or reorders them
+        // (INNER's misses die under the mask, in place) — so the fact
+        // segment's birth sequences still describe row i, and `_seq`
+        // reads the same coordinate through a join as without one. The
+        // virtual form has to be made explicit: it means "sequence ==
+        // row id", and this scratch segment's row ids start at 0.
+        let sequence = match view.segment.sequence_info() {
+            SequenceInfo::RowIds => SequenceInfo::Contiguous {
+                base: view.segment.base_row_id(),
+            },
+            carried => carried.clone(),
+        };
         let segment = Segment::from_batch(
             joined,
             view.segment.ordering_key(),
             view.segment.is_ordered(),
-        );
+        )
+        .with_sequence(sequence);
         joined_views.push(SegmentView {
             segment: Arc::new(segment),
             live,
@@ -491,7 +514,41 @@ fn execute_single(
     // Views with no live rows contribute nothing; dropping them up front
     // means "one batch per segment" below never emits an empty batch.
     let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
+    // Standard SQL orders by columns the query does not project:
+    // `SELECT x FROM t ORDER BY ts`. The sort resolves against the
+    // output schema, so such a column is carried as a hidden last item
+    // — projected, sorted by, dropped — the same trick HAVING's hidden
+    // columns use. Only for row-per-row projections: under DISTINCT
+    // the hidden column would leak into what "distinct" means, and
+    // under GROUP BY an ungrouped column has no per-row value — both
+    // shapes keep today's refusal, as standard SQL refuses them.
+    let hidden_order = match (&plan.projection, plan.distinct, &plan.order_by) {
+        (Projection::Items(items), false, Some(order_by)) => !items.iter().any(|item| {
+            let output_name = match item {
+                PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
+                PlanItem::Computed { name, .. } => name,
+                PlanItem::WindowAgg {
+                    function, alias, ..
+                } => alias.as_deref().unwrap_or(function),
+            };
+            output_name == order_by.column
+        }),
+        _ => false,
+    };
     let mut output = match &plan.projection {
+        Projection::Items(items) if hidden_order => {
+            let mut extended = items.clone();
+            extended.push(PlanItem::Column {
+                name: plan
+                    .order_by
+                    .as_ref()
+                    .expect("checked above")
+                    .column
+                    .clone(),
+                alias: None,
+            });
+            project_items(schema, &views, &extended, registry)?
+        }
         Projection::Items(items) => project_items(schema, &views, items, registry)?,
         Projection::Aggregate {
             keys,
@@ -511,10 +568,25 @@ fn execute_single(
         output = distinct_output(output);
     }
     if let Some(order_by) = &plan.order_by {
-        output = sort_output(output, order_by)?;
+        // Only the rows OFFSET/LIMIT can reach are worth sorting.
+        let keep = plan
+            .limit
+            .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
+        output = sort_output(output, order_by, keep)?;
     }
     if plan.limit.is_some() || plan.offset.is_some() {
         output = limit_output(output, plan.offset.unwrap_or(0), plan.limit);
+    }
+    if hidden_order {
+        // The carried sort column was never part of the answer.
+        let visible = output.schema.fields().len() - 1;
+        let schema = Schema::new(output.schema.fields()[..visible].to_vec());
+        let batches = output
+            .batches
+            .iter()
+            .map(|batch| RecordBatch::new(schema.clone(), batch.columns()[..visible].to_vec()))
+            .collect();
+        output = QueryOutput { schema, batches };
     }
     Ok(output)
 }
@@ -992,7 +1064,28 @@ fn resolve<'a>(schema: &'a Schema, name: &str) -> Result<(usize, &'a Field), Que
         .iter()
         .enumerate()
         .find(|(_, field)| field.name() == name)
-        .ok_or_else(|| QueryError::UnknownColumn(name.to_owned()))
+        // Everything reaching here resolves against the *stored*
+        // schema, where the pseudocolumn does not exist: projection
+        // intercepts it first, so this is always a refusal.
+        .ok_or_else(|| crate::plan::no_such_column(name))
+}
+
+/// The ingest-sequence pseudocolumn, materialized per view: every row's
+/// birth sequence as `BIGINT`, live rows only, in stored order — the
+/// same rows and order [`passthrough`] would hand back for a real
+/// column. Sequences are `u64` in storage and `i64` here because SQL has
+/// no unsigned type; the gap is unreachable (`i64::MAX` appends).
+fn sequence_column(views: &[&SegmentView], name: &str) -> (Field, Vec<Column>) {
+    let columns = views
+        .iter()
+        .map(|view| {
+            let values: Buffer<i64> = live_rows(view)
+                .map(|row| view.segment.sequence_at(row) as i64)
+                .collect();
+            Column::Numeric(NumericData::I64(NumericColumn::new_non_null(values)))
+        })
+        .collect();
+    (Field::new(name, ColumnType::I64, false), columns)
 }
 
 /// Local row indices a reader sees, in stored order.
@@ -1046,6 +1139,9 @@ fn passthrough(
     name: &str,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    if name == SEQUENCE_COLUMN {
+        return Ok(sequence_column(views, alias.unwrap_or(name)));
+    }
     let (index, field) = resolve(schema, name)?;
     let mut out = Field::new(alias.unwrap_or(name), field.column_type(), field.nullable());
     if let Some(logical) = field.logical() {
@@ -1867,47 +1963,65 @@ fn assemble_aggregate<'a>(
     }
 }
 
-/// A sortable view of one output cell.
-#[derive(Clone, PartialEq, PartialOrd)]
+/// A sortable view of one output cell. Numbers only: symbol columns
+/// are unordered labels (#58, ruled 2026-07-29), so nothing else can
+/// reach the sort.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum SortCell {
     I64(i64),
     F64(f64),
-    Text(String),
 }
 
-/// Sorts the whole output by one column into a single batch — the
-/// materialization ORDER BY inherently asks for, plus (today) a `String`
-/// per row for key columns and a doubled `picks` index, and **no top-k**:
-/// `ORDER BY ... LIMIT k` still sorts and materializes the entire result
-/// before the limit applies (#56). Nulls sort **last in
-/// both directions**, DuckDB's default (PostgreSQL flips them under
-/// DESC; when the two disagree we follow our oracle); `f64` uses total
-/// order, so NaN sorts above every number.
-fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, QueryError> {
-    let (column_index, _) = resolve(&output.schema, &order_by.column)?;
-    let mut picks: Vec<(usize, usize)> = Vec::with_capacity(output.num_rows());
-    let mut cells: Vec<Option<SortCell>> = Vec::with_capacity(output.num_rows());
-    for (batch_index, batch) in output.batches.iter().enumerate() {
-        let column = &batch.columns()[column_index];
-        for row in 0..batch.num_rows() {
-            picks.push((batch_index, row));
-            cells.push(match column {
-                Column::Numeric(NumericData::F64(numeric)) => numeric
-                    .is_valid(row)
-                    .then(|| SortCell::F64(numeric.values().as_slice()[row])),
-                Column::Numeric(NumericData::I64(numeric)) => numeric
-                    .is_valid(row)
-                    .then(|| SortCell::I64(numeric.values().as_slice()[row])),
-                Column::Key(keys) => keys
-                    .value_at(row)
-                    .map(|value| SortCell::Text(value.to_owned())),
-            });
-        }
+/// One row's place in the sort: its key cell, where the row lives, and
+/// its input position — which breaks ties, so every path here returns
+/// exactly the stable order.
+type SortEntry = (Option<SortCell>, (usize, usize), usize);
+
+/// Sorts the output by one column into a single batch. Nulls sort
+/// **last in both directions**, DuckDB's default (PostgreSQL flips them
+/// under DESC; when the two disagree we follow our oracle); `f64` uses
+/// total order, so NaN sorts above every number.
+///
+/// `keep` is how many leading rows the query can actually use —
+/// `OFFSET + LIMIT`, or `None` when it asks for all of them. Given a
+/// bound, this takes the **top-k** path (#80): one sweep holding a
+/// heap of the k best rows, so the work is O(n log k) and the memory
+/// O(k), where the full sort costs O(n log n) and materializes a
+/// sorted copy of everything — a ten-row answer no longer pays for a
+/// million-row sort. Both paths return the same rows in the same
+/// order; the tie-breaking position is what makes that exact rather
+/// than merely equivalent.
+///
+/// A symbol column is refused (#58 = B, ruled 2026-07-29): its codes
+/// are per-segment first-appearance ranks, so they carry no order to
+/// sort by, and the alternative — ranking the labels as text — asks an
+/// engine that refuses to *produce* a string to rank strings, in a byte
+/// order that is only "alphabetical" for ASCII. Identities are not
+/// ordered; the arithmetic refusal and this one are the same rule.
+fn sort_output(
+    output: QueryOutput,
+    order_by: &OrderBy,
+    keep: Option<usize>,
+) -> Result<QueryOutput, QueryError> {
+    let (column_index, field) = resolve(&output.schema, &order_by.column)?;
+    if field.column_type() == ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "ORDER BY '{}': symbol columns are unordered labels, not ordered text \
+             — group or filter by them, and order by a number (their codes are \
+             per-segment, so they rank nothing)",
+            order_by.column
+        )));
     }
-    let mut order: Vec<usize> = (0..picks.len()).collect();
-    let compare_values = |left: &SortCell, right: &SortCell| match (left, right) {
-        (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
-        (left, right) => left.partial_cmp(right).expect("same variant per column"),
+    let cell = |batch: &RecordBatch, row: usize| -> Option<SortCell> {
+        match &batch.columns()[column_index] {
+            Column::Numeric(NumericData::F64(numeric)) => numeric
+                .is_valid(row)
+                .then(|| SortCell::F64(numeric.values().as_slice()[row])),
+            Column::Numeric(NumericData::I64(numeric)) => numeric
+                .is_valid(row)
+                .then(|| SortCell::I64(numeric.values().as_slice()[row])),
+            Column::Key(_) => unreachable!("symbol columns are refused above"),
+        }
     };
     // Nulls last in both directions unless the query says otherwise
     // (NULLS FIRST/LAST) — placement sits outside the DESC reversal.
@@ -1916,25 +2030,101 @@ fn sort_output(output: QueryOutput, order_by: &OrderBy) -> Result<QueryOutput, Q
     } else {
         std::cmp::Ordering::Greater
     };
-    order.sort_by(|&left, &right| match (&cells[left], &cells[right]) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => null_order,
-        (Some(_), None) => null_order.reverse(),
-        (Some(left), Some(right)) => {
-            let ordering = compare_values(left, right);
-            if order_by.descending {
-                ordering.reverse()
-            } else {
-                ordering
+    let compare = |left: &SortEntry, right: &SortEntry| {
+        let ordering = match (&left.0, &right.0) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => null_order,
+            (Some(_), None) => null_order.reverse(),
+            (Some(left), Some(right)) => {
+                let ordering = match (left, right) {
+                    (SortCell::F64(left), SortCell::F64(right)) => cmp_f64(*left, *right),
+                    (left, right) => left.partial_cmp(right).expect("same variant per column"),
+                };
+                if order_by.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+        };
+        // Input position breaks every tie: this is what a stable sort
+        // does, and holding to it keeps top-k's answer identical to
+        // the full sort's rather than merely as valid.
+        ordering.then(left.2.cmp(&right.2))
+    };
+    let rows = output.num_rows();
+    let mut entries: Vec<SortEntry> = Vec::with_capacity(keep.unwrap_or(rows).min(rows));
+    let mut position = 0usize;
+    for (batch_index, batch) in output.batches.iter().enumerate() {
+        for row in 0..batch.num_rows() {
+            let entry = (cell(batch, row), (batch_index, row), position);
+            position += 1;
+            match keep {
+                // Bounded: the heap's root is the worst row kept, so a
+                // candidate is admitted only by displacing it — and
+                // nothing else is ever retained.
+                Some(k) if entries.len() == k => {
+                    if k > 0 && compare(&entry, &entries[0]) == std::cmp::Ordering::Less {
+                        entries[0] = entry;
+                        sift_down(&mut entries, 0, &compare);
+                    }
+                }
+                _ => {
+                    entries.push(entry);
+                    let last = entries.len() - 1;
+                    sift_up(&mut entries, last, &compare);
+                }
             }
         }
-    });
-    let picks: Vec<(usize, usize)> = order.into_iter().map(|index| picks[index]).collect();
+    }
+    entries.sort_by(compare);
+    let picks: Vec<(usize, usize)> = entries.into_iter().map(|entry| entry.1).collect();
     let batch = take_rows(&output.schema, &output.batches, &picks);
     Ok(QueryOutput {
         schema: output.schema,
         batches: vec![batch],
     })
+}
+
+/// Restores the max-heap property upward from `index` — the worst
+/// entry (greatest under `compare`) rises toward the root.
+fn sift_up(
+    heap: &mut [SortEntry],
+    mut index: usize,
+    compare: &impl Fn(&SortEntry, &SortEntry) -> std::cmp::Ordering,
+) {
+    while index > 0 {
+        let parent = (index - 1) / 2;
+        if compare(&heap[index], &heap[parent]) != std::cmp::Ordering::Greater {
+            break;
+        }
+        heap.swap(index, parent);
+        index = parent;
+    }
+}
+
+/// Restores the max-heap property downward from `index`.
+fn sift_down(
+    heap: &mut [SortEntry],
+    mut index: usize,
+    compare: &impl Fn(&SortEntry, &SortEntry) -> std::cmp::Ordering,
+) {
+    loop {
+        let (left, right) = (2 * index + 1, 2 * index + 2);
+        let mut worst = index;
+        if left < heap.len() && compare(&heap[left], &heap[worst]) == std::cmp::Ordering::Greater {
+            worst = left;
+        }
+        if right < heap.len() && compare(&heap[right], &heap[worst]) == std::cmp::Ordering::Greater
+        {
+            worst = right;
+        }
+        if worst == index {
+            return;
+        }
+        heap.swap(index, worst);
+        index = worst;
+    }
 }
 
 /// Applies OFFSET/LIMIT across the output's rows (in the output's
@@ -2371,6 +2561,239 @@ mod tests {
         }
     }
 
+    /// The `_seq` values of a result, flattened across batches.
+    fn seq_values(output: &QueryOutput, index: usize) -> Vec<i64> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
+                    panic!("_seq is i64")
+                };
+                column.values().as_slice().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_reads_each_rows_coordinate() {
+        let rows: Vec<(i64, &str, f64)> = (0..7)
+            .map(|i| (i as i64, "A", i as f64))
+            .collect::<Vec<_>>();
+        let views = segmented(&rows, 3);
+        let output = run(&views, "SELECT _seq, ts FROM t").unwrap();
+        // A table that never diverged: sequence == row id == ts here.
+        assert_eq!(seq_values(&output, 0), (0..7).collect::<Vec<i64>>());
+        assert_eq!(output.schema.fields()[0].name(), "_seq");
+        assert_eq!(output.schema.fields()[0].column_type(), ColumnType::I64);
+        assert!(!output.schema.fields()[0].nullable());
+        // It is a column like any other downstream — order and page by
+        // it, which is how a session reads back its latest coordinate.
+        let latest = run(&views, "SELECT _seq FROM t ORDER BY _seq DESC LIMIT 1").unwrap();
+        assert_eq!(seq_values(&latest, 0), [6]);
+        let aliased = run(&views, "SELECT _seq AS at FROM t ORDER BY at DESC LIMIT 1").unwrap();
+        assert_eq!(aliased.schema.fields()[0].name(), "at");
+        assert_eq!(seq_values(&aliased, 0), [6]);
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_follows_the_live_mask() {
+        // WHERE narrows the rows; the coordinates must stay attached to
+        // the rows that survive, not renumber to their output position.
+        let rows: Vec<(i64, &str, f64)> = (0..6)
+            .map(|i| (i as i64, if i % 2 == 0 { "A" } else { "B" }, i as f64))
+            .collect::<Vec<_>>();
+        let views = segmented(&rows, 2);
+        let output = run(&views, "SELECT _seq, ts FROM t WHERE sym = 'B'").unwrap();
+        assert_eq!(seq_values(&output, 0), [1, 3, 5]);
+    }
+
+    #[test]
+    fn the_sequence_pseudocolumn_is_projection_only() {
+        let views = segment(&[(1, "A", 1.0)]);
+        for sql in [
+            "SELECT ts FROM t WHERE _seq > 0",
+            "SELECT count(*) AS n FROM t GROUP BY _seq",
+            "SELECT _seq + 1 AS next FROM t",
+        ] {
+            let error = run(&views, sql).unwrap_err().to_string();
+            assert!(error.contains("can be selected"), "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn top_k_returns_exactly_the_leading_rows_of_the_full_sort() {
+        // The bounded heap must not merely produce *a* valid answer: it
+        // must produce the same rows, in the same order, as sorting
+        // everything and cutting — ties included, which is where a heap
+        // that ignores input position drifts from a stable sort.
+        let rows: Vec<(i64, &str, f64)> = (0..40)
+            .map(|i| {
+                // x repeats every 4 rows: 10 four-way ties, so almost
+                // every k lands inside a tie group.
+                (i as i64, ["A", "B", "C"][i % 3], (i % 4) as f64)
+            })
+            .collect();
+        let views = segmented(&rows, 7);
+        let ts_of = |output: &QueryOutput| -> Vec<i64> {
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("ts is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        for order in ["ORDER BY x", "ORDER BY x DESC", "ORDER BY ts DESC"] {
+            let full = ts_of(&run(&views, &format!("SELECT ts, sym, x FROM t {order}")).unwrap());
+            for k in [0usize, 1, 3, 9, 39, 40, 100] {
+                let bounded = ts_of(
+                    &run(
+                        &views,
+                        &format!("SELECT ts, sym, x FROM t {order} LIMIT {k}"),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(bounded, full[..k.min(full.len())], "{order} LIMIT {k}");
+            }
+            // OFFSET rides along: the bound is offset + limit, and the
+            // window taken from it must still match the full sort's.
+            for (offset, limit) in [(0, 5), (5, 5), (37, 5), (40, 1)] {
+                let window = ts_of(
+                    &run(
+                        &views,
+                        &format!("SELECT ts, sym, x FROM t {order} LIMIT {limit} OFFSET {offset}"),
+                    )
+                    .unwrap(),
+                );
+                let expected: Vec<i64> = full
+                    .iter()
+                    .copied()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                assert_eq!(window, expected, "{order} LIMIT {limit} OFFSET {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn order_by_a_column_the_query_does_not_project() {
+        // Standard SQL: the sort key need not be in the SELECT list.
+        // It is carried as a hidden column and dropped, so the output
+        // schema is exactly what the query asked for.
+        let views = segmented(
+            &[
+                (3, "A", 30.0),
+                (1, "B", 10.0),
+                (2, "A", 20.0),
+                (4, "B", 40.0),
+            ],
+            2,
+        );
+        let output = run(&views, "SELECT x FROM t ORDER BY ts").unwrap();
+        assert_eq!(output.schema.fields().len(), 1);
+        assert_eq!(output.schema.fields()[0].name(), "x");
+        assert_eq!(
+            flatten(&output, 0),
+            [Some(10.0), Some(20.0), Some(30.0), Some(40.0)]
+        );
+        // Riding top-k: the bound applies to the hidden sort too.
+        let output = run(&views, "SELECT x FROM t ORDER BY ts DESC LIMIT 2").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(40.0), Some(30.0)]);
+        // A computed projection ordered by a stored column it ignores.
+        let output = run(&views, "SELECT x * 2 AS d FROM t ORDER BY ts LIMIT 1").unwrap();
+        assert_eq!(output.schema.fields()[0].name(), "d");
+        assert_eq!(flatten(&output, 0), [Some(20.0)]);
+        // An alias that shadows the stored name refers to the OUTPUT
+        // column, standard SQL's precedence — no hidden column then.
+        let output = run(&views, "SELECT x AS ts FROM t ORDER BY ts LIMIT 1").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(10.0)]); // smallest x, not ts
+                                                       // The symbol refusal still holds when the column is hidden.
+        let error = run(&views, "SELECT x FROM t ORDER BY sym")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unordered labels"), "{error}");
+        // And a name that exists nowhere is still unknown.
+        assert!(run(&views, "SELECT x FROM t ORDER BY nope").is_err());
+    }
+
+    #[test]
+    fn symbol_columns_cannot_be_ordered_by() {
+        // #58 = B: labels are identities, and identities have no order
+        // — not through their codes (per-segment first-appearance
+        // ranks) and not through their text (an engine that refuses to
+        // produce a string does not rank strings).
+        let views = segmented(&[(1, "C", 1.0), (2, "A", 2.0), (3, "B", 3.0)], 2);
+        for sql in [
+            "SELECT sym, x FROM t ORDER BY sym",
+            "SELECT sym, x FROM t ORDER BY sym DESC",
+            "SELECT sym, x FROM t ORDER BY sym LIMIT 1",
+            // Through an alias, and through a grouped projection —
+            // wherever the output column is a symbol.
+            "SELECT sym AS label, x FROM t ORDER BY label",
+            "SELECT sym, count(*) AS n FROM t GROUP BY sym ORDER BY sym",
+        ] {
+            let error = run(&views, sql).unwrap_err().to_string();
+            assert!(error.contains("unordered labels"), "{sql}: {error}");
+        }
+        // The rest of the surface is untouched: group by them, filter
+        // by them, order by a number.
+        assert!(run(&views, "SELECT sym, x FROM t ORDER BY x").is_ok());
+        assert!(run(&views, "SELECT sym, count(*) AS n FROM t GROUP BY sym").is_ok());
+        assert!(run(&views, "SELECT ts FROM t WHERE sym = 'A'").is_ok());
+    }
+
+    #[test]
+    fn top_k_places_nulls_where_the_full_sort_does() {
+        // Null placement is the other thing the heap has to carry: a
+        // NULLS FIRST query's k rows are the null ones.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut buffer = WriteBuffer::new(schema.clone(), 0).unwrap();
+        for i in 0..12i64 {
+            let y = if i % 3 == 0 {
+                RowValue::Null
+            } else {
+                RowValue::F64((12 - i) as f64)
+            };
+            buffer.append(&[RowValue::I64(i), y]).unwrap();
+        }
+        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let registry = registry();
+        let go = |sql: &str| -> Vec<i64> {
+            let output =
+                execute(&schema, &views, &crate::plan::plan(sql).unwrap(), &registry).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                        panic!("ts is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST LIMIT 4"),
+            [0, 3, 6, 9]
+        );
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST LIMIT 4"),
+            go("SELECT ts, y FROM t ORDER BY y NULLS FIRST")[..4]
+        );
+        assert_eq!(
+            go("SELECT ts, y FROM t ORDER BY y DESC LIMIT 3"),
+            go("SELECT ts, y FROM t ORDER BY y DESC")[..3]
+        );
+    }
+
     #[test]
     fn empty_table_yields_schema_and_no_batches() {
         let output = run(&[], "SELECT ts, x FROM t").unwrap();
@@ -2574,7 +2997,7 @@ mod query1_tests {
             let output = run(
                 &views,
                 "SELECT sym, count(*) AS n, sum(x) AS total, avg(x) AS mean_x, \
-                 min(x) AS low, max(x) AS high FROM t GROUP BY sym ORDER BY sym",
+                 min(x) AS low, max(x) AS high FROM t GROUP BY sym",
             )
             .unwrap();
             assert_eq!(output.batches.len(), 1);
@@ -2582,16 +3005,24 @@ mod query1_tests {
             let Column::Key(sym) = &batch.columns()[0] else {
                 panic!("sym type")
             };
-            assert_eq!(sym.value_at(0), Some("A"));
-            assert_eq!(sym.value_at(1), Some("B"));
+            // Group order is arbitrary — a symbol column cannot be
+            // ordered by (#58) — so the groups are read by label. Here
+            // first appearance happens to be A then B.
+            let labels: Vec<&str> = (0..batch.num_rows())
+                .map(|row| sym.value_at(row).expect("no null group"))
+                .collect();
+            let a = labels.iter().position(|&label| label == "A").expect("A");
+            let b = labels.iter().position(|&label| label == "B").expect("B");
             let Column::Numeric(NumericData::I64(n)) = &batch.columns()[1] else {
                 panic!("count type")
             };
-            assert_eq!(n.values().as_slice(), &[3, 2]);
-            assert_eq!(f64_column(batch, 2).values().as_slice(), &[9.0, 30.0]);
-            assert_eq!(f64_column(batch, 3).values().as_slice(), &[3.0, 15.0]);
-            assert_eq!(f64_column(batch, 4).values().as_slice(), &[1.0, 10.0]);
-            assert_eq!(f64_column(batch, 5).values().as_slice(), &[6.0, 20.0]);
+            assert_eq!([n.values().as_slice()[a], n.values().as_slice()[b]], [3, 2]);
+            let column =
+                |index: usize, row: usize| f64_column(batch, index).values().as_slice()[row];
+            assert_eq!([column(2, a), column(2, b)], [9.0, 30.0]);
+            assert_eq!([column(3, a), column(3, b)], [3.0, 15.0]);
+            assert_eq!([column(4, a), column(4, b)], [1.0, 10.0]);
+            assert_eq!([column(5, a), column(5, b)], [6.0, 20.0]);
         }
     }
 
@@ -2696,13 +3127,12 @@ mod query1_tests {
             assert_eq!(flatten(&output, 1), [Some(5.0), Some(4.0)]);
             let output = run(&views, "SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1").unwrap();
             assert_eq!(flatten(&output, 0), [Some(2.0), Some(3.0)]);
-            // Keys sort by rendered value, not by dictionary code.
-            let output = run(&views, "SELECT sym, x FROM t ORDER BY sym").unwrap();
-            let Column::Key(sym) = &output.batches[0].columns()[0] else {
-                panic!("sym type")
-            };
-            let values: Vec<&str> = (0..5).map(|row| sym.value_at(row).unwrap()).collect();
-            assert_eq!(values, ["A", "A", "B", "B", "C"]);
+            // Symbols are unordered labels: ORDER BY refuses them
+            // rather than ranking codes or rendering text (#58).
+            let error = run(&views, "SELECT sym, x FROM t ORDER BY sym")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unordered labels"), "{error}");
             // LIMIT without ORDER BY keeps ingest order.
             let output = run(&views, "SELECT ts FROM t LIMIT 3").unwrap();
             let Column::Numeric(NumericData::I64(ts)) = &output.batches[0].columns()[0] else {

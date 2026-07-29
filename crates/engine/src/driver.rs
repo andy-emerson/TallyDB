@@ -241,7 +241,7 @@ mod tests {
         // driven from inside the script.
         db.run_script(
             r#"
-                query("CREATE TABLE derived (ts BIGINT ORDERING KEY, sym KEY NOT NULL, \
+                query("CREATE TABLE derived (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, \
                        rel DOUBLE, rdot DOUBLE)")
                 local r, n = query("SELECT ts, sym, x, y FROM trades")
                 assert(n == 60)

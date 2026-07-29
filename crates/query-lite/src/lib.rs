@@ -81,7 +81,7 @@ pub use exec::{
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,
     DeletePlan, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem, Projection, QueryError,
-    SetValue, Statement, UpdatePlan,
+    SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
 };
 pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 

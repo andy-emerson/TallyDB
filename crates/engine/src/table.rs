@@ -57,6 +57,8 @@ pub enum EngineError {
     DuplicateTable(String),
     /// The declared ordering key is not a column of the schema.
     UnknownOrderingKey(String),
+    /// The schema declares a column whose name the engine reserves.
+    ReservedColumn(String),
     /// Registering a script-backed function failed (bad kernel syntax,
     /// unusable parameter name, unsupported output type).
     Script(String),
@@ -75,6 +77,11 @@ impl fmt::Display for EngineError {
             EngineError::UnknownOrderingKey(name) => {
                 write!(f, "ordering key '{name}' is not a column")
             }
+            EngineError::ReservedColumn(name) => write!(
+                f,
+                "column '{name}' is reserved — it is the ingest-sequence \
+                 pseudocolumn every table already has"
+            ),
             EngineError::Script(message) => write!(f, "script: {message}"),
         }
     }
@@ -192,7 +199,7 @@ impl Table {
         ordering_key: &str,
         dir: impl AsRef<std::path::Path>,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -213,7 +220,7 @@ impl Table {
         dir: impl AsRef<std::path::Path>,
         options: StoreOptions,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -236,6 +243,33 @@ impl Table {
         ))
     }
 
+    /// Opens an existing persistent table **read-only** (F4): the
+    /// cross-process reader — a console or binding process watching a
+    /// directory another process writes. Takes no directory lock, so
+    /// any number of readers coexist with the one writer; every
+    /// mutation refuses loudly. The view is the durable prefix — the
+    /// flushed segments and committed deletes, consistent per mutation
+    /// (see `Store::open_read_only` for the exact contract) — and
+    /// [`Table::refresh`] re-reads it.
+    pub fn open_read_only(
+        name: impl Into<String>,
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Table, EngineError> {
+        let backend = FsBackend::open_read_only(dir.as_ref()).map_err(StorageError::from)?;
+        Ok(Table::from_store(
+            name,
+            Store::open_read_only(Arc::new(backend))?,
+        ))
+    }
+
+    /// Re-reads the durable state (read-only tables only): rows the
+    /// writer has flushed since the open, deletes it has committed, a
+    /// new generation after its compaction. Registered functions
+    /// survive a refresh; snapshots minted before one stay valid.
+    pub fn refresh(&mut self) -> Result<(), EngineError> {
+        Ok(self.store.refresh()?)
+    }
+
     /// As [`Table::persistent`], with an explicit segment-row threshold.
     pub fn persistent_with_segment_rows(
         name: impl Into<String>,
@@ -244,7 +278,7 @@ impl Table {
         dir: impl AsRef<std::path::Path>,
         segment_rows: usize,
     ) -> Result<Table, EngineError> {
-        let index = ordering_index(&schema, ordering_key)?;
+        let index = validated_ordering_index(&schema, ordering_key)?;
         let backend = fs_backend(dir)?;
         Ok(Table::from_store(
             name,
@@ -258,7 +292,7 @@ impl Table {
         ordering_key: &str,
         segment_rows: Option<usize>,
     ) -> Result<Table, EngineError> {
-        let ordering_index = ordering_index(&schema, ordering_key)?;
+        let ordering_index = validated_ordering_index(&schema, ordering_key)?;
         let store = match segment_rows {
             None => Store::new(schema, ordering_index)?,
             Some(rows) => Store::with_segment_rows(schema, ordering_index, rows)?,
@@ -383,13 +417,17 @@ impl Table {
 
     /// The table's ingest-sequence watermark: the sequence the next
     /// appended row will receive. Every knowledge coordinate the table
-    /// holds is `<=` it, so **`ASOF next_sequence()` reads the latest
-    /// state** whatever the table's mutation history. Record it before
-    /// a correction to keep a queryable before/after boundary.
+    /// holds is `<` it, so **`ASOF next_sequence() - 1` reads the
+    /// latest state** whatever the table's mutation history — and keeps
+    /// reading it, because the coordinate has been spent and no later
+    /// arrival can join it. `ASOF next_sequence()` reads the same state
+    /// today but addresses a coordinate that is still unspent, so its
+    /// answer moves with the next append. Prefer the spent one; record
+    /// it before a correction to keep a queryable before/after boundary.
     ///
-    /// Not `next_sequence() - 1`: a `DELETE` stamps its kill at the
-    /// watermark without consuming it, so that cut still shows the
-    /// deleted rows (`Store::next_sequence` has the full note).
+    /// Zero rows means zero spent coordinates: there is nothing below
+    /// the watermark to cut at, and every `AS OF` reads an empty table
+    /// anyway.
     pub fn next_sequence(&self) -> u64 {
         self.store.next_sequence()
     }
@@ -538,7 +576,7 @@ impl Table {
                         },
                         ColumnType::Key => {
                             return Err(EngineError::Query(QueryError::TypeError(format!(
-                                "number into KEY column '{}' (keys take strings)",
+                                "number into SYMBOL column '{}' (labels take strings)",
                                 field.name()
                             ))))
                         }
@@ -1013,7 +1051,22 @@ pub(crate) fn is_identifier(name: &str) -> bool {
 }
 
 /// Resolves the declared ordering key to its column index.
-fn ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
+/// Checks a schema at definition time and locates its ordering key.
+/// Beyond the ordering key itself, the one rule is the reserved name:
+/// `_seq` is the ingest-sequence pseudocolumn every table already has
+/// (#75), and a declared column of that name would shadow it. `CREATE
+/// TABLE` refuses it in the planner; this is the same refusal for
+/// schemas built through the Rust API.
+fn validated_ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize, EngineError> {
+    if schema
+        .fields()
+        .iter()
+        .any(|field| field.name() == query_lite::SEQUENCE_COLUMN)
+    {
+        return Err(EngineError::ReservedColumn(
+            query_lite::SEQUENCE_COLUMN.to_owned(),
+        ));
+    }
     schema
         .fields()
         .iter()
@@ -1028,7 +1081,7 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 }
 
 /// Maps a lowered `CREATE TABLE` (the #49 DDL grammar: `BIGINT`,
-/// `DOUBLE`, the coined `KEY`, one `ORDERING KEY` column) onto the
+/// `DOUBLE`, `SYMBOL`, one `ORDERING KEY` column) onto the
 /// engine's schema types. Returns the schema and the ordering-key
 /// column name. Shared by every SQL surface — shell, and later the
 /// server and workbench — so the mapping cannot fork.
@@ -1041,7 +1094,7 @@ pub fn schema_from_create(
         let column_type = match column.type_name.as_str() {
             "BIGINT" => ColumnType::I64,
             "DOUBLE" => ColumnType::F64,
-            "KEY" => ColumnType::Key,
+            "SYMBOL" => ColumnType::Key,
             other => {
                 return Err(EngineError::Query(QueryError::Unsupported(format!(
                     "column type '{other}'"
@@ -1071,7 +1124,7 @@ pub fn type_name(column_type: ColumnType) -> &'static str {
     match column_type {
         ColumnType::I64 => "BIGINT",
         ColumnType::F64 => "DOUBLE",
-        ColumnType::Key => "KEY",
+        ColumnType::Key => "SYMBOL",
     }
 }
 
@@ -1629,11 +1682,97 @@ mod tests {
             .collect()
     }
 
+    /// `_seq` (#75) reads back the coordinate `AS OF` addresses — the
+    /// point of the pseudocolumn is that a session can learn a cut from
+    /// SQL alone, with no Rust-side `next_sequence()` call.
+    #[test]
+    fn the_sequence_pseudocolumn_addresses_the_knowledge_axis() {
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        for i in 0..4i64 {
+            table
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        let seqs = |table: &Table, sql: &str| -> Vec<i64> {
+            let output = table.query(sql).unwrap();
+            output
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(column)) =
+                        &batch.columns()[0]
+                    else {
+                        panic!("_seq is i64")
+                    };
+                    column.values().as_slice().to_vec()
+                })
+                .collect()
+        };
+        assert_eq!(seqs(&table, "SELECT _seq FROM t"), [0, 1, 2, 3]);
+        // A correction: the replacement is born at coordinate 4, and
+        // `_seq` reports *birth*, not position — so the corrected row
+        // carries 4 while its neighbours keep their original
+        // coordinates, and the table is now diverged (row id != seq).
+        table.mutate("UPDATE t SET x = 100.0 WHERE ts = 1").unwrap();
+        let coordinates = seqs(&table, "SELECT _seq, ts FROM t ORDER BY ts");
+        assert_eq!(coordinates, [0, 4, 2, 3]);
+        // The readback is a usable cut: the largest coordinate is the
+        // latest state, and one below it is the state before the
+        // correction — no Rust-side call anywhere in the loop.
+        let latest = seqs(&table, "SELECT _seq FROM t ORDER BY _seq DESC LIMIT 1")[0];
+        assert_eq!(latest, 4);
+        assert_eq!(
+            flatten(
+                &table
+                    .query(&format!("SELECT ts, x FROM t ASOF {latest} ORDER BY ts"))
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(100.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(
+            flatten(
+                &table
+                    .query(&format!(
+                        "SELECT ts, x FROM t ASOF {} ORDER BY ts",
+                        latest - 1
+                    ))
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
+        );
+        // Read through a cut, it reports what was known then — the
+        // pre-correction row carrying its original coordinate.
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ASOF 3 ORDER BY ts"),
+            [0, 1, 2, 3]
+        );
+        // Compaction reassigns row ids; birth coordinates do not move,
+        // in the present or through the cut — which now reads from
+        // history segments rather than live ones.
+        table.compact().unwrap();
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ORDER BY ts"),
+            coordinates
+        );
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ASOF 3 ORDER BY ts"),
+            [0, 1, 2, 3]
+        );
+    }
+
     /// `ASOF next_sequence()` is the latest state in every mutation
-    /// shape. The tempting off-by-one — `next_sequence() - 1` — held
-    /// for appends and `UPDATE` but not for `DELETE`, which stamps its
-    /// kill at the watermark without consuming it; the docs claimed the
-    /// wrong one until this test was written.
+    /// shape — and, since a `DELETE` consumes its coordinate (ruled
+    /// 2026-07-29), so is `ASOF next_sequence() - 1`. The second form
+    /// is the one worth having: it names a coordinate that has actually
+    /// been spent, so the cut keeps its meaning as ingest continues,
+    /// while the watermark is a moving address. Before the ruling this
+    /// test existed to record that `- 1` was *wrong* after a delete.
     #[test]
     fn as_of_at_the_watermark_is_the_latest_state_after_any_mutation() {
         let build = || {
@@ -1682,6 +1821,30 @@ mod tests {
             assert_eq!(
                 at_watermark, latest,
                 "{label}: ASOF next_sequence() must read the latest state"
+            );
+            // Every mutation now consumes a coordinate, so the last
+            // spent one is the latest state too — the stable idiom.
+            let at_last_spent = table
+                .query(&format!("SELECT ts FROM t ASOF {}", watermark - 1))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                at_last_spent, latest,
+                "{label}: ASOF next_sequence() - 1 must read the latest state"
+            );
+            // And it stays that answer: a later arrival is born above
+            // the cut, which is exactly what the watermark cannot
+            // promise (it addresses the arrival too).
+            table
+                .append(&[RowValue::I64(99), RowValue::F64(99.0)])
+                .unwrap();
+            let after_arrival = table
+                .query(&format!("SELECT ts FROM t ASOF {}", watermark - 1))
+                .unwrap()
+                .num_rows();
+            assert_eq!(
+                after_arrival, latest,
+                "{label}: a spent coordinate's answer must not drift"
             );
         }
     }
@@ -2008,6 +2171,58 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_table_rides_alongside_the_writer() {
+        // F4 at the engine seam: two Table handles over one directory —
+        // the writer appends and corrects, the reader queries the
+        // durable prefix through ordinary SQL and refresh advances it.
+        let dir = std::env::temp_dir().join(format!("tallydb-f4-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut writer = Table::persistent_with_segment_rows("t", schema, "ts", &dir, 100).unwrap();
+        for i in 0..4i64 {
+            writer
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        let mut reader = Table::open_read_only("t", &dir).unwrap();
+        assert_eq!(reader.query("SELECT ts FROM t").unwrap().num_rows(), 4);
+        // The reader speaks the whole SQL surface, AS OF included.
+        writer.mutate("UPDATE t SET x = 99.0 WHERE ts = 1").unwrap();
+        writer.flush().unwrap();
+        reader.refresh().unwrap();
+        assert_eq!(
+            flatten(&reader.query("SELECT ts, x FROM t ORDER BY ts").unwrap(), 1),
+            [Some(0.0), Some(99.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(
+            flatten(
+                &reader
+                    .query("SELECT ts, x FROM t ASOF 3 ORDER BY ts")
+                    .unwrap(),
+                1
+            ),
+            [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
+        );
+        // Mutation through the reader refuses at the storage seam.
+        let error = reader
+            .mutate("DELETE FROM t WHERE ts = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only"), "{error}");
+        assert!(reader
+            .append(&[RowValue::I64(9), RowValue::F64(9.0)])
+            .is_err());
+        // A writer refuses refresh — it sees its own state already.
+        assert!(writer.refresh().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn lifecycle_errors_are_specific() {
         let table = linear_table(None);
         assert!(matches!(
@@ -2022,6 +2237,16 @@ mod tests {
         assert!(matches!(
             Table::new("t", m1_schema(), "x"),
             Err(EngineError::Storage(StorageError::BadOrderingKey { .. }))
+        ));
+        // The reserved pseudocolumn name, refused through the Rust API
+        // exactly as `CREATE TABLE` refuses it.
+        let shadowing = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new(query_lite::SEQUENCE_COLUMN, ColumnType::I64, false),
+        ]);
+        assert!(matches!(
+            Table::new("t", shadowing, "ts"),
+            Err(EngineError::ReservedColumn(_))
         ));
     }
 }
@@ -2082,7 +2307,7 @@ mod ddl_and_insert {
         assert!(table
             .mutate("INSERT INTO t VALUES (1.5, 'A', 1.0, 1.0)")
             .is_err());
-        // Number into KEY: loud.
+        // Number into a SYMBOL column: loud.
         assert!(table
             .mutate("INSERT INTO t VALUES (1, 7, 1.0, 1.0)")
             .is_err());
@@ -2126,7 +2351,7 @@ mod ddl_and_insert {
 
     #[test]
     fn the_ddl_grammar_maps_onto_engine_types() {
-        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym KEY NOT NULL, px DOUBLE)";
+        let sql = "CREATE TABLE ticks (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, px DOUBLE)";
         let Statement::CreateTable(plan) = parse_statement(sql).unwrap() else {
             panic!("parses as CREATE TABLE")
         };
@@ -2153,7 +2378,13 @@ mod ddl_and_insert {
             parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, name VARCHAR)").unwrap_err();
         let message = error.to_string();
         assert!(message.contains("interned labels"), "{message}");
-        assert!(message.contains("KEY"), "{message}");
+        assert!(message.contains("SYMBOL"), "{message}");
+        // And the retired spelling names its replacement rather than
+        // reciting the type list.
+        let message = parse_statement("CREATE TABLE t (ts BIGINT ORDERING KEY, sym KEY)")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("spelled SYMBOL"), "{message}");
         // No ordering key: loud, with guidance.
         let error = parse_statement("CREATE TABLE t (a BIGINT, b DOUBLE)").unwrap_err();
         assert!(error.to_string().contains("ORDERING KEY"), "{}", error);
@@ -2361,6 +2592,93 @@ mod mutation_tests {
         // Unqualified DELETE clears the table.
         assert_eq!(table.mutate("DELETE FROM t").unwrap(), 5);
         assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 0);
+    }
+
+    #[test]
+    fn is_null_selects_rows_for_mutation() {
+        // The predicate's other consumer: DELETE/UPDATE reach the same
+        // evaluator, and a wrong bitmap here destroys data rather than
+        // returning the wrong page. Nulls span segments (size 3).
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("y", ColumnType::F64, true),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 3).unwrap();
+        for i in 0..10i64 {
+            let y = if i % 3 == 0 {
+                RowValue::Null
+            } else {
+                RowValue::F64(i as f64)
+            };
+            table
+                .append(&[RowValue::I64(i), RowValue::Key("A"), y])
+                .unwrap();
+        }
+        // ts 0, 3, 6, 9 are null.
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NULL ORDER BY ts")
+                .unwrap()
+                .num_rows(),
+            4
+        );
+        // UPDATE finds exactly those rows, and they stop being null.
+        // (0 is a value no other row carries — y is `i` elsewhere.)
+        assert_eq!(
+            table.mutate("UPDATE t SET y = 0 WHERE y IS NULL").unwrap(),
+            4
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NULL")
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y IS NOT NULL")
+                .unwrap()
+                .num_rows(),
+            10
+        );
+        // DELETE takes the rows the UPDATE just wrote, and only those.
+        assert_eq!(table.mutate("DELETE FROM t WHERE y = 0").unwrap(), 4);
+        let survivors = table.query("SELECT ts FROM t ORDER BY ts").unwrap();
+        assert_eq!(survivors.num_rows(), 6);
+    }
+
+    #[test]
+    fn set_accepts_a_negative_literal_like_where_does() {
+        // A negative number parses as unary minus over a literal; WHERE
+        // unwrapped it, SET did not — so a value could be filtered on
+        // but not assigned. Both sides now accept the same spellings.
+        let mut table = small_table();
+        assert_eq!(
+            table.mutate("UPDATE t SET y = -1.5 WHERE ts = 2").unwrap(),
+            1
+        );
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y = -1.5")
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        // Exact through the integer path too: -3 into an f64 column.
+        assert_eq!(table.mutate("UPDATE t SET y = -3 WHERE ts = 4").unwrap(), 1);
+        assert_eq!(
+            table
+                .query("SELECT ts FROM t WHERE y = -3")
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        // A minus that is not a number stays refused.
+        assert!(table
+            .mutate("UPDATE t SET sym = -'A' WHERE ts = 0")
+            .is_err());
     }
 
     #[test]

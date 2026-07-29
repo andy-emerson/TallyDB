@@ -372,9 +372,9 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
     append(&mut store, 10, "A", 1.0); // id 0
     append(&mut store, 20, "B", 2.0); // id 1
     append(&mut store, 30, "A", 3.0); // id 2
-    store.tombstone(&[0]).unwrap(); // stamped at watermark 3
-    append(&mut store, 40, "B", 4.0); // id 3
-    store.tombstone(&[2]).unwrap(); // stamped at watermark 4
+    store.tombstone(&[0]).unwrap(); // consumes coordinate 3
+    append(&mut store, 40, "B", 4.0); // id 3, born at 4
+    store.tombstone(&[2]).unwrap(); // consumes coordinate 5
     store.compact().unwrap();
     // Live reads: unchanged semantics, history invisible.
     assert_eq!(
@@ -383,15 +383,15 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
     );
     assert_eq!(store.snapshot().unwrap().len(), 1);
     // The dead rows live on, addressed by sequence alone: births are
-    // their virtual-era row ids, kills the watermark each delete
-    // landed at, cells intact, merge-ordered (ts 10 before ts 30).
+    // their virtual-era row ids, kills the coordinate each delete
+    // consumed, cells intact, merge-ordered (ts 10 before ts 30).
     let history = store.history();
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].sequence_info(),
         &SequenceInfo::Explicit(vec![0, 2])
     );
-    assert_eq!(history[0].superseded(), Some(&[3, 4][..]));
+    assert_eq!(history[0].superseded(), Some(&[3, 5][..]));
     let Column::Numeric(NumericData::I64(ts)) = &history[0].batch().columns()[0] else {
         panic!("ts type")
     };
@@ -400,11 +400,11 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
     let views = store.snapshot().unwrap();
     assert_eq!(
         views[0].segment.sequence_info(),
-        &SequenceInfo::Explicit(vec![1, 3])
+        &SequenceInfo::Explicit(vec![1, 4])
     );
     // A second round accumulates history; it never rewrites what an
     // earlier compaction retained.
-    store.tombstone(&[0]).unwrap(); // ts 20, birth 1, stamped at 4
+    store.tombstone(&[0]).unwrap(); // ts 20, birth 1, consumes 6
     store.compact().unwrap();
     let history = store.history();
     assert_eq!(history.len(), 2);
@@ -413,7 +413,7 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
         &SequenceInfo::Explicit(vec![0, 2])
     );
     assert_eq!(history[1].sequence_info(), &SequenceInfo::Explicit(vec![1]));
-    assert_eq!(history[1].superseded(), Some(&[4][..]));
+    assert_eq!(history[1].superseded(), Some(&[6][..]));
 }
 
 #[test]
