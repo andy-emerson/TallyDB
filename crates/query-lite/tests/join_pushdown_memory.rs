@@ -1,55 +1,21 @@
 //! A join gathers only the dimension columns the query reads (#81).
 //!
 //! Every gathered attribute becomes a full column at *fact*
-//! cardinality — a dimension of seven attributes joined against a
-//! million rows is seven million cells, however many of them the
-//! SELECT list wanted. So the claim is about allocation, and this
-//! measures allocation: the same join, reading one attribute or all of
-//! them, under a counting allocator.
-//!
-//! One test function, and its own test binary: the allocator is
-//! process-wide, so a second test measuring concurrently would see this
-//! one's peak.
+//! cardinality — a dimension of eight attributes joined against a
+//! hundred thousand rows is eight hundred thousand cells, however many
+//! of them the SELECT list wanted. So the claim is about allocation,
+//! and this measures allocation: the same join, reading one attribute
+//! or all of them, under a counting allocator.
+
+mod common;
 
 use arrow_lite::{ColumnType, Field, Schema};
+use common::peak_of;
 use query_lite::{execute_join, plan, Registry};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_lite::{RowValue, SegmentView, Store};
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-// SAFETY: every method forwards to `System` unchanged; the counters are
-// bookkeeping around it and never affect the pointers handed out.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(pointer, layout) }
-    }
-}
-
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-/// Peak bytes live *above the level at entry* while `body` runs.
-fn peak_of(body: impl FnOnce()) -> usize {
-    let baseline = LIVE.load(Ordering::Relaxed);
-    PEAK.store(baseline, Ordering::Relaxed);
-    body();
-    PEAK.load(Ordering::Relaxed).saturating_sub(baseline)
-}
+static ALLOCATOR: common::Counting = common::Counting;
 
 const ROWS: i64 = 100_000;
 /// Attribute columns on the dimension, beyond its key.

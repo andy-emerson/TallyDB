@@ -1719,11 +1719,23 @@ mod tests {
             ),
             [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
         );
-        // Compaction reassigns row ids; birth coordinates do not move.
+        // Read through a cut, it reports what was known then — the
+        // pre-correction row carrying its original coordinate.
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ASOF 3 ORDER BY ts"),
+            [0, 1, 2, 3]
+        );
+        // Compaction reassigns row ids; birth coordinates do not move,
+        // in the present or through the cut — which now reads from
+        // history segments rather than live ones.
         table.compact().unwrap();
         assert_eq!(
             seqs(&table, "SELECT _seq, ts FROM t ORDER BY ts"),
             coordinates
+        );
+        assert_eq!(
+            seqs(&table, "SELECT _seq, ts FROM t ASOF 3 ORDER BY ts"),
+            [0, 1, 2, 3]
         );
     }
 

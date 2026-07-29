@@ -518,9 +518,10 @@ fn render_schema(name: &str, schema: &Schema, ordering_key: &str) -> String {
 /// `.help`'s text; the SQL surface itself is DESIGN.md's stdlib table.
 pub const HELP: &str = "\
 Statements end with ';' and may span lines. SQL surface: SELECT (WHERE,
-GROUP BY/HAVING, ORDER BY [NULLS FIRST|LAST], LIMIT, DISTINCT, window
-functions, scalar expressions, CASE, LIKE on keys), INSERT, UPDATE,
-DELETE, CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
+GROUP BY/HAVING, ORDER BY a numeric column [NULLS FIRST|LAST], LIMIT,
+DISTINCT, window functions, scalar expressions, CASE, IS NULL, LIKE on
+symbols), INSERT, UPDATE, DELETE, CREATE TABLE (BIGINT | DOUBLE |
+SYMBOL, one ORDERING KEY column).
 
 Commands:
   .help                     this text
