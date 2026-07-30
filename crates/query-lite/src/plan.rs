@@ -359,6 +359,22 @@ pub struct JoinPlan {
     /// `true` for LEFT (unmatched fact rows keep null dimension cells);
     /// `false` for INNER (unmatched fact rows drop).
     pub left: bool,
+    /// `Some` when the query wrote `ASOF LEFT JOIN` / `ASOF INNER
+    /// JOIN` (#65): match each fact row to the dimension's most recent
+    /// row at-or-before it on the two tables' declared ordering keys,
+    /// within the `ON` equality's partition.
+    pub as_of: Option<AsOfMatch>,
+}
+
+/// How an as-of join compares the two ordering keys (#65: the operator
+/// is what the user's explicit inequality selects, `>=` by default).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AsOfMatch {
+    /// The dimension row's key is **at or before** the fact's — the
+    /// default, and what `q.ts <= t.ts` spells.
+    AtOrBefore,
+    /// Strictly before, which `q.ts < t.ts` spells.
+    StrictlyBefore,
 }
 
 /// The SELECT plan.
@@ -949,23 +965,19 @@ fn is_create_table(sql: &str) -> bool {
 }
 
 /// Splits the knowledge-time clause out of the SQL text before parsing:
-/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
-/// keyword followed by `JOIN` and is left alone) and the SQL:2011
-/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
-/// as known at ingest sequence n". Returns the SQL with the clause
-/// spliced out (`None` when the text held no clause — untouched input is
-/// never rewritten) and the cut it named. The two-word near-miss
-/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
-/// alias named OF), so it gets a teaching error instead of a puzzle.
-fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
-    // Shallow tokenization, recording each token's byte span: quoted runs
-    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
-    // string literal can look like a clause; comments are skipped whole so
-    // nothing inside one does either; hugging punctuation splits off so
-    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
-    // ORIGINAL text (below), never reassembled from tokens — reassembly
-    // would collapse the newline that terminates a `--` comment and
-    // silently comment out the rest of the statement.
+/// Shallow tokenization with byte spans, shared by every pre-parse
+/// lift. Quoted runs (`'…'` with `''` escapes, `"…"`) stay single
+/// tokens so nothing inside a string literal can look like a clause;
+/// comments are skipped whole so nothing inside one does either;
+/// hugging punctuation splits off so `ASOF 5,` scans.
+///
+/// **Spans are the point.** A lift splices its clause out of the
+/// ORIGINAL text using these spans, never reassembling the statement
+/// from tokens — reassembly collapses the newline that terminates a
+/// `--` comment and silently comments out the rest of the statement.
+/// That was a real bug (found at the M4 close), and it is why every
+/// new lift must come through here.
+fn tokenize_with_spans(sql: &str) -> (Vec<&str>, Vec<(usize, usize)>, Vec<String>) {
     let mut tokens: Vec<&str> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut chars = sql.char_indices().peekable();
@@ -1029,6 +1041,84 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
+    (tokens, spans, lower)
+}
+
+/// Lifts the `ASOF` token that *precedes a join* (#65's hybrid: the
+/// grammar is ClickHouse's, the authority is our schema). The token is
+/// spliced out by byte span and the remainder parses as an ordinary
+/// join, which is why no fork of sqlparser is needed — verified
+/// 2026-07-29: sqlparser 0.62 parses only Snowflake's `MATCH_CONDITION`
+/// form and DuckDB accepts only its own `ON` form, and the two accepted
+/// sets are disjoint, so neither spelling could be borrowed.
+///
+/// Runs **before** [`extract_as_of`], because `ASOF LEFT JOIN` would
+/// otherwise look like the time-travel clause with `LEFT` as its cut.
+///
+/// Bare `ASOF JOIN` is refused: bare as-of semantics are a genuine
+/// vendor divergence, so the user says which they mean. (Standing
+/// revisit flagged by the Human 2026-07-30 — see #65.)
+fn extract_asof_join(sql: &str) -> Result<(Option<String>, bool), QueryError> {
+    let (_, spans, lower) = tokenize_with_spans(sql);
+    let mut found: Option<(usize, usize)> = None;
+    for index in 0..lower.len() {
+        if lower[index] != "asof" {
+            continue;
+        }
+        match lower.get(index + 1).map(String::as_str) {
+            Some("join") => {
+                return Err(QueryError::Unsupported(
+                    "bare ASOF JOIN — write ASOF LEFT JOIN (keep unmatched fact rows, \
+                     null-padded) or ASOF INNER JOIN (drop them). Vendors disagree on \
+                     what a bare as-of join means, so this engine makes you say it"
+                        .to_owned(),
+                ));
+            }
+            Some("left") | Some("inner") => {
+                // `ASOF LEFT JOIN` / `ASOF INNER JOIN` — and only those:
+                // `ASOF LEFT` with no JOIN is not a join at all, and
+                // falls through to the time-travel lift's own error.
+                if lower.get(index + 2).map(String::as_str) != Some("join") {
+                    continue;
+                }
+                if found.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "one ASOF join per query".to_owned(),
+                    ));
+                }
+                found = Some(spans[index]);
+            }
+            _ => continue,
+        }
+    }
+    let Some((start, end)) = found else {
+        return Ok((None, false));
+    };
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(&sql[..start]);
+    rewritten.push_str(&sql[end..]);
+    Ok((Some(rewritten), true))
+}
+
+/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
+/// keyword followed by `JOIN` and is left alone) and the SQL:2011
+/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
+/// as known at ingest sequence n". Returns the SQL with the clause
+/// spliced out (`None` when the text held no clause — untouched input is
+/// never rewritten) and the cut it named. The two-word near-miss
+/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
+/// alias named OF), so it gets a teaching error instead of a puzzle.
+fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
+    // Shallow tokenization, recording each token's byte span: quoted runs
+    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
+    // string literal can look like a clause; comments are skipped whole so
+    // nothing inside one does either; hugging punctuation splits off so
+    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
+    // ORIGINAL text (below), never reassembled from tokens — reassembly
+    // would collapse the newline that terminates a `--` comment and
+    // silently comment out the rest of the statement.
+    let (tokens, spans, lower) = tokenize_with_spans(sql);
+
     let parse_cut = |token: &str| -> Result<u64, QueryError> {
         token.parse::<u64>().map_err(|_| {
             QueryError::Unsupported(format!(
@@ -1101,6 +1191,16 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
 }
 
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    // The as-of JOIN lift runs first: `ASOF LEFT JOIN` would otherwise
+    // read as the time-travel clause with `LEFT` as its cut.
+    let joined;
+    let (sql, asof_join) = match extract_asof_join(sql)? {
+        (Some(rewritten), flag) => {
+            joined = rewritten;
+            (joined.as_str(), flag)
+        }
+        (None, flag) => (sql, flag),
+    };
     let stripped;
     let (sql, as_of) = match extract_as_of(sql)? {
         (Some(cleaned), cut) => {
@@ -1131,7 +1231,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
     }
     match statement {
         ast::Statement::Query(query) => {
-            let mut plan = lower_query(query)?;
+            let mut plan = lower_query(query, asof_join)?;
             if as_of.is_some() {
                 if plan.join.is_some() {
                     return Err(QueryError::Unsupported(
@@ -1270,7 +1370,7 @@ fn lower_delete(delete: &ast::Delete) -> Result<DeletePlan, QueryError> {
     })
 }
 
-fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {
+fn lower_query(query: &ast::Query, asof_join: bool) -> Result<Plan, QueryError> {
     if query.with.is_some() {
         return Err(QueryError::Unsupported("WITH / CTEs".to_owned()));
     }
@@ -1281,7 +1381,7 @@ fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {
             "set operations / VALUES".to_owned(),
         ));
     };
-    let mut plan = lower_select(select)?;
+    let mut plan = lower_select(select, asof_join)?;
     plan.order_by = order_by;
     plan.limit = limit;
     plan.offset = offset;
@@ -1355,7 +1455,7 @@ fn lower_limit(
     Ok((limit, offset))
 }
 
-fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
+fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryError> {
     let distinct = match &select.distinct {
         None | Some(ast::Distinct::All) => false,
         Some(ast::Distinct::Distinct) => true,
@@ -1381,7 +1481,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
     // front after validating their qualifier, so the rest of the
     // lowering — and the executor's joined schema — see plain names.
     let (join, projection_exprs, selection_expr) =
-        match lower_join(&table, fact_alias.as_deref(), joins)? {
+        match lower_join(&table, fact_alias.as_deref(), joins, asof_join)? {
             Some((plan, dimension_alias)) => {
                 let mut known: Vec<&str> = vec![&table, &plan.dimension];
                 if let Some(alias) = &fact_alias {
@@ -1589,6 +1689,7 @@ fn lower_join(
     fact: &str,
     fact_alias: Option<&str>,
     joins: &[ast::Join],
+    asof_join: bool,
 ) -> Result<Option<(JoinPlan, Option<String>)>, QueryError> {
     match joins {
         [] => Ok(None),
@@ -1619,17 +1720,38 @@ fn lower_join(
             };
             let dimension = object_name(name)?;
             let dimension_alias = alias.as_ref().map(|alias| ident(&alias.name));
-            // ON: an equality of two (possibly qualified) columns, one
-            // per side, in either order.
+            // ON: the equality of two (possibly qualified) columns —
+            // and, for an as-of join only, an optional second conjunct
+            // naming the time axis explicitly.
+            let (equality, inequality) = match on {
+                ast::Expr::BinaryOp {
+                    left,
+                    op: ast::BinaryOperator::And,
+                    right,
+                } if asof_join => (left.as_ref(), Some(right.as_ref())),
+                other => (other, None),
+            };
             let ast::Expr::BinaryOp {
                 left: on_left,
                 op: ast::BinaryOperator::Eq,
                 right: on_right,
-            } = on
+            } = equality
             else {
-                return Err(QueryError::Unsupported(
-                    "JOIN ON must be a single equality".to_owned(),
-                ));
+                return Err(QueryError::Unsupported(if asof_join {
+                    "ASOF JOIN ON must start with the partition equality                      (fact.key = dim.key), optionally AND an inequality on the                      ordering keys"
+                        .to_owned()
+                } else {
+                    "JOIN ON must be a single equality".to_owned()
+                }));
+            };
+            // The time axis: implicit (at-or-before) unless the query
+            // spells an inequality, which is VALIDATED rather than
+            // obeyed — it must name the two tables' ordering keys, and
+            // all it selects is >= versus >.
+            let as_of = match (asof_join, inequality) {
+                (false, _) => None,
+                (true, None) => Some(AsOfMatch::AtOrBefore),
+                (true, Some(expr)) => Some(lower_asof_inequality(expr)?),
             };
             let side = |expr: &ast::Expr| -> Result<(Option<String>, String), QueryError> {
                 match expr {
@@ -1673,6 +1795,7 @@ fn lower_join(
                     fact_key,
                     dimension_key,
                     left,
+                    as_of,
                 },
                 dimension_alias,
             )))
@@ -1680,6 +1803,47 @@ fn lower_join(
         _ => Err(QueryError::Unsupported(
             "one JOIN per query (star schema: fact times one dimension at a time)".to_owned(),
         )),
+    }
+}
+
+/// Validates an as-of join's explicit time-axis inequality. The
+/// engine already knows the axis — it is the two tables' declared
+/// ordering keys — so this neither chooses columns nor reorders
+/// anything: it checks that what the user wrote agrees with the
+/// schema, and reads off which comparison they meant.
+///
+/// Written dimension-first (`q.ts <= t.ts`) or fact-first
+/// (`t.ts >= q.ts`); both say the same thing.
+fn lower_asof_inequality(expr: &ast::Expr) -> Result<AsOfMatch, QueryError> {
+    let ast::Expr::BinaryOp { left, op, right } = expr else {
+        return Err(QueryError::Unsupported(
+            "ASOF JOIN's second ON conjunct must compare the two ordering keys".to_owned(),
+        ));
+    };
+    let column = |expr: &ast::Expr| -> Result<String, QueryError> {
+        match expr {
+            ast::Expr::Identifier(name) => Ok(ident(name)),
+            ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [_, name] => Ok(ident(name)),
+                _ => Err(QueryError::Unsupported(
+                    "ON columns may carry one table qualifier".to_owned(),
+                )),
+            },
+            other => Err(QueryError::Unsupported(format!(
+                "ASOF ON side '{other}' (plain columns only)"
+            ))),
+        }
+    };
+    // Both sides must be columns; which side is which decides how to
+    // read the operator, since `q.ts <= t.ts` and `t.ts >= q.ts` are
+    // the same statement.
+    let (_, _) = (column(left)?, column(right)?);
+    match op {
+        ast::BinaryOperator::LtEq | ast::BinaryOperator::GtEq => Ok(AsOfMatch::AtOrBefore),
+        ast::BinaryOperator::Lt | ast::BinaryOperator::Gt => Ok(AsOfMatch::StrictlyBefore),
+        other => Err(QueryError::Unsupported(format!(
+            "ASOF JOIN's time comparison is '{other}' — it must be one of              <=, <, >=, > (which one only selects whether an exactly-equal              timestamp matches)"
+        ))),
     }
 }
 
@@ -2328,6 +2492,95 @@ mod tests {
             let error = format!("{}", parse_statement(sql).unwrap_err());
             assert!(error.contains(needle), "{sql}: {error}");
         }
+    }
+
+    #[test]
+    fn an_asof_join_lifts_its_keyword_and_reads_the_time_axis() {
+        // #65's hybrid: the ASOF token is spliced out by byte span and
+        // the remainder parses as an ordinary join, so no fork of
+        // sqlparser is needed.
+        let lifted = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym").unwrap();
+        let join = lifted.join.expect("joined");
+        assert_eq!(join.as_of, Some(AsOfMatch::AtOrBefore), "implicit axis");
+        assert!(join.left, "ASOF LEFT JOIN keeps unmatched fact rows");
+        assert_eq!(join.fact_key, "sym");
+        assert_eq!(join.dimension_key, "sym");
+        let inner = plan("SELECT t.x FROM t ASOF INNER JOIN q ON t.sym = q.sym").unwrap();
+        assert!(!inner.join.expect("joined").left, "INNER drops them");
+        // An explicit inequality is permitted and only selects the
+        // comparison; either side order says the same thing.
+        for (sql, expected) in [
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts <= t.ts",
+                AsOfMatch::AtOrBefore,
+            ),
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND t.ts >= q.ts",
+                AsOfMatch::AtOrBefore,
+            ),
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts < t.ts",
+                AsOfMatch::StrictlyBefore,
+            ),
+        ] {
+            let join = plan(sql).unwrap().join.expect("joined");
+            assert_eq!(join.as_of, Some(expected), "{sql}");
+        }
+        // A plain join is untouched — no as-of anything.
+        let plain = plan("SELECT t.x FROM t LEFT JOIN q ON t.sym = q.sym").unwrap();
+        assert_eq!(plain.join.expect("joined").as_of, None);
+    }
+
+    #[test]
+    fn the_asof_join_lift_survives_comments_and_string_literals() {
+        // The M4-close lesson: a pre-parse lift that reassembles from
+        // tokens collapses the newline ending a `--` comment and
+        // silently comments out the rest of the statement. This one
+        // splices by byte span, so the comment stays a comment.
+        let commented_join = plan(
+            "SELECT t.x FROM t ASOF LEFT JOIN q -- pick the prior quote\n             ON t.sym = q.sym WHERE t.x > 1",
+        )
+        .expect("plans");
+        assert!(commented_join.join.is_some(), "the join survived");
+        assert!(commented_join.predicate.is_some(), "and so did the WHERE");
+        // ASOF inside a comment or a string is inert.
+        let inert = plan("SELECT x FROM t WHERE sym = 'ASOF LEFT JOIN'").unwrap();
+        assert!(inert.join.is_none() && inert.as_of.is_none());
+        let commented = plan("SELECT x FROM t /* ASOF LEFT JOIN q */ WHERE x > 1").unwrap();
+        assert!(commented.join.is_none());
+        // One token, two clauses, told apart by what follows it — the
+        // lift separates them correctly. Combining them is then refused
+        // for an unrelated and pre-existing reason (M4.4: a knowledge
+        // cut binds to one table's sequence space, and the join
+        // lowering does not carry it), which is the error the user
+        // should see rather than a parse puzzle.
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym ASOF 7").unwrap_err()
+        );
+        assert!(error.contains("AS OF with JOIN"), "{error}");
+    }
+
+    #[test]
+    fn bare_asof_join_is_refused_by_name() {
+        // Vendors genuinely diverge on bare as-of semantics, so the
+        // user says which they mean (#65; standing revisit flagged
+        // 2026-07-30).
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF JOIN q ON t.sym = q.sym").unwrap_err()
+        );
+        assert!(error.contains("bare ASOF JOIN"), "{error}");
+        assert!(error.contains("ASOF LEFT JOIN"), "{error}");
+        assert!(error.contains("ASOF INNER JOIN"), "{error}");
+        // And a comparison that is not an inequality is named, not
+        // quietly ignored.
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts <> t.ts")
+                .unwrap_err()
+        );
+        assert!(error.contains("time comparison"), "{error}");
     }
 
     #[test]
