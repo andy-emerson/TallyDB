@@ -6,10 +6,12 @@
 use std::io::{IsTerminal, Read};
 use tallydb_shell::{only_comments, split_statements, Console, Outcome};
 
-const USAGE: &str = "usage: tallydb DIR [--read-only] [-c \"sql\"]\n\
+const USAGE: &str = "usage: tallydb DIR [--read-only] [--cache MiB] [-c \"sql\"]\n\
   DIR         the database directory (created if absent)\n\
   --read-only open alongside a writer process: queries only, .refresh\n\
               re-reads what the writer has flushed\n\
+  --cache MiB the residency budget: decoded segments retained in\n\
+              memory (default: unbounded — everything touched stays)\n\
   -c \"sql\"    run statements and exit (repeatable); also reads piped stdin";
 
 fn main() {
@@ -17,6 +19,7 @@ fn main() {
     let mut dir = None;
     let mut batch: Vec<String> = Vec::new();
     let mut read_only = false;
+    let mut cache_bytes: Option<u64> = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-c" => match arguments.next() {
@@ -24,6 +27,10 @@ fn main() {
                 None => exit_usage("-c needs a SQL argument"),
             },
             "--read-only" => read_only = true,
+            "--cache" => match arguments.next().and_then(|mib| mib.parse::<u64>().ok()) {
+                Some(mib) => cache_bytes = Some(mib.saturating_mul(1024 * 1024)),
+                None => exit_usage("--cache needs a size in MiB"),
+            },
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -36,9 +43,9 @@ fn main() {
         exit_usage("missing DIR");
     };
     let opened = if read_only {
-        Console::open_read_only(&dir)
+        Console::open_read_only_with_cache(&dir, cache_bytes)
     } else {
-        Console::open(&dir)
+        Console::open_with_cache(&dir, cache_bytes)
     };
     let mut console = match opened {
         Ok(console) => console,

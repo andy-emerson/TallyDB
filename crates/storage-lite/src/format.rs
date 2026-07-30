@@ -74,13 +74,23 @@
 //!   name_len u16, name bytes (UTF-8)
 //!   column_type u8, nullable u8, logical u8 tag + u8 payload
 //! then (v2 only) the sections, each: tag u16, length u32, payload
+//!   tag 1 — segment records: u32 count, then per segment
+//!             name_len u16 + name, base_row_id u64, row_count u64,
+//!             ordered u8, sequence kind u8 (0 row-ids;
+//!             1 contiguous + base u64; 2 explicit + end u64),
+//!             zone-map count u32, then per column the segment
+//!             format's zone-map field verbatim
 //!   tag 2 — the ingest-sequence watermark
 //!   tag 3 — the history segments' names
 //! ```
 //!
 //! Sections are additive and skippable: a decoder ignores tags it does
-//! not know, which is what lets the knowledge axis and F3's zone-map
-//! lift share one revision.
+//! not know, which is what let the knowledge axis (tag 2, M4.4) and the
+//! residency design's segment records (tag 1, 2026-07-30) share one
+//! revision. Tag 1 makes the manifest the authoritative list of the
+//! generation's live segments: reopen reads exactly the named files,
+//! and a manifest without the section (an older writer's) falls back to
+//! scanning the backend.
 
 use crate::alp::{
     decode_alp_f64, decode_for_i64, decode_for_u32, encode_alp_f64, encode_for_i64, encode_for_u32,
@@ -427,6 +437,49 @@ fn encode_zone_map(out: &mut Vec<u8>, zone_map: Option<&ZoneMap>) {
     }
 }
 
+/// The zone-map field's reader — shared by the segment format's column
+/// entries and the manifest's segment records, which is what keeps the
+/// two encodings one encoding.
+fn decode_zone_map(
+    reader: &mut Reader<'_>,
+    column_type: ColumnType,
+    name: &str,
+) -> Result<Option<ZoneMap>, FormatError> {
+    let presence = reader.u8()?;
+    if presence & !0b11 != 0 || (presence & 0b10 != 0 && (presence & 1 == 0)) {
+        return Err(FormatError::Corrupt(format!(
+            "invalid zone-map presence byte {presence:#04x} for '{name}'"
+        )));
+    }
+    if presence & 1 == 0 {
+        return Ok(None);
+    }
+    let has_nan = presence & 0b10 != 0;
+    let min = reader.take(8)?;
+    let max = reader.take(8)?;
+    Ok(Some(match column_type {
+        ColumnType::F64 => ZoneMap::F64 {
+            min: f64::from_le_bytes(min.try_into().unwrap()),
+            max: f64::from_le_bytes(max.try_into().unwrap()),
+            has_nan,
+        },
+        ColumnType::I64 if has_nan => {
+            return Err(FormatError::Corrupt(format!(
+                "i64 column '{name}' carries the NaN zone-map bit"
+            )))
+        }
+        ColumnType::I64 => ZoneMap::I64 {
+            min: i64::from_le_bytes(min.try_into().unwrap()),
+            max: i64::from_le_bytes(max.try_into().unwrap()),
+        },
+        ColumnType::Key => {
+            return Err(FormatError::Corrupt(format!(
+                "key column '{name}' carries a zone map"
+            )))
+        }
+    }))
+}
+
 fn encode_validity(out: &mut Vec<u8>, validity: Option<&Bitmap>) {
     match validity {
         None => out.push(0),
@@ -604,16 +657,116 @@ pub const MANIFEST_VERSION: u16 = 1;
 /// The sectioned manifest version (M4.4): v1's exact layout, then
 /// `section_count: u16` followed by `tag: u16, length: u32, payload`
 /// per section. Readers skip unknown tags, so sections fill in over
-/// time without another version bump. Assigned tags: 1 = per-segment
-/// zone maps (reserved for the segment-lazy work, never yet written),
-/// 2 = knowledge state (the `u64` ingest-sequence watermark — see
-/// [`ManifestSections::next_sequence`]), 3 = history segments.
+/// time without another version bump. Assigned tags: 1 = segment
+/// records (the residency design, 2026-07-30 — see [`SegmentRecord`]:
+/// per live segment its name, row span, ordering flag, sequence
+/// summary, and zone maps, so an open prunes and plans before touching
+/// any segment file), 2 = knowledge state (the `u64` ingest-sequence
+/// watermark — see [`ManifestSections::next_sequence`]), 3 = history
+/// segments.
 pub const MANIFEST_VERSION_SECTIONED: u16 = 2;
+
+/// What the manifest knows about one flushed segment without opening
+/// its file: everything query planning prunes on and everything reopen
+/// verifies — the metadata half of the residency design (ruled
+/// 2026-07-30: prune-metadata lives in a manifest section, so an open
+/// touches no segment file until a query actually needs its rows).
+#[derive(Clone, PartialEq, Debug)]
+pub struct SegmentRecord {
+    /// The backend object name (`seg-<generation>-<base>.tlyseg`).
+    pub name: String,
+    /// Id of the segment's first row.
+    pub base_row_id: u64,
+    /// Rows in the segment.
+    pub rows: u64,
+    /// Whether the ordering key arrived non-decreasing.
+    pub ordered: bool,
+    /// Where the segment's birth sequences stand — enough for the
+    /// watermark fold and the reader's supersession-visibility rule;
+    /// the per-row array (if any) stays in the segment file.
+    pub sequence: SequenceSummary,
+    /// Per-column zone maps, aligned to the schema; `None` per the
+    /// segment format's meaning (no valid comparable values).
+    pub zone_maps: Vec<Option<ZoneMap>>,
+}
+
+impl SegmentRecord {
+    /// Derives the record from a decoded segment — the one constructor,
+    /// so a record can never disagree with the segment it describes.
+    pub fn of(name: String, segment: &Segment) -> SegmentRecord {
+        // Every stored segment carries zone maps (the write buffer and
+        // compaction both compute them at freeze). A maps-free segment
+        // here would record an all-`None` row, which *means* every
+        // column is all-null — a silent pruning corruption, refused.
+        assert!(
+            segment.zone_maps_present(),
+            "a stored segment always carries zone maps"
+        );
+        let rows = segment.batch().num_rows();
+        SegmentRecord {
+            name,
+            base_row_id: segment.base_row_id(),
+            rows: rows as u64,
+            ordered: segment.is_ordered(),
+            sequence: match segment.sequence_info() {
+                SequenceInfo::RowIds => SequenceSummary::RowIds,
+                SequenceInfo::Contiguous { base } => SequenceSummary::Contiguous { base: *base },
+                SequenceInfo::Explicit(_) => SequenceSummary::Explicit {
+                    end: segment.sequence_end(),
+                },
+            },
+            zone_maps: (0..segment.batch().columns().len())
+                .map(|index| segment.zone_map(index).copied())
+                .collect(),
+        }
+    }
+
+    /// The sequence one past the segment's largest birth — the value
+    /// [`Segment::sequence_end`] computes from data, here from metadata.
+    pub fn sequence_end(&self) -> u64 {
+        match self.sequence {
+            SequenceSummary::RowIds => self.base_row_id + self.rows,
+            SequenceSummary::Contiguous { base } => base + self.rows,
+            SequenceSummary::Explicit { end } => end,
+        }
+    }
+
+    /// Whether this segment's sequences have left the virtual state
+    /// (the record-level form of `sequence_info() != RowIds`).
+    pub fn diverged(&self) -> bool {
+        self.sequence != SequenceSummary::RowIds
+    }
+}
+
+/// A [`SequenceInfo`] with the per-row array reduced to its end: the
+/// manifest carries where a segment's sequences *stand*, not what they
+/// *are*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SequenceSummary {
+    /// Sequence == row id.
+    RowIds,
+    /// Row `i` carries sequence `base + i`.
+    Contiguous {
+        /// The first row's sequence.
+        base: u64,
+    },
+    /// Non-contiguous per-row births; only the fold survives here.
+    Explicit {
+        /// One past the largest birth sequence.
+        end: u64,
+    },
+}
 
 /// Manifest section content beyond the v1 core. `Default` is the
 /// empty state, which encodes as plain v1.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ManifestSections {
+    /// The generation's live segments in base-row-id order, with the
+    /// metadata an open needs before touching any segment file. Empty
+    /// on manifests from writers older than this section (or tables
+    /// with nothing flushed): reopen then falls back to scanning the
+    /// backend and re-earns the section at its next manifest write.
+    pub segments: Vec<SegmentRecord>,
     /// The ingest-sequence watermark: the sequence the next appended
     /// row will receive. `Some` exactly when the table has diverged —
     /// run a retaining compaction that broke sequence == row id — and
@@ -630,7 +783,7 @@ pub struct ManifestSections {
 impl ManifestSections {
     /// Whether encoding needs the sectioned version at all.
     pub fn is_empty(&self) -> bool {
-        self.next_sequence.is_none() && self.history.is_empty()
+        self.segments.is_empty() && self.next_sequence.is_none() && self.history.is_empty()
     }
 
     /// Whether the table has ever diverged (sequence != row id).
@@ -639,6 +792,7 @@ impl ManifestSections {
     }
 }
 
+const SECTION_SEGMENTS: u16 = 1;
 const SECTION_KNOWLEDGE: u16 = 2;
 const SECTION_HISTORY: u16 = 3;
 
@@ -683,6 +837,33 @@ pub fn encode_manifest(
     }
     if version == MANIFEST_VERSION_SECTIONED {
         let mut section_bytes: Vec<(u16, Vec<u8>)> = Vec::new();
+        if !sections.segments.is_empty() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(sections.segments.len() as u32).to_le_bytes());
+            for record in &sections.segments {
+                payload.extend_from_slice(&(record.name.len() as u16).to_le_bytes());
+                payload.extend_from_slice(record.name.as_bytes());
+                payload.extend_from_slice(&record.base_row_id.to_le_bytes());
+                payload.extend_from_slice(&record.rows.to_le_bytes());
+                payload.push(u8::from(record.ordered));
+                match record.sequence {
+                    SequenceSummary::RowIds => payload.push(0),
+                    SequenceSummary::Contiguous { base } => {
+                        payload.push(1);
+                        payload.extend_from_slice(&base.to_le_bytes());
+                    }
+                    SequenceSummary::Explicit { end } => {
+                        payload.push(2);
+                        payload.extend_from_slice(&end.to_le_bytes());
+                    }
+                }
+                payload.extend_from_slice(&(record.zone_maps.len() as u32).to_le_bytes());
+                for zone_map in &record.zone_maps {
+                    encode_zone_map(&mut payload, zone_map.as_ref());
+                }
+            }
+            section_bytes.push((SECTION_SEGMENTS, payload));
+        }
         if let Some(next_sequence) = sections.next_sequence {
             section_bytes.push((SECTION_KNOWLEDGE, next_sequence.to_le_bytes().to_vec()));
         }
@@ -748,6 +929,71 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, FormatError> {
             let length = reader.u32()? as usize;
             let payload = reader.take(length)?;
             match tag {
+                SECTION_SEGMENTS => {
+                    let mut inner = Reader {
+                        bytes: payload,
+                        position: 0,
+                    };
+                    let count = inner.u32()? as usize;
+                    for _ in 0..count {
+                        let len = inner.u16()? as usize;
+                        let name = std::str::from_utf8(inner.take(len)?)
+                            .map_err(|_| {
+                                FormatError::Corrupt("segment record name is not UTF-8".to_owned())
+                            })?
+                            .to_owned();
+                        let base_row_id = inner.u64()?;
+                        let rows = inner.u64()?;
+                        let ordered = match inner.u8()? {
+                            0 => false,
+                            1 => true,
+                            other => {
+                                return Err(FormatError::Corrupt(format!(
+                                    "segment record '{name}' has ordered byte {other}"
+                                )))
+                            }
+                        };
+                        let sequence = match inner.u8()? {
+                            0 => SequenceSummary::RowIds,
+                            1 => SequenceSummary::Contiguous { base: inner.u64()? },
+                            2 => SequenceSummary::Explicit { end: inner.u64()? },
+                            other => {
+                                return Err(FormatError::Corrupt(format!(
+                                    "segment record '{name}' has sequence kind {other}"
+                                )))
+                            }
+                        };
+                        let map_count = inner.u32()? as usize;
+                        if map_count != fields.len() {
+                            return Err(FormatError::Corrupt(format!(
+                                "segment record '{name}' carries {map_count} zone maps \
+                                 for {} columns",
+                                fields.len()
+                            )));
+                        }
+                        let mut zone_maps = Vec::with_capacity(map_count);
+                        for field in &fields {
+                            zone_maps.push(decode_zone_map(
+                                &mut inner,
+                                field.column_type(),
+                                &name,
+                            )?);
+                        }
+                        sections.segments.push(SegmentRecord {
+                            name,
+                            base_row_id,
+                            rows,
+                            ordered,
+                            sequence,
+                            zone_maps,
+                        });
+                    }
+                    if inner.position != payload.len() {
+                        return Err(FormatError::Corrupt(
+                            "trailing bytes in the segments section".to_owned(),
+                        ));
+                    }
+                }
                 SECTION_KNOWLEDGE => {
                     let watermark: [u8; 8] = payload.try_into().map_err(|_| {
                         FormatError::Corrupt("knowledge section is 8 bytes".to_owned())
@@ -810,40 +1056,7 @@ fn decode_column(
     let column_type = field.column_type();
     let codec = Codec::from_tag(reader.u8()?)
         .ok_or_else(|| FormatError::Corrupt(format!("unknown codec for '{name}'")))?;
-    let presence = reader.u8()?;
-    if presence & !0b11 != 0 || (presence & 0b10 != 0 && (presence & 1 == 0)) {
-        return Err(FormatError::Corrupt(format!(
-            "invalid zone-map presence byte {presence:#04x} for '{name}'"
-        )));
-    }
-    let zone_map = if presence & 1 != 0 {
-        let has_nan = presence & 0b10 != 0;
-        let min = reader.take(8)?;
-        let max = reader.take(8)?;
-        Some(match column_type {
-            ColumnType::F64 => ZoneMap::F64 {
-                min: f64::from_le_bytes(min.try_into().unwrap()),
-                max: f64::from_le_bytes(max.try_into().unwrap()),
-                has_nan,
-            },
-            ColumnType::I64 if has_nan => {
-                return Err(FormatError::Corrupt(format!(
-                    "i64 column '{name}' carries the NaN zone-map bit"
-                )))
-            }
-            ColumnType::I64 => ZoneMap::I64 {
-                min: i64::from_le_bytes(min.try_into().unwrap()),
-                max: i64::from_le_bytes(max.try_into().unwrap()),
-            },
-            ColumnType::Key => {
-                return Err(FormatError::Corrupt(format!(
-                    "key column '{name}' carries a zone map"
-                )))
-            }
-        })
-    } else {
-        None
-    };
+    let zone_map = decode_zone_map(reader, column_type, &name)?;
     let validity = if reader.u8()? != 0 {
         let byte_len = reader.u32()? as usize;
         let bytes = reader.take(byte_len)?;

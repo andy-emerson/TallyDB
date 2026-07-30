@@ -36,27 +36,115 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-29, M4 merged; step 2 of the 10-step plan done)
+## Snapshot (2026-07-30: step 1 BUILT — the residency design; step 2 is the check-in)
 
-**Where execution is: steps 1–6 are complete and pushed. Next: step 7
-— the Human's merge.** The branch holds, in order: the doc pass; the
-seven fruit builds (IS NULL, `_seq`, DELETE-consumes, #80 top-k, #81
-pushdown, SYMBOL, #58(B)); the step-3 code pass; the pause outcomes
-(FIRST/LAST ruled (a); #62 split into #62+#83, both decisions open;
-`_seq` stays, revisit open; hidden ORDER BY + SET negative literal
-built; delete-flush cost ruled (a), documented); step 5's research
-items — #42 (corpus tick size, ALP+RD+raw for f64, FOR+bit-packing
-for i64/u32, golden split v1-decode/v2-encode, measured 4.18×
-ticks / 1.16× telemetry / 6–10× codes) and F4 (read-only
-cross-process opens: FsBackend::open_read_only,
-Store::open_read_only with the supersession-visibility rule,
-Table::open_read_only/refresh, console --read-only with
-.refresh/.flush); and the step-6 code+doc passes. Gate green at
-head: 402 tests both legs, six oracles, fmt/clippy/doc.
+**State:** `main` = `cfeba35` (PR #86: AGENTS.md v2.4.0 +
+CONTRIBUTING.md + vector logo). `claude/dev` rebased onto it and
+carries step 1, built and pushed: the residency ruling (option b,
+manifest-section metadata, advisory budget, unbounded interim
+default) in three code commits (`322974b` manifest tag 1 +
+authoritative layout; `177b75b` lazy fault-in + budget + handle API
+sweep; `cb2a6d6` refresh retention + the budget differential) plus
+the decision-record doc commit. Full gate green at the push: fmt,
+clippy both legs, 28 suites (all guards verified tripping),
+rustdoc both legs, all six oracles over the faulting path. New
+issues: #87 (residency deferrals: column granularity, hard budget,
+the default), #88 (streaming scans — unpruned full-table working
+set). Local toolchain **Rust 1.97.1** matching CI — keep it current
+so the gate sees what CI sees.
 
-Post-merge (steps 8–10): M5.0–M5.4 per the recorded table, then
-code/doc pass, then the second merge. FIRST/LAST = (a) is the ruled
-naming for M5.3.
+### The plan (amended by the Human 2026-07-30, after step 1 landed)
+
+The research steps are **done for now**: step 1 shipped, and the
+Human deferred steps 3–6 ("enough research-grade stuff for today").
+The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
+
+1. ~~**Tables bigger than memory**~~ — DONE. Ruled 2026-07-30
+   (option b; metadata home = manifest section; (c) + budget
+   semantics + default deferred to #87) and built the same day —
+   see the snapshot above and DESIGN.md *The residency design*.
+   Proposed as PR #89; the Human merges.
+2. **M5.0–M5.4** ← NEXT, once #89 merges and `claude/dev` restarts
+   from the new `main`. Every design decision it needs is closed:
+   - **M5.0 streaming primitives** (#77 tranche 2a): rolling
+     var/stddev, expanding aggregates, lag/diff/shift, log/simple
+     returns, EWMA — O(n) incremental on the re-anchored compensated
+     discipline; NumPy oracle + bench row per op. **SQL surface per
+     #77.1 = (a)**: only standard-named ops reach SQL (`var_pop`,
+     `stddev_pop`); EWMA/`diff`/multi-factor stay script-side until
+     individually named. The **prelude ships here, compiled into the
+     binary with `.prelude` printing its source** (#77.3 = a).
+   - **M5.1** `LAG`/`LEAD` + `RANGE` frames — standard names, so in
+     by the #77.1 rule; DuckDB differential.
+   - **M5.2** the as-of join exactly as ruled (#65 hybrid): `ASOF`
+     lifted pre-parse by byte span, `ON` only, ordering keys are the
+     time axis (explicit inequality validated, not obeyed), bare
+     `ASOF JOIN` refused, no `TOLERANCE`. Ordered co-walk gated on
+     `is_ordered()` both sides. DuckDB differential + the
+     vanilla-SQL definitional reference.
+   - **M5.3** bucketing (F1 = d: monotone integer arithmetic on the
+     ordering key in `GROUP BY`, streaming O(1)) + `FIRST`/`LAST`
+     **ruled (a)** + cross-sectional partitioning.
+   - **M5.4** the matrix tier on faer — **SQL gets scalar reductions
+     only** (#77.2 = c): R², residual, fitted; vectors/matrices via
+     API and scripts. Per-frame recompute ships it correct; the
+     incremental up/downdating research is deferred (below).
+3. **Code pass** (repo-wide review + fixes).
+4. **Doc pass** (truth then clarity; README claims at evidence).
+5. **Merge** (the Human).
+
+**Deferred, not dropped** (the Human's research steps 3–6, to be
+rescheduled): **continuous queries (#83)** — opens with the Plan
+conversation the issue requires (which query shapes are maintainable;
+what a maintained result does when its input is corrected), never
+with code. **Incremental multi-factor** — K > 2 rolling OLS by
+sliding-window factorization up/downdating, with per-frame faer
+recompute as the shipped-correct safety net; it is M5.4's deep end,
+so M5.4 lands without it and gains it later.
+
+### Rulings landed since the M5 ruling batch
+
+- **FIRST/LAST = (a)**: `FIRST(x)`/`LAST(x)`, the de-facto TSDB
+  names; well-defined here because the ordering key is declared.
+- **#62 split approved**: #62 = ingest hooks (engineering, decisions
+  still open); #83 = continuous queries (research, Plan conversation
+  required). Neither scheduled by that split — #83 is now step 3.
+- **`_seq` stays `_seq`** — with an open revisit (the Human learned
+  the "never seen" claim was really "never seen *unbidden*"; users
+  do type it).
+- **Delete-flush cost = (a)** accept and document (done): persistent
+  DELETE seals the buffer; reopen trigger recorded in DESIGN.md.
+
+### Remaining open decisions (none gate steps 1–7 except as noted)
+
+- Step 1's residency design and step 3's #83 scoping — the two
+  conversations the plan itself schedules.
+- **#82** compaction 2× peak: document vs engineer (deferred).
+- **#57** regex menu (deferred by ruling; option-f sketch on issue).
+- **#46** agentic touchpoints; **#52** benchmark suite (M5.7).
+- Boolean + logical-annotation revisit (parked, flagged
+  wrong-on-purpose).
+- #62 ingest hooks: unscheduled.
+
+### Standing session facts
+
+- Gate = fmt · clippy both legs `-D warnings` · test both legs ·
+  rustdoc both legs · six oracle scripts (pyarrow_roundtrip via
+  `-p arrow-lite --features oracle-harness`; the other five via
+  `-p engine --features oracle-harness`). 402 tests at the merge.
+  Doc-only (.md) pushes have gone without the full gate.
+- CI runs on pull-request events only; CI stable moves — if clippy
+  fails there and not here, `rustup update stable` and re-run.
+- The scratchpad probe crate lives under the session scratchpad
+  (path-deps on real crates); rebuild if needed, never in-repo.
+- sqlparser 0.62.0, GenericDialect. Any new pre-parse lift must
+  splice by byte span, skip comments whole, carry adversarial tests.
+- Beta shape (built as of this merge): feed-writer process +
+  read-only consoles (`--read-only`, `.refresh`/`.flush`) over one
+  directory; readers see the durable prefix, old-or-new per
+  mutation.
+- `rm -rf crates/engine/tests/__pycache__` after running oracles
+  (gitignored now, but keep the tree clean).
 
 ### Superseded snapshot (kept for the ledger below)
 

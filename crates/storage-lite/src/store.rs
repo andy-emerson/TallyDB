@@ -33,13 +33,16 @@
 //! executor) check [`Segment::is_ordered`] and the live ordering bounds
 //! instead of assuming.
 
-use crate::format::{decode_manifest, decode_segment, encode_manifest, encode_segment};
+use crate::format::{
+    decode_manifest, decode_segment, encode_manifest, encode_segment, SegmentRecord,
+};
 use crate::io::{IoError, StorageBackend};
-use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer};
+use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};
 use crate::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Rows per segment before an automatic flush. Large enough that segment
 /// bookkeeping is noise, small enough that a segment is a reasonable unit
@@ -174,6 +177,390 @@ impl SegmentView {
     }
 }
 
+/// Residency accounting shared by every lazy slot of one store — the
+/// engineering half of the 2026-07-30 residency ruling (option b):
+/// decoded segments are a cache over the compressed files, retained
+/// under a byte budget and evicted least-recently-used.
+///
+/// The budget is **advisory over retention, never over correctness**:
+/// a segment some snapshot or query still holds (its `Arc` is shared)
+/// is never evicted, so one query's working set may transiently exceed
+/// the budget — the documented bound is budget + the largest concurrent
+/// working set. `None` means unbounded (the interim default; the
+/// default's final value is decision #87).
+pub(crate) struct SegmentCache {
+    budget: Option<u64>,
+    /// Bytes currently retained by slots (not counting evicted segments
+    /// queries still pin — those are theirs, not the cache's).
+    resident: Mutex<u64>,
+    /// A monotone use-clock; slots stamp it on every touch.
+    clock: AtomicU64,
+    /// Every evictable slot ever minted for this store; dead weak refs
+    /// are swept during eviction scans.
+    registry: Mutex<Vec<Weak<SegmentSlot>>>,
+}
+
+impl SegmentCache {
+    fn new(budget: Option<u64>) -> Arc<SegmentCache> {
+        Arc::new(SegmentCache {
+            budget,
+            resident: Mutex::new(0),
+            clock: AtomicU64::new(0),
+            registry: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn register(&self, slot: &Arc<SegmentSlot>) {
+        self.registry
+            .lock()
+            .expect("cache registry lock poisoned")
+            .push(Arc::downgrade(slot));
+    }
+
+    /// Accounts `bytes` of freshly decoded segment and evicts the
+    /// least-recently-used unpinned slots until the total fits the
+    /// budget again. A pinned slot (its segment `Arc` is shared with a
+    /// snapshot or query) is skipped — eviction reclaims only memory
+    /// nothing is reading.
+    fn admit(&self, bytes: u64) {
+        let mut resident = self.resident.lock().expect("cache lock poisoned");
+        *resident += bytes;
+        let Some(budget) = self.budget else { return };
+        if *resident <= budget {
+            return;
+        }
+        let mut candidates: Vec<(u64, Arc<SegmentSlot>)> = {
+            let mut registry = self.registry.lock().expect("cache registry lock poisoned");
+            registry.retain(|weak| weak.strong_count() > 0);
+            registry
+                .iter()
+                .filter_map(Weak::upgrade)
+                .map(|slot| (slot.last_touch.load(Ordering::Relaxed), slot))
+                .collect()
+        };
+        candidates.sort_by_key(|(touch, _)| *touch);
+        for (_, slot) in candidates {
+            if *resident <= budget {
+                break;
+            }
+            if let Some(freed) = slot.evict() {
+                *resident = resident.saturating_sub(freed);
+            }
+        }
+        // Still over budget here means everything left is pinned — the
+        // advisory overshoot; it drains as those readers finish.
+    }
+}
+
+/// What a read-only refresh carries from the previous open: the slot
+/// context (cache included) and the slots themselves, so anything the
+/// new manifest still names keeps its decoded state.
+struct RefreshCarry {
+    shared: Arc<SlotShared>,
+    segments: Vec<Arc<SegmentSlot>>,
+    history: Vec<Arc<SegmentSlot>>,
+}
+
+impl RefreshCarry {
+    fn slot_named(&self, name: &str) -> Option<Arc<SegmentSlot>> {
+        self.segments
+            .iter()
+            .find(|slot| slot.name.as_deref() == Some(name))
+            .cloned()
+    }
+
+    fn history_named(&self, name: &str) -> Option<Arc<SegmentSlot>> {
+        self.history
+            .iter()
+            .find(|slot| slot.name.as_deref() == Some(name))
+            .cloned()
+    }
+}
+
+/// Per-store context every slot shares: what a fault-in needs to read,
+/// verify, and account a segment.
+pub(crate) struct SlotShared {
+    schema: Schema,
+    ordering_key: usize,
+    backend: Option<Arc<dyn StorageBackend>>,
+    cache: Arc<SegmentCache>,
+}
+
+/// What a slot knows about its segment without decoding it — served
+/// from the manifest's segment record (tag 1) or derived from a
+/// decoded segment; either way it answers planning (pruning, live
+/// masks, ordering) with zero I/O.
+pub(crate) struct SegmentMeta {
+    base_row_id: u64,
+    rows: usize,
+    ordered: bool,
+    /// One past the largest birth sequence (open-time watermark folds).
+    sequence_end: u64,
+    /// Whether sequences have left the virtual state.
+    diverged: bool,
+    zone_maps: Vec<Option<ZoneMap>>,
+}
+
+impl SegmentMeta {
+    fn of(segment: &Segment) -> SegmentMeta {
+        SegmentMeta {
+            base_row_id: segment.base_row_id(),
+            rows: segment.batch().num_rows(),
+            ordered: segment.is_ordered(),
+            sequence_end: segment.sequence_end(),
+            diverged: segment.sequence_info() != &SequenceInfo::RowIds,
+            zone_maps: (0..segment.batch().columns().len())
+                .map(|index| segment.zone_map(index).copied())
+                .collect(),
+        }
+    }
+
+    fn from_record(record: &SegmentRecord) -> SegmentMeta {
+        SegmentMeta {
+            base_row_id: record.base_row_id,
+            rows: record.rows as usize,
+            ordered: record.ordered,
+            sequence_end: record.sequence_end(),
+            diverged: record.diverged(),
+            zone_maps: record.zone_maps.clone(),
+        }
+    }
+}
+
+/// One segment's residency slot: metadata always in memory, the decoded
+/// segment faulted in from the backend on first data access and
+/// evictable under the cache budget. The store's shared state holds
+/// slots; snapshots hold [`SegmentHandle`]s over them; the decoded
+/// [`Segment`] exists only while resident or pinned.
+pub(crate) struct SegmentSlot {
+    /// `None` on history slots, which are only ever read whole under
+    /// `AS OF` — they fault for data, never answer metadata.
+    meta: Option<SegmentMeta>,
+    /// The backend object to fault from; `None` for permanently
+    /// resident slots (in-memory stores, buffer snapshots, scratch).
+    name: Option<String>,
+    shared: Arc<SlotShared>,
+    state: Mutex<Option<Arc<Segment>>>,
+    /// Decoded footprint, known once decoded (0 until then).
+    bytes: AtomicU64,
+    last_touch: AtomicU64,
+}
+
+impl SegmentSlot {
+    /// A slot already holding its decoded segment. Evictable exactly
+    /// when `name` names a backend object to fault it back from.
+    fn resident(
+        segment: Arc<Segment>,
+        shared: Arc<SlotShared>,
+        name: Option<String>,
+    ) -> Arc<SegmentSlot> {
+        let bytes = segment.resident_bytes();
+        let slot = Arc::new(SegmentSlot {
+            meta: Some(SegmentMeta::of(&segment)),
+            name,
+            state: Mutex::new(Some(segment)),
+            bytes: AtomicU64::new(bytes),
+            last_touch: AtomicU64::new(shared.cache.tick()),
+            shared,
+        });
+        if slot.evictable() {
+            slot.shared.cache.register(&slot);
+            slot.shared.cache.admit(bytes);
+        }
+        slot
+    }
+
+    /// A slot that has never decoded: metadata from the manifest
+    /// record, data faulted on first touch.
+    fn lazy(record: &SegmentRecord, shared: Arc<SlotShared>) -> Arc<SegmentSlot> {
+        let slot = Arc::new(SegmentSlot {
+            meta: Some(SegmentMeta::from_record(record)),
+            name: Some(record.name.clone()),
+            state: Mutex::new(None),
+            bytes: AtomicU64::new(0),
+            last_touch: AtomicU64::new(shared.cache.tick()),
+            shared,
+        });
+        slot.shared.cache.register(&slot);
+        slot
+    }
+
+    /// A history slot: no metadata, faulted whole under `AS OF`.
+    fn history(name: String, shared: Arc<SlotShared>) -> Arc<SegmentSlot> {
+        let slot = Arc::new(SegmentSlot {
+            meta: None,
+            name: Some(name),
+            state: Mutex::new(None),
+            bytes: AtomicU64::new(0),
+            last_touch: AtomicU64::new(shared.cache.tick()),
+            shared,
+        });
+        slot.shared.cache.register(&slot);
+        slot
+    }
+
+    fn evictable(&self) -> bool {
+        self.name.is_some() && self.shared.backend.is_some()
+    }
+
+    fn meta(&self) -> &SegmentMeta {
+        self.meta
+            .as_ref()
+            .expect("only history slots lack metadata, and they are never asked")
+    }
+
+    /// The decoded segment: resident, or faulted in now. The fault
+    /// reads the whole file (the backend is whole-object), decodes,
+    /// verifies schema and metadata agreement, and accounts the bytes —
+    /// evicting colder slots if a budget is set.
+    fn segment(&self) -> Result<Arc<Segment>, StorageError> {
+        self.last_touch
+            .store(self.shared.cache.tick(), Ordering::Relaxed);
+        let mut state = self.state.lock().expect("slot lock poisoned");
+        if let Some(segment) = &*state {
+            return Ok(Arc::clone(segment));
+        }
+        let name = self.name.as_ref().expect("an empty slot is named");
+        let backend = self
+            .shared
+            .backend
+            .as_ref()
+            .expect("an empty slot has a backend");
+        let segment = decode_segment(&backend.read(name)?)?;
+        if segment.batch().schema() != &self.shared.schema {
+            return Err(StorageError::SchemaMismatch {
+                reason: format!("segment '{name}' was written under a different schema"),
+            });
+        }
+        if let Some(meta) = &self.meta {
+            if segment.base_row_id() != meta.base_row_id
+                || segment.batch().num_rows() != meta.rows
+                || segment.is_ordered() != meta.ordered
+                || segment.sequence_end() != meta.sequence_end
+            {
+                return Err(StorageError::SchemaMismatch {
+                    reason: format!("segment '{name}' disagrees with its manifest record"),
+                });
+            }
+        }
+        let segment = Arc::new(segment);
+        let bytes = segment.resident_bytes();
+        self.bytes.store(bytes, Ordering::Relaxed);
+        *state = Some(Arc::clone(&segment));
+        drop(state);
+        self.shared.cache.admit(bytes);
+        Ok(segment)
+    }
+
+    /// Drops the resident segment if nothing outside the slot holds it.
+    /// Returns the bytes freed. `try_lock`: a slot mid-fault is simply
+    /// not a candidate this round.
+    fn evict(&self) -> Option<u64> {
+        let mut state = self.state.try_lock().ok()?;
+        let segment = state.as_ref()?;
+        if Arc::strong_count(segment) > 1 {
+            return None; // pinned by a snapshot or a running query
+        }
+        *state = None;
+        Some(self.bytes.load(Ordering::Relaxed))
+    }
+}
+
+/// One segment as a snapshot addresses it: always-available metadata
+/// (row span, ordering, zone maps, the live mask) plus [`Self::view`],
+/// which faults the decoded segment in on first data access. Queries
+/// prune on the metadata and pay decode only for the segments that
+/// survive — the query-side half of the residency design.
+#[derive(Clone)]
+pub struct SegmentHandle {
+    slot: Arc<SegmentSlot>,
+    live: Option<Bitmap>,
+}
+
+impl SegmentHandle {
+    /// A handle over an already-decoded, permanently resident segment —
+    /// the shape `AS OF` reads, buffer snapshots, and tests produce.
+    pub fn resident(segment: Arc<Segment>, live: Option<Bitmap>) -> SegmentHandle {
+        let shared = Arc::new(SlotShared {
+            schema: segment.batch().schema().clone(),
+            ordering_key: segment.ordering_key(),
+            backend: None,
+            cache: SegmentCache::new(None),
+        });
+        SegmentHandle {
+            slot: SegmentSlot::resident(segment, shared, None),
+            live,
+        }
+    }
+
+    /// Rows in the segment (live or not).
+    pub fn rows(&self) -> usize {
+        self.slot.meta().rows
+    }
+
+    /// Id of the segment's first row.
+    pub fn base_row_id(&self) -> u64 {
+        self.slot.meta().base_row_id
+    }
+
+    /// Whether the ordering key arrived non-decreasing.
+    pub fn is_ordered(&self) -> bool {
+        self.slot.meta().ordered
+    }
+
+    /// Index of the declared ordering-key column.
+    pub fn ordering_key(&self) -> usize {
+        self.slot.shared.ordering_key
+    }
+
+    /// The zone map for column `index` — same meaning as
+    /// [`Segment::zone_map`], served without touching the segment file.
+    pub fn zone_map(&self, index: usize) -> Option<&ZoneMap> {
+        self.slot
+            .meta()
+            .zone_maps
+            .get(index)
+            .and_then(Option::as_ref)
+    }
+
+    /// Whether this segment carries zone maps at all — same meaning as
+    /// [`Segment::zone_maps_present`].
+    pub fn zone_maps_present(&self) -> bool {
+        !self.slot.meta().zone_maps.is_empty()
+    }
+
+    /// Bit per row, `true` = live; `None` when nothing is tombstoned.
+    pub fn live(&self) -> Option<&Bitmap> {
+        self.live.as_ref()
+    }
+
+    /// Rows a reader will actually see.
+    pub fn live_rows(&self) -> usize {
+        match &self.live {
+            None => self.rows(),
+            Some(mask) => mask.count_set(),
+        }
+    }
+
+    /// Whether local row `row` is live.
+    pub fn is_live(&self, row: usize) -> bool {
+        self.live.as_ref().is_none_or(|mask| mask.get(row))
+    }
+
+    /// The data view: the decoded segment plus this handle's live mask.
+    /// This is the fault point — everything above answers from metadata.
+    pub fn view(&self) -> Result<SegmentView, StorageError> {
+        Ok(SegmentView {
+            segment: self.slot.segment()?,
+            live: self.live.clone(),
+        })
+    }
+}
+
 /// A table's storage: an active write buffer plus frozen segments.
 ///
 /// ```
@@ -192,9 +579,9 @@ impl SegmentView {
 /// }
 /// let segments = store.snapshot().unwrap();
 /// // Two full segments plus the live buffer's single row.
-/// let rows: Vec<usize> = segments.iter().map(|s| s.segment.batch().num_rows()).collect();
+/// let rows: Vec<usize> = segments.iter().map(|s| s.rows()).collect();
 /// assert_eq!(rows, [2, 2, 1]);
-/// assert_eq!(segments[2].segment.base_row_id(), 4);
+/// assert_eq!(segments[2].base_row_id(), 4);
 /// ```
 pub struct Store {
     schema: Schema,
@@ -219,6 +606,10 @@ pub struct Store {
     /// writes. Every mutating operation refuses; [`Store::refresh`]
     /// re-reads the durable state.
     read_only: bool,
+    /// The per-store context every segment slot shares: schema,
+    /// backend, and the residency cache. Rebuilt when the store gains
+    /// its backend at open.
+    slot_shared: Arc<SlotShared>,
     /// The reader-visible state, shared with every [`StoreReader`]. The
     /// lock is held only to read or swap it — never across encoding,
     /// backend I/O, or compaction's merge — so a reader's `snapshot()`
@@ -230,7 +621,7 @@ pub struct Store {
 /// and the tombstone set. Everything else in [`Store`] belongs to the
 /// single writer alone.
 struct Shared {
-    segments: Vec<Arc<Segment>>,
+    segments: Vec<Arc<SegmentSlot>>,
     buffer: WriteBuffer,
     /// Row id of the buffer's first row.
     buffer_base: u64,
@@ -246,8 +637,9 @@ struct Shared {
     tombstones: BTreeMap<u64, u64>,
     /// History segments: superseded row versions a retaining compaction
     /// preserved. Never in a latest-knowledge snapshot; entered only
-    /// under `AS OF`.
-    history: Vec<Arc<Segment>>,
+    /// under `AS OF` — which is why their slots carry no metadata and
+    /// fault whole on first use.
+    history: Vec<Arc<SegmentSlot>>,
 }
 
 /// A diverged table's live knowledge state: where the ingest-sequence
@@ -372,7 +764,7 @@ pub struct StoreReader {
 impl StoreReader {
     /// A point-in-time view, exactly as [`Store::snapshot`] — callable
     /// from any thread while the writer appends, mutates, or compacts.
-    pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
+    pub fn snapshot(&self) -> Result<Vec<SegmentHandle>, StorageError> {
         snapshot_of(&lock(&self.shared))
     }
 
@@ -384,28 +776,39 @@ impl StoreReader {
 
 /// A point-in-time capture of everything an `AS OF` read needs, taken
 /// under one lock so the three parts can never be torn against each
-/// other: the latest-knowledge views, the history segments, and the
+/// other: the latest-knowledge handles, the history slots, and the
 /// pending (uncompacted) tombstones' kill stamps.
 pub struct KnowledgeSnapshot {
-    /// The latest-knowledge views, exactly as [`Store::snapshot`].
-    pub views: Vec<SegmentView>,
-    /// History segments (see [`Store::history`]).
-    pub history: Vec<Arc<Segment>>,
+    /// The latest-knowledge handles, exactly as [`Store::snapshot`].
+    latest: Vec<SegmentHandle>,
+    /// History slots (see [`Store::history`]); faulted by `as_of`.
+    history: Vec<Arc<SegmentSlot>>,
     /// Pending tombstones: row id → the sequence its kill landed at.
-    pub stamps: BTreeMap<u64, u64>,
+    stamps: BTreeMap<u64, u64>,
 }
 
 impl KnowledgeSnapshot {
+    /// The latest-knowledge handles — what a plain (no `AS OF`) query
+    /// runs over.
+    pub fn latest(&self) -> &[SegmentHandle] {
+        &self.latest
+    }
+
     /// The table as it was known at ingest-sequence `cut`: rows born at
     /// or before the cut and not superseded by it. Live segments keep
     /// rows whose pending tombstone (if any) landed after the cut;
     /// history rows return where their kill came later. The result runs
     /// through the ordinary executor — the knowledge mask is just a
     /// live mask.
-    pub fn as_of(&self, cut: u64) -> Vec<SegmentView> {
-        let mut out = Vec::with_capacity(self.views.len() + self.history.len());
-        for view in &self.views {
-            let segment = Arc::clone(&view.segment);
+    ///
+    /// This **decodes** every segment it consults (masks come from
+    /// per-row birth and kill sequences): `AS OF` pays the fault-in for
+    /// the axis it walks, which is the residency design's intended
+    /// trade — history is cold by definition.
+    pub fn as_of(&self, cut: u64) -> Result<Vec<SegmentHandle>, StorageError> {
+        let mut out = Vec::with_capacity(self.latest.len() + self.history.len());
+        for handle in &self.latest {
+            let segment = handle.view()?.segment;
             let base = segment.base_row_id();
             let rows = segment.batch().num_rows();
             let mut mask = Vec::with_capacity(rows);
@@ -420,16 +823,11 @@ impl KnowledgeSnapshot {
                 all_live &= live;
                 mask.push(live);
             }
-            out.push(if all_live {
-                SegmentView::all_live(segment)
-            } else {
-                SegmentView {
-                    segment,
-                    live: Some(Bitmap::from_bools(mask)),
-                }
-            });
+            let live = (!all_live).then(|| Bitmap::from_bools(mask));
+            out.push(SegmentHandle::resident(segment, live));
         }
-        for segment in &self.history {
+        for slot in &self.history {
+            let segment = slot.segment()?;
             let rows = segment.batch().num_rows();
             let kills = segment.superseded();
             let mask = (0..rows).map(|row| {
@@ -440,19 +838,17 @@ impl KnowledgeSnapshot {
                 let kill = kills.map_or(0, |kills| kills[row]);
                 segment.sequence_at(row) <= cut && kill > cut
             });
-            out.push(SegmentView {
-                segment: Arc::clone(segment),
-                live: Some(Bitmap::from_bools(mask)),
-            });
+            let live = Some(Bitmap::from_bools(mask));
+            out.push(SegmentHandle::resident(segment, live));
         }
-        out
+        Ok(out)
     }
 }
 
 /// The [`KnowledgeSnapshot`] algorithm over locked state.
 fn knowledge_snapshot_of(shared: &Shared) -> Result<KnowledgeSnapshot, StorageError> {
     Ok(KnowledgeSnapshot {
-        views: snapshot_of(shared)?,
+        latest: snapshot_of(shared)?,
         history: shared.history.clone(),
         stamps: shared.tombstones.clone(),
     })
@@ -514,6 +910,14 @@ pub struct StoreOptions {
     /// The durability level (persistent stores only; an in-memory
     /// store has nothing to sync to).
     pub wal_sync: WalSync,
+    /// The residency budget: decoded segments retained in memory, in
+    /// bytes (2026-07-30 ruling, option b). `None` — the interim
+    /// default, decision #87 — retains everything ever touched, which
+    /// is the pre-residency behavior exactly. The budget bounds
+    /// *retention*, not correctness: segments a snapshot or running
+    /// query still holds are never evicted, so peak memory is the
+    /// budget plus the largest concurrent working set.
+    pub cache_bytes: Option<u64>,
 }
 
 /// One stored row's fixed width under `schema` — the #44 conversion.
@@ -531,8 +935,28 @@ fn row_width(schema: &Schema) -> usize {
 /// The snapshot algorithm over locked state: every frozen segment plus
 /// (if the buffer holds rows) a segment frozen from a copy of it, each
 /// carrying the live mask its tombstones impose.
-fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
-    let mut segments = shared.segments.clone();
+fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentHandle>, StorageError> {
+    let live_mask = |base: u64, end: u64| {
+        if shared.tombstones.range(base..end).next().is_none() {
+            None
+        } else {
+            Some(Bitmap::from_bools(
+                (base..end).map(|id| !shared.tombstones.contains_key(&id)),
+            ))
+        }
+    };
+    let mut out: Vec<SegmentHandle> = shared
+        .segments
+        .iter()
+        .map(|slot| {
+            let base = slot.meta().base_row_id;
+            let end = base + slot.meta().rows as u64;
+            SegmentHandle {
+                slot: Arc::clone(slot),
+                live: live_mask(base, end),
+            }
+        })
+        .collect();
     if !shared.buffer.is_empty() {
         let mut segment = shared.buffer.snapshot_at(shared.buffer_base)?;
         // Post-divergence, the buffer's rows carry sequences from the
@@ -541,25 +965,12 @@ fn snapshot_of(shared: &Shared) -> Result<Vec<SegmentView>, StorageError> {
         if let Some(sequence) = shared.buffer_sequence() {
             segment = segment.with_sequence(sequence);
         }
-        segments.push(Arc::new(segment));
+        let base = segment.base_row_id();
+        let end = base + segment.batch().num_rows() as u64;
+        let live = live_mask(base, end);
+        out.push(SegmentHandle::resident(Arc::new(segment), live));
     }
-    Ok(segments
-        .into_iter()
-        .map(|segment| {
-            let base = segment.base_row_id();
-            let end = base + segment.batch().num_rows() as u64;
-            if shared.tombstones.range(base..end).next().is_none() {
-                SegmentView::all_live(segment)
-            } else {
-                let live =
-                    Bitmap::from_bools((base..end).map(|id| !shared.tombstones.contains_key(&id)));
-                SegmentView {
-                    segment,
-                    live: Some(live),
-                }
-            }
-        })
-        .collect())
+    Ok(out)
 }
 
 impl Store {
@@ -578,8 +989,15 @@ impl Store {
     ) -> Result<Store, StorageError> {
         assert!(segment_rows >= 1, "segment_rows must be at least 1");
         let buffer = WriteBuffer::new(schema.clone(), ordering_key)?;
+        let slot_shared = Arc::new(SlotShared {
+            schema: schema.clone(),
+            ordering_key,
+            backend: None,
+            cache: SegmentCache::new(None),
+        });
         Ok(Store {
             read_only: false,
+            slot_shared,
             schema,
             ordering_key,
             segment_rows,
@@ -678,22 +1096,48 @@ impl Store {
     /// reader that catches the middle sees a named file vanish, and
     /// the open retries from the manifest (bounded), which is atomic.
     ///
-    /// Refresh by [`Store::refresh`]; today that re-reads and
-    /// re-decodes the whole state (segment-lazy open is F3, tracked).
+    /// Refresh by [`Store::refresh`], which re-reads the metadata and
+    /// keeps every already-decoded segment it can (same names, same
+    /// schema — the immutable files guarantee the bytes).
     pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        Store::open_read_only_with_cache(backend, None)
+    }
+
+    /// As [`Store::open_read_only`], with a residency budget (see
+    /// [`StoreOptions::cache_bytes`]) — the reader-side knob: a console
+    /// riding alongside a feed writer bounds what it retains decoded.
+    pub fn open_read_only_with_cache(
+        backend: Arc<dyn StorageBackend>,
+        cache_bytes: Option<u64>,
+    ) -> Result<Store, StorageError> {
+        Store::open_read_only_inner(backend, cache_bytes, None)
+    }
+
+    fn open_read_only_inner(
+        backend: Arc<dyn StorageBackend>,
+        cache_bytes: Option<u64>,
+        previous: Option<&RefreshCarry>,
+    ) -> Result<Store, StorageError> {
+        let mut missing = String::new();
         for _ in 0..8 {
-            match Store::load_read_only(backend.clone()) {
+            match Store::load_read_only(backend.clone(), cache_bytes, previous) {
                 Ok(store) => return Ok(store),
                 // A compaction moved the generation mid-scan: a named
                 // object vanished. The next manifest read names the
                 // complete new generation — go again.
-                Err(StorageError::Io(IoError::NotFound(_))) => continue,
+                Err(StorageError::Io(IoError::NotFound(name))) => missing = name,
                 Err(error) => return Err(error),
             }
         }
-        Err(StorageError::Misuse(
-            "read-only open kept racing generation changes; retry".to_owned(),
-        ))
+        // Eight straight misses on a manifest-named object is either a
+        // writer compacting continuously (rare, resolved by retrying)
+        // or an object the store has actually lost — say which object,
+        // so the second case is diagnosable.
+        Err(StorageError::Misuse(format!(
+            "read-only open kept racing generation changes ('{missing}' \
+             stayed unreadable); retry — if this persists with an idle \
+             writer, the store has lost that object"
+        )))
     }
 
     /// Re-reads the durable state (read-only stores only): new flushed
@@ -712,7 +1156,21 @@ impl Store {
             .backend
             .clone()
             .expect("read-only stores are persistent");
-        *self = Store::open_read_only(backend)?;
+        // The residency budget survives the refresh, and so does the
+        // decoded cache: slots whose names the new manifest still
+        // carries are reused whole (the files are immutable, so same
+        // name = same bytes), which is what keeps a reader's hot
+        // window hot across every refresh.
+        let cache_bytes = self.slot_shared.cache.budget;
+        let previous = {
+            let shared = lock(&self.shared);
+            RefreshCarry {
+                shared: Arc::clone(&self.slot_shared),
+                segments: shared.segments.clone(),
+                history: shared.history.clone(),
+            }
+        };
+        *self = Store::open_read_only_inner(backend, cache_bytes, Some(&previous))?;
         Ok(())
     }
 
@@ -729,7 +1187,11 @@ impl Store {
         Ok(())
     }
 
-    fn load_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+    fn load_read_only(
+        backend: Arc<dyn StorageBackend>,
+        cache_bytes: Option<u64>,
+        previous: Option<&RefreshCarry>,
+    ) -> Result<Store, StorageError> {
         let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
         let schema = manifest.schema.clone();
         let ordering_key = manifest.ordering_key;
@@ -737,43 +1199,92 @@ impl Store {
         let mut store = Store::with_segment_rows(schema, ordering_key, DEFAULT_SEGMENT_ROWS)?;
         store.read_only = true;
         store.manifest_sections = manifest.sections;
-        let mut segments = Vec::new();
+        // A refresh keeps the previous open's slot context whole —
+        // same cache instance, so accounting and eviction stay
+        // continuous and carried slots stay registered — as long as
+        // the manifest still describes the same table.
+        let slot_shared = match previous {
+            Some(carry)
+                if carry.shared.schema == store.schema
+                    && carry.shared.ordering_key == ordering_key =>
+            {
+                Arc::clone(&carry.shared)
+            }
+            _ => Arc::new(SlotShared {
+                schema: store.schema.clone(),
+                ordering_key,
+                backend: Some(backend.clone()),
+                cache: SegmentCache::new(cache_bytes),
+            }),
+        };
+        store.slot_shared = Arc::clone(&slot_shared);
+        let mut slots: Vec<Arc<SegmentSlot>> = Vec::new();
         // Delete logs are held back until the segment watermark is
-        // known: the supersession-visibility rule needs it.
+        // known: the supersession-visibility rule needs it. They are
+        // always discovered by listing — logs commit between manifest
+        // writes, so the manifest cannot name them.
         let mut logs: Vec<DeleteLog> = Vec::new();
-        for name in backend.list()? {
+        let recorded_layout = !store.manifest_sections.segments.is_empty();
+        let listing = backend.list()?;
+        for name in &listing {
             if name
                 .strip_prefix(&delete_log_prefix(generation))
                 .and_then(|rest| rest.strip_suffix(".tlyd"))
                 .is_some()
             {
-                logs.push(decode_tombstones(&backend.read(&name)?)?);
+                logs.push(decode_tombstones(&backend.read(name)?)?);
                 continue;
             }
-            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+            if recorded_layout
+                || !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg"))
+            {
                 continue;
             }
-            let segment = decode_segment(&backend.read(&name)?)?;
+            let segment = decode_segment(&backend.read(name)?)?;
             if segment.batch().schema() != &store.schema {
                 return Err(StorageError::SchemaMismatch {
                     reason: format!("segment '{name}' was written under a different schema"),
                 });
             }
-            segments.push(Arc::new(segment));
+            slots.push(SegmentSlot::resident(
+                Arc::new(segment),
+                Arc::clone(&slot_shared),
+                Some(name.clone()),
+            ));
         }
-        segments.sort_by_key(|segment| segment.base_row_id());
+        if recorded_layout {
+            // The manifest names the layout: lazy slots, nothing
+            // decoded. A named file missing from the listing is a
+            // compaction moving the generation mid-read — surfaced as
+            // NotFound so the open's bounded retry re-reads the
+            // manifest, which is atomic. (Later faults hit the same
+            // NotFound if the race lands mid-query; refresh resolves.)
+            // A refresh reuses the previous state's slot for any name
+            // it still carries — resident stays resident.
+            for record in &store.manifest_sections.segments {
+                if !listing.contains(&record.name) {
+                    return Err(StorageError::Io(IoError::NotFound(record.name.clone())));
+                }
+                if let Some(kept) = previous.and_then(|carry| carry.slot_named(&record.name)) {
+                    slots.push(kept);
+                    continue;
+                }
+                slots.push(SegmentSlot::lazy(record, Arc::clone(&slot_shared)));
+            }
+        }
+        slots.sort_by_key(|slot| slot.meta().base_row_id);
         let mut expected_base = 0u64;
-        for segment in &segments {
-            if segment.base_row_id() != expected_base {
+        for slot in &slots {
+            if slot.meta().base_row_id != expected_base {
                 return Err(StorageError::MissingRows { expected_base });
             }
-            expected_base += segment.batch().num_rows() as u64;
+            expected_base += slot.meta().rows as u64;
         }
-        // The flushed watermark, from segments alone — the test the
+        // The flushed watermark, from metadata alone — the test the
         // visibility rule runs against.
-        let flushed = segments
+        let flushed = slots
             .iter()
-            .map(|segment| segment.sequence_end())
+            .map(|slot| slot.meta().sequence_end)
             .fold(0, u64::max);
         let mut tombstones = BTreeMap::new();
         for log in &logs {
@@ -793,36 +1304,32 @@ impl Store {
                 "a delete log ran ahead of its rows; retrying".to_owned(),
             )));
         }
-        let history_names = store.manifest_sections.history.clone();
-        let mut history = Vec::with_capacity(history_names.len());
-        for name in &history_names {
-            let segment = decode_segment(&backend.read(name)?)?;
-            if segment.batch().schema() != &store.schema {
-                return Err(StorageError::SchemaMismatch {
-                    reason: format!(
-                        "history segment '{name}' was written under a different schema"
-                    ),
-                });
-            }
-            history.push(Arc::new(segment));
-        }
+        let history: Vec<Arc<SegmentSlot>> = store
+            .manifest_sections
+            .history
+            .iter()
+            .map(|name| {
+                // History files are never rewritten once listed, so a
+                // refresh reuses their slots by name unconditionally.
+                previous
+                    .and_then(|carry| carry.history_named(name))
+                    .unwrap_or_else(|| SegmentSlot::history(name.clone(), Arc::clone(&slot_shared)))
+            })
+            .collect();
         let recorded = store.manifest_sections.next_sequence;
         let killed_at = tombstones.values().copied().max().unwrap_or(0);
-        let diverged = recorded.is_some()
-            || killed_at > 0
-            || segments
-                .iter()
-                .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
+        let diverged =
+            recorded.is_some() || killed_at > 0 || slots.iter().any(|slot| slot.meta().diverged);
         let watermark = diverged.then(|| {
             let spent = if killed_at > 0 { killed_at + 1 } else { 0 };
-            segments
+            slots
                 .iter()
-                .map(|segment| segment.sequence_end())
+                .map(|slot| slot.meta().sequence_end)
                 .fold(recorded.unwrap_or(0).max(spent), u64::max)
         });
         {
             let mut shared = lock(&store.shared);
-            shared.segments = segments;
+            shared.segments = slots;
             shared.buffer_base = expected_base;
             shared.knowledge = watermark.map(|next| Knowledge {
                 next,
@@ -910,11 +1417,29 @@ impl Store {
                 0
             }
         };
-        let mut segments = Vec::new();
+        let slot_shared = Arc::new(SlotShared {
+            schema: store.schema.clone(),
+            ordering_key,
+            backend: Some(backend.clone()),
+            cache: SegmentCache::new(options.cache_bytes),
+        });
+        store.slot_shared = Arc::clone(&slot_shared);
+        let mut slots: Vec<Arc<SegmentSlot>> = Vec::new();
         let mut tombstones = BTreeMap::new();
         let mut committed_supersessions: BTreeSet<u64> = BTreeSet::new();
         let mut next_sequence = 0u64;
-        for name in backend.list()? {
+        // Whether the manifest names the segments (tag 1). When it
+        // does, it is authoritative: the open builds lazy slots from
+        // the records and decodes nothing — the residency design's
+        // instant open — and a stray segment file (a crash between a
+        // flush's segment write and its manifest write) is invisible,
+        // its rows still in the WAL, replayed below. Without the
+        // section (an older writer's manifest) the backend scan is the
+        // list, as it always was, and the section is earned right after
+        // the load so the next open takes the short path.
+        let recorded_layout = !store.manifest_sections.segments.is_empty();
+        let listing = backend.list()?;
+        for name in &listing {
             // Objects from other generations are a crashed compaction's
             // leftovers — invisible here, removed by the next compaction.
             if let Some(sequence) = name
@@ -924,7 +1449,7 @@ impl Store {
                 let sequence: u64 = sequence.parse().map_err(|_| StorageError::SchemaMismatch {
                     reason: format!("delete log '{name}' has a malformed name"),
                 })?;
-                let log = decode_tombstones(&backend.read(&name)?)?;
+                let log = decode_tombstones(&backend.read(name)?)?;
                 tombstones.extend(log.ids.iter().map(|&id| (id, log.stamped_at)));
                 if log.superseding != 0 {
                     committed_supersessions.insert(log.superseding);
@@ -932,10 +1457,12 @@ impl Store {
                 next_sequence = next_sequence.max(sequence + 1);
                 continue;
             }
-            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+            if recorded_layout
+                || !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg"))
+            {
                 continue;
             }
-            let segment = decode_segment(&backend.read(&name)?)?;
+            let segment = decode_segment(&backend.read(name)?)?;
             if segment.batch().schema() != &store.schema {
                 return Err(StorageError::SchemaMismatch {
                     reason: format!("segment '{name}' was written under a different schema"),
@@ -946,15 +1473,33 @@ impl Store {
                     reason: format!("segment '{name}' orders on a different column"),
                 });
             }
-            segments.push(Arc::new(segment));
+            slots.push(SegmentSlot::resident(
+                Arc::new(segment),
+                Arc::clone(&slot_shared),
+                Some(name.clone()),
+            ));
         }
-        segments.sort_by_key(|segment| segment.base_row_id());
+        if recorded_layout {
+            for record in &store.manifest_sections.segments {
+                // The writer holds the directory lock, so no compaction
+                // can be moving the generation under it: a named file
+                // absent from the listing is lost rows, not a race —
+                // said now, at open, rather than at first fault.
+                if !listing.contains(&record.name) {
+                    return Err(StorageError::MissingRows {
+                        expected_base: record.base_row_id,
+                    });
+                }
+                slots.push(SegmentSlot::lazy(record, Arc::clone(&slot_shared)));
+            }
+        }
+        slots.sort_by_key(|slot| slot.meta().base_row_id);
         let mut expected_base = 0u64;
-        for segment in &segments {
-            if segment.base_row_id() != expected_base {
+        for slot in &slots {
+            if slot.meta().base_row_id != expected_base {
                 return Err(StorageError::MissingRows { expected_base });
             }
-            expected_base += segment.batch().num_rows() as u64;
+            expected_base += slot.meta().rows as u64;
         }
         // A tombstone naming a row id that was never made durable is the
         // fingerprint of a torn mutation written by a pre-fix build (or a
@@ -966,19 +1511,14 @@ impl Store {
         // History segments are exactly the ones the manifest names — a
         // `hist-` file the manifest does not know is a crashed
         // compaction's stray, invisible here and pre-cleaned by the
-        // next compaction.
-        let mut history = Vec::with_capacity(store.manifest_sections.history.len());
-        for name in &store.manifest_sections.history {
-            let segment = decode_segment(&backend.read(name)?)?;
-            if segment.batch().schema() != &store.schema {
-                return Err(StorageError::SchemaMismatch {
-                    reason: format!(
-                        "history segment '{name}' was written under a different schema"
-                    ),
-                });
-            }
-            history.push(Arc::new(segment));
-        }
+        // next compaction. Slots only: history is read whole under
+        // `AS OF`, so nothing is decoded (or schema-checked) until then.
+        let history: Vec<Arc<SegmentSlot>> = store
+            .manifest_sections
+            .history
+            .iter()
+            .map(|name| SegmentSlot::history(name.clone(), Arc::clone(&slot_shared)))
+            .collect();
         // A diverged table's watermark: the manifest records it at each
         // compaction, but flushes — and supersessions, which diverge a
         // table without a compaction — advance sequences without
@@ -1000,21 +1540,37 @@ impl Store {
         // by a delete on a table with no rows to delete.)
         let recorded = store.manifest_sections.next_sequence;
         let killed_at = tombstones.values().copied().max().unwrap_or(0);
-        let diverged = recorded.is_some()
-            || killed_at > 0
-            || segments
-                .iter()
-                .any(|segment| segment.sequence_info() != &SequenceInfo::RowIds);
+        let diverged =
+            recorded.is_some() || killed_at > 0 || slots.iter().any(|slot| slot.meta().diverged);
         let watermark = diverged.then(|| {
             let spent = if killed_at > 0 { killed_at + 1 } else { 0 };
-            segments
+            slots
                 .iter()
-                .map(|segment| segment.sequence_end())
+                .map(|slot| slot.meta().sequence_end)
                 .fold(recorded.unwrap_or(0).max(spent), u64::max)
         });
+        // A legacy manifest (no tag 1) earns its segment records now —
+        // derived from the segments just decoded, named by the same
+        // deterministic rule that wrote them — so the next open reads
+        // exactly the named files.
+        if !recorded_layout && !slots.is_empty() {
+            let mut records = Vec::with_capacity(slots.len());
+            for slot in &slots {
+                let name = slot.name.clone().expect("legacy slots are named");
+                let segment = slot.segment()?;
+                records.push(crate::format::SegmentRecord::of(name, &segment));
+            }
+            let mut sections = store.manifest_sections.clone();
+            sections.segments = records;
+            backend.write(
+                MANIFEST,
+                &encode_manifest(&store.schema, ordering_key, generation, &sections),
+            )?;
+            store.manifest_sections = sections;
+        }
         {
             let mut shared = lock(&store.shared);
-            shared.segments = segments;
+            shared.segments = slots;
             shared.buffer_base = expected_base;
             shared.knowledge = watermark.map(|next| Knowledge {
                 next,
@@ -1070,9 +1626,12 @@ impl Store {
     /// The history segments: superseded row versions preserved by
     /// retaining compactions, in the order they were retained. Never
     /// part of [`Store::snapshot`] — latest-knowledge reads pay nothing
-    /// for them; `AS OF` reads walk them explicitly.
-    pub fn history(&self) -> Vec<Arc<Segment>> {
-        lock(&self.shared).history.clone()
+    /// for them; `AS OF` reads walk them explicitly. **Decodes** every
+    /// history segment not already resident (history is lazy — the
+    /// residency design).
+    pub fn history(&self) -> Result<Vec<Arc<Segment>>, StorageError> {
+        let slots = lock(&self.shared).history.clone();
+        slots.iter().map(|slot| slot.segment()).collect()
     }
 
     /// The ingest-sequence watermark: the sequence the next appended
@@ -1351,17 +1910,36 @@ impl Store {
                 None => segment,
             }
         };
-        if let Some(backend) = &self.backend {
+        let name = self
+            .backend
+            .as_ref()
+            .map(|_| segment_name(self.generation, segment.base_row_id()));
+        if let (Some(backend), Some(name)) = (&self.backend, &name) {
+            backend.write(name, &encode_segment(&segment))?;
+            // The manifest names the segment (tag 1) — written after the
+            // segment so a crash between the two leaves an orphan file
+            // the manifest never adopted (its rows still in the WAL),
+            // and before the WAL reset so the log is only truncated once
+            // the layout that covers it is committed. Adopted in memory
+            // only after the write succeeds, like compaction's commit.
+            let mut sections = self.manifest_sections.clone();
+            sections
+                .segments
+                .push(crate::format::SegmentRecord::of(name.clone(), &segment));
             backend.write(
-                &segment_name(self.generation, segment.base_row_id()),
-                &encode_segment(&segment),
+                MANIFEST,
+                &encode_manifest(&self.schema, self.ordering_key, self.generation, &sections),
             )?;
+            self.manifest_sections = sections;
         }
         // Built before the lock so adoption below cannot fail partway.
+        // The fresh segment stays resident (the writer just built it)
+        // but is evictable: named, it can always fault back in.
+        let slot = SegmentSlot::resident(Arc::new(segment), self.slot_shared.clone(), name);
         let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
         {
             let mut shared = lock(&self.shared);
-            shared.segments.push(Arc::new(segment));
+            shared.segments.push(slot);
             shared.buffer = fresh;
             shared.buffer_base = self.rows;
             // The empty buffer restarts contiguous at the watermark.
@@ -1616,8 +2194,16 @@ impl Store {
         };
         // Collect every row's (ordering value, row id, location),
         // buffer included via an ephemeral snapshot — live rows headed
-        // for the new generation, dead rows for history.
-        let views = self.snapshot()?;
+        // for the new generation, dead rows for history. The merge
+        // reads every row, so every segment is materialized here: a
+        // compaction's working set is the whole table by construction
+        // (the 2× peak, decision #82 — the residency budget is advisory
+        // and this is its documented overshoot case).
+        let views = self
+            .snapshot()?
+            .iter()
+            .map(SegmentHandle::view)
+            .collect::<Result<Vec<SegmentView>, StorageError>>()?;
         let capacity = views.iter().map(SegmentView::live_rows).sum();
         let mut order: Vec<(i64, u64, usize, usize)> = Vec::with_capacity(capacity);
         let mut dead_order: Vec<(i64, u64, usize, usize)> = Vec::new();
@@ -1762,6 +2348,18 @@ impl Store {
         // Persist the next generation and commit it atomically.
         if let Some(backend) = &self.backend {
             let next = self.generation + 1;
+            // The new generation's segment records, in base order — the
+            // manifest is the authoritative segment list (tag 1), so the
+            // commit below publishes layout and metadata in one write.
+            sections.segments = new_segments
+                .iter()
+                .map(|segment| {
+                    crate::format::SegmentRecord::of(
+                        segment_name(next, segment.base_row_id()),
+                        segment,
+                    )
+                })
+                .collect();
             // Pre-clean: a compaction that crashed after writing some
             // next-generation objects left strays under exactly this
             // generation — and possibly `hist-` files the manifest never
@@ -1803,8 +2401,29 @@ impl Store {
         // holding pre-swap views keeps its segments alive through their
         // `Arc`s — read-copy-update, no coordination needed.
         {
+            // The merged segments enter as resident slots (named under
+            // the new generation, so they can fault back in if evicted);
+            // new history segments likewise, under their `hist-` names.
+            let new_slots: Vec<Arc<SegmentSlot>> = new_segments
+                .into_iter()
+                .map(|segment| {
+                    let name = self
+                        .backend
+                        .as_ref()
+                        .map(|_| segment_name(self.generation, segment.base_row_id()));
+                    SegmentSlot::resident(Arc::new(segment), self.slot_shared.clone(), name)
+                })
+                .collect();
+            let new_history_slots: Vec<Arc<SegmentSlot>> = new_history
+                .into_iter()
+                .zip(&new_history_names)
+                .map(|(segment, name)| {
+                    let name = self.backend.as_ref().map(|_| name.clone());
+                    SegmentSlot::resident(Arc::new(segment), self.slot_shared.clone(), name)
+                })
+                .collect();
             let mut shared = lock(&self.shared);
-            shared.segments = new_segments.into_iter().map(Arc::new).collect();
+            shared.segments = new_slots;
             shared.buffer = fresh_buffer;
             shared.buffer_base = base;
             shared.knowledge = watermark.map(|next| Knowledge {
@@ -1813,10 +2432,7 @@ impl Store {
                 explicit: None,
             });
             shared.tombstones.clear();
-            shared.history = old_history
-                .into_iter()
-                .chain(new_history.into_iter().map(Arc::new))
-                .collect();
+            shared.history = old_history.into_iter().chain(new_history_slots).collect();
         }
         self.rows = base;
         self.delete_log_sequence = 0;
@@ -1872,12 +2488,15 @@ impl Store {
         Ok(())
     }
 
-    /// A point-in-time view: every frozen segment plus (if the buffer
-    /// holds rows) a segment frozen from a copy of it, each carrying the
-    /// live mask its tombstones impose. Untombstoned segments come back
-    /// mask-free — the zero-copy common case. Appends and tombstones
-    /// after the call don't affect the returned views.
-    pub fn snapshot(&self) -> Result<Vec<SegmentView>, StorageError> {
+    /// A point-in-time view: one [`SegmentHandle`] per frozen segment
+    /// plus (if the buffer holds rows) one frozen from a copy of it,
+    /// each carrying the live mask its tombstones impose. Untombstoned
+    /// segments come back mask-free — the zero-copy common case.
+    /// Appends and tombstones after the call don't affect the returned
+    /// handles. Metadata (row spans, zone maps, ordering) answers with
+    /// no I/O; [`SegmentHandle::view`] faults the decoded segment in —
+    /// the residency design's query seam.
+    pub fn snapshot(&self) -> Result<Vec<SegmentHandle>, StorageError> {
         snapshot_of(&lock(&self.shared))
     }
 }
@@ -1908,6 +2527,15 @@ mod tests {
         ])
     }
 
+    fn materialized(store: &Store) -> Vec<SegmentView> {
+        store
+            .snapshot()
+            .unwrap()
+            .iter()
+            .map(|handle| handle.view().unwrap())
+            .collect()
+    }
+
     fn append_n(store: &mut Store, range: std::ops::Range<i64>) {
         for i in range {
             store
@@ -1925,7 +2553,7 @@ mod tests {
         let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
         append_n(&mut store, 0..10);
         assert_eq!(store.segment_count(), 2); // two full, two rows live
-        let segments = store.snapshot().unwrap();
+        let segments = materialized(&store);
         assert_eq!(segments.len(), 3);
         assert_eq!(
             segments
@@ -1945,7 +2573,7 @@ mod tests {
                 .unwrap();
             assert_eq!(id, i as u64);
         }
-        let segments = store.snapshot().unwrap();
+        let segments = materialized(&store);
         assert_eq!(
             segments
                 .iter()
@@ -1960,7 +2588,7 @@ mod tests {
     fn snapshot_is_isolated_from_later_appends() {
         let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
         append_n(&mut store, 0..5);
-        let before = store.snapshot().unwrap();
+        let before = materialized(&store);
         append_n(&mut store, 5..9);
         // The old snapshot still sees exactly its five rows...
         assert_eq!(before.len(), 1);
@@ -1970,7 +2598,7 @@ mod tests {
         };
         assert_eq!(ts.values().as_slice(), &[0, 1, 2, 3, 4]);
         // ...and a fresh one sees all nine.
-        let after = store.snapshot().unwrap();
+        let after = materialized(&store);
         assert_eq!(after[0].segment.batch().num_rows(), 9);
     }
 
@@ -1980,8 +2608,8 @@ mod tests {
         // the segment and the buffer share the same numeric allocation.
         let mut store = Store::with_segment_rows(schema(), 0, 100).unwrap();
         append_n(&mut store, 0..4);
-        let first = store.snapshot().unwrap();
-        let second = store.snapshot().unwrap();
+        let first = materialized(&store);
+        let second = materialized(&store);
         let ptr = |segment: &Segment| {
             let Column::Numeric(NumericData::F64(x)) = &segment.batch().columns()[2] else {
                 panic!("x type")
@@ -1997,7 +2625,7 @@ mod tests {
         append_n(&mut store, 0..5);
         store.flush().unwrap();
         assert_eq!(store.segment_count(), 1);
-        assert_eq!(store.snapshot().unwrap().len(), 1);
+        assert_eq!(materialized(&store).len(), 1);
         // Flushing an empty buffer is a no-op, not an empty segment.
         store.flush().unwrap();
         assert_eq!(store.segment_count(), 1);
@@ -2007,7 +2635,7 @@ mod tests {
     fn ordering_bounds_expose_cross_segment_order() {
         let mut store = Store::with_segment_rows(schema(), 0, 3).unwrap();
         append_n(&mut store, 0..9);
-        let segments = store.snapshot().unwrap();
+        let segments = materialized(&store);
         let bounds: Vec<_> = segments
             .iter()
             .map(|s| s.segment.ordering_bounds().unwrap())
@@ -2035,7 +2663,7 @@ mod tests {
             .append(&[RowValue::I64(2), RowValue::Key("A")])
             .unwrap();
         store.flush().unwrap();
-        assert_eq!(store.snapshot().unwrap()[0].segment.batch().num_rows(), 2);
+        assert_eq!(materialized(&store)[0].segment.batch().num_rows(), 2);
     }
 
     #[test]
@@ -2057,13 +2685,13 @@ mod tests {
         // sequence data readers will need under `AS OF`.
         let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
         append_n(&mut store, 0..2);
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(views[0].segment.sequence_info(), &SequenceInfo::RowIds);
         assert_eq!(views[0].segment.sequence_at(1), 1);
         store.flush().unwrap();
         store.diverge(100).unwrap();
         append_n(&mut store, 2..4);
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         // The buffer snapshot is stamped; row ids stay their own axis.
         assert_eq!(
             views[1].segment.sequence_info(),
@@ -2075,7 +2703,7 @@ mod tests {
         // buffer picks up where the flush left the sequence space.
         store.flush().unwrap();
         append_n(&mut store, 4..5);
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views[1].segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 100 }
@@ -2104,7 +2732,7 @@ mod tests {
         store.tombstone(&[1]).unwrap();
         assert_eq!(store.next_sequence(), 14);
         store.compact().unwrap();
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         // Merge order is ts 3, 5 — sequences 12, 10, explicit because
         // the merge follows the ordering key, not ingest.
         assert_eq!(
@@ -2117,7 +2745,7 @@ mod tests {
         store
             .append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)])
             .unwrap();
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views[1].segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 14 }
@@ -2137,7 +2765,7 @@ mod tests {
         assert_eq!(store.next_sequence(), 4, "the kill spent coordinate 3");
         append_n(&mut store, 3..4);
         assert_eq!(store.next_sequence(), 5);
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views[0].segment.sequence_info(),
             &SequenceInfo::Explicit(vec![0, 1, 2, 4]),
@@ -2149,8 +2777,9 @@ mod tests {
         let live_at = |cut: u64| -> usize {
             knowledge
                 .as_of(cut)
+                .unwrap()
                 .iter()
-                .map(crate::SegmentView::live_rows)
+                .map(crate::SegmentHandle::live_rows)
                 .sum()
         };
         assert_eq!(live_at(2), 3);
@@ -2174,8 +2803,10 @@ mod tests {
         let xs_at = |cut: u64| -> Vec<f64> {
             let mut xs: Vec<f64> = knowledge
                 .as_of(cut)
+                .unwrap()
                 .iter()
                 .flat_map(|view| {
+                    let view = view.view().unwrap();
                     let Column::Numeric(NumericData::F64(x)) = &view.segment.batch().columns()[2]
                     else {
                         panic!("x type")
@@ -2260,7 +2891,7 @@ mod tests {
         let store = Store::persistent_with_segment_rows(backend, schema(), 0, 100).unwrap();
         assert_eq!(store.live_len(), 3);
         assert_eq!(store.next_sequence(), 4);
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         let total_live: usize = views.iter().map(SegmentView::live_rows).sum();
         assert_eq!(total_live, 3, "replacement in, victim out — never both");
     }
@@ -2289,7 +2920,7 @@ mod tests {
         // virtual segment; the replacement then landed in an explicit
         // one — and that second segment alone is what tells reopen the
         // table diverged.
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(views[0].segment.sequence_info(), &SequenceInfo::RowIds);
         assert_eq!(
             views[1].segment.sequence_info(),
@@ -2312,7 +2943,7 @@ mod tests {
         drop(store);
         let store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views[0].segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 50 }
@@ -2330,7 +2961,7 @@ mod tests {
         drop(store);
         let mut store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views[0].segment.sequence_info(),
             &SequenceInfo::Explicit(vec![50, 51, 52, 53])
@@ -2338,7 +2969,7 @@ mod tests {
         store
             .append(&[RowValue::I64(9), RowValue::Key("A"), RowValue::F64(0.0)])
             .unwrap();
-        let views = store.snapshot().unwrap();
+        let views = materialized(&store);
         assert_eq!(
             views.last().unwrap().segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 56 }

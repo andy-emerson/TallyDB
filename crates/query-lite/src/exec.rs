@@ -47,7 +47,7 @@ use arrow_lite::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use storage_lite::{Segment, SegmentView, SequenceInfo};
+use storage_lite::{Segment, SegmentHandle, SegmentView, SequenceInfo};
 
 /// One window-aggregate implementation, registered by the embedder.
 pub trait WindowAggregate: Send + Sync {
@@ -189,14 +189,18 @@ impl QueryOutput {
     }
 }
 
-/// Runs `plan` over `views` — one table's snapshot, in append order, all
-/// sharing `schema` — resolving window functions in `registry`.
+/// Runs `plan` over `handles` — one table's snapshot, in append order,
+/// all sharing `schema` — resolving window functions in `registry`.
+///
+/// The snapshot arrives as [`SegmentHandle`]s (the residency design):
+/// zone-map pruning runs on their metadata, and only the segments that
+/// survive are materialized — a pruned segment's file is never read.
 ///
 /// The embedder has already resolved the plan's table name to this
 /// snapshot; nothing here re-checks it.
 pub fn execute(
     schema: &Schema,
-    views: &[SegmentView],
+    handles: &[SegmentHandle],
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
@@ -206,7 +210,7 @@ pub fn execute(
                 .to_owned(),
         ));
     }
-    execute_single(schema, views, plan, registry)
+    execute_single(schema, handles, plan, registry)
 }
 
 /// Runs a star-schema join plan: `fact_views` joined against
@@ -229,15 +233,29 @@ pub fn execute(
 /// multiplication.
 pub fn execute_join(
     fact_schema: &Schema,
-    fact_views: &[SegmentView],
+    fact_handles: &[SegmentHandle],
     dimension_schema: &Schema,
-    dimension_views: &[SegmentView],
+    dimension_handles: &[SegmentHandle],
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
     let Some(join) = &plan.join else {
-        return execute(fact_schema, fact_views, plan, registry);
+        return execute(fact_schema, fact_handles, plan, registry);
     };
+    // A join reads both sides whole (the gather touches every fact row
+    // and any dimension row a key can reach), so both sides materialize
+    // here; single-table pruning happens after the join, on the joined
+    // intermediate, exactly as before.
+    let fact_views = fact_handles
+        .iter()
+        .map(SegmentHandle::view)
+        .collect::<Result<Vec<SegmentView>, _>>()?;
+    let fact_views = &fact_views[..];
+    let dimension_views = dimension_handles
+        .iter()
+        .map(SegmentHandle::view)
+        .collect::<Result<Vec<SegmentView>, _>>()?;
+    let dimension_views = &dimension_views[..];
     let (fact_key_index, fact_key_field) = resolve(fact_schema, &join.fact_key)?;
     if fact_key_field.column_type() != ColumnType::Key {
         return Err(QueryError::TypeError(format!(
@@ -370,7 +388,13 @@ pub fn execute_join(
             live,
         });
     }
-    execute_single(&joined_schema, &joined_views, plan, registry)
+    // The joined intermediate is query-lifetime and already in memory:
+    // resident handles, so the shared pipeline's fault point is a no-op.
+    let joined_handles: Vec<SegmentHandle> = joined_views
+        .into_iter()
+        .map(|view| SegmentHandle::resident(view.segment, view.live))
+        .collect();
+    execute_single(&joined_schema, &joined_handles, plan, registry)
 }
 
 /// One dimension column, gathered per fact row (`None` pick = no match:
@@ -474,46 +498,51 @@ fn assemble_key(codes: Buffer<u32>, validity: Vec<bool>, mut dictionary: Diction
 /// The single-input pipeline `execute` and `execute_join` share.
 fn execute_single(
     schema: &Schema,
-    views: &[SegmentView],
+    handles: &[SegmentHandle],
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
     // WHERE first, standard SQL order of operations: the predicate folds
     // into each view's live mask, so everything downstream — windows
     // included — sees only the surviving rows.
-    let filtered: Vec<SegmentView>;
-    let views: &[SegmentView] = match &plan.predicate {
-        None => views,
-        Some(predicate) => {
-            filtered = views
-                .iter()
-                .map(|view| {
-                    // Zone-map pruning: skip evaluating segments whose
-                    // value ranges provably cannot match. Correctness
-                    // never depends on this — the pruned outcome is
-                    // exactly an all-false match.
-                    let rows = view.segment.batch().num_rows();
-                    let live = if !can_match(predicate, schema, view) {
-                        Bitmap::new_unset(rows)
-                    } else {
-                        let matched = evaluate_predicate(predicate, schema, view)?;
-                        match &view.live {
-                            None => matched,
-                            Some(live) => live.and(&matched),
-                        }
-                    };
-                    Ok(SegmentView {
-                        segment: view.segment.clone(),
-                        live: Some(live),
-                    })
-                })
-                .collect::<Result<Vec<SegmentView>, QueryError>>()?;
-            &filtered
+    //
+    // Zone-map pruning runs on the handle's metadata, BEFORE the fault:
+    // a pruned segment (its value ranges provably cannot match) is
+    // never read, never decoded — under the residency design pruning
+    // saves I/O, not just evaluation. Correctness never depends on it —
+    // the pruned outcome is exactly an all-false match. Fully-dead
+    // handles are dropped the same way, so "one batch per segment"
+    // below never emits an empty batch.
+    let mut materialized: Vec<SegmentView> = Vec::new();
+    for handle in handles {
+        if handle.live_rows() == 0 {
+            continue;
         }
-    };
-    // Views with no live rows contribute nothing; dropping them up front
-    // means "one batch per segment" below never emits an empty batch.
-    let views: Vec<&SegmentView> = views.iter().filter(|view| view.live_rows() > 0).collect();
+        if let Some(predicate) = &plan.predicate {
+            if !can_match(predicate, schema, handle) {
+                continue;
+            }
+        }
+        let view = handle.view()?; // the fault point
+        let view = match &plan.predicate {
+            None => view,
+            Some(predicate) => {
+                let matched = evaluate_predicate(predicate, schema, &view)?;
+                let live = match &view.live {
+                    None => matched,
+                    Some(live) => live.and(&matched),
+                };
+                SegmentView {
+                    segment: view.segment,
+                    live: Some(live),
+                }
+            }
+        };
+        if view.live_rows() > 0 {
+            materialized.push(view);
+        }
+    }
+    let views: Vec<&SegmentView> = materialized.iter().collect();
     // Standard SQL orders by columns the query does not project:
     // `SELECT x FROM t ORDER BY ts`. The sort resolves against the
     // output schema, so such a column is carried as a hidden last item
@@ -2309,15 +2338,19 @@ mod tests {
         ])
     }
 
-    /// One mask-free view holding `rows`, as the M1 tests built.
-    pub(super) fn segment(rows: &[(i64, &str, f64)]) -> Vec<SegmentView> {
+    /// One mask-free resident handle holding `rows`, as the M1 tests
+    /// built (handles since the residency design; resident = no fault).
+    pub(super) fn segment(rows: &[(i64, &str, f64)]) -> Vec<SegmentHandle> {
         let mut buffer = WriteBuffer::new(schema(), 0).unwrap();
         for &(ts, sym, x) in rows {
             buffer
                 .append(&[RowValue::I64(ts), RowValue::Key(sym), RowValue::F64(x)])
                 .unwrap();
         }
-        vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))]
+        vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )]
     }
 
     /// The same rows split into segments of `segment_rows` via a Store —
@@ -2332,7 +2365,7 @@ mod tests {
         store
     }
 
-    pub(super) fn segmented(rows: &[(i64, &str, f64)], segment_rows: usize) -> Vec<SegmentView> {
+    pub(super) fn segmented(rows: &[(i64, &str, f64)], segment_rows: usize) -> Vec<SegmentHandle> {
         store(rows, segment_rows).snapshot().unwrap()
     }
 
@@ -2358,7 +2391,7 @@ mod tests {
             .collect()
     }
 
-    pub(super) fn run(views: &[SegmentView], sql: &str) -> Result<QueryOutput, QueryError> {
+    pub(super) fn run(views: &[SegmentHandle], sql: &str) -> Result<QueryOutput, QueryError> {
         execute(&schema(), views, &plan(sql).unwrap(), &registry())
     }
 
@@ -2477,7 +2510,8 @@ mod tests {
             &[2.0]
         );
         // Mask-free segment: still the stored allocation, shared.
-        let stored = f64_column(views[1].segment.batch(), 2);
+        let view = views[1].view().unwrap();
+        let stored = f64_column(view.segment.batch(), 2);
         assert_eq!(
             f64_column(&output.batches[1], 0).values().as_ptr(),
             stored.values().as_ptr()
@@ -2554,6 +2588,7 @@ mod tests {
         let output = run(&views, "SELECT x FROM t").unwrap();
         assert_eq!(output.batches.len(), 2);
         for (view, batch) in views.iter().zip(&output.batches) {
+            let view = view.view().unwrap();
             let stored = f64_column(view.segment.batch(), 2);
             let out = f64_column(batch, 0);
             // Zero-copy: each result batch is its segment's buffer, shared.
@@ -2764,7 +2799,10 @@ mod tests {
             };
             buffer.append(&[RowValue::I64(i), y]).unwrap();
         }
-        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let views = vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )];
         let registry = registry();
         let go = |sql: &str| -> Vec<i64> {
             let output =
@@ -2926,7 +2964,7 @@ mod tests {
             &[(1, "A", 1.0), (5, "A", 2.0), (3, "A", 3.0), (4, "A", 4.0)],
             2,
         );
-        assert!(views.iter().all(|view| view.segment.is_ordered()));
+        assert!(views.iter().all(|view| view.is_ordered()));
         assert!(matches!(run(&views, sql), Err(QueryError::Unordered(_))));
         // Touching boundaries (equal values) are fine — "roughly sorted"
         // allows ties.
@@ -3072,7 +3110,10 @@ mod query1_tests {
                 ])
                 .unwrap();
         }
-        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let views = vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )];
         let output = execute(
             &schema,
             &views,
@@ -3094,7 +3135,10 @@ mod query1_tests {
                 ])
                 .unwrap();
         }
-        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let views = vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )];
         assert!(matches!(
             execute(
                 &schema,
@@ -3512,7 +3556,10 @@ mod query1_tests {
                 ])
                 .unwrap();
         }
-        let views = vec![SegmentView::all_live(Arc::new(buffer.freeze().unwrap()))];
+        let views = vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )];
         let output = execute(
             &schema,
             &views,

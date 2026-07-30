@@ -664,7 +664,7 @@ rebuild, being wrong about the additive one costs a later layer.
 | Axis | Our position | Licensing assumption | Reversal class |
 |---|---|---|---|
 | Mutation | Cut to the endpoint: append-only storage, tombstone+reinsert | Data is appended, not revised (assumption 1) | Foundational |
-| Working set | **Cut, amended by ruling 2026-07-28**: the *queried working set* fits in memory. Segment-lazy open lands in M5 — the manifest carries per-segment zone maps so pruning runs before decode, and a segment's bytes load on first touch; decode-into-memory stands until then. (Distinct from the retired mmap/ranged-read path: whole-object reads and the backend contract are untouched.) | The rows a query touches fit in memory (see below) | Foundational |
+| Working set | **Cut, built 2026-07-30** (the residency design, below): the *queried working set* fits in memory — the table itself need not. Opens read manifest metadata only; the executor prunes on it before any decode; segments fault in on first touch and are retained under a byte budget. (Whole-object reads and the backend contract are untouched — this is not the retired mmap/ranged-read path.) An unpruned full-table scan's working set is still the whole table (#88). | The rows a query touches fit in memory (see below) | Foundational |
 | Query (planner) | Cut: a **fixed-strategy planner** — `plan()` exists; search, costing, and choice do not | One access path ⇒ nothing to choose between | Additive |
 | Query (surface) | **Refused**: broad standard SQL, bounded by the inclusion principle | — | Additive |
 | Access path | Cut totally: no secondary indexes; ordering-key clustering + scan is the one path (zone maps are pruning metadata, not a path) | Ordered ingest on the declared key (assumption 2) | Invasive |
@@ -1039,6 +1039,67 @@ grouped on, because `AS OF` is how a coordinate filters and a second,
 weaker spelling of that would be worse than none; whether predicates
 should reach it is a live question, not a settled no. And the
 kill-coordinate column stays deferred, as ruled.
+
+## The residency design (ruled by the Human, 2026-07-30; built the same day)
+
+**The ruling.** Tables bigger than memory are handled by **segment-granular
+lazy residency (option b)**: an open reads metadata only, segments decode
+on first data access, and decoded segments are retained as a cache under a
+byte budget, evicted least-recently-used. The prune-metadata lives in **a
+manifest section (tag 1)** — one record per live segment carrying its
+name, row span, ordering flag, sequence summary, and zone maps, written by
+every flush (segment file → manifest → WAL reset) and by compaction's
+commit. The manifest is thereby the authoritative segment list; a stray
+segment file (a crash inside the flush window) is never adopted, its rows
+recovered from the WAL. Legacy manifests fall back to the backend scan and
+earn the section at the next writer open.
+
+**Rejected alternatives.** *Document the ceiling* (nothing built): the
+append-heavy ledger is exactly the shape that outgrows RAM — disqualifying.
+*Query-scoped streaming with no cache*: every query re-pays decode
+(31–93M values/s per #42's run), turning the ~120µs hot-window query into
+~10ms+ — wrong trade for an access pattern predictably skewed to recent
+data, which is precisely what LRU serves. *Column-granular residency*:
+a refinement, not an alternative — deferred with its reopen trigger to
+#87. *Metadata via ranged reads + segment-header parse*: forces a
+per-section checksum redesign now (the whole-file CRC cannot verify a
+partial read), and in a browser costs one range request per segment just
+to plan, where the manifest is a single small fetch — the WASM future
+argues *for* the manifest section, not against it. Ranged reads travel
+with column granularity in #87, when partial-segment fetch earns its
+checksum revision.
+
+**The budget's contract.** `StoreOptions::cache_bytes` (engine
+`open_read_only_with_cache`, console `--cache MiB`), surviving a reader's
+refresh. It is **advisory over retention, never over correctness**: a
+segment an `Arc` still pins (a snapshot, a running query) is never
+evicted, so peak memory is the budget plus the largest concurrent working
+set. The interim default is unbounded — today's behavior exactly; the
+default's final value, and a strict-refusal mode, are deferred to #87.
+The bound's sharp edge is recorded as #88: the executor materializes
+every surviving segment for a query's lifetime and zero-copy outputs pin
+inputs, so an unpruned full-table scan's working set is the table itself;
+streaming aggregation is the recorded follow-up. Compaction likewise
+materializes everything by construction (#82's territory).
+
+**What a refresh keeps.** The F4 reader's refresh reuses the previous
+open's slot context wholesale — same cache, same decoded segments — for
+every name the new manifest still carries (files are immutable within a
+generation; history files always). Resident stays resident,
+pointer-equal, zero re-reads.
+
+**Reversal class.** Additive: the eager path is the lazy path with every
+fault taken at once, the format change is one skippable manifest section,
+and old binaries scan as before.
+
+**Evidence.** Counting-backend tests pin each claim (a recorded open
+reads no segment files; a pruned segment's file is never read; the budget
+evicts cold, never pinned; refresh keeps decoded state); a forty-segment
+table under a four-segment budget answers six query shapes
+batch-identical to an unbounded open; the crash window between segment
+and manifest writes is pinned end-to-end by injected failure; all six
+differential oracles pass over the faulting path. Corruption moved with
+the design: a bad segment file is loud at first fault, not at open.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
@@ -1743,8 +1804,8 @@ tallydb/
     storage-lite/   # append-optimized segments partitioned on the ordering
                     #   key; compaction; zone maps; the WAL; I/O behind a
                     #   backend trait (native = a directory of files;
-                    #   decode-into-memory is the owned working-set cut —
-                    #   see *What v1 cuts*; OPFS/WASM backend later)
+                    #   lazy fault-in under a byte budget is the working-set
+                    #   cut — see *The residency design*; OPFS/WASM later)
     query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
                     #   validated against DuckDB/DataFusion as an oracle
     engine/         # ties storage + query + compute together; enforces

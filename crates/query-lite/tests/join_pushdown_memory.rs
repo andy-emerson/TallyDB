@@ -12,7 +12,7 @@ mod common;
 use arrow_lite::{ColumnType, Field, Schema};
 use common::peak_of;
 use query_lite::{execute_join, plan, Registry};
-use storage_lite::{RowValue, SegmentView, Store};
+use storage_lite::{RowValue, SegmentHandle, Store};
 
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
@@ -54,8 +54,8 @@ fn a_join_gathers_only_the_columns_the_query_reads() {
         }
         dimension.append(&row).unwrap();
     }
-    let fact_views: Vec<SegmentView> = fact.snapshot().unwrap();
-    let dimension_views: Vec<SegmentView> = dimension.snapshot().unwrap();
+    let fact_views: Vec<SegmentHandle> = fact.snapshot().unwrap();
+    let dimension_views: Vec<SegmentHandle> = dimension.snapshot().unwrap();
     let registry = Registry::new();
     let run = |sql: &str| {
         let plan = plan(sql).unwrap();
