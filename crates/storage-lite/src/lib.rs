@@ -116,5 +116,6 @@ pub use format::{
 pub use io::{FsBackend, IoError, LogWriter, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};
 pub use store::{
-    KnowledgeSnapshot, SegmentView, Store, StoreOptions, StoreReader, WalSync, DEFAULT_SEGMENT_ROWS,
+    KnowledgeSnapshot, SegmentHandle, SegmentView, Store, StoreOptions, StoreReader, WalSync,
+    DEFAULT_SEGMENT_ROWS,
 };

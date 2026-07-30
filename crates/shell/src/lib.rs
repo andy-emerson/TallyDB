@@ -68,7 +68,7 @@ impl Console {
     /// Opens (creating if needed) the storage directory, takes the
     /// process lock, and opens every table found inside.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Console, String> {
-        Console::open_inner(dir.into(), false)
+        Console::open_inner(dir.into(), false, None)
     }
 
     /// Opens the directory **read-only** (F4): no lock, so this console
@@ -76,14 +76,36 @@ impl Console {
     /// database. Mutating statements refuse loudly; `.refresh` re-reads
     /// what the writer has flushed — the beta shape's console half.
     pub fn open_read_only(dir: impl Into<PathBuf>) -> Result<Console, String> {
+        Console::open_read_only_with_cache(dir, None)
+    }
+
+    /// As [`Console::open`], with a residency budget in bytes: decoded
+    /// segments this console retains in memory (the `--cache` flag;
+    /// 2026-07-30 residency design). `None` retains everything touched.
+    pub fn open_with_cache(
+        dir: impl Into<PathBuf>,
+        cache_bytes: Option<u64>,
+    ) -> Result<Console, String> {
+        Console::open_inner(dir.into(), false, cache_bytes)
+    }
+
+    /// As [`Console::open_read_only`], with a residency budget.
+    pub fn open_read_only_with_cache(
+        dir: impl Into<PathBuf>,
+        cache_bytes: Option<u64>,
+    ) -> Result<Console, String> {
         let dir = dir.into();
         if !dir.is_dir() {
             return Err(format!("{} is not a database directory", dir.display()));
         }
-        Console::open_inner(dir, true)
+        Console::open_inner(dir, true, cache_bytes)
     }
 
-    fn open_inner(dir: PathBuf, read_only: bool) -> Result<Console, String> {
+    fn open_inner(
+        dir: PathBuf,
+        read_only: bool,
+        cache_bytes: Option<u64>,
+    ) -> Result<Console, String> {
         let lock = if read_only {
             None
         } else {
@@ -108,7 +130,10 @@ impl Console {
         // One options value serves both the tables opened here and the
         // ones `CREATE TABLE` makes later — two separate defaults would
         // silently drift the day options become configurable.
-        let options = StoreOptions::default();
+        let options = StoreOptions {
+            cache_bytes,
+            ..StoreOptions::default()
+        };
         let sink: Arc<dyn LogSink + Sync> = Arc::new(StderrSink);
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|error| format!("reading {}: {error}", dir.display()))?
@@ -123,7 +148,7 @@ impl Console {
                 .ok_or_else(|| format!("unreadable table directory {}", path.display()))?
                 .to_owned();
             let mut table = if read_only {
-                Table::open_read_only(&name, &path)
+                Table::open_read_only_with_cache(&name, &path, cache_bytes)
             } else {
                 Table::open(&name, &path, options)
             }
@@ -175,8 +200,9 @@ impl Console {
             if known.contains(&name) {
                 continue;
             }
-            let mut table = Table::open_read_only(&name, &path)
-                .map_err(|error| format!("opening table '{name}': {error}"))?;
+            let mut table =
+                Table::open_read_only_with_cache(&name, &path, self.options.cache_bytes)
+                    .map_err(|error| format!("opening table '{name}': {error}"))?;
             table.set_lua_log_sink(Arc::clone(&self.sink));
             self.database
                 .add_table(table)

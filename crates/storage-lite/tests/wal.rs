@@ -47,6 +47,7 @@ fn append_n(store: &mut Store, range: std::ops::Range<i64>) {
 fn ts_values(store: &Store) -> Vec<i64> {
     let mut out = Vec::new();
     for view in store.snapshot().unwrap() {
+        let view = view.view().unwrap();
         let arrow_lite::Column::Numeric(NumericData::I64(ts)) = &view.segment.batch().columns()[0]
         else {
             panic!("ts is i64")
@@ -370,6 +371,7 @@ fn replay_across_a_consumed_coordinate_keeps_births_below_it() {
         .unwrap()
         .iter()
         .flat_map(|view| {
+            let view = view.view().unwrap();
             let segment = &view.segment;
             (0..segment.batch().num_rows())
                 .filter(|&row| view.is_live(row))

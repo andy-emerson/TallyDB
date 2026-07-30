@@ -69,6 +69,7 @@ fn rows(store: &Store) -> Vec<(i64, String, f64)> {
         .unwrap()
         .iter()
         .flat_map(|view| {
+            let view = view.view().unwrap();
             let batch = view.segment.batch();
             let Column::Numeric(NumericData::I64(ts)) = &batch.columns()[0] else {
                 panic!("ts type")
@@ -121,11 +122,11 @@ fn compaction_drops_tombstones_and_restores_contiguity() {
     );
     // Bases are contiguous over the new ids and everything is live.
     let views = store.snapshot().unwrap();
-    assert!(views.iter().all(|view| view.live.is_none()));
+    assert!(views.iter().all(|view| view.live().is_none()));
     assert_eq!(
         views
             .iter()
-            .map(|view| view.segment.base_row_id())
+            .map(|view| view.base_row_id())
             .collect::<Vec<_>>(),
         [0, 3]
     );
@@ -142,7 +143,7 @@ fn compaction_sorts_late_arrivals_and_keeps_ingest_order_on_ties() {
     append(&mut store, 20, "B", 4.0); // duplicate ordering value, later ingest
     append(&mut store, 5, "C", 5.0); // very late
     let unordered = store.snapshot().unwrap();
-    assert!(unordered.iter().any(|view| !view.segment.is_ordered()));
+    assert!(unordered.iter().any(|view| !view.is_ordered()));
     store.compact().unwrap();
     // Sorted by ts; the tie at 20 keeps ingest order (x=3 before x=4);
     // duplicates survive — nothing collapses them.
@@ -160,7 +161,7 @@ fn compaction_sorts_late_arrivals_and_keeps_ingest_order_on_ties() {
         .snapshot()
         .unwrap()
         .iter()
-        .all(|view| view.segment.is_ordered()));
+        .all(|view| view.is_ordered()));
 }
 
 #[test]
@@ -177,6 +178,7 @@ fn compaction_merges_dictionaries_per_segment() {
     let views = store.snapshot().unwrap();
     let mut values: Vec<String> = Vec::new();
     for view in &views {
+        let view = view.view().unwrap();
         let Column::Key(sym) = &view.segment.batch().columns()[1] else {
             panic!("sym type")
         };
@@ -247,7 +249,7 @@ fn crashed_compaction_before_commit_is_invisible() {
                 .unwrap()
                 .snapshot()
                 .unwrap();
-            let bytes = storage_lite::encode_segment(&donor[0].segment);
+            let bytes = storage_lite::encode_segment(&donor[0].view().unwrap().segment);
             backend
                 .write("seg-g0000000001-00000000000000000999.tlyseg", &bytes)
                 .unwrap();
@@ -385,7 +387,7 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
     // The dead rows live on, addressed by sequence alone: births are
     // their virtual-era row ids, kills the coordinate each delete
     // consumed, cells intact, merge-ordered (ts 10 before ts 30).
-    let history = store.history();
+    let history = store.history().unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].sequence_info(),
@@ -399,14 +401,14 @@ fn retaining_compaction_moves_superseded_rows_to_history() {
     // The live rows diverged with their birth sequences preserved.
     let views = store.snapshot().unwrap();
     assert_eq!(
-        views[0].segment.sequence_info(),
+        views[0].view().unwrap().segment.sequence_info(),
         &SequenceInfo::Explicit(vec![1, 4])
     );
     // A second round accumulates history; it never rewrites what an
     // earlier compaction retained.
     store.tombstone(&[0]).unwrap(); // ts 20, birth 1, consumes 6
     store.compact().unwrap();
-    let history = store.history();
+    let history = store.history().unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(
         history[0].sequence_info(),
@@ -424,22 +426,23 @@ fn an_ordered_untombstoned_table_stays_virtual_through_compaction() {
     }
     store.compact().unwrap();
     // Nothing retained, nothing moved: no history, still virtual.
-    assert!(store.history().is_empty());
+    assert!(store.history().unwrap().is_empty());
     let views = store.snapshot().unwrap();
     assert!(views
         .iter()
-        .all(|view| view.segment.sequence_info() == &SequenceInfo::RowIds));
+        .all(|view| view.view().unwrap().segment.sequence_info() == &SequenceInfo::RowIds));
     // But mere disorder — no delete anywhere — moves row ids, and
     // moved ids diverge the table: birth sequences freeze as they
     // were while ids renumber under the sort.
     append(&mut store, 3, "A", 99.0); // late arrival: id 7, sequence 7
     store.compact().unwrap();
-    assert!(store.history().is_empty());
+    assert!(store.history().unwrap().is_empty());
     let sequences: Vec<u64> = store
         .snapshot()
         .unwrap()
         .iter()
         .flat_map(|view| {
+            let view = view.view().unwrap();
             (0..view.segment.batch().num_rows())
                 .map(|row| view.segment.sequence_at(row))
                 .collect::<Vec<_>>()
@@ -466,7 +469,8 @@ fn history_survives_reopen_and_unlisted_strays_are_invisible() {
         {
             let donor = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100)
                 .unwrap()
-                .history()[0]
+                .history()
+                .unwrap()[0]
                 .clone();
             backend
                 .write(
@@ -478,7 +482,7 @@ fn history_survives_reopen_and_unlisted_strays_are_invisible() {
         let mut store =
             Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
         // The listed history came back whole; the stray was not loaded.
-        let history = store.history();
+        let history = store.history().unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(
             history[0].sequence_info(),
@@ -505,7 +509,7 @@ fn history_survives_reopen_and_unlisted_strays_are_invisible() {
         );
         let reopened =
             Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
-        assert_eq!(reopened.history().len(), 2);
+        assert_eq!(reopened.history().unwrap().len(), 2);
         assert_eq!(reopened.live_len(), 2);
     });
 }
@@ -523,7 +527,8 @@ fn nulls_survive_compaction() {
     store.append(&[RowValue::I64(1), RowValue::Null]).unwrap();
     store.compact().unwrap();
     let views = store.snapshot().unwrap();
-    let Column::Numeric(NumericData::F64(y)) = &views[0].segment.batch().columns()[1] else {
+    let view = views[0].view().unwrap();
+    let Column::Numeric(NumericData::F64(y)) = &view.segment.batch().columns()[1] else {
         panic!("y type")
     };
     // Sorted: the null row (ts 1) now comes first, still null.

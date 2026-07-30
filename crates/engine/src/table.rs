@@ -37,9 +37,16 @@ use query_lite::{
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use storage_lite::{
-    FsBackend, RowValue, SegmentView, StorageBackend, StorageError, Store, StoreOptions,
-    StoreReader,
+    FsBackend, RowValue, SegmentHandle, SegmentView, StorageBackend, StorageError, Store,
+    StoreOptions, StoreReader,
 };
+
+/// Faults every handle in: the shape mutation planning and export use,
+/// which read all rows by construction. Queries never come through
+/// here — the executor prunes on handle metadata first.
+fn materialize(handles: &[SegmentHandle]) -> Result<Vec<SegmentView>, StorageError> {
+    handles.iter().map(SegmentHandle::view).collect()
+}
 
 /// Why a table or database operation failed.
 #[derive(Debug)]
@@ -255,10 +262,21 @@ impl Table {
         name: impl Into<String>,
         dir: impl AsRef<std::path::Path>,
     ) -> Result<Table, EngineError> {
+        Table::open_read_only_with_cache(name, dir, None)
+    }
+
+    /// As [`Table::open_read_only`], with a residency budget in bytes
+    /// (`None` = retain everything touched): the reader-side knob of
+    /// the 2026-07-30 residency design, surviving [`Table::refresh`].
+    pub fn open_read_only_with_cache(
+        name: impl Into<String>,
+        dir: impl AsRef<std::path::Path>,
+        cache_bytes: Option<u64>,
+    ) -> Result<Table, EngineError> {
         let backend = FsBackend::open_read_only(dir.as_ref()).map_err(StorageError::from)?;
         Ok(Table::from_store(
             name,
-            Store::open_read_only(Arc::new(backend))?,
+            Store::open_read_only_with_cache(Arc::new(backend), cache_bytes)?,
         ))
     }
 
@@ -403,8 +421,11 @@ impl Table {
     pub(crate) fn execute_plan(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
         let segments = match plan.as_of {
             // Knowledge-time travel: the same executor over an as-of
-            // snapshot — the knowledge mask is just a live mask.
-            Some(cut) => self.store.knowledge_snapshot()?.as_of(cut),
+            // snapshot — the knowledge mask is just a live mask. `AS OF`
+            // materializes what it walks (masks come from per-row birth
+            // and kill sequences), so it pays fault-in; the plain path
+            // hands lazy handles to the executor, which prunes first.
+            Some(cut) => self.store.knowledge_snapshot()?.as_of(cut)?,
             None => self.store.snapshot()?,
         };
         Ok(execute(
@@ -909,7 +930,7 @@ impl Table {
 
     fn delete(&mut self, delete: DeletePlan) -> Result<u64, EngineError> {
         self.check_table(&delete.table)?;
-        let views = self.store.snapshot()?;
+        let views = materialize(&self.store.snapshot()?)?;
         let ids = self.matched_row_ids(&views, delete.predicate.as_ref())?;
         Ok(self.store.tombstone(&ids)?)
     }
@@ -956,7 +977,7 @@ impl Table {
             assigned.push((index, value));
         }
         // Build the corrected copies of every matched live row.
-        let views = self.store.snapshot()?;
+        let views = materialize(&self.store.snapshot()?)?;
         let mut matched_ids: Vec<u64> = Vec::new();
         let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
         for view in &views {
@@ -1192,10 +1213,10 @@ impl TableSnapshot {
         let views;
         let segments = match plan.as_of {
             Some(cut) => {
-                views = self.knowledge.as_of(cut);
+                views = self.knowledge.as_of(cut)?;
                 &views
             }
-            None => &self.knowledge.views,
+            None => self.knowledge.latest(),
         };
         Ok(execute(&self.schema, segments, &plan, &self.registry)?)
     }

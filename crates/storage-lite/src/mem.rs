@@ -625,6 +625,42 @@ impl Segment {
         &self.batch
     }
 
+    /// The decoded segment's in-memory footprint: value buffers,
+    /// validity bitmaps, dictionaries, and sequence/kill arrays. The
+    /// number the residency budget accounts in (2026-07-30 ruling) —
+    /// buffer payloads, not allocator overhead, so it slightly
+    /// undercounts; the budget's contract is a retention target, not an
+    /// allocator ceiling.
+    pub fn resident_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        for column in self.batch.columns() {
+            match column {
+                Column::Numeric(numeric) => {
+                    bytes += (numeric.len() * 8) as u64;
+                    if let Some(validity) = numeric.validity() {
+                        bytes += validity.as_bytes().len() as u64;
+                    }
+                }
+                Column::Key(keys) => {
+                    bytes += (keys.len() * 4) as u64;
+                    if let Some(validity) = keys.validity() {
+                        bytes += validity.as_bytes().len() as u64;
+                    }
+                    let dictionary = keys.dictionary();
+                    bytes += dictionary.bytes().len() as u64;
+                    bytes += (dictionary.offsets().len() * 4) as u64;
+                }
+            }
+        }
+        if let SequenceInfo::Explicit(values) = &self.sequence {
+            bytes += (values.len() * 8) as u64;
+        }
+        if let Some(kills) = &self.superseded {
+            bytes += (kills.len() * 8) as u64;
+        }
+        bytes
+    }
+
     /// Index of the declared ordering key column.
     pub fn ordering_key(&self) -> usize {
         self.ordering_key

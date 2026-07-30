@@ -39,6 +39,7 @@ fn live_ts(store: &Store) -> Vec<i64> {
         .unwrap()
         .iter()
         .flat_map(|view| {
+            let view = view.view().unwrap();
             let Column::Numeric(NumericData::I64(ts)) = &view.segment.batch().columns()[0] else {
                 panic!("ts type")
             };
@@ -160,8 +161,8 @@ fn an_unflushed_supersession_shows_the_pre_state_never_the_torn_middle() {
         0,
         storage_lite::StoreOptions {
             segment_rows: Some(100),
-            segment_bytes: None,
             wal_sync: WalSync::Group(std::time::Duration::from_secs(3600)),
+            ..storage_lite::StoreOptions::default()
         },
     )
     .unwrap();
@@ -222,8 +223,9 @@ fn refresh_follows_a_compaction_into_the_new_generation() {
     let live_at = |cut: u64| -> usize {
         knowledge
             .as_of(cut)
+            .unwrap()
             .iter()
-            .map(storage_lite::SegmentView::live_rows)
+            .map(storage_lite::SegmentHandle::live_rows)
             .sum()
     };
     assert_eq!(live_at(5), 6, "before the kill: all six");

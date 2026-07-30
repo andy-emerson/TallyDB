@@ -48,6 +48,16 @@ pub enum QueryError {
     Unordered(String),
     /// A registered aggregate failed.
     Compute(String),
+    /// Storage failed to materialize a segment the query needs — a
+    /// fault-in error under the residency design (I/O, checksum, or a
+    /// reader racing a compaction).
+    Storage(storage_lite::StorageError),
+}
+
+impl From<storage_lite::StorageError> for QueryError {
+    fn from(error: storage_lite::StorageError) -> QueryError {
+        QueryError::Storage(error)
+    }
 }
 
 impl fmt::Display for QueryError {
@@ -60,6 +70,7 @@ impl fmt::Display for QueryError {
             QueryError::TypeError(message) => write!(f, "type error: {message}"),
             QueryError::Unordered(message) => write!(f, "data not ordered: {message}"),
             QueryError::Compute(message) => write!(f, "compute error: {message}"),
+            QueryError::Storage(error) => write!(f, "storage error: {error}"),
         }
     }
 }

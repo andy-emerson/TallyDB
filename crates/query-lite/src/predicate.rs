@@ -18,7 +18,7 @@ use crate::plan::QueryError;
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
 use std::cmp::Ordering;
-use storage_lite::SegmentView;
+use storage_lite::{SegmentHandle, SegmentView};
 
 /// A numeric literal, kept as written: integers stay exact `i64`, so an
 /// `i64` column never round-trips through `f64` precision.
@@ -540,8 +540,8 @@ fn leaf_result(rows: usize, verdict: impl Fn(usize) -> (bool, bool)) -> ThreeVal
 /// for one column of a segment that has them.
 ///
 /// [`Segment::from_batch_unpruned`]: storage_lite::Segment::from_batch_unpruned
-pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> bool {
-    if !view.segment.zone_maps_present() {
+pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentHandle) -> bool {
+    if !view.zone_maps_present() {
         return true;
     }
     match predicate {
@@ -556,7 +556,7 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
             if schema.fields()[index].column_type() == ColumnType::Key {
                 return true; // let evaluate report the type error
             }
-            let Some(zone_map) = view.segment.zone_map(index) else {
+            let Some(zone_map) = view.zone_map(index) else {
                 return false; // no valid values: a comparison matches nothing
             };
             fn interval_may_hold<T: PartialOrd>(op: CmpOp, min: T, max: T, target: T) -> bool {
@@ -632,7 +632,7 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentView) -> 
             if schema.fields()[index].column_type() == ColumnType::Key {
                 return true; // keys have no zone map either way
             }
-            view.segment.zone_map(index).is_some()
+            view.zone_map(index).is_some()
         }
         // Key membership and NOT don't prune: dictionaries aren't ranges,
         // and negating an interval fact soundly needs exact bounds
@@ -758,6 +758,13 @@ mod like_tests {
 
 #[cfg(test)]
 mod tests {
+    use storage_lite::SegmentHandle;
+
+    /// The pruning probe: `can_match` reads metadata through a handle.
+    fn handle_of(view: &SegmentView) -> SegmentHandle {
+        SegmentHandle::resident(view.segment.clone(), view.live.clone())
+    }
+
     use super::*;
     use arrow_lite::{ColumnType, Field};
     use storage_lite::{RowValue, WriteBuffer};
@@ -804,7 +811,10 @@ mod tests {
             // Pruning stays sound: any op that matches a row must also
             // report the segment as maybe-matching.
             if expected.iter().any(|&matched| matched) {
-                assert!(can_match(&predicate, &schema, &view), "{op:?} {target}");
+                assert!(
+                    can_match(&predicate, &schema, &handle_of(&view)),
+                    "{op:?} {target}"
+                );
             }
         }
     }
@@ -818,16 +828,44 @@ mod tests {
             op,
             value: Number::Float(target),
         };
-        assert!(can_match(&compare(CmpOp::Gt, 100.0), &schema, &view));
-        assert!(can_match(&compare(CmpOp::Ge, 100.0), &schema, &view));
-        assert!(can_match(&compare(CmpOp::Ne, 100.0), &schema, &view));
+        assert!(can_match(
+            &compare(CmpOp::Gt, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(can_match(
+            &compare(CmpOp::Ge, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(can_match(
+            &compare(CmpOp::Ne, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
         // NaN is not below anything: < / <= / = still prune by bounds.
-        assert!(!can_match(&compare(CmpOp::Lt, 0.5), &schema, &view));
-        assert!(!can_match(&compare(CmpOp::Le, 0.5), &schema, &view));
-        assert!(!can_match(&compare(CmpOp::Eq, 100.0), &schema, &view));
+        assert!(!can_match(
+            &compare(CmpOp::Lt, 0.5),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(!can_match(
+            &compare(CmpOp::Le, 0.5),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(!can_match(
+            &compare(CmpOp::Eq, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
         // Without NaN, the upper bound prunes as before.
         let (schema, clean) = nan_view(&[1.0, 5.0]);
-        assert!(!can_match(&compare(CmpOp::Gt, 100.0), &schema, &clean));
+        assert!(!can_match(
+            &compare(CmpOp::Gt, 100.0),
+            &schema,
+            &handle_of(&clean)
+        ));
     }
 
     #[test]
@@ -839,10 +877,26 @@ mod tests {
             value: Number::Float(target),
         };
         // NaN matches only the >-side and <>.
-        assert!(can_match(&compare(CmpOp::Gt, 100.0), &schema, &view));
-        assert!(can_match(&compare(CmpOp::Ne, 3.0), &schema, &view));
-        assert!(!can_match(&compare(CmpOp::Lt, 100.0), &schema, &view));
-        assert!(!can_match(&compare(CmpOp::Eq, 3.0), &schema, &view));
+        assert!(can_match(
+            &compare(CmpOp::Gt, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(can_match(
+            &compare(CmpOp::Ne, 3.0),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(!can_match(
+            &compare(CmpOp::Lt, 100.0),
+            &schema,
+            &handle_of(&view)
+        ));
+        assert!(!can_match(
+            &compare(CmpOp::Eq, 3.0),
+            &schema,
+            &handle_of(&view)
+        ));
         let matched = evaluate(&compare(CmpOp::Gt, 100.0), &schema, &view).unwrap();
         assert!(matched.get(0) && matched.get(1));
     }
@@ -1064,6 +1118,12 @@ mod tests {
 
 #[cfg(test)]
 mod pruning_tests {
+    use storage_lite::SegmentHandle;
+
+    fn handle_of(view: &SegmentView) -> SegmentHandle {
+        SegmentHandle::resident(view.segment.clone(), view.live.clone())
+    }
+
     use super::*;
     use arrow_lite::{ColumnType, Field};
     use storage_lite::{RowValue, SegmentView, WriteBuffer};
@@ -1112,7 +1172,7 @@ mod pruning_tests {
         ];
         for (predicate, expected) in cases {
             assert_eq!(
-                can_match(&predicate, &schema, &view),
+                can_match(&predicate, &schema, &handle_of(&view)),
                 expected,
                 "{predicate:?}"
             );
@@ -1122,12 +1182,16 @@ mod pruning_tests {
         let hit = compare("ts", CmpOp::Eq, Number::Int(15));
         let miss = compare("ts", CmpOp::Eq, Number::Int(99));
         let and = Predicate::And(Box::new(hit.clone()), Box::new(miss.clone()));
-        assert!(!can_match(&and, &schema, &view));
+        assert!(!can_match(&and, &schema, &handle_of(&view)));
         let or = Predicate::Or(Box::new(hit.clone()), Box::new(miss.clone()));
-        assert!(can_match(&or, &schema, &view));
+        assert!(can_match(&or, &schema, &handle_of(&view)));
         let both_miss = Predicate::Or(Box::new(miss.clone()), Box::new(miss.clone()));
-        assert!(!can_match(&both_miss, &schema, &view));
-        assert!(can_match(&Predicate::Not(Box::new(miss)), &schema, &view));
+        assert!(!can_match(&both_miss, &schema, &handle_of(&view)));
+        assert!(can_match(
+            &Predicate::Not(Box::new(miss)),
+            &schema,
+            &handle_of(&view)
+        ));
         assert!(can_match(
             &Predicate::KeyEquals {
                 column: "sym".into(),
@@ -1135,13 +1199,13 @@ mod pruning_tests {
                 negated: false
             },
             &schema,
-            &view
+            &handle_of(&view)
         ));
         // i64 bounds vs a float literal never prune (soundness first).
         assert!(can_match(
             &compare("ts", CmpOp::Eq, Number::Float(9.5)),
             &schema,
-            &view
+            &handle_of(&view)
         ));
     }
 
@@ -1158,7 +1222,7 @@ mod pruning_tests {
         assert!(!can_match(
             &compare("y", CmpOp::Ge, Number::Float(0.0)),
             &schema,
-            &null_view
+            &handle_of(&null_view)
         ));
         // NULL plus NaN: NaN *is* a value (greater than every number,
         // D2 ruling), so `>=` may match — and does, on the NaN row.
@@ -1169,14 +1233,14 @@ mod pruning_tests {
             .unwrap();
         let view = SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()));
         let ge = compare("y", CmpOp::Ge, Number::Float(0.0));
-        assert!(can_match(&ge, &schema, &view));
+        assert!(can_match(&ge, &schema, &handle_of(&view)));
         let matched = evaluate(&ge, &schema, &view).unwrap();
         assert!(!matched.get(0) && matched.get(1));
         // The <-side still prunes: NaN is never below a number.
         assert!(!can_match(
             &compare("y", CmpOp::Lt, Number::Float(0.0)),
             &schema,
-            &view
+            &handle_of(&view)
         ));
     }
 
@@ -1206,19 +1270,19 @@ mod pruning_tests {
         };
         // No valid value anywhere: nothing can be non-null.
         let all_null = segment(&[None, None]);
-        assert!(!can_match(&is_null(true), &schema, &all_null));
+        assert!(!can_match(&is_null(true), &schema, &handle_of(&all_null)));
         // ... but nulls are what the segment is made of.
-        assert!(can_match(&is_null(false), &schema, &all_null));
+        assert!(can_match(&is_null(false), &schema, &handle_of(&all_null)));
         // One value is enough to keep IS NOT NULL alive, and IS NULL
         // never prunes: zone maps count values, not absences.
         let mixed = segment(&[None, Some(1.0)]);
-        assert!(can_match(&is_null(true), &schema, &mixed));
-        assert!(can_match(&is_null(false), &schema, &mixed));
+        assert!(can_match(&is_null(true), &schema, &handle_of(&mixed)));
+        assert!(can_match(&is_null(false), &schema, &handle_of(&mixed)));
         // Key columns carry no zone map, so neither arm prunes them.
         let keys = Predicate::IsNull {
             column: "sym".into(),
             negated: true,
         };
-        assert!(can_match(&keys, &schema, &all_null));
+        assert!(can_match(&keys, &schema, &handle_of(&all_null)));
     }
 }
