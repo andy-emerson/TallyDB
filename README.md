@@ -357,13 +357,19 @@ directly.)
 ## How we work
 
 This repository follows the working agreement in [`AGENTS.md`](AGENTS.md)
-([source](https://github.com/andy-emerson/working-agreement)). The
-repo-specific half lives here:
+(v2.4.0) and the craft conventions in
+[`CONTRIBUTING.md`](CONTRIBUTING.md), both copied unedited from
+[working-agreement](https://github.com/andy-emerson/working-agreement).
+The repo-specific half lives here:
 
-- **Durable documents:** this README (the user-facing current state) and
-  [`DESIGN.md`](DESIGN.md) — the design companion: philosophy, invariants,
-  crate boundaries, settled decisions, build order, and the test plan's
-  skeleton.
+- **Durable documents:** four, each answering one question.
+  [`AGENTS.md`](AGENTS.md) — *how we work*: phases, claims, reviews,
+  merges. [`DESIGN.md`](DESIGN.md) — *what we build and why*: philosophy,
+  invariants, crate boundaries, settled decisions, build order, and the
+  test plan's skeleton. [`CONTRIBUTING.md`](CONTRIBUTING.md) — *how it is
+  written*: the conventions of the craft, including the commit shape.
+  This README — *where it is now*, for a user. The first and third are
+  project-agnostic and arrive by replacement; the other two are ours.
 - **Living status:** [GitHub Issues](https://github.com/andy-emerson/TallyDB/issues).
   Open decisions carry the `decision` label; everything else open is a todo
   or a bug. Settled decisions — including rejected alternatives and their
@@ -381,4 +387,5 @@ repo-specific half lives here:
   preferred executable evidence.
 - **Audience:** documentation is written for a reader with a BS in applied
   mathematics and a CS minor; code for the CS-minor side — see DESIGN.md,
-  *Who we write for*.
+  *Who we write for*. `CONTRIBUTING.md` leaves that fluency setting to the
+  Human; DESIGN.md is where this repository sets it.
