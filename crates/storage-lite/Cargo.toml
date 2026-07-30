@@ -6,11 +6,11 @@ license.workspace = true
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-# No mmap dependency: the working-set cut is owned (a table fits in
-# memory; v1 opens decode-into-memory — see DESIGN.md, "The axes"), so
-# an mmap backend is retired, not deferred. If the reopen trigger ever
-# fires, the escape is a zero-copy-open format version behind the I/O
-# trait, and the dependency lands then — not before.
+# No mmap dependency: the working-set cut is owned (the queried working
+# set fits in memory; segments fault in whole on first touch — see
+# DESIGN.md, "The residency design"), so an mmap backend is retired,
+# not deferred; #42's compressed columns cannot be mapped anyway. Ranged
+# reads return, if ever, with column-granular residency (#87).
 
 [dev-dependencies]
 corpus = { path = "../corpus" }

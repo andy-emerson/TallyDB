@@ -66,11 +66,13 @@
 //! in its contract. The native implementation is a directory of files
 //! ([`io::FsBackend`]); an OPFS-backed WASM implementation slots in
 //! later without touching anything above the trait. Whole-object reads
-//! are the contract by decision: the working-set cut is owned (a table
-//! fits in memory; v1 opens decode-into-memory — DESIGN.md, "The
-//! axes"), so mmap and ranged reads are **retired**, not deferred. The
-//! recorded escape, if the reopen trigger fires, is a zero-copy-open
-//! format version — an additive new format, not a partial-read path
+//! are the contract by decision: the working-set cut is owned (the
+//! *queried* working set fits in memory — the table need not: opens are
+//! metadata-only and segments fault in whole on first touch under the
+//! residency design, 2026-07-30 — DESIGN.md, "The axes"), so mmap and
+//! ranged reads are **retired**, not deferred. Ranged reads return, if
+//! ever, with column-granular residency and its per-section checksum
+//! revision (#87) — an additive format step, not a partial-read path
 //! bolted onto this one.
 //!
 //! ## Scope for this crate

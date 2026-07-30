@@ -7,10 +7,11 @@
 //! implementation; [`MemBackend`] backs tests and demonstrates the shape
 //! an OPFS/WASM backend must fit. Whole-object reads are the contract
 //! by decision, not omission: the working-set cut is owned (DESIGN.md,
-//! *The axes* — a table fits in memory; v1 opens decode-into-memory),
-//! so ranged reads and mmap are retired as follow-ups. The recorded
-//! escape, if the reopen trigger ever fires, is a zero-copy-open
-//! format version, at which point this trait grows additively.
+//! *The axes* — the queried working set fits in memory; segments fault
+//! in whole on first touch under the residency design, 2026-07-30), so
+//! ranged reads and mmap are retired as follow-ups. Ranged reads
+//! return, if ever, with column-granular residency and its checksum
+//! revision (#87), at which point this trait grows additively.
 
 use std::collections::BTreeMap;
 use std::fmt;

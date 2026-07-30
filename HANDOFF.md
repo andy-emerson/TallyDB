@@ -36,30 +36,30 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-30: first M5 merge landed; the research plan begins)
+## Snapshot (2026-07-30: step 1 BUILT — the residency design; step 2 is the check-in)
 
-**State:** the first M5 merge is on `main` (PR #85, merge `4e1295c`):
-the fruit table, the standard-SQL gaps, #42 compression, F4
-cross-process readers, all passes. `claude/dev` recreated from that
-`main`, clean, pushed. Merge proposal #84 served its purpose. #42
-closed with evidence. Local toolchain updated to **Rust 1.97.1** to
-match CI after a clippy-drift failure (fixed in `6b18dd4`) — keep the
-local stable current so the gate sees what CI sees.
+**State:** `main` = `cfeba35` (PR #86: AGENTS.md v2.4.0 +
+CONTRIBUTING.md + vector logo). `claude/dev` rebased onto it and
+carries step 1, built and pushed: the residency ruling (option b,
+manifest-section metadata, advisory budget, unbounded interim
+default) in three code commits (`322974b` manifest tag 1 +
+authoritative layout; `177b75b` lazy fault-in + budget + handle API
+sweep; `cb2a6d6` refresh retention + the budget differential) plus
+the decision-record doc commit. Full gate green at the push: fmt,
+clippy both legs, 28 suites (all guards verified tripping),
+rustdoc both legs, all six oracles over the faulting path. New
+issues: #87 (residency deferrals: column granularity, hard budget,
+the default), #88 (streaming scans — unpruned full-table working
+set). Local toolchain **Rust 1.97.1** matching CI — keep it current
+so the gate sees what CI sees.
 
 ### The Human's current plan (set 2026-07-30, replaces the old steps 8–10)
 
-1. **Tables bigger than memory** — the residency problem, promoted
-   from the unscheduled remainder. NO DESIGN RULING EXISTS: today a
-   table decodes every segment into RAM at open and keeps it there,
-   and #42 sharpened the problem (compressed disk means
-   decode-on-demand; the mmap escape hatch is gone by our own
-   choice). The open design questions — what stays resident, what
-   evicts it, how zone-map pruning drives *fetch* not just skip, what
-   a query's memory ceiling means, F3 segment-lazy open as the
-   entry — are the Human's to close. **Step 1 therefore OPENS with
-   the design fork surfaced (options, user/dev pov, recommendation,
-   gates), builds only after the ruling.**
-2. **Check with the Human.**
+1. ~~**Tables bigger than memory**~~ — DONE. Ruled 2026-07-30
+   (option b; metadata home = manifest section; (c) + budget
+   semantics + default deferred to #87) and built the same day —
+   see the snapshot above and DESIGN.md *The residency design*.
+2. **Check with the Human.** ← WE ARE HERE.
 3. **Continuous queries (#83)** — true research: incremental view
    maintenance under tombstones, corrections, and the knowledge
    axis. The issue itself records: **needs a Plan conversation
