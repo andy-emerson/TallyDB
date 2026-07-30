@@ -301,6 +301,28 @@ WINDOW_QUERIES = [
     "SELECT ts, covar_pop(y, x) OVER (ORDER BY ts "
     "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "WHERE y > -100000 ORDER BY ts",
+    # M5.0: the one-column dispersion pair, which DuckDB also
+    # implements. `x` is the ordering key's own scale (no offset in the
+    # corpus, but a wide range), and the unbounded frame exercises the
+    # recompute path while the trailing frames exercise the incremental
+    # sweep — both must match the same oracle.
+    "SELECT ts, var_pop(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, stddev_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, var_pop(y) OVER (ORDER BY ts "
+    "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, stddev_pop(y) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    # A single-row frame: population spread of one point is 0, not NULL
+    # — the edge where a "needs two rows" reading would diverge.
+    "SELECT ts, var_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 0 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
 ]
 
 EIGEN_PRECEDING = 19

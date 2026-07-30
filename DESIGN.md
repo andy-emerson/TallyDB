@@ -900,6 +900,7 @@ DuckDB differential family; the shell's help cites this table.
 | multi-column `ORDER BY` | in, later | additive lowering |
 | `LIMIT`/`OFFSET` | in, built | |
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
+| `var_pop` / `stddev_pop` as windows | in, built (M5.0) | one column; variance *is* self-covariance, so they share `covar_pop`'s corrected two-pass and incremental sweep. Population forms only, matching the `_pop` family; sample forms and the group-level (non-window) surface are additive and unbuilt — as they are for `covar_pop`/`corr` |
 | `RANGE` frames | in, later | needs ordering-key-typed ranges |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
 | `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |

@@ -350,6 +350,18 @@ impl Table {
                 kind: PairKind::EigenMax,
             }),
         );
+        registry.register(
+            "var_pop",
+            Arc::new(SpreadStatistic {
+                kind: SpreadKind::VarPop,
+            }),
+        );
+        registry.register(
+            "stddev_pop",
+            Arc::new(SpreadStatistic {
+                kind: SpreadKind::StddevPop,
+            }),
+        );
         Table {
             name: name.into(),
             store,
@@ -1363,6 +1375,101 @@ impl RollingRegression {
         Some(match self.output {
             RegressionOutput::Slope => slope,
             RegressionOutput::Intercept => moments.mean_y() - slope * moments.mean_x(),
+        })
+    }
+}
+
+/// Which one-column dispersion statistic an instance computes (M5.0).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SpreadKind {
+    /// Population variance — 0 for a single point, matching `var_pop`.
+    VarPop,
+    /// Population standard deviation: the root of [`SpreadKind::VarPop`].
+    StddevPop,
+}
+
+/// One-column dispersion over a window: `var_pop(x)` and
+/// `stddev_pop(x)`, the two standard-named members of M5.0's streaming
+/// tranche (#77.1 = a — only ops bearing standard SQL names reach SQL).
+///
+/// Variance *is* the covariance of a column with itself, so this shares
+/// [`PairStatistic`]'s machinery rather than duplicating it: the
+/// per-window path runs the same corrected two-pass, and the
+/// incremental path runs the same [`shifted_sweep`] with the column
+/// passed as both series, reading `var_y` off the shared moments. One
+/// algorithm, one set of numerics guarantees, two surfaces.
+pub(crate) struct SpreadStatistic {
+    pub(crate) kind: SpreadKind,
+}
+
+impl WindowAggregate for SpreadStatistic {
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        let x = args[0];
+        let n = x.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let count = n as f64;
+        let mean = x.iter().sum::<f64>() / count;
+        // The corrected two-pass (Chan–Golub–LeVeque), exactly as
+        // `PairStatistic::evaluate` runs it: `sum_d` is zero in exact
+        // arithmetic and merely small in floating point, and carrying
+        // it is what holds the noise floor at a large offset.
+        let (mut sum_d, mut var) = (0.0f64, 0.0f64);
+        for &xi in x {
+            let d = xi - mean;
+            sum_d += d;
+            var += d * d;
+        }
+        var = (var - sum_d * sum_d / count) / count;
+        Ok(self.value_from_variance(var))
+    }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            return recompute_frames(self, columns, None);
+        };
+        let x = columns[0];
+        let mut results = Vec::with_capacity(x.len());
+        // The column as both series: `var_y` of (x, x) is x's variance.
+        shifted_sweep(x, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => self.value_from_variance(moments.population().0),
+                // Non-finite frame: the reference arithmetic, exactly
+                // as the recompute path would run it.
+                None => self
+                    .evaluate(&[&x[lo..=i]])
+                    .expect("the dispersion statistics do not error"),
+            });
+        });
+        Ok(results)
+    }
+}
+
+impl SpreadStatistic {
+    /// The statistic's value from a finished population variance — one
+    /// finalization shared by the per-window and incremental paths, so
+    /// their semantics cannot diverge.
+    fn value_from_variance(&self, var: f64) -> Option<f64> {
+        // A mathematically non-negative variance can land just below
+        // zero through rounding, and `sqrt` of that is NaN — a wrong
+        // answer, not a loud one. Clamp first. NaN is checked
+        // explicitly because `f64::max` *discards* a NaN operand
+        // (`NaN.max(0.0) == 0.0`), which would turn a genuinely
+        // undefined window into a confident zero.
+        let var = if var.is_nan() { var } else { var.max(0.0) };
+        Some(match self.kind {
+            SpreadKind::VarPop => var,
+            SpreadKind::StddevPop => var.sqrt(),
         })
     }
 }
@@ -2794,6 +2901,73 @@ mod mutation_tests {
         table.query(window).unwrap();
     }
 
+    /// One output column flattened across batches, nulls preserved.
+    fn f64s(output: &query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let column = f64_column(batch, index);
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dispersion_windows_answer_through_sql_and_agree_with_hand_computation() {
+        // M5.0's SQL surface: `var_pop`/`stddev_pop` over a ROWS frame,
+        // through the ordinary window path — registered natives, so
+        // they need no special casing anywhere above the registry.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+        for (i, x) in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0].iter().enumerate() {
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(*x),
+                    RowValue::F64(0.0),
+                ])
+                .unwrap();
+        }
+        // The textbook set: mean 5, population variance 4, stddev 2.
+        let whole = "OVER (ORDER BY ts ROWS BETWEEN 7 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT var_pop(x) {whole} AS v, stddev_pop(x) {whole} AS s FROM t"
+            ))
+            .unwrap();
+        let variance = f64s(&output, 0);
+        let stddev = f64s(&output, 1);
+        assert_eq!(variance.last().unwrap(), &Some(4.0));
+        assert_eq!(stddev.last().unwrap(), &Some(2.0));
+        // A single-row frame has zero spread, never NULL — population
+        // variance of one point is 0, as `covar_pop` is for one pair.
+        let single = "OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!("SELECT var_pop(x) {single} AS v FROM t"))
+            .unwrap();
+        assert!(f64s(&output, 0).iter().all(|v| *v == Some(0.0)));
+        // stddev is exactly the root of var over every trailing frame.
+        let trailing = "OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT var_pop(x) {trailing} AS v, stddev_pop(x) {trailing} AS s FROM t"
+            ))
+            .unwrap();
+        for (v, s) in f64s(&output, 0).iter().zip(f64s(&output, 1)) {
+            match (v, s) {
+                (Some(v), Some(s)) => assert!((v.sqrt() - s).abs() < 1e-15, "{v} {s}"),
+                other => panic!("both defined on this frame: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn update_validates_before_mutating() {
         let mut table = small_table();
@@ -2932,6 +3106,15 @@ mod window_truth {
     /// `high_precision` fills it; `stats_from` leaves it NaN.
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Stats {
+        /// `y`'s population variance — what `var_pop(y)` must match,
+        /// and the square of what `stddev_pop(y)` must match (M5.0).
+        pub(crate) var_y: f64,
+        /// `x`'s population variance. The corpora put their 1e6–1e12
+        /// offsets on `x` alone, so this is the *adversarial* column
+        /// for a one-column statistic — checking dispersion only on
+        /// `y` would never exercise the cancellation the corrected
+        /// two-pass exists to prevent.
+        pub(crate) var_x: f64,
         pub(crate) covar: f64,
         pub(crate) corr: f64,
         pub(crate) eigen_max: f64,
@@ -2950,6 +3133,8 @@ mod window_truth {
         let half_trace = (var_y + var_x) / 2.0;
         let radius = ((var_y - var_x) / 2.0).hypot(covar);
         Stats {
+            var_y,
+            var_x,
             covar,
             corr,
             eigen_max: half_trace + radius,
@@ -3122,9 +3307,31 @@ mod window_numerics_guard {
                     truth.covar.abs() > 1e-3
                         && truth.corr.abs() > 1e-3
                         && truth.eigen_max.abs() > 1e-3
-                        && truth.slope.abs() > 1e-3,
+                        && truth.slope.abs() > 1e-3
+                        && truth.var_y.abs() > 1e-3
+                        && truth.var_x.abs() > 1e-3,
                     "{name} row {i}: corpus left a statistic near zero"
                 );
+                // M5.0's dispersion pair takes one column, so it runs
+                // once per column — and `x` is the one that matters:
+                // it carries the corpus offset, so an uncorrected
+                // two-pass shows up here and nowhere else.
+                for (column, var) in [(&window[..1], truth.var_y), (&window[1..], truth.var_x)] {
+                    for (kind, expected) in [
+                        (SpreadKind::VarPop, var),
+                        (SpreadKind::StddevPop, var.sqrt()),
+                    ] {
+                        let got = SpreadStatistic { kind }
+                            .evaluate(column)
+                            .unwrap()
+                            .expect("defined on these corpora");
+                        assert!(
+                            relative(got, expected) < BOUND,
+                            "{name} row {i} {kind:?}: {got} vs {expected} (relative {:.2e})",
+                            relative(got, expected)
+                        );
+                    }
+                }
                 for (kind, expected) in [
                     (PairKind::CovarPop, truth.covar),
                     (PairKind::Corr, truth.corr),
@@ -3208,6 +3415,45 @@ mod window_numerics_guard {
                 }),
             ),
         ];
+        // The arity-1 statistics run the same comparison over `y`
+        // alone, which carries the NaN and −Inf rows.
+        let spreads: Vec<(&str, Box<dyn WindowAggregate>)> = vec![
+            (
+                "var_pop",
+                Box::new(SpreadStatistic {
+                    kind: SpreadKind::VarPop,
+                }),
+            ),
+            (
+                "stddev_pop",
+                Box::new(SpreadStatistic {
+                    kind: SpreadKind::StddevPop,
+                }),
+            ),
+        ];
+        for preceding in [1usize, 3, 7] {
+            for (name, aggregate) in &spreads {
+                let one: [&[f64]; 1] = [&y];
+                let incremental = aggregate.evaluate_frames(&one, Some(preceding)).unwrap();
+                let reference =
+                    query_lite::recompute_frames(aggregate.as_ref(), &one, Some(preceding))
+                        .unwrap();
+                assert_eq!(incremental.len(), reference.len());
+                for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
+                    match (got, want) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) if a.is_nan() && b.is_nan() => {}
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => assert!(
+                            ((a - b) / b).abs() < 1e-9,
+                            "{name} w={} row {i}: {a} vs {b}",
+                            preceding + 1
+                        ),
+                        (got, want) => panic!("{name} row {i}: {got:?} vs {want:?}"),
+                    }
+                }
+            }
+        }
         for preceding in [1usize, 3, 7] {
             for (name, aggregate) in &aggregates {
                 let incremental = aggregate
@@ -3287,6 +3533,27 @@ mod window_numerics_guard {
                     .evaluate_frames(&columns, Some(w - 1))
                     .unwrap();
                 check(label, results, pick);
+            }
+            // M5.0's dispersion pair sweeps each column on its own —
+            // `x` included, which is where the corpus offset lives.
+            for (kind, on_y, on_x) in [
+                (
+                    SpreadKind::VarPop,
+                    &(|s: &Stats| s.var_y) as &dyn Fn(&Stats) -> f64,
+                    &(|s: &Stats| s.var_x) as &dyn Fn(&Stats) -> f64,
+                ),
+                (
+                    SpreadKind::StddevPop,
+                    &|s: &Stats| s.var_y.sqrt(),
+                    &|s: &Stats| s.var_x.sqrt(),
+                ),
+            ] {
+                for (slice, pick) in [(&columns[..1], on_y), (&columns[1..], on_x)] {
+                    let results = SpreadStatistic { kind }
+                        .evaluate_frames(slice, Some(w - 1))
+                        .unwrap();
+                    check(&format!("{kind:?}"), results, pick);
+                }
             }
         }
     }
