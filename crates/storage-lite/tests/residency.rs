@@ -224,3 +224,38 @@ fn an_unbounded_store_retains_everything_it_touches() {
         "each segment read exactly once"
     );
 }
+
+#[test]
+fn a_refresh_keeps_what_it_already_decoded() {
+    let dir = std::env::temp_dir().join(format!("tallydb-refresh-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let writer_backend: Arc<dyn StorageBackend> = Arc::new(FsBackend::new(&dir).unwrap());
+    let mut writer = Store::persistent_with(writer_backend, schema(), 0, options(4, None)).unwrap();
+    append_n(&mut writer, 0..8);
+    writer.flush().unwrap();
+
+    let counting = CountingBackend::new(Arc::new(FsBackend::open_read_only(&dir).unwrap()));
+    let backend: Arc<dyn StorageBackend> = counting.clone();
+    let mut reader = Store::open_read_only(backend).unwrap();
+    let before = reader.snapshot().unwrap()[0].view().unwrap();
+    assert_eq!(counting.segment_reads(), 1);
+
+    append_n(&mut writer, 8..12);
+    writer.flush().unwrap();
+    reader.refresh().unwrap();
+    // The refreshed view of segment 0 is the very same decoded segment
+    // — pointer-equal, zero reads — while the new segment faults on
+    // first touch like any other.
+    let after = reader.snapshot().unwrap();
+    assert_eq!(after.len(), 3);
+    let refreshed = after[0].view().unwrap();
+    assert!(
+        Arc::ptr_eq(&before.segment, &refreshed.segment),
+        "the decoded segment survived the refresh"
+    );
+    assert_eq!(counting.segment_reads(), 1, "no re-read of the kept slot");
+    after[2].view().unwrap();
+    assert_eq!(counting.segment_reads(), 2, "the new segment faults once");
+    drop(writer);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

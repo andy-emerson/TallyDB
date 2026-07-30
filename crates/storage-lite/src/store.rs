@@ -256,6 +256,31 @@ impl SegmentCache {
     }
 }
 
+/// What a read-only refresh carries from the previous open: the slot
+/// context (cache included) and the slots themselves, so anything the
+/// new manifest still names keeps its decoded state.
+struct RefreshCarry {
+    shared: Arc<SlotShared>,
+    segments: Vec<Arc<SegmentSlot>>,
+    history: Vec<Arc<SegmentSlot>>,
+}
+
+impl RefreshCarry {
+    fn slot_named(&self, name: &str) -> Option<Arc<SegmentSlot>> {
+        self.segments
+            .iter()
+            .find(|slot| slot.name.as_deref() == Some(name))
+            .cloned()
+    }
+
+    fn history_named(&self, name: &str) -> Option<Arc<SegmentSlot>> {
+        self.history
+            .iter()
+            .find(|slot| slot.name.as_deref() == Some(name))
+            .cloned()
+    }
+}
+
 /// Per-store context every slot shares: what a fault-in needs to read,
 /// verify, and account a segment.
 pub(crate) struct SlotShared {
@@ -1071,8 +1096,9 @@ impl Store {
     /// reader that catches the middle sees a named file vanish, and
     /// the open retries from the manifest (bounded), which is atomic.
     ///
-    /// Refresh by [`Store::refresh`]; today that re-reads and
-    /// re-decodes the whole state (segment-lazy open is F3, tracked).
+    /// Refresh by [`Store::refresh`], which re-reads the metadata and
+    /// keeps every already-decoded segment it can (same names, same
+    /// schema — the immutable files guarantee the bytes).
     pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
         Store::open_read_only_with_cache(backend, None)
     }
@@ -1084,9 +1110,17 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         cache_bytes: Option<u64>,
     ) -> Result<Store, StorageError> {
+        Store::open_read_only_inner(backend, cache_bytes, None)
+    }
+
+    fn open_read_only_inner(
+        backend: Arc<dyn StorageBackend>,
+        cache_bytes: Option<u64>,
+        previous: Option<&RefreshCarry>,
+    ) -> Result<Store, StorageError> {
         let mut missing = String::new();
         for _ in 0..8 {
-            match Store::load_read_only(backend.clone(), cache_bytes) {
+            match Store::load_read_only(backend.clone(), cache_bytes, previous) {
                 Ok(store) => return Ok(store),
                 // A compaction moved the generation mid-scan: a named
                 // object vanished. The next manifest read names the
@@ -1122,9 +1156,21 @@ impl Store {
             .backend
             .clone()
             .expect("read-only stores are persistent");
-        // The residency budget survives the refresh.
+        // The residency budget survives the refresh, and so does the
+        // decoded cache: slots whose names the new manifest still
+        // carries are reused whole (the files are immutable, so same
+        // name = same bytes), which is what keeps a reader's hot
+        // window hot across every refresh.
         let cache_bytes = self.slot_shared.cache.budget;
-        *self = Store::open_read_only_with_cache(backend, cache_bytes)?;
+        let previous = {
+            let shared = lock(&self.shared);
+            RefreshCarry {
+                shared: Arc::clone(&self.slot_shared),
+                segments: shared.segments.clone(),
+                history: shared.history.clone(),
+            }
+        };
+        *self = Store::open_read_only_inner(backend, cache_bytes, Some(&previous))?;
         Ok(())
     }
 
@@ -1144,6 +1190,7 @@ impl Store {
     fn load_read_only(
         backend: Arc<dyn StorageBackend>,
         cache_bytes: Option<u64>,
+        previous: Option<&RefreshCarry>,
     ) -> Result<Store, StorageError> {
         let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
         let schema = manifest.schema.clone();
@@ -1152,12 +1199,24 @@ impl Store {
         let mut store = Store::with_segment_rows(schema, ordering_key, DEFAULT_SEGMENT_ROWS)?;
         store.read_only = true;
         store.manifest_sections = manifest.sections;
-        let slot_shared = Arc::new(SlotShared {
-            schema: store.schema.clone(),
-            ordering_key,
-            backend: Some(backend.clone()),
-            cache: SegmentCache::new(cache_bytes),
-        });
+        // A refresh keeps the previous open's slot context whole —
+        // same cache instance, so accounting and eviction stay
+        // continuous and carried slots stay registered — as long as
+        // the manifest still describes the same table.
+        let slot_shared = match previous {
+            Some(carry)
+                if carry.shared.schema == store.schema
+                    && carry.shared.ordering_key == ordering_key =>
+            {
+                Arc::clone(&carry.shared)
+            }
+            _ => Arc::new(SlotShared {
+                schema: store.schema.clone(),
+                ordering_key,
+                backend: Some(backend.clone()),
+                cache: SegmentCache::new(cache_bytes),
+            }),
+        };
         store.slot_shared = Arc::clone(&slot_shared);
         let mut slots: Vec<Arc<SegmentSlot>> = Vec::new();
         // Delete logs are held back until the segment watermark is
@@ -1200,9 +1259,15 @@ impl Store {
             // NotFound so the open's bounded retry re-reads the
             // manifest, which is atomic. (Later faults hit the same
             // NotFound if the race lands mid-query; refresh resolves.)
+            // A refresh reuses the previous state's slot for any name
+            // it still carries — resident stays resident.
             for record in &store.manifest_sections.segments {
                 if !listing.contains(&record.name) {
                     return Err(StorageError::Io(IoError::NotFound(record.name.clone())));
+                }
+                if let Some(kept) = previous.and_then(|carry| carry.slot_named(&record.name)) {
+                    slots.push(kept);
+                    continue;
                 }
                 slots.push(SegmentSlot::lazy(record, Arc::clone(&slot_shared)));
             }
@@ -1243,7 +1308,13 @@ impl Store {
             .manifest_sections
             .history
             .iter()
-            .map(|name| SegmentSlot::history(name.clone(), Arc::clone(&slot_shared)))
+            .map(|name| {
+                // History files are never rewritten once listed, so a
+                // refresh reuses their slots by name unconditionally.
+                previous
+                    .and_then(|carry| carry.history_named(name))
+                    .unwrap_or_else(|| SegmentSlot::history(name.clone(), Arc::clone(&slot_shared)))
+            })
             .collect();
         let recorded = store.manifest_sections.next_sequence;
         let killed_at = tombstones.values().copied().max().unwrap_or(0);

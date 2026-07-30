@@ -2192,6 +2192,60 @@ mod tests {
     }
 
     #[test]
+    fn a_table_bigger_than_its_budget_answers_exactly_like_a_resident_one() {
+        // The residency differential: forty segments, a budget of
+        // roughly four — every query below forces faults and evictions
+        // mid-stream — checked batch-for-batch against the same
+        // directory opened unbounded (the pre-residency behavior).
+        let dir = std::env::temp_dir().join(format!("tallydb-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, true),
+        ]);
+        {
+            let mut writer =
+                Table::persistent_with_segment_rows("t", schema, "ts", &dir, 64).unwrap();
+            for i in 0..2_560i64 {
+                let x = if i % 97 == 0 {
+                    RowValue::Null
+                } else {
+                    RowValue::F64(((i * 2_654_435_761u64 as i64) % 1_000_003) as f64)
+                };
+                writer
+                    .append(&[
+                        RowValue::I64(i),
+                        RowValue::Key(["A", "B", "C", "D"][(i % 4) as usize]),
+                        x,
+                    ])
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        // Two read-only handles (no directory lock, so they coexist):
+        // one under the budget, one unbounded.
+        let budgeted = Table::open_read_only_with_cache("t", &dir, Some(16 * 1024)).unwrap();
+        let resident = Table::open_read_only("t", &dir).unwrap();
+        for sql in [
+            "SELECT count(*), sum(ts), min(x), max(x) FROM t",
+            "SELECT ts, x FROM t WHERE ts >= 2500",
+            "SELECT ts, sym, x FROM t ORDER BY x LIMIT 7",
+            "SELECT sym, count(*) AS n, avg(x) FROM t GROUP BY sym ORDER BY n",
+            "SELECT ts FROM t WHERE x IS NULL LIMIT 20",
+            "SELECT ts, x * 2 + 1 FROM t WHERE ts >= 640 AND ts < 704",
+        ] {
+            let lean = budgeted.query(sql).unwrap();
+            let full = resident.query(sql).unwrap();
+            assert_eq!(lean.schema, full.schema, "{sql}");
+            assert_eq!(lean.batches, full.batches, "{sql}");
+        }
+        drop(budgeted);
+        drop(resident);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_read_only_table_rides_alongside_the_writer() {
         // F4 at the engine seam: two Table handles over one directory —
         // the writer appends and corrects, the reader queries the
