@@ -3035,6 +3035,94 @@ mod mutation_tests {
     }
 
     #[test]
+    fn range_frames_share_one_window_across_tied_timestamps() {
+        // The peer rule, which is what separates RANGE from ROWS:
+        // standard SQL ends a RANGE frame at the current row's LAST
+        // PEER, so every row sharing an ordering value reports the
+        // identical window — including peers that sit *after* it.
+        //
+        // The expected values below are DuckDB 1.5.5's, taken directly
+        // (2026-07-30) rather than derived here: the differential
+        // corpus has no tied timestamps, so this property has no
+        // coverage there and needed its own reference.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        for (ts, x) in [
+            (10i64, 1.0f64),
+            (20, 2.0),
+            (20, 3.0),
+            (20, 4.0),
+            (25, 5.0),
+            (40, 6.0),
+        ] {
+            table
+                .append(&[RowValue::I64(ts), RowValue::F64(x)])
+                .unwrap();
+        }
+        let frame = "OVER (ORDER BY ts RANGE BETWEEN 10 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT sum(x) {frame} AS s, count(x) {frame} AS n FROM t"
+            ))
+            .unwrap();
+        // The three ts=20 rows all see rows with ts in [10, 20] — all
+        // four of them — so each reports 1+2+3+4 = 10, not a running
+        // total. A row-count reading would give 3, 6, 10 instead.
+        assert_eq!(
+            f64s(&output, 0),
+            [
+                Some(1.0),
+                Some(10.0),
+                Some(10.0),
+                Some(10.0),
+                Some(14.0),
+                Some(6.0)
+            ]
+        );
+        // COUNT exports as i64 (B5), so read it as one.
+        let counts: Vec<Option<i64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[1] else {
+                    panic!("count exports i64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [Some(1), Some(4), Some(4), Some(4), Some(4), Some(1)]
+        );
+        // A zero span is the peer group itself: the tied rows see only
+        // each other, and an untied row sees only itself.
+        let peers = "OVER (ORDER BY ts RANGE BETWEEN 0 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!("SELECT sum(x) {peers} AS s FROM t"))
+            .unwrap();
+        assert_eq!(
+            f64s(&output, 0),
+            [
+                Some(1.0),
+                Some(9.0),
+                Some(9.0),
+                Some(9.0),
+                Some(5.0),
+                Some(6.0)
+            ]
+        );
+    }
+
+    #[test]
     fn lag_and_lead_refuse_what_they_cannot_mean() {
         let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
         for i in 0..6i64 {

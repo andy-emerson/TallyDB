@@ -83,6 +83,31 @@ pub trait WindowAggregate: Send + Sync {
         recompute_frames(self, columns, preceding)
     }
 
+    /// Evaluates every frame over one contiguous run where the frames
+    /// are given **explicitly** as half-open `(start, end)` row ranges —
+    /// the `RANGE` shape, where a frame's width follows the ordering
+    /// key's *values* rather than a row count.
+    ///
+    /// Two properties hold and an override may rely on both: `start`
+    /// and `end` are each non-decreasing across the run (the ordering
+    /// key is non-decreasing, checked before the window runs), and
+    /// every frame is non-empty. A frame is **not** necessarily
+    /// trailing — standard SQL ends a `RANGE` frame at the current
+    /// row's last peer, so `end` can exceed `position + 1`.
+    ///
+    /// The default recomputes each frame through [`Self::evaluate`],
+    /// which is correct for any aggregate. An aggregate whose
+    /// consecutive frames share work can override this with a
+    /// two-pointer sweep; because the executor only ever calls through
+    /// here, the override is a pure implementation swap.
+    fn evaluate_bounded_frames(
+        &self,
+        columns: &[&[f64]],
+        bounds: &[(usize, usize)],
+    ) -> Result<Vec<Option<f64>>, String> {
+        recompute_bounded_frames(self, columns, bounds)
+    }
+
     /// The Arrow type of this window's output column. Computed in `f64`
     /// internally, but a function whose result is logically integral (e.g.
     /// `COUNT`) declares `I64` so its output column matches SQL — the
@@ -1234,18 +1259,71 @@ pub fn recompute_frames<A: WindowAggregate + ?Sized>(
     Ok(results)
 }
 
+/// Frame-by-frame recomputation over explicit `(start, end)` bounds —
+/// the [`WindowAggregate::evaluate_bounded_frames`] default, exposed so
+/// an incremental override can fall back to it.
+pub fn recompute_bounded_frames<A: WindowAggregate + ?Sized>(
+    aggregate: &A,
+    columns: &[&[f64]],
+    bounds: &[(usize, usize)],
+) -> Result<Vec<Option<f64>>, String> {
+    let mut results = Vec::with_capacity(bounds.len());
+    let mut frame: Vec<&[f64]> = Vec::with_capacity(columns.len());
+    for &(start, end) in bounds {
+        frame.clear();
+        frame.extend(columns.iter().map(|column| &column[start..end]));
+        results.push(aggregate.evaluate(&frame)?);
+    }
+    Ok(results)
+}
+
+/// The `(start, end)` row range of each `RANGE` frame over one run's
+/// ordering-key values, which arrive non-decreasing.
+///
+/// `start` is the first row whose key is `>= key[i] - span` (saturating,
+/// so a span wider than the data simply starts at the run's beginning),
+/// and `end` is one past the current row's **last peer** — every row
+/// sharing `key[i]`. That peer rule is standard SQL's, and it is why
+/// rows with equal ordering keys all see the identical frame.
+///
+/// Both pointers only advance, so the whole pass is O(rows).
+fn range_bounds(keys: &[i64], span: u64) -> Vec<(usize, usize)> {
+    let mut bounds = Vec::with_capacity(keys.len());
+    let (mut start, mut end) = (0usize, 0usize);
+    for (position, &key) in keys.iter().enumerate() {
+        // The span is unsigned and keys can be negative: saturate so a
+        // wide span cannot wrap into a bogus lower bound.
+        let floor = key.saturating_sub_unsigned(span);
+        while keys[start] < floor {
+            start += 1;
+        }
+        end = end.max(position + 1);
+        while end < keys.len() && keys[end] == key {
+            end += 1;
+        }
+        bounds.push((start, end));
+    }
+    bounds
+}
+
 /// Calls the aggregate's frame-sequence evaluation and holds it to the
 /// executor's contract: one result per row of the run.
 fn evaluate_run(
     aggregate: &dyn WindowAggregate,
     columns: &[&[f64]],
     rows: usize,
-    preceding: Option<usize>,
+    frame: Frame,
+    keys: &[i64],
 ) -> Result<Vec<Option<f64>>, QueryError> {
     debug_assert!(columns.iter().all(|column| column.len() == rows));
-    let results = aggregate
-        .evaluate_frames(columns, preceding)
-        .map_err(QueryError::Compute)?;
+    let results = match frame {
+        Frame::Rows(preceding) => aggregate.evaluate_frames(columns, preceding),
+        Frame::Range(span) => {
+            debug_assert_eq!(keys.len(), rows);
+            aggregate.evaluate_bounded_frames(columns, &range_bounds(keys, span))
+        }
+    }
+    .map_err(QueryError::Compute)?;
     if results.len() != rows {
         return Err(QueryError::Compute(format!(
             "window aggregate returned {} results for {rows} frames",
@@ -1329,6 +1407,23 @@ impl ArgValues<'_> {
             ArgValues::Gathered(values) => values,
         }
     }
+}
+
+/// Per-view live ordering-key values — what a `RANGE` frame measures
+/// its span against. The ordering key is `i64` by construction and
+/// NOT NULL by DDL, so this cannot fail the way an argument column can.
+fn ordering_values(views: &[&SegmentView], index: usize) -> Vec<Vec<i64>> {
+    views
+        .iter()
+        .map(|view| {
+            let Column::Numeric(NumericData::I64(column)) = &view.segment.batch().columns()[index]
+            else {
+                return Vec::new(); // a non-i64 ordering key cannot occur
+            };
+            let values = column.values().as_slice();
+            live_rows(view).map(|row| values[row]).collect()
+        })
+        .collect()
 }
 
 /// Per-view live `f64` values for one argument column, validated
@@ -1548,21 +1643,6 @@ fn window_aggregate(
     frame: Frame,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
-    // RANGE frames are lowered but not yet executed: their bounds are
-    // value spans whose row counts vary, and — because standard SQL
-    // ends a RANGE frame at the current row's *last peer* — they are
-    // not even trailing in row-index terms. The executor's sweeps take
-    // a uniform row count, so RANGE is refused here rather than
-    // silently reinterpreted as ROWS, which would be a wrong answer on
-    // any table with tied ordering keys.
-    let preceding = match frame {
-        Frame::Rows(preceding) => preceding,
-        Frame::Range(_) => {
-            return Err(QueryError::Unsupported(
-                "RANGE frames are parsed but not yet executed — use ROWS for now".to_owned(),
-            ))
-        }
-    };
     // The embedder's registry wins (explicit beats implicit); the
     // standard aggregates are always available as window functions.
     let builtin;
@@ -1596,15 +1676,17 @@ fn window_aggregate(
         .iter()
         .map(|view| vec![None; view.live_rows()])
         .collect();
+    let keys = ordering_values(views, order_index);
     match partition_by {
-        None => unpartitioned(aggregate.as_ref(), &args, preceding, &mut results)?,
+        None => unpartitioned(aggregate.as_ref(), &args, &keys, frame, &mut results)?,
         Some(partition_column) => partitioned(
             schema,
             views,
             aggregate.as_ref(),
             &args,
+            &keys,
             partition_column,
-            preceding,
+            frame,
             &mut results,
         )?,
     }
@@ -1630,7 +1712,8 @@ fn window_aggregate(
 fn unpartitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
-    preceding: Option<usize>,
+    keys: &[Vec<i64>],
+    frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
     let gathered: Vec<Vec<f64>>;
@@ -1649,7 +1732,16 @@ fn unpartitioned(
         gathered.iter().map(Vec::as_slice).collect()
     };
     let rows: usize = results.iter().map(Vec::len).sum();
-    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, preceding)?.into_iter();
+    // The run's ordering values, contiguous — windows span view
+    // boundaries, the stored buffers don't.
+    let run_keys: Vec<i64> = match keys {
+        [single] => single.clone(),
+        many => many
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect(),
+    };
+    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, frame, &run_keys)?.into_iter();
     for result in results.iter_mut() {
         for slot in result.iter_mut() {
             *slot = outputs.next().expect("length checked by evaluate_run");
@@ -1664,13 +1756,15 @@ fn unpartitioned(
 /// first; each partition's rows are then gathered into contiguous
 /// scratch (they are scattered even within one segment) and results
 /// scattered back to their view and live position.
+#[allow(clippy::too_many_arguments)]
 fn partitioned(
     schema: &Schema,
     views: &[&SegmentView],
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
+    ordering: &[Vec<i64>],
     partition_column: &str,
-    preceding: Option<usize>,
+    frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
     let (index, _) = resolve(schema, partition_column)?;
@@ -1681,6 +1775,9 @@ fn partitioned(
     // (view index, live position within the view).
     let mut scratch: Vec<Vec<Vec<f64>>> = Vec::new();
     let mut origins: Vec<Vec<(usize, usize)>> = Vec::new();
+    // Each partition's ordering values, in the same order as its rows —
+    // what a RANGE frame measures its span against.
+    let mut partition_keys: Vec<Vec<i64>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
         let Column::Key(keys) = &view.segment.batch().columns()[index] else {
             return Err(QueryError::TypeError(format!(
@@ -1711,6 +1808,7 @@ fn partitioned(
         while scratch.len() < unified.len() {
             scratch.push(vec![Vec::new(); args.len()]);
             origins.push(Vec::new());
+            partition_keys.push(Vec::new());
         }
         let codes = keys.codes().as_slice();
         for (live_position, row) in live_rows(view).enumerate() {
@@ -1719,11 +1817,12 @@ fn partitioned(
                 scratch[partition][argument].push(per_view[view_index].as_slice()[live_position]);
             }
             origins[partition].push((view_index, live_position));
+            partition_keys[partition].push(ordering[view_index][live_position]);
         }
     }
-    for (values, rows) in scratch.iter().zip(&origins) {
+    for ((values, rows), run_keys) in scratch.iter().zip(&origins).zip(&partition_keys) {
         let columns: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
-        let outputs = evaluate_run(aggregate, &columns, rows.len(), preceding)?;
+        let outputs = evaluate_run(aggregate, &columns, rows.len(), frame, run_keys)?;
         for (output, &(view_index, live_position)) in outputs.into_iter().zip(rows) {
             results[view_index][live_position] = output;
         }

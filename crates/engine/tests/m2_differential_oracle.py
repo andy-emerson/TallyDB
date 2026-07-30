@@ -335,6 +335,28 @@ WINDOW_QUERIES = [
     "ORDER BY ts",
     # The default offset is 1, in both engines.
     "SELECT ts, lag(x) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    # M5.1: RANGE frames — bounded by ordering-key VALUE, not row count.
+    # NOTE ON COVERAGE: this corpus has 5000 rows and 5000 DISTINCT
+    # timestamps, so these families do NOT exercise the peer rule
+    # (standard SQL ends a RANGE frame at the current row's last peer,
+    # so tied rows all share one frame). What they do cover is the
+    # value-span arithmetic against irregular spacing, which the row
+    # cadence's jitter provides. The peer rule is covered instead by
+    # `range_frames_share_one_window_across_tied_timestamps` in engine,
+    # whose expected values were taken from DuckDB directly.
+    "SELECT ts, sum(x) OVER (ORDER BY ts RANGE BETWEEN 500 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, avg(x) OVER (ORDER BY ts RANGE BETWEEN 0 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, count(x) OVER (ORDER BY ts RANGE BETWEEN 100 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, min(x) OVER (PARTITION BY sym ORDER BY ts "
+    "RANGE BETWEEN 2000 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, var_pop(x) OVER (ORDER BY ts RANGE BETWEEN 1000 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    # A span wider than the whole corpus: every frame starts at row 1.
+    "SELECT ts, sum(x) OVER (ORDER BY ts RANGE BETWEEN 100000000 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
 ]
 
 EIGEN_PRECEDING = 19

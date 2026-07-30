@@ -677,18 +677,24 @@ rebuild, being wrong about the additive one costs a later layer.
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
 | Durability | Not cut: publish is atomic **and synced**, and the write buffer sits behind a sidecar WAL with sync levels (#43, ruled on measurement: default group commit ≤ 100ms, `Full` for a zero loss window, `Off` restoring the flush boundary) | — | — |
 
-**`RANGE` frames, and why they are not simply the next row of that
-table.** Every frame the executor runs today is a *trailing row count*,
-uniform across the column, which is exactly what lets
+**`RANGE` frames, and what they cost.** Every `ROWS` frame is a
+trailing row count, uniform across the column, which is what lets
 `WindowAggregate::evaluate_frames` slide one add and one remove per
 step. A `RANGE` frame is bounded by ordering-key *value*, so its width
-varies row to row, and the sliding identity no longer has a fixed
-window to re-anchor against. Supporting it means either a frame
-representation that carries per-row bounds through that trait, or
-falling back to per-frame recompute and losing the incremental
-dividend on precisely the statistics that were built to have it. That
-is a design question about the compute seam, not a parser addition,
-which is why `RANGE` stays "later" while `LAG`/`LEAD` landed.
+varies row to row — and, because standard SQL ends such a frame at the
+current row's **last peer**, it is not even trailing in row-index
+terms: a frame can extend forward over rows sharing the current row's
+key. The executor therefore computes explicit `(start, end)` bounds per
+row (one O(rows) pass, both pointers monotone) and hands them to
+`WindowAggregate::evaluate_bounded_frames`, whose default recomputes
+each frame. That default is why `RANGE` is correct for every
+aggregate, including embedders' and Lua kernels', the day it ships.
+What it is not yet is *incremental*: an aggregate with sliding state
+can override that method with a two-pointer sweep, and until it does,
+a wide `RANGE` frame costs O(rows x window) where the equivalent
+`ROWS` frame costs O(rows). Tracked, with the safety net that a
+statistic whose override cannot hold its accuracy simply keeps the
+default and stays correct.
 
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
@@ -915,7 +921,7 @@ DuckDB differential family; the shell's help cites this table.
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
 | `var_pop` / `stddev_pop` as windows | in, built (M5.0) | one column; variance *is* self-covariance, so they share `covar_pop`'s corrected two-pass and incremental sweep. Population forms only, matching the `_pop` family; sample forms and the group-level (non-window) surface are additive and unbuilt — as they are for `covar_pop`/`corr` |
 | `LAG` / `LEAD` | in, built (M5.1) | positional, not aggregates: they copy a neighbouring row, so the output keeps the **source column's type** — a lagged `BIGINT` stays `BIGINT`, because a nanosecond stamp is past 2^53 where `f64` stops being exact. Frameless (standard SQL gives them no frame; a frame clause is refused, not ignored); optional offset defaults to 1; the third `default` argument and symbol columns are refused by name |
-| `RANGE` frames | in, later | needs ordering-key-typed ranges, and a frame representation the incremental sweep can carry — see the note below the table |
+| `RANGE` frames | in, built (M5.1) | bounded by ordering-key **value**, in the key's own units (no `INTERVAL` type: a 5-minute span over ns stamps is `300000000000`). Ends at the current row's **last peer**, per standard SQL, so tied rows share one window. Answers via per-frame recompute today; the incremental sweep over these bounds is the tracked follow-up |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
 | `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
