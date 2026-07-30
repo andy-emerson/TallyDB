@@ -11,7 +11,7 @@ mod common;
 
 use arrow_lite::{ColumnType, Field, Schema};
 use common::peak_of;
-use query_lite::{execute_join, plan, Registry};
+use query_lite::{execute_join, plan, JoinSide, Registry};
 use storage_lite::{RowValue, SegmentHandle, Store};
 
 #[global_allocator]
@@ -60,10 +60,16 @@ fn a_join_gathers_only_the_columns_the_query_reads() {
     let run = |sql: &str| {
         let plan = plan(sql).unwrap();
         let output = execute_join(
-            &fact_schema,
-            &fact_views,
-            &dimension_schema,
-            &dimension_views,
+            JoinSide {
+                schema: &fact_schema,
+                handles: &fact_views,
+                ordering_key: 0,
+            },
+            JoinSide {
+                schema: &dimension_schema,
+                handles: &dimension_views,
+                ordering_key: 0,
+            },
             &plan,
             &registry,
         )

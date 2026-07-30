@@ -359,6 +359,91 @@ WINDOW_QUERIES = [
     "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
 ]
 
+
+# M5.2 (#65): as-of joins, checked against the DEFINITION rather than
+# against DuckDB's own ASOF JOIN.
+#
+# Every other family here runs identical SQL on both sides, so DuckDB's
+# implementation is the reference. That is the wrong reference for this
+# one: two implementations of "the latest quote at or before" can agree
+# with each other and both be wrong about ties, about the empty prefix,
+# or about which side the inequality binds. So the oracle side is a
+# correlated scalar subquery — the textbook definition, in vanilla SQL,
+# with no ASOF anything in it — and agreement means the engine computes
+# what the phrase means.
+#
+# Ties matter and are not avoided: the fixture repeats timestamps
+# deliberately, and the definition breaks the tie the way the engine
+# does, by taking the last of them in storage order. `seq` is that
+# order, attached by the referee when it replicates the table.
+ASOF_MATCH = """
+    (SELECT r.q FROM quotes r
+      WHERE r.sym = t.sym AND r.qts {operator} t.ts
+      ORDER BY r.qts DESC, r.seq DESC LIMIT 1)
+"""
+
+# (engine sql, oracle sql). Both must project the same column names.
+ASOF_FAMILIES = [
+    # The plain shapes: LEFT keeps the corpus rows whose symbol has no
+    # quote yet, INNER drops them.
+    (
+        "SELECT ts, corpus.sym, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT t.ts AS ts, t.sym AS sym, " + ASOF_MATCH.format(operator="<=") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    (
+        "SELECT ts, corpus.sym, q FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT * FROM (SELECT t.ts AS ts, t.sym AS sym, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL ORDER BY ts",
+    ),
+    # An explicit inequality restating the ordering keys, both ways
+    # round: it selects the comparison and nothing else.
+    (
+        "SELECT ts, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym AND quotes.qts < corpus.ts ORDER BY ts",
+        "SELECT t.ts AS ts, " + ASOF_MATCH.format(operator="<") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    (
+        "SELECT ts, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym AND corpus.ts >= quotes.qts ORDER BY ts",
+        "SELECT t.ts AS ts, " + ASOF_MATCH.format(operator="<=") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    # The joined rows are ordinary rows: filters, arithmetic, aggregates
+    # and windows run over them exactly as they would over one table.
+    (
+        "SELECT ts, x * q AS scaled FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym WHERE x > 5 ORDER BY ts",
+        "SELECT ts, x * q AS scaled FROM (SELECT t.ts AS ts, t.x AS x, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL AND x > 5 ORDER BY ts",
+    ),
+    (
+        "SELECT ts, sum(q) OVER (PARTITION BY corpus.sym ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w "
+        "FROM corpus ASOF INNER JOIN quotes ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT ts, sum(q) OVER (PARTITION BY sym ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM "
+        "(SELECT t.ts AS ts, t.sym AS sym, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL ORDER BY ts",
+    ),
+    # A join whose dimension column the SELECT never names still has to
+    # match, because the WHERE reads it (#81's pushdown must not drop
+    # the column the as-of match produced).
+    (
+        "SELECT ts FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym WHERE q > 0 ORDER BY ts",
+        "SELECT ts FROM (SELECT t.ts AS ts, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q > 0 ORDER BY ts",
+    ),
+]
+
 EIGEN_PRECEDING = 19
 
 
@@ -456,6 +541,15 @@ def main() -> None:
     connection.execute("CREATE TABLE corpus AS SELECT * FROM corpus_input")
     connection.register("sensors_input", dimension)
     connection.execute("CREATE TABLE sensors AS SELECT * FROM sensors_input")
+    # The quote history, numbered in the order the engine stores it —
+    # `seq` is what breaks a tie between quotes sharing a timestamp, so
+    # it has to be attached here, before DuckDB is free to reorder.
+    quotes = read_stream_hook(lib, "tallydb_corpus_quotes_stream")
+    quotes = quotes.append_column(
+        "seq", pa.array(range(quotes.num_rows), type=pa.int64())
+    )
+    connection.register("quotes_input", quotes)
+    connection.execute("CREATE TABLE quotes AS SELECT * FROM quotes_input")
 
     passed = 0
     for sql in families():
@@ -507,10 +601,29 @@ def main() -> None:
         oracle = connection.execute(sql).to_arrow_table()
         compare_tables(sql, engine, oracle, window=True)
         passed += 1
+    # The as-of families claim to cover the tie rule; check that before
+    # trusting them. (The M5.1 lesson: a corpus with 5000 distinct
+    # timestamps cannot exercise a rule about equal ones, and a comment
+    # saying otherwise is just a comment.)
+    ties = connection.execute(
+        "SELECT count(*) FROM (SELECT sym, qts FROM quotes "
+        "GROUP BY sym, qts HAVING count(*) > 1)"
+    ).fetchone()[0]
+    if ties < 50:
+        sys.exit(
+            f"FAIL the quote history has only {ties} tied (sym, qts) "
+            "timestamps — the as-of families cannot cover the tie rule"
+        )
+    for sql, definition in ASOF_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        compare_tables(sql, engine, oracle, window=True)
+        passed += 1
     numpy_eigen_check(lib, inputs)
     print(
         f"Differential: {passed} generated queries agree with DuckDB "
-        f"{duckdb.__version__} over {inputs.num_rows} corpus rows"
+        f"{duckdb.__version__} over {inputs.num_rows} corpus rows "
+        f"and {quotes.num_rows} quotes"
     )
 
 

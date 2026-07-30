@@ -475,10 +475,16 @@ impl Table {
         let fact_views = self.store.snapshot()?;
         let dimension_views = dimension.store.snapshot()?;
         Ok(query_lite::execute_join(
-            self.store.schema(),
-            &fact_views,
-            dimension.store.schema(),
-            &dimension_views,
+            query_lite::JoinSide {
+                schema: self.store.schema(),
+                handles: &fact_views,
+                ordering_key: self.store.ordering_key(),
+            },
+            query_lite::JoinSide {
+                schema: dimension.store.schema(),
+                handles: &dimension_views,
+                ordering_key: dimension.store.ordering_key(),
+            },
             plan,
             &self.current_registry(),
         )?)

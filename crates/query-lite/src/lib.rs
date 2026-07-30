@@ -75,13 +75,13 @@ pub mod plan;
 pub mod predicate;
 
 pub use exec::{
-    contiguous, execute, execute_join, recompute_frames, ColumnFunction, QueryOutput, Registry,
-    WindowAggregate,
+    contiguous, execute, execute_join, recompute_frames, ColumnFunction, JoinSide, QueryOutput,
+    Registry, WindowAggregate,
 };
 pub use plan::{
-    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,
-    DeletePlan, Frame, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem, Projection,
-    QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
+    parse_statement, plan, AggCall, AggFunction, AggItem, AsOfMatch, Assignment, ColumnSpec,
+    CreateTablePlan, DeletePlan, Frame, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem,
+    Projection, QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
 };
 pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
 

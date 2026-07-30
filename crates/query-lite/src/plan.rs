@@ -364,7 +364,17 @@ pub struct JoinPlan {
     /// row at-or-before it on the two tables' declared ordering keys,
     /// within the `ON` equality's partition.
     pub as_of: Option<AsOfMatch>,
+    /// The two columns an explicit `ASOF` inequality named, if the
+    /// query wrote one: `(fact side, dimension side)`. The planner has
+    /// no schemas, so it only checks their *shape*; the executor —
+    /// which knows the declared ordering keys — is what checks they
+    /// name the time axis, and refuses with a teaching error if not.
+    pub as_of_named: Option<(String, String)>,
 }
+
+/// One side of a join's `ON` comparison: its table qualifier, if the
+/// query wrote one, and its column name.
+type OnSide = (Option<String>, String);
 
 /// How an as-of join compares the two ordering keys (#65: the operator
 /// is what the user's explicit inequality selects, `>=` by default).
@@ -1744,16 +1754,7 @@ fn lower_join(
                     "JOIN ON must be a single equality".to_owned()
                 }));
             };
-            // The time axis: implicit (at-or-before) unless the query
-            // spells an inequality, which is VALIDATED rather than
-            // obeyed — it must name the two tables' ordering keys, and
-            // all it selects is >= versus >.
-            let as_of = match (asof_join, inequality) {
-                (false, _) => None,
-                (true, None) => Some(AsOfMatch::AtOrBefore),
-                (true, Some(expr)) => Some(lower_asof_inequality(expr)?),
-            };
-            let side = |expr: &ast::Expr| -> Result<(Option<String>, String), QueryError> {
+            let side = |expr: &ast::Expr| -> Result<OnSide, QueryError> {
                 match expr {
                     ast::Expr::Identifier(column) => Ok((None, ident(column))),
                     ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
@@ -1767,12 +1768,24 @@ fn lower_join(
                     ))),
                 }
             };
-            let (left_side, right_side) = (side(on_left)?, side(on_right)?);
             let is_fact = |qualifier: &Option<String>| {
                 qualifier
                     .as_ref()
                     .map(|name| name == fact || fact_alias.is_some_and(|alias| name == alias))
             };
+            // The time axis: implicit (at-or-before) unless the query
+            // spells an inequality, which is VALIDATED rather than
+            // obeyed — it must name the two tables' ordering keys, and
+            // all it selects is >= versus >.
+            let (as_of, as_of_named) = match (asof_join, inequality) {
+                (false, _) => (None, None),
+                (true, None) => (Some(AsOfMatch::AtOrBefore), None),
+                (true, Some(expr)) => {
+                    let (matching, named) = lower_asof_inequality(expr, &side, &is_fact)?;
+                    (Some(matching), Some(named))
+                }
+            };
+            let (left_side, right_side) = (side(on_left)?, side(on_right)?);
             // Assign sides: qualified names decide; two unqualified
             // names are ambiguous only if they can't be told apart —
             // require at least one qualifier.
@@ -1796,6 +1809,7 @@ fn lower_join(
                     dimension_key,
                     left,
                     as_of,
+                    as_of_named,
                 },
                 dimension_alias,
             )))
@@ -1813,38 +1827,70 @@ fn lower_join(
 /// schema, and reads off which comparison they meant.
 ///
 /// Written dimension-first (`q.ts <= t.ts`) or fact-first
-/// (`t.ts >= q.ts`); both say the same thing.
-fn lower_asof_inequality(expr: &ast::Expr) -> Result<AsOfMatch, QueryError> {
+/// (`t.ts >= q.ts`); both say the same thing. Which side is the fact is
+/// read from the qualifiers, never from the operator — otherwise
+/// `t.ts <= q.ts`, which asks for the quote *after* each trade, would
+/// be silently answered with the one before it.
+///
+/// Returns the comparison and the two column names it used, fact side
+/// first, for the executor to check against the declared ordering keys.
+fn lower_asof_inequality(
+    expr: &ast::Expr,
+    side: &dyn Fn(&ast::Expr) -> Result<OnSide, QueryError>,
+    is_fact: &dyn Fn(&Option<String>) -> Option<bool>,
+) -> Result<(AsOfMatch, (String, String)), QueryError> {
     let ast::Expr::BinaryOp { left, op, right } = expr else {
         return Err(QueryError::Unsupported(
             "ASOF JOIN's second ON conjunct must compare the two ordering keys".to_owned(),
         ));
     };
-    let column = |expr: &ast::Expr| -> Result<String, QueryError> {
-        match expr {
-            ast::Expr::Identifier(name) => Ok(ident(name)),
-            ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-                [_, name] => Ok(ident(name)),
-                _ => Err(QueryError::Unsupported(
-                    "ON columns may carry one table qualifier".to_owned(),
-                )),
-            },
-            other => Err(QueryError::Unsupported(format!(
-                "ASOF ON side '{other}' (plain columns only)"
-            ))),
+    let (left_side, right_side) = (side(left)?, side(right)?);
+    let fact_on_left = match (is_fact(&left_side.0), is_fact(&right_side.0)) {
+        (Some(true), Some(false)) | (Some(true), None) | (None, Some(false)) => true,
+        (Some(false), Some(true)) | (None, Some(true)) | (Some(false), None) => false,
+        _ => {
+            return Err(QueryError::Unsupported(
+                "qualify at least one side of ASOF JOIN's time comparison, so it \
+                 says which table each ordering key belongs to (fact.ts >= dim.ts)"
+                    .to_owned(),
+            ))
         }
     };
-    // Both sides must be columns; which side is which decides how to
-    // read the operator, since `q.ts <= t.ts` and `t.ts >= q.ts` are
-    // the same statement.
-    let (_, _) = (column(left)?, column(right)?);
-    match op {
-        ast::BinaryOperator::LtEq | ast::BinaryOperator::GtEq => Ok(AsOfMatch::AtOrBefore),
-        ast::BinaryOperator::Lt | ast::BinaryOperator::Gt => Ok(AsOfMatch::StrictlyBefore),
-        other => Err(QueryError::Unsupported(format!(
-            "ASOF JOIN's time comparison is '{other}' — it must be one of              <=, <, >=, > (which one only selects whether an exactly-equal              timestamp matches)"
-        ))),
+    // The operator says two things: which way the comparison points,
+    // and whether an exactly-equal timestamp counts. Only the second is
+    // ours to obey.
+    let (left_is_later, matching) = match op {
+        ast::BinaryOperator::GtEq => (true, AsOfMatch::AtOrBefore),
+        ast::BinaryOperator::Gt => (true, AsOfMatch::StrictlyBefore),
+        ast::BinaryOperator::LtEq => (false, AsOfMatch::AtOrBefore),
+        ast::BinaryOperator::Lt => (false, AsOfMatch::StrictlyBefore),
+        other => {
+            return Err(QueryError::Unsupported(format!(
+                "ASOF JOIN's time comparison is '{other}' — it must be one of \
+                 <=, <, >=, > (which one only selects whether an exactly-equal \
+                 timestamp matches)"
+            )))
+        }
+    };
+    // An as-of join looks *backwards*: the fact's clock is the later
+    // one. Written the other way round, the query is asking for the
+    // dimension row that comes after — a different question, and one
+    // worth refusing rather than quietly answering the reverse of.
+    if left_is_later != fact_on_left {
+        return Err(QueryError::Unsupported(format!(
+            "ASOF JOIN's time comparison puts the {} row at or after the {} one \
+             — an as-of join looks backwards, so write it the other way round \
+             (fact.ts >= dim.ts)",
+            if fact_on_left { "dimension" } else { "fact" },
+            if fact_on_left { "fact" } else { "dimension" },
+        )));
     }
+    let named = if fact_on_left {
+        (left_side.1, right_side.1)
+    } else {
+        (right_side.1, left_side.1)
+    };
+    Ok((matching, named))
 }
 
 fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError> {
@@ -2525,10 +2571,38 @@ mod tests {
         ] {
             let join = plan(sql).unwrap().join.expect("joined");
             assert_eq!(join.as_of, Some(expected), "{sql}");
+            // The columns travel fact-side first whichever way round
+            // the query wrote them; only the executor, which has the
+            // schemas, can say whether they name the ordering keys.
+            assert_eq!(
+                join.as_of_named,
+                Some(("ts".to_owned(), "ts".to_owned())),
+                "{sql}"
+            );
         }
+        // Written backwards, the inequality asks for the quote *after*
+        // each trade — a different question, refused rather than
+        // silently answered in reverse. The operator alone cannot tell:
+        // both of these are `<=`, and only the qualifiers separate them.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND t.ts <= q.ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("looks backwards"), "{error}");
+        // Unqualified on both sides, nothing says which table is which.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND ts <= ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("qualify at least one side"), "{error}");
+        // An equality is not an ordering.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts = t.ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be one of"), "{error}");
         // A plain join is untouched — no as-of anything.
         let plain = plan("SELECT t.x FROM t LEFT JOIN q ON t.sym = q.sym").unwrap();
-        assert_eq!(plain.join.expect("joined").as_of, None);
+        let plain = plain.join.expect("joined");
+        assert_eq!(plain.as_of, None);
+        assert_eq!(plain.as_of_named, None);
     }
 
     #[test]

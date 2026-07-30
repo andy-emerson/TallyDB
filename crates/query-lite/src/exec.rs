@@ -37,8 +37,8 @@
 //! decision #6 accepted).
 
 use crate::plan::{
-    AggCall, AggFunction, AggItem, ArithOp, Frame, OrderBy, Plan, PlanItem, Projection, QueryError,
-    ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
+    AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, JoinPlan, OrderBy, Plan, PlanItem,
+    Projection, QueryError, ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
@@ -238,8 +238,24 @@ pub fn execute(
     execute_single(schema, handles, plan, registry)
 }
 
-/// Runs a star-schema join plan: `fact_views` joined against
-/// `dimension_views` on the plan's key columns, then the ordinary
+/// One side of a join: a table's schema, a snapshot of its segments,
+/// and the index of its declared ordering-key column.
+///
+/// The ordering key travels separately because the schema cannot say
+/// it — and because an as-of join needs it even from a side with no
+/// segments to ask, so that a query naming the wrong column is refused
+/// the same way whether or not the table happens to be empty.
+pub struct JoinSide<'a> {
+    /// The table's stored schema.
+    pub schema: &'a Schema,
+    /// Its segments, in append order.
+    pub handles: &'a [SegmentHandle],
+    /// Index of the declared ordering-key column (`i64 NOT NULL`).
+    pub ordering_key: usize,
+}
+
+/// Runs a star-schema join plan: the fact side joined against the
+/// dimension side on the plan's key columns, then the ordinary
 /// single-table pipeline over the joined intermediate.
 ///
 /// The join is fact-driven: output stays one batch per fact segment;
@@ -256,27 +272,36 @@ pub fn execute(
 /// key must be unique among its live rows — a star-schema dimension is
 /// a lookup table, and a duplicate key is an error, not a silent row
 /// multiplication.
+///
+/// An **as-of** join ([`crate::AsOfMatch`], #65) changes exactly that
+/// last rule and nothing else: the dimension key is deliberately *not*
+/// unique — a quote table has many rows per symbol — and each fact row
+/// takes the most recent of its key's dimension rows on the two
+/// tables' declared ordering keys. Everything downstream (the gather,
+/// the live mask, INNER versus LEFT) is the equi-join's, unchanged.
 pub fn execute_join(
-    fact_schema: &Schema,
-    fact_handles: &[SegmentHandle],
-    dimension_schema: &Schema,
-    dimension_handles: &[SegmentHandle],
+    fact: JoinSide<'_>,
+    dimension: JoinSide<'_>,
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
+    let fact_schema = fact.schema;
+    let dimension_schema = dimension.schema;
     let Some(join) = &plan.join else {
-        return execute(fact_schema, fact_handles, plan, registry);
+        return execute(fact_schema, fact.handles, plan, registry);
     };
     // A join reads both sides whole (the gather touches every fact row
     // and any dimension row a key can reach), so both sides materialize
     // here; single-table pruning happens after the join, on the joined
     // intermediate, exactly as before.
-    let fact_views = fact_handles
+    let fact_views = fact
+        .handles
         .iter()
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
     let fact_views = &fact_views[..];
-    let dimension_views = dimension_handles
+    let dimension_views = dimension
+        .handles
         .iter()
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
@@ -296,25 +321,18 @@ pub fn execute_join(
             join.dimension_key
         )));
     }
-    // The dimension lookup: key value → (view, row), unique or bust.
-    let mut lookup: HashMap<String, (usize, usize)> = HashMap::new();
-    for (view_index, view) in dimension_views.iter().enumerate() {
-        let Column::Key(keys) = &view.segment.batch().columns()[dimension_key_index] else {
-            unreachable!("validated as a key column above")
-        };
-        for row in live_rows(view) {
-            let Some(value) = keys.value_at(row) else {
-                continue; // a null dimension key matches nothing
-            };
-            if lookup.insert(value.to_owned(), (view_index, row)).is_some() {
-                return Err(QueryError::TypeError(format!(
-                    "dimension key '{}' is not unique (value '{value}'): a star-schema \
-                     dimension is a lookup table",
-                    join.dimension_key
-                )));
-            }
+    let index = match join.as_of {
+        None => DimensionIndex::unique(dimension_views, dimension_key_index, &join.dimension_key)?,
+        Some(matching) => {
+            check_as_of_axis(join, &fact, &dimension)?;
+            DimensionIndex::history(
+                dimension_views,
+                dimension_key_index,
+                dimension.ordering_key,
+                matching,
+            )
         }
-    }
+    };
     // The joined schema: fact columns, then the dimension columns the
     // query actually reads (#81) minus its key (which duplicates the
     // fact key), all nullable (LEFT produces nulls; INNER's
@@ -355,21 +373,7 @@ pub fn execute_join(
         let Column::Key(keys) = &batch.columns()[fact_key_index] else {
             unreachable!("validated as a key column above")
         };
-        let dictionary = keys.dictionary();
-        // The once-per-distinct-value lookup.
-        let remap: Vec<Option<(usize, usize)>> = (0..dictionary.len() as u32)
-            .map(|code| lookup.get(dictionary.value(code)).copied())
-            .collect();
-        let codes = keys.codes().as_slice();
-        let picks: Vec<Option<(usize, usize)>> = (0..batch.num_rows())
-            .map(|row| {
-                if keys.is_valid(row) {
-                    remap[codes[row] as usize]
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let picks = index.picks(batch, keys, fact.ordering_key);
         let live = if join.left {
             view.live.clone()
         } else {
@@ -420,6 +424,186 @@ pub fn execute_join(
         .map(|view| SegmentHandle::resident(view.segment, view.live))
         .collect();
     execute_single(&joined_schema, &joined_handles, plan, registry)
+}
+
+/// One key's dimension rows for an as-of match: `(ordering-key value,
+/// view, row)`, ascending, with the tie order the match rule wants.
+type KeyHistory = Vec<(i64, usize, usize)>;
+
+/// The dimension side, indexed for whichever question the fact rows
+/// are going to ask it.
+enum DimensionIndex {
+    /// An equi-join: one row per key value, or the join is an error.
+    Unique(HashMap<String, (usize, usize)>),
+    /// An as-of join: every row per key value, in time order, and the
+    /// comparison that decides which of them a fact clock reaches.
+    History(HashMap<String, KeyHistory>, AsOfMatch),
+}
+
+impl DimensionIndex {
+    /// The star-schema lookup: key value → (view, row), unique or bust.
+    fn unique(
+        dimension_views: &[SegmentView],
+        key_index: usize,
+        key_name: &str,
+    ) -> Result<DimensionIndex, QueryError> {
+        let mut lookup: HashMap<String, (usize, usize)> = HashMap::new();
+        for (view_index, view) in dimension_views.iter().enumerate() {
+            let Column::Key(keys) = &view.segment.batch().columns()[key_index] else {
+                unreachable!("validated as a key column above")
+            };
+            for row in live_rows(view) {
+                let Some(value) = keys.value_at(row) else {
+                    continue; // a null dimension key matches nothing
+                };
+                if lookup.insert(value.to_owned(), (view_index, row)).is_some() {
+                    return Err(QueryError::TypeError(format!(
+                        "dimension key '{key_name}' is not unique (value '{value}'): a \
+                         star-schema dimension is a lookup table"
+                    )));
+                }
+            }
+        }
+        Ok(DimensionIndex::Unique(lookup))
+    }
+
+    /// The as-of index: per key value, that key's live rows as
+    /// `(clock, view, row)` in ascending clock order.
+    ///
+    /// Rows are collected in ingest order and then sorted by clock with
+    /// a *stable* sort, which costs a linear scan over the ordered data
+    /// TallyDB expects and does the right thing over data that arrived
+    /// out of order — this is where an as-of join stops depending on
+    /// the ordering key having actually been ordered. Stability is also
+    /// what settles ties: among dimension rows sharing a timestamp, the
+    /// last-ingested one is the match, the same "newest version wins"
+    /// rule corrections already follow.
+    fn history(
+        dimension_views: &[SegmentView],
+        key_index: usize,
+        time_index: usize,
+        matching: AsOfMatch,
+    ) -> DimensionIndex {
+        let mut history: HashMap<String, KeyHistory> = HashMap::new();
+        for (view_index, view) in dimension_views.iter().enumerate() {
+            let columns = view.segment.batch().columns();
+            let Column::Key(keys) = &columns[key_index] else {
+                unreachable!("validated as a key column above")
+            };
+            let clocks = ordering_clocks(&columns[time_index]);
+            for row in live_rows(view) {
+                let Some(value) = keys.value_at(row) else {
+                    continue; // a null dimension key matches nothing
+                };
+                history
+                    .entry(value.to_owned())
+                    .or_default()
+                    .push((clocks[row], view_index, row));
+            }
+        }
+
+        for rows in history.values_mut() {
+            rows.sort_by_key(|&(clock, _, _)| clock);
+        }
+        DimensionIndex::History(history, matching)
+    }
+
+    /// One fact segment's dimension picks: `(view, row)` per fact row,
+    /// `None` where the key matches nothing (equi-join) or nothing has
+    /// happened yet on the time axis (as-of).
+    ///
+    /// Both forms resolve the key once per *distinct dictionary value*
+    /// rather than once per row (decision #6's pattern); an as-of join
+    /// then pays one binary search per row over that key's history.
+    fn picks(
+        &self,
+        batch: &RecordBatch,
+        keys: &KeyColumn,
+        time_index: usize,
+    ) -> Vec<Option<(usize, usize)>> {
+        let dictionary = keys.dictionary();
+        let codes = keys.codes().as_slice();
+        match self {
+            DimensionIndex::Unique(lookup) => {
+                let remap: Vec<Option<(usize, usize)>> = (0..dictionary.len() as u32)
+                    .map(|code| lookup.get(dictionary.value(code)).copied())
+                    .collect();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        if keys.is_valid(row) {
+                            remap[codes[row] as usize]
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            DimensionIndex::History(history, matching) => {
+                let remap: Vec<Option<&KeyHistory>> = (0..dictionary.len() as u32)
+                    .map(|code| history.get(dictionary.value(code)))
+                    .collect();
+                let clocks = ordering_clocks(&batch.columns()[time_index]);
+                (0..batch.num_rows())
+                    .map(|row| {
+                        if !keys.is_valid(row) {
+                            return None;
+                        }
+                        let candidates = remap[codes[row] as usize]?;
+                        let clock = clocks[row];
+                        // How much of this key's history the fact row's
+                        // clock has reached; the match is the last of it.
+                        let reached = match matching {
+                            AsOfMatch::AtOrBefore => {
+                                candidates.partition_point(|&(at, _, _)| at <= clock)
+                            }
+                            AsOfMatch::StrictlyBefore => {
+                                candidates.partition_point(|&(at, _, _)| at < clock)
+                            }
+                        };
+                        reached
+                            .checked_sub(1)
+                            .map(|last| (candidates[last].1, candidates[last].2))
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// An ordering-key column's values. Storage validates the ordering key
+/// as `i64 NOT NULL` when a table is defined, so there is no other case
+/// and no null to consider.
+fn ordering_clocks(column: &Column) -> &[i64] {
+    let Column::Numeric(NumericData::I64(clocks)) = column else {
+        unreachable!("storage validates the ordering key as an i64 column")
+    };
+    clocks.values().as_slice()
+}
+
+/// Checks an explicit `ASOF ... ON ... AND q.ts <= t.ts` against the
+/// schemas. The time axis is *not* the query's to choose: it is the two
+/// tables' declared ordering keys, which is what makes the match a
+/// walk rather than a search. So an inequality naming anything else is
+/// refused here — the planner has no schemas and can only check its
+/// shape.
+fn check_as_of_axis(
+    join: &JoinPlan,
+    fact: &JoinSide<'_>,
+    dimension: &JoinSide<'_>,
+) -> Result<(), QueryError> {
+    let Some((named_fact, named_dimension)) = &join.as_of_named else {
+        return Ok(()); // implicit: the axis is the ordering keys by construction
+    };
+    let fact_axis = fact.schema.fields()[fact.ordering_key].name();
+    let dimension_axis = dimension.schema.fields()[dimension.ordering_key].name();
+    if named_fact != fact_axis || named_dimension != dimension_axis {
+        return Err(QueryError::Unsupported(format!(
+            "ASOF JOIN matches on the tables' declared ordering keys — '{fact_axis}' \
+             and '{dimension_axis}' — so its time comparison can only restate them; \
+             '{named_fact}' and '{named_dimension}' name something else"
+        )));
+    }
+    Ok(())
 }
 
 /// One dimension column, gathered per fact row (`None` pick = no match:
