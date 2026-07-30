@@ -36,27 +36,99 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-29, M4 merged; step 2 of the 10-step plan done)
+## Snapshot (2026-07-30: first M5 merge landed; the research plan begins)
 
-**Where execution is: steps 1–6 are complete and pushed. Next: step 7
-— the Human's merge.** The branch holds, in order: the doc pass; the
-seven fruit builds (IS NULL, `_seq`, DELETE-consumes, #80 top-k, #81
-pushdown, SYMBOL, #58(B)); the step-3 code pass; the pause outcomes
-(FIRST/LAST ruled (a); #62 split into #62+#83, both decisions open;
-`_seq` stays, revisit open; hidden ORDER BY + SET negative literal
-built; delete-flush cost ruled (a), documented); step 5's research
-items — #42 (corpus tick size, ALP+RD+raw for f64, FOR+bit-packing
-for i64/u32, golden split v1-decode/v2-encode, measured 4.18×
-ticks / 1.16× telemetry / 6–10× codes) and F4 (read-only
-cross-process opens: FsBackend::open_read_only,
-Store::open_read_only with the supersession-visibility rule,
-Table::open_read_only/refresh, console --read-only with
-.refresh/.flush); and the step-6 code+doc passes. Gate green at
-head: 402 tests both legs, six oracles, fmt/clippy/doc.
+**State:** the first M5 merge is on `main` (PR #85, merge `4e1295c`):
+the fruit table, the standard-SQL gaps, #42 compression, F4
+cross-process readers, all passes. `claude/dev` recreated from that
+`main`, clean, pushed. Merge proposal #84 served its purpose. #42
+closed with evidence. Local toolchain updated to **Rust 1.97.1** to
+match CI after a clippy-drift failure (fixed in `6b18dd4`) — keep the
+local stable current so the gate sees what CI sees.
 
-Post-merge (steps 8–10): M5.0–M5.4 per the recorded table, then
-code/doc pass, then the second merge. FIRST/LAST = (a) is the ruled
-naming for M5.3.
+### The Human's current plan (set 2026-07-30, replaces the old steps 8–10)
+
+1. **Tables bigger than memory** — the residency problem, promoted
+   from the unscheduled remainder. NO DESIGN RULING EXISTS: today a
+   table decodes every segment into RAM at open and keeps it there,
+   and #42 sharpened the problem (compressed disk means
+   decode-on-demand; the mmap escape hatch is gone by our own
+   choice). The open design questions — what stays resident, what
+   evicts it, how zone-map pruning drives *fetch* not just skip, what
+   a query's memory ceiling means, F3 segment-lazy open as the
+   entry — are the Human's to close. **Step 1 therefore OPENS with
+   the design fork surfaced (options, user/dev pov, recommendation,
+   gates), builds only after the ruling.**
+2. **Check with the Human.**
+3. **Continuous queries (#83)** — true research: incremental view
+   maintenance under tombstones, corrections, and the knowledge
+   axis. The issue itself records: **needs a Plan conversation
+   before any build** — which query shapes are maintainable, and
+   what happens to a maintained result when its input is corrected.
+   Step 3 opens with that conversation.
+4. **Check with the Human.**
+5. **Incremental multi-factor (M5.4's deep end)** — K > 2 rolling
+   OLS incrementally (sliding-window factorization up/downdating is
+   the research; catastrophic-cancellation control per the existing
+   compensated-truth guard). Safety net: per-frame recompute on faer
+   ships the feature correct regardless — the research buys the
+   speed win. SQL surface per #77.2: scalar reductions only.
+6. **Check with the Human.**
+7. **M5.0–M5.4** per the recorded table: M5.0 streaming primitives
+   (rolling var/stddev, expanding, lag/diff/shift, returns, EWMA —
+   incremental compensated; NumPy oracle + bench per op; prelude
+   ships here, compiled-in per #77.3); M5.1 `LAG`/`LEAD` + `RANGE`
+   frames (DuckDB differential); M5.2 the as-of join as ruled (#65
+   hybrid); M5.3 bucketing (F1 = d, monotone ordering-key arithmetic
+   in GROUP BY) + `FIRST`/`LAST` **ruled (a)** + cross-sectional
+   partitioning; M5.4 matrix tier on faer (absorbs step 5's result).
+8. **Code pass** (repo-wide review + fixes).
+9. **Doc pass** (truth then clarity; README claims at evidence).
+10. **Merge** (the Human).
+
+### Rulings landed since the M5 ruling batch
+
+- **FIRST/LAST = (a)**: `FIRST(x)`/`LAST(x)`, the de-facto TSDB
+  names; well-defined here because the ordering key is declared.
+- **#62 split approved**: #62 = ingest hooks (engineering, decisions
+  still open); #83 = continuous queries (research, Plan conversation
+  required). Neither scheduled by that split — #83 is now step 3.
+- **`_seq` stays `_seq`** — with an open revisit (the Human learned
+  the "never seen" claim was really "never seen *unbidden*"; users
+  do type it).
+- **Delete-flush cost = (a)** accept and document (done): persistent
+  DELETE seals the buffer; reopen trigger recorded in DESIGN.md.
+
+### Remaining open decisions (none gate steps 1–7 except as noted)
+
+- Step 1's residency design and step 3's #83 scoping — the two
+  conversations the plan itself schedules.
+- **#82** compaction 2× peak: document vs engineer (deferred).
+- **#57** regex menu (deferred by ruling; option-f sketch on issue).
+- **#46** agentic touchpoints; **#52** benchmark suite (M5.7).
+- Boolean + logical-annotation revisit (parked, flagged
+  wrong-on-purpose).
+- #62 ingest hooks: unscheduled.
+
+### Standing session facts
+
+- Gate = fmt · clippy both legs `-D warnings` · test both legs ·
+  rustdoc both legs · six oracle scripts (pyarrow_roundtrip via
+  `-p arrow-lite --features oracle-harness`; the other five via
+  `-p engine --features oracle-harness`). 402 tests at the merge.
+  Doc-only (.md) pushes have gone without the full gate.
+- CI runs on pull-request events only; CI stable moves — if clippy
+  fails there and not here, `rustup update stable` and re-run.
+- The scratchpad probe crate lives under the session scratchpad
+  (path-deps on real crates); rebuild if needed, never in-repo.
+- sqlparser 0.62.0, GenericDialect. Any new pre-parse lift must
+  splice by byte span, skip comments whole, carry adversarial tests.
+- Beta shape (built as of this merge): feed-writer process +
+  read-only consoles (`--read-only`, `.refresh`/`.flush`) over one
+  directory; readers see the durable prefix, old-or-new per
+  mutation.
+- `rm -rf crates/engine/tests/__pycache__` after running oracles
+  (gitignored now, but keep the tree clean).
 
 ### Superseded snapshot (kept for the ledger below)
 
