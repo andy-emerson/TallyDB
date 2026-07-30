@@ -175,7 +175,8 @@ type — and (b) no general-purpose cost-based optimizer.
 | SQL capability | In / Out | Bounding invariant |
 |---|---|---|
 | `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE`, scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE` on keys, `NULLS FIRST`/`LAST`, `CREATE TABLE`/`INSERT` | **in** (built) | — |
-| regex on keys (#57), `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
+| `RANGE` frames, `ASOF JOIN` (#65) | **in** (built, M5.1–M5.2) | — |
+| regex on keys (#57), ordered-merge relatives beyond `ASOF JOIN` | **in** (not yet built) | — |
 | `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
 | joins no structural fact licenses — neither side small enough to materialize, inputs not co-ordered on the join key, join-*order* search | **out** | (b): would need a cost-based optimizer (see *the join constraint, completed*) |
 | a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
@@ -807,6 +808,21 @@ safe at any scale without estimation:
 | Broadcast/hash lookup | one side small enough to materialize, key-unique | unbounded memory |
 | Ordered merge (`ASOF JOIN` and relatives, #65) | both sides ordered on the join key — their declared ordering key | unbounded memory *and* sorting |
 
+**Build note (2026-07-30, M5.2): what shipped is clause 1's shape, not
+clause 2's.** The as-of join as built indexes the dimension side in
+memory — one ascending `(clock, row)` list per key — and binary-searches
+it per fact row. That is correct at any ordering (the index is stably
+sorted, so a late-arriving quote still matches), and it needs no
+`is_ordered()` gate; but it materializes the dimension, so it is
+guarded by clause 1's size invariant, not clause 2's streaming
+property. The co-walk clause 2 describes — a cursor per side, memory
+independent of both inputs, licensing large ⋈ large — is **not built**:
+`execute_join` materializes both sides up front, and making the
+dimension streaming is the same work as streaming scans generally
+(#88). Until then, the ordered-merge row above states a *design*, and
+the as-of join's actual reach is "dimension fits in memory". Tracked as
+#92; the trigger to close it is a quote history that does not fit.
+
 Clause 1 is the size invariant, unchanged, guarding the strategy that
 materializes a build side. Clause 2 needs no size bound as a *property,
 not an exemption*: a merge over inputs already clustered on the join key
@@ -923,7 +939,8 @@ DuckDB differential family; the shell's help cites this table.
 | `LAG` / `LEAD` | in, built (M5.1) | positional, not aggregates: they copy a neighbouring row, so the output keeps the **source column's type** — a lagged `BIGINT` stays `BIGINT`, because a nanosecond stamp is past 2^53 where `f64` stops being exact. Frameless (standard SQL gives them no frame; a frame clause is refused, not ignored); optional offset defaults to 1; the third `default` argument and symbol columns are refused by name |
 | `RANGE` frames | in, built (M5.1) | bounded by ordering-key **value**, in the key's own units (no `INTERVAL` type: a 5-minute span over ns stamps is `300000000000`). Ends at the current row's **last peer**, per standard SQL, so tied rows share one window. Answers via per-frame recompute today; the incremental sweep over these bounds is the tracked follow-up |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
-| `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |
+| `ASOF LEFT` / `ASOF INNER JOIN` | in, built (M5.2) | the hybrid — see *The M5 ruling batch*, item 2, and its build note. Each fact row takes the most recent of its key's dimension rows on the two **declared ordering keys**; an explicit inequality is validated, not obeyed. Ties on the dimension's clock go to the last row in storage order. The dimension side is indexed in memory, not co-walked — see the join-constraint note |
+| ordered-merge relatives beyond `ASOF` (`LT`, `SPLICE`, …) | in, later | nothing coined; the same lift mechanism serves them |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
 | DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `BIGINT`/`DOUBLE`/`SYMBOL`, `ORDERING KEY` constraint; `VARCHAR`, `PRIMARY KEY` and the retired `KEY` spelling refused with teaching errors |
 | non-correlated subqueries / CTEs | in, later | named subplans |
@@ -971,6 +988,41 @@ none is built unless its row in the stdlib table says so.
    (the row with `MAX(ts) <=` the fact's), which checks the definition
    rather than another vendor's implementation. The executor is an
    ordered co-walk gated on `is_ordered()` for **both** sides.
+
+   **Build note (M5.2, 2026-07-30).** Built, and the evidence landed
+   as ruled: seven differential families whose oracle side is a
+   correlated scalar subquery in vanilla SQL — the definition of "the
+   latest quote at or before" — rather than DuckDB's own `ASOF JOIN`.
+   Three things about the build differ from or extend the ruling, and
+   are recorded here rather than left in a conversation:
+
+   - **Not a co-walk.** The executor indexes the dimension side per key
+     (an ascending `(clock, row)` list, stably sorted) and binary-
+     searches it per fact row. That is correct whatever order the data
+     arrived in — a late-arriving quote still matches — so it needs no
+     `is_ordered()` gate on either side, where a co-walk would have to
+     refuse a transiently disordered table. The cost is that the
+     dimension materializes: the streaming property clause 2 of the
+     join constraint claims is **designed, not built** (#92, and see
+     the build note there).
+   - **Ties on the dimension's clock go to the last row in storage
+     order** — the same "newest version wins" rule corrections follow.
+     The alternative (refusing a duplicate `(key, clock)`) was rejected:
+     a quote table legitimately prints twice on one stamp, and kdb+'s
+     `aj` takes the last such row too. The differential covers this on
+     purpose: the fixture injects per-symbol tied timestamps and the
+     oracle counts them before trusting the families.
+   - **The inequality's sides are assigned by qualifier, not by
+     operator.** `t.ts <= q.ts` and `q.ts <= t.ts` are the same
+     operator and opposite questions; reading the operator alone would
+     have answered the first (the quote *after* each trade) with the
+     one before it. Written backwards, it is refused.
+
+   One limitation the build meets rather than creates: both tables are
+   timestamped, and a dimension attribute sharing a fact column's name
+   is refused, so `quotes.ts` beside `trades.ts` must be renamed. That
+   is the pre-existing equi-join rule, not a new choice — the open
+   decision about whether to change it is #93.
 3. **Library naming (#77.1): SQL exposes only operations bearing
    standard names.** `var_pop`, `stddev_pop`, `LAG`/`LEAD` pass into
    SQL freely; EWMA, `diff`, multi-factor regression have no standard

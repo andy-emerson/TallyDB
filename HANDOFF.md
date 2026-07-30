@@ -76,12 +76,24 @@ The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
      binary with `.prelude` printing its source** (#77.3 = a).
    - **M5.1** `LAG`/`LEAD` + `RANGE` frames — standard names, so in
      by the #77.1 rule; DuckDB differential.
-   - **M5.2** the as-of join exactly as ruled (#65 hybrid): `ASOF`
-     lifted pre-parse by byte span, `ON` only, ordering keys are the
-     time axis (explicit inequality validated, not obeyed), bare
-     `ASOF JOIN` refused, no `TOLERANCE`. Ordered co-walk gated on
-     `is_ordered()` both sides. DuckDB differential + the
-     vanilla-SQL definitional reference.
+   - ~~**M5.2** the as-of join~~ — DONE (2026-07-30), as ruled (#65
+     hybrid): `ASOF` lifted pre-parse by byte span, `ON` only,
+     ordering keys are the time axis (explicit inequality validated,
+     not obeyed), bare `ASOF JOIN` refused, no `TOLERANCE`. Evidence
+     as ruled: seven differential families against a vanilla-SQL
+     **definitional** oracle (a correlated subquery, not DuckDB's own
+     `ASOF JOIN`). Three build notes for the Human, all in DESIGN.md
+     *M5 ruling batch* item 2: it is **not** the ordered co-walk the
+     ruling described — a per-key sorted index plus binary search,
+     which needs no `is_ordered()` gate and is correct over late
+     arrivals, but materializes the dimension (**#92**: clause 2 of
+     the join constraint stays designed, not built); ties on the
+     dimension's clock go to the **last row in storage order**; and
+     the inequality's sides are assigned by qualifier, not operator,
+     so a backwards comparison is refused. **Open decision #93** (not
+     gating): both tables are timestamped, and a dimension attribute
+     sharing a fact column's name is refused, so `quotes.ts` beside
+     `trades.ts` must be renamed today.
    - **M5.3** bucketing (F1 = d: monotone integer arithmetic on the
      ordering key in `GROUP BY`, streaming O(1)) + `FIRST`/`LAST`
      **ruled (a)** + cross-sectional partitioning.

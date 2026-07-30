@@ -76,8 +76,9 @@ financial ledgers: anything whose shape matches the three assumptions above.
 text columns or blobs, no third column type, and no joins beyond the two
 shapes the engine can execute without a cost-based optimizer: equi-joins
 where one side is small enough to materialize (the star-schema family —
-lookups, dimensions, reference tables), and ordered-merge joins (`ASOF`
-and relatives, planned) where both sides are ordered on the join key.
+lookups, dimensions, reference tables), and as-of joins (`ASOF LEFT
+JOIN` / `ASOF INNER JOIN`, matched on the tables' declared ordering
+keys; relatives planned).
 Two large tables joined on an arbitrary key is refused loudly, not
 served slowly. If your data doesn't fit the three
 assumptions, use Postgres, DuckDB, or SQLite — they're better at being
