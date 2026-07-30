@@ -2969,6 +2969,130 @@ mod mutation_tests {
     }
 
     #[test]
+    fn lag_and_lead_read_neighbouring_rows_and_keep_the_column_type() {
+        // M5.1. LAG/LEAD are positional, not aggregates: they copy a
+        // neighbour's value, so the output column carries the SOURCE
+        // column's type. That is not a nicety — a nanosecond timestamp
+        // is past 2^53, where f64 stops being exact, and lagging a
+        // timestamp is the most natural thing a user will write.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        // Nanosecond-scale stamps, one apart: distinguishable in i64,
+        // indistinguishable after a round trip through f64.
+        let base = 1_700_000_000_000_000_001i64;
+        for i in 0..6i64 {
+            table
+                .append(&[RowValue::I64(base + i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        let output = table
+            .query("SELECT lag(ts, 1) OVER (ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        assert_eq!(
+            output.schema.fields()[0].column_type(),
+            ColumnType::I64,
+            "a lagged BIGINT stays BIGINT"
+        );
+        let previous: Vec<Option<i64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                    panic!("expected i64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(previous[0], None, "no row before the first");
+        // Every stamp exact, one nanosecond apart — the whole point.
+        for (i, got) in previous.iter().enumerate().skip(1) {
+            assert_eq!(*got, Some(base + i as i64 - 1), "row {i}");
+        }
+        // LEAD looks the other way and runs off the far end.
+        let output = table
+            .query("SELECT lead(x, 2) OVER (ORDER BY ts) AS ahead FROM t")
+            .unwrap();
+        assert_eq!(output.schema.fields()[0].column_type(), ColumnType::F64);
+        let ahead = f64s(&output, 0);
+        assert_eq!(ahead[0], Some(2.0));
+        assert_eq!(ahead[3], Some(5.0));
+        assert_eq!(ahead[4], None, "past the end");
+        assert_eq!(ahead[5], None);
+        // The default offset is 1, as in standard SQL.
+        let output = table
+            .query("SELECT lag(x) OVER (ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        assert_eq!(f64s(&output, 0)[1], Some(0.0));
+    }
+
+    #[test]
+    fn lag_and_lead_refuse_what_they_cannot_mean() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+        for i in 0..6i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        // A frame clause is meaningless on a one-row lookup, and
+        // standard SQL gives these functions none: refused, not ignored.
+        let framed = "SELECT lag(x, 1) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+                      AND CURRENT ROW) FROM t";
+        assert!(matches!(
+            table.query(framed),
+            Err(EngineError::Query(QueryError::Unsupported(_)))
+        ));
+        // Symbols are unordered labels whose codes are per-segment, so a
+        // lagged code would name nothing (the #58 reasoning).
+        assert!(matches!(
+            table.query("SELECT lag(sym, 1) OVER (ORDER BY ts) FROM t"),
+            Err(EngineError::Query(QueryError::TypeError(_)))
+        ));
+        // Offset 0 is the row itself; the third (default) argument is
+        // standard but unbuilt — refused by name, never silently dropped.
+        for sql in [
+            "SELECT lag(x, 0) OVER (ORDER BY ts) FROM t",
+            "SELECT lag(x, 1, 0.0) OVER (ORDER BY ts) FROM t",
+            "SELECT lag(x, -1) OVER (ORDER BY ts) FROM t",
+        ] {
+            assert!(
+                matches!(
+                    table.query(sql),
+                    Err(EngineError::Query(QueryError::Unsupported(_)))
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn lag_partitions_by_symbol_and_never_crosses_a_partition() {
+        // The cross-sectional shape: each symbol's own previous row,
+        // never the interleaved neighbour's.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 2).unwrap();
+        for i in 0..8i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let output = table
+            .query("SELECT lag(x, 1) OVER (PARTITION BY sym ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        let previous = f64s(&output, 0);
+        // linear_row alternates A (even ts) and B (odd ts), x = ts.
+        assert_eq!(previous[0], None, "first A has no predecessor");
+        assert_eq!(previous[1], None, "first B has no predecessor");
+        assert_eq!(previous[2], Some(0.0), "A: 2 follows 0");
+        assert_eq!(previous[3], Some(1.0), "B: 3 follows 1");
+        assert_eq!(previous[4], Some(2.0));
+        assert_eq!(previous[5], Some(3.0));
+    }
+
+    #[test]
     fn update_validates_before_mutating() {
         let mut table = small_table();
         // Type mismatch: string into a numeric column.

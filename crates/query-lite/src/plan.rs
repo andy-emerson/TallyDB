@@ -111,6 +111,24 @@ pub enum PlanItem {
         /// Output name, if aliased.
         alias: Option<String>,
     },
+    /// `LAG(x, k)` / `LEAD(x, k)` — a positional lookup, **not** an
+    /// aggregate: it reads another *row* rather than reducing a frame,
+    /// which is why standard SQL gives it no frame clause and why it
+    /// carries the source column's type instead of computing in `f64`.
+    WindowValue {
+        /// `true` for `LEAD` (look forward), `false` for `LAG`.
+        lead: bool,
+        /// The column read.
+        column: String,
+        /// How many rows away, `>= 1`.
+        offset: usize,
+        /// PARTITION BY column (a key column), if present.
+        partition_by: Option<String>,
+        /// ORDER BY column — must be the data's ordering key.
+        order_by: String,
+        /// Output name, if aliased.
+        alias: Option<String>,
+    },
 }
 
 /// A scalar arithmetic operator.
@@ -397,6 +415,18 @@ impl Plan {
                             names.extend(args.iter().cloned());
                             names.extend(partition_by.iter().cloned());
                             names.insert(order_by.clone());
+                        }
+                        PlanItem::WindowValue {
+                            column,
+                            partition_by,
+                            order_by,
+                            ..
+                        } => {
+                            names.insert(column.clone());
+                            names.insert(order_by.clone());
+                            if let Some(partition) = partition_by {
+                                names.insert(partition.clone());
+                            }
                         }
                     }
                 }
@@ -1943,7 +1973,6 @@ fn lower_window_call(
     let ast::WindowType::WindowSpec(spec) = over else {
         return Err(QueryError::Unsupported("named WINDOW clauses".to_owned()));
     };
-    let args = lower_args(&function.args)?;
     let partition_by = match spec.partition_by.as_slice() {
         [] => None,
         [ast::Expr::Identifier(column)] => Some(ident(column)),
@@ -1966,6 +1995,28 @@ fn lower_window_call(
     if order.options.asc == Some(false) {
         return Err(QueryError::Unsupported("ORDER BY ... DESC".to_owned()));
     }
+    if let Some(lead) = positional_window(&name) {
+        // A frame clause on `LAG`/`LEAD` is meaningless — the function
+        // reads one specific row, not a range of them — and standard
+        // SQL accordingly gives them none. Refuse a frame rather than
+        // silently ignoring what the user wrote.
+        if spec.window_frame.is_some() {
+            return Err(QueryError::Unsupported(format!(
+                "{name} reads one row, so it takes no frame — drop the \
+                 ROWS/RANGE clause"
+            )));
+        }
+        let (column, offset) = lower_offset_args(&name, &function.args)?;
+        return Ok(PlanItem::WindowValue {
+            lead,
+            column,
+            offset,
+            partition_by,
+            order_by: ident(order_column),
+            alias,
+        });
+    }
+    let args = lower_args(&function.args)?;
     let preceding = lower_frame(spec.window_frame.as_ref())?;
     Ok(PlanItem::WindowAgg {
         function: name,
@@ -1975,6 +2026,76 @@ fn lower_window_call(
         preceding,
         alias,
     })
+}
+
+/// Whether `name` is a positional window function, and which way it
+/// looks. These are the only window calls whose arguments are not all
+/// columns, so they are recognized before the columns-only rule runs.
+fn positional_window(name: &str) -> Option<bool> {
+    match name {
+        "lag" => Some(false),
+        "lead" => Some(true),
+        _ => None,
+    }
+}
+
+/// `LAG`/`LEAD`'s arguments: the column, and an optional positive
+/// offset defaulting to 1 (SQL's own default). A third `default`
+/// argument is standard but unbuilt — refused by name rather than
+/// silently dropped, because dropping it would change answers.
+fn lower_offset_args(
+    name: &str,
+    args: &ast::FunctionArguments,
+) -> Result<(String, usize), QueryError> {
+    let ast::FunctionArguments::List(list) = args else {
+        return Err(QueryError::Unsupported(format!(
+            "{name} without an argument list"
+        )));
+    };
+    let mut column: Option<String> = None;
+    let mut offset: Option<usize> = None;
+    for (position, argument) in list.args.iter().enumerate() {
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = argument else {
+            return Err(QueryError::Unsupported(format!(
+                "{name}'s arguments must be a column and an optional offset"
+            )));
+        };
+        match (position, expr) {
+            (0, ast::Expr::Identifier(name)) => column = Some(ident(name)),
+            (1, ast::Expr::Value(value)) => {
+                let ast::Value::Number(number, _) = &value.value else {
+                    return Err(QueryError::Unsupported(format!(
+                        "{name}'s offset must be a literal positive integer"
+                    )));
+                };
+                let parsed = number.parse::<usize>().map_err(|_| {
+                    QueryError::Unsupported(format!(
+                        "{name}'s offset must be a literal positive integer, got '{number}'"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(QueryError::Unsupported(format!(
+                        "{name}'s offset must be at least 1 (offset 0 is the row itself)"
+                    )));
+                }
+                offset = Some(parsed);
+            }
+            (2, _) => {
+                return Err(QueryError::Unsupported(format!(
+                    "{name}'s third (default) argument"
+                )))
+            }
+            _ => {
+                return Err(QueryError::Unsupported(format!(
+                    "{name}'s arguments must be a column and an optional offset"
+                )))
+            }
+        }
+    }
+    let Some(column) = column else {
+        return Err(QueryError::Unsupported(format!("{name} needs a column")));
+    };
+    Ok((column, offset.unwrap_or(1)))
 }
 
 /// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW`;

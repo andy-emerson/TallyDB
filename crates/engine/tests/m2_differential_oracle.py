@@ -323,6 +323,18 @@ WINDOW_QUERIES = [
     "SELECT ts, var_pop(x) OVER (ORDER BY ts "
     "ROWS BETWEEN 0 PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "ORDER BY ts",
+    # M5.1: LAG/LEAD, positional and frameless. The head/tail rows a
+    # lookup cannot define must be NULL in both engines, and the
+    # partitioned forms must not read across a partition boundary.
+    "SELECT ts, lag(x, 1) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lead(x, 1) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lag(x, 5) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lag(x, 1) OVER (PARTITION BY sym ORDER BY ts) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, lead(x, 3) OVER (PARTITION BY sym ORDER BY ts) AS w FROM corpus "
+    "ORDER BY ts",
+    # The default offset is 1, in both engines.
+    "SELECT ts, lag(x) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
 ]
 
 EIGEN_PRECEDING = 19

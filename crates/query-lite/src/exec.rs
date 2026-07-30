@@ -553,13 +553,17 @@ fn execute_single(
     // shapes keep today's refusal, as standard SQL refuses them.
     let hidden_order = match (&plan.projection, plan.distinct, &plan.order_by) {
         (Projection::Items(items), false, Some(order_by)) => !items.iter().any(|item| {
-            let output_name = match item {
-                PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
-                PlanItem::Computed { name, .. } => name,
-                PlanItem::WindowAgg {
-                    function, alias, ..
-                } => alias.as_deref().unwrap_or(function),
-            };
+            let output_name =
+                match item {
+                    PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
+                    PlanItem::Computed { name, .. } => name,
+                    PlanItem::WindowAgg {
+                        function, alias, ..
+                    } => alias.as_deref().unwrap_or(function),
+                    PlanItem::WindowValue { lead, alias, .. } => alias
+                        .as_deref()
+                        .unwrap_or(if *lead { "lead" } else { "lag" }),
+                };
             output_name == order_by.column
         }),
         _ => false,
@@ -714,6 +718,23 @@ fn project_items(
                 partition_by.as_deref(),
                 order_by,
                 *preceding,
+                alias.as_deref(),
+            )?,
+            PlanItem::WindowValue {
+                lead,
+                column,
+                offset,
+                partition_by,
+                order_by,
+                alias,
+            } => window_value(
+                schema,
+                views,
+                *lead,
+                column,
+                *offset,
+                partition_by.as_deref(),
+                order_by,
                 alias.as_deref(),
             )?,
         };
@@ -1339,6 +1360,180 @@ fn argument_values<'a>(
         });
     }
     Ok(result)
+}
+
+/// One column's live values, kept in the source column's own type so a
+/// positional lookup never rounds. `i64` is not widened: a nanosecond
+/// timestamp exceeds 2^53, where `f64` stops being exact — and reading
+/// a *neighbouring timestamp* is the single most common `LAG`.
+enum ValueSeq {
+    F64(Vec<Option<f64>>),
+    I64(Vec<Option<i64>>),
+}
+
+impl ValueSeq {
+    fn column_type(&self) -> ColumnType {
+        match self {
+            ValueSeq::F64(_) => ColumnType::F64,
+            ValueSeq::I64(_) => ColumnType::I64,
+        }
+    }
+}
+
+/// `LAG`/`LEAD`: read the value `offset` rows away within the partition
+/// (the whole ordered run when unpartitioned), NULL where that row does
+/// not exist. Not an aggregate — nothing is reduced, so nothing is
+/// computed in `f64` and the output column carries the source column's
+/// type (`BIGINT` stays `BIGINT`).
+///
+/// Standard SQL gives these no frame, and the planner refuses one.
+#[allow(clippy::too_many_arguments)]
+fn window_value(
+    schema: &Schema,
+    views: &[&SegmentView],
+    lead: bool,
+    column: &str,
+    offset: usize,
+    partition_by: Option<&str>,
+    order_by: &str,
+    alias: Option<&str>,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let (index, field) = resolve(schema, column)?;
+    if field.column_type() == ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "LAG/LEAD on symbol column '{column}': symbols are labels whose \
+             codes are per-segment, so a lagged code would name nothing — \
+             lag a number, or group by the symbol"
+        )));
+    }
+    let (order_index, _) = resolve(schema, order_by)?;
+    check_order(views, order_index, order_by)?;
+    // Per view, the live values in order — typed, nulls preserved.
+    let mut per_view: Vec<ValueSeq> = Vec::with_capacity(views.len());
+    for view in views {
+        per_view.push(match &view.segment.batch().columns()[index] {
+            Column::Numeric(NumericData::F64(source)) => ValueSeq::F64(
+                live_rows(view)
+                    .map(|row| {
+                        source
+                            .is_valid(row)
+                            .then(|| source.values().as_slice()[row])
+                    })
+                    .collect(),
+            ),
+            Column::Numeric(NumericData::I64(source)) => ValueSeq::I64(
+                live_rows(view)
+                    .map(|row| {
+                        source
+                            .is_valid(row)
+                            .then(|| source.values().as_slice()[row])
+                    })
+                    .collect(),
+            ),
+            Column::Key(_) => unreachable!("refused above"),
+        });
+    }
+    let output_type = per_view
+        .first()
+        .map_or(field.column_type(), ValueSeq::column_type);
+    // The row order the lookup walks: for each partition, the ordered
+    // (view, live position) pairs — the same origin bookkeeping the
+    // partitioned aggregate path builds.
+    let runs = value_runs(schema, views, partition_by)?;
+    let mut results: Vec<ValueSeq> = views
+        .iter()
+        .map(|view| match output_type {
+            ColumnType::I64 => ValueSeq::I64(vec![None; view.live_rows()]),
+            _ => ValueSeq::F64(vec![None; view.live_rows()]),
+        })
+        .collect();
+    for run in &runs {
+        for (position, &(view_index, live_position)) in run.iter().enumerate() {
+            // LAG looks back, LEAD looks forward; out of range is NULL.
+            let source = if lead {
+                position.checked_add(offset).filter(|at| *at < run.len())
+            } else {
+                position.checked_sub(offset)
+            };
+            let Some(source) = source else { continue };
+            let (from_view, from_position) = run[source];
+            match (&mut results[view_index], &per_view[from_view]) {
+                (ValueSeq::F64(out), ValueSeq::F64(src)) => {
+                    out[live_position] = src[from_position];
+                }
+                (ValueSeq::I64(out), ValueSeq::I64(src)) => {
+                    out[live_position] = src[from_position];
+                }
+                _ => {
+                    return Err(QueryError::TypeError(format!(
+                        "column '{column}' has different types across segments"
+                    )))
+                }
+            }
+        }
+    }
+    let name = alias.unwrap_or(if lead { "lead" } else { "lag" });
+    let columns = results
+        .into_iter()
+        .map(|result| match result {
+            ValueSeq::F64(values) => assemble_f64(values),
+            ValueSeq::I64(values) => assemble_i64(values),
+        })
+        .collect();
+    Ok((Field::new(name, output_type, true), columns))
+}
+
+/// The ordered `(view, live position)` runs a positional window walks:
+/// one run for the whole snapshot when unpartitioned, else one per
+/// distinct partition key.
+fn value_runs(
+    schema: &Schema,
+    views: &[&SegmentView],
+    partition_by: Option<&str>,
+) -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
+    let Some(partition_column) = partition_by else {
+        let mut run = Vec::new();
+        for (view_index, view) in views.iter().enumerate() {
+            for live_position in 0..view.live_rows() {
+                run.push((view_index, live_position));
+            }
+        }
+        return Ok(vec![run]);
+    };
+    let (index, _) = resolve(schema, partition_column)?;
+    let mut unified: HashMap<String, usize> = HashMap::new();
+    let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
+    for (view_index, view) in views.iter().enumerate() {
+        let Column::Key(keys) = &view.segment.batch().columns()[index] else {
+            return Err(QueryError::TypeError(format!(
+                "PARTITION BY '{partition_column}' must be a key column"
+            )));
+        };
+        let any_live_null =
+            keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row));
+        if any_live_null {
+            return Err(QueryError::Unsupported(format!(
+                "PARTITION BY '{partition_column}' has nulls (unsupported as a partition key)"
+            )));
+        }
+        let dictionary = keys.dictionary();
+        let remap: Vec<usize> = (0..dictionary.len() as u32)
+            .map(|code| {
+                let next = unified.len();
+                *unified
+                    .entry(dictionary.value(code).to_owned())
+                    .or_insert(next)
+            })
+            .collect();
+        while runs.len() < unified.len() {
+            runs.push(Vec::new());
+        }
+        let codes = keys.codes().as_slice();
+        for (live_position, row) in live_rows(view).enumerate() {
+            runs[remap[codes[row] as usize]].push((view_index, live_position));
+        }
+    }
+    Ok(runs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2287,6 +2482,15 @@ fn assemble_f64(results: Vec<Option<f64>>) -> Column {
     let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
     let values: Buffer<f64> = results.into_iter().map(|v| v.unwrap_or(0.0)).collect();
     assemble_numeric_f64(values, validity)
+}
+
+/// Materializes an `i64` output column from `i64` results — the
+/// positional-window path (`LAG`/`LEAD` over a `BIGINT` column), where
+/// values are *copied*, never computed, so nothing rounds.
+fn assemble_i64(results: Vec<Option<i64>>) -> Column {
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<i64> = results.into_iter().map(|v| v.unwrap_or(0)).collect();
+    assemble_numeric_i64(values, validity)
 }
 
 /// Materializes an `i64` output column from integral `f64` results — the
