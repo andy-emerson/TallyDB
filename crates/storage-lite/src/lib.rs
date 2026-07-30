@@ -111,7 +111,7 @@ pub mod tombstone;
 pub use codec::{Codec, CodecError};
 pub use format::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, Manifest,
-    ManifestSections,
+    ManifestSections, SegmentRecord, SequenceSummary,
 };
 pub use io::{FsBackend, IoError, LogWriter, MemBackend, StorageBackend};
 pub use mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};

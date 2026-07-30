@@ -391,6 +391,7 @@ fn sectioned_manifest_round_trips_and_v1_stays_byte_identical() {
     let v1 = encode_manifest(&schema, 0, 3, &empty);
     assert_eq!(&v1[8..10], &1u16.to_le_bytes(), "empty sections stay v1");
     let sections = ManifestSections {
+        segments: Vec::new(),
         next_sequence: Some(7_000),
         history: vec!["seg-g0000000001-00000000000000000000.tlyseg".to_owned()],
     };
@@ -404,12 +405,99 @@ fn sectioned_manifest_round_trips_and_v1_stays_byte_identical() {
 }
 
 #[test]
+fn segment_records_round_trip_with_every_zone_map_and_sequence_shape() {
+    // Tag 1 (the residency design, 2026-07-30): each record carries the
+    // metadata an open prunes and folds on. The fixture spans every
+    // sequence summary and every zone-map state, the all-NaN f64 zone
+    // included — that one cannot be compared with `==` (NaN != NaN), so
+    // determinism is checked at the byte level: re-encoding the decode
+    // reproduces the bytes exactly.
+    use storage_lite::{SegmentRecord, SequenceSummary, ZoneMap};
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("x", ColumnType::F64, true),
+        Field::new("sym", ColumnType::Key, false),
+    ]);
+    let sections = ManifestSections {
+        segments: vec![
+            SegmentRecord {
+                name: "seg-g0000000000-00000000000000000000.tlyseg".to_owned(),
+                base_row_id: 0,
+                rows: 4,
+                ordered: true,
+                sequence: SequenceSummary::RowIds,
+                zone_maps: vec![
+                    Some(ZoneMap::I64 { min: 10, max: 40 }),
+                    Some(ZoneMap::F64 {
+                        min: -1.5,
+                        max: 9.25,
+                        has_nan: true,
+                    }),
+                    None,
+                ],
+            },
+            SegmentRecord {
+                name: "seg-g0000000000-00000000000000000004.tlyseg".to_owned(),
+                base_row_id: 4,
+                rows: 2,
+                ordered: false,
+                sequence: SequenceSummary::Contiguous { base: 9 },
+                // An all-null i64 column and an all-NaN f64 column.
+                zone_maps: vec![
+                    None,
+                    Some(ZoneMap::F64 {
+                        min: f64::NAN,
+                        max: f64::NAN,
+                        has_nan: true,
+                    }),
+                    None,
+                ],
+            },
+            SegmentRecord {
+                name: "seg-g0000000000-00000000000000000006.tlyseg".to_owned(),
+                base_row_id: 6,
+                rows: 3,
+                ordered: true,
+                sequence: SequenceSummary::Explicit { end: 17 },
+                zone_maps: vec![
+                    Some(ZoneMap::I64 { min: -5, max: -5 }),
+                    Some(ZoneMap::F64 {
+                        min: 0.0,
+                        max: 0.0,
+                        has_nan: false,
+                    }),
+                    None,
+                ],
+            },
+        ],
+        next_sequence: None,
+        history: Vec::new(),
+    };
+    let bytes = encode_manifest(&schema, 0, 0, &sections);
+    assert_eq!(&bytes[8..10], &2u16.to_le_bytes(), "records are v2");
+    let decoded = decode_manifest(&bytes).unwrap();
+    assert_eq!(decoded.sections.segments.len(), 3);
+    // Scalar fields compare directly; the NaN-carrying maps via bytes.
+    for (decoded, original) in decoded.sections.segments.iter().zip(&sections.segments) {
+        assert_eq!(decoded.name, original.name);
+        assert_eq!(decoded.base_row_id, original.base_row_id);
+        assert_eq!(decoded.rows, original.rows);
+        assert_eq!(decoded.ordered, original.ordered);
+        assert_eq!(decoded.sequence, original.sequence);
+        assert_eq!(decoded.sequence_end(), original.sequence_end());
+    }
+    let reencoded = encode_manifest(&schema, 0, 0, &decoded.sections);
+    assert_eq!(bytes, reencoded, "decode-encode reproduces every byte");
+}
+
+#[test]
 fn unknown_manifest_sections_are_skipped_whole() {
     // The forward-compatibility contract: a reader ignores tags it
-    // does not know (zone maps arrive later under tag 1), so sections
-    // fill in over time without a version bump.
+    // does not know, so sections fill in over time without a version
+    // bump — segment records (tag 1) arrived exactly this way.
     let schema = Schema::new(vec![Field::new("ts", ColumnType::I64, false)]);
     let sections = ManifestSections {
+        segments: Vec::new(),
         next_sequence: Some(41_520),
         history: Vec::new(),
     };

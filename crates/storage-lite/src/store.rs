@@ -681,19 +681,26 @@ impl Store {
     /// Refresh by [`Store::refresh`]; today that re-reads and
     /// re-decodes the whole state (segment-lazy open is F3, tracked).
     pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
+        let mut missing = String::new();
         for _ in 0..8 {
             match Store::load_read_only(backend.clone()) {
                 Ok(store) => return Ok(store),
                 // A compaction moved the generation mid-scan: a named
                 // object vanished. The next manifest read names the
                 // complete new generation — go again.
-                Err(StorageError::Io(IoError::NotFound(_))) => continue,
+                Err(StorageError::Io(IoError::NotFound(name))) => missing = name,
                 Err(error) => return Err(error),
             }
         }
-        Err(StorageError::Misuse(
-            "read-only open kept racing generation changes; retry".to_owned(),
-        ))
+        // Eight straight misses on a manifest-named object is either a
+        // writer compacting continuously (rare, resolved by retrying)
+        // or an object the store has actually lost — say which object,
+        // so the second case is diagnosable.
+        Err(StorageError::Misuse(format!(
+            "read-only open kept racing generation changes ('{missing}' \
+             stayed unreadable); retry — if this persists with an idle \
+             writer, the store has lost that object"
+        )))
     }
 
     /// Re-reads the durable state (read-only stores only): new flushed
@@ -729,6 +736,32 @@ impl Store {
         Ok(())
     }
 
+    /// Checks a manifest segment record against the segment it names.
+    /// The two are written from the same in-memory segment, so any
+    /// disagreement on the load-bearing scalars — where the rows sit
+    /// and where their sequences end, the numbers open-time folds run
+    /// on — is corruption the per-file checksums cannot see (each file
+    /// is internally consistent; the *pair* is not).
+    fn verify_record(
+        record: &crate::format::SegmentRecord,
+        segment: &Segment,
+    ) -> Result<(), StorageError> {
+        let rows = segment.batch().num_rows() as u64;
+        if record.base_row_id != segment.base_row_id()
+            || record.rows != rows
+            || record.ordered != segment.is_ordered()
+            || record.sequence_end() != segment.sequence_end()
+        {
+            return Err(StorageError::SchemaMismatch {
+                reason: format!(
+                    "segment '{}' disagrees with its manifest record",
+                    record.name
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn load_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
         let manifest = decode_manifest(&backend.read(MANIFEST)?)?;
         let schema = manifest.schema.clone();
@@ -739,8 +772,11 @@ impl Store {
         store.manifest_sections = manifest.sections;
         let mut segments = Vec::new();
         // Delete logs are held back until the segment watermark is
-        // known: the supersession-visibility rule needs it.
+        // known: the supersession-visibility rule needs it. They are
+        // always discovered by listing — logs commit between manifest
+        // writes, so the manifest cannot name them.
         let mut logs: Vec<DeleteLog> = Vec::new();
+        let recorded_layout = !store.manifest_sections.segments.is_empty();
         for name in backend.list()? {
             if name
                 .strip_prefix(&delete_log_prefix(generation))
@@ -750,7 +786,9 @@ impl Store {
                 logs.push(decode_tombstones(&backend.read(&name)?)?);
                 continue;
             }
-            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+            if recorded_layout
+                || !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg"))
+            {
                 continue;
             }
             let segment = decode_segment(&backend.read(&name)?)?;
@@ -760,6 +798,25 @@ impl Store {
                 });
             }
             segments.push(Arc::new(segment));
+        }
+        if recorded_layout {
+            // The manifest names the layout: read exactly those files.
+            // A named file that has vanished is a compaction moving the
+            // generation mid-read — the NotFound surfaces to the open's
+            // bounded retry, which re-reads the manifest atomically.
+            for record in &store.manifest_sections.segments {
+                let segment = decode_segment(&backend.read(&record.name)?)?;
+                if segment.batch().schema() != &store.schema {
+                    return Err(StorageError::SchemaMismatch {
+                        reason: format!(
+                            "segment '{}' was written under a different schema",
+                            record.name
+                        ),
+                    });
+                }
+                Self::verify_record(record, &segment)?;
+                segments.push(Arc::new(segment));
+            }
         }
         segments.sort_by_key(|segment| segment.base_row_id());
         let mut expected_base = 0u64;
@@ -914,6 +971,15 @@ impl Store {
         let mut tombstones = BTreeMap::new();
         let mut committed_supersessions: BTreeSet<u64> = BTreeSet::new();
         let mut next_sequence = 0u64;
+        // Whether the manifest names the segments (tag 1). When it
+        // does, it is authoritative: reopen reads exactly the named
+        // files, and a stray segment file — a crash between a flush's
+        // segment write and its manifest write — is invisible (its
+        // rows are still in the WAL, replayed below). Without the
+        // section (an older writer's manifest) the backend scan is the
+        // list, as it always was, and the section is earned right after
+        // the load so the next open takes the short path.
+        let recorded_layout = !store.manifest_sections.segments.is_empty();
         for name in backend.list()? {
             // Objects from other generations are a crashed compaction's
             // leftovers — invisible here, removed by the next compaction.
@@ -932,7 +998,9 @@ impl Store {
                 next_sequence = next_sequence.max(sequence + 1);
                 continue;
             }
-            if !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg")) {
+            if recorded_layout
+                || !(name.starts_with(&segment_prefix(generation)) && name.ends_with(".tlyseg"))
+            {
                 continue;
             }
             let segment = decode_segment(&backend.read(&name)?)?;
@@ -947,6 +1015,38 @@ impl Store {
                 });
             }
             segments.push(Arc::new(segment));
+        }
+        if recorded_layout {
+            for record in &store.manifest_sections.segments {
+                // The writer holds the directory lock, so no compaction
+                // can be moving the generation under it: a named file
+                // that is absent is lost rows, not a race.
+                let bytes = match backend.read(&record.name) {
+                    Ok(bytes) => bytes,
+                    Err(IoError::NotFound(_)) => {
+                        return Err(StorageError::MissingRows {
+                            expected_base: record.base_row_id,
+                        })
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let segment = decode_segment(&bytes)?;
+                if segment.batch().schema() != &store.schema {
+                    return Err(StorageError::SchemaMismatch {
+                        reason: format!(
+                            "segment '{}' was written under a different schema",
+                            record.name
+                        ),
+                    });
+                }
+                if segment.ordering_key() != ordering_key {
+                    return Err(StorageError::SchemaMismatch {
+                        reason: format!("segment '{}' orders on a different column", record.name),
+                    });
+                }
+                Self::verify_record(record, &segment)?;
+                segments.push(Arc::new(segment));
+            }
         }
         segments.sort_by_key(|segment| segment.base_row_id());
         let mut expected_base = 0u64;
@@ -1028,6 +1128,32 @@ impl Store {
         store.delete_log_sequence = next_sequence;
         store.generation = generation;
         store.backend = Some(backend);
+        // A legacy manifest (no tag 1) earns its segment records now —
+        // derived from the segments just decoded, named by the same
+        // deterministic rule that wrote them — so the next open reads
+        // exactly the named files.
+        if !recorded_layout {
+            let records: Vec<crate::format::SegmentRecord> = lock(&store.shared)
+                .segments
+                .iter()
+                .map(|segment| {
+                    crate::format::SegmentRecord::of(
+                        segment_name(generation, segment.base_row_id()),
+                        segment,
+                    )
+                })
+                .collect();
+            if !records.is_empty() {
+                let mut sections = store.manifest_sections.clone();
+                sections.segments = records;
+                let backend = store.backend.as_ref().expect("just installed");
+                backend.write(
+                    MANIFEST,
+                    &encode_manifest(&store.schema, ordering_key, generation, &sections),
+                )?;
+                store.manifest_sections = sections;
+            }
+        }
         store.replay_wal(&committed_supersessions)?;
         Ok(store)
     }
@@ -1352,10 +1478,23 @@ impl Store {
             }
         };
         if let Some(backend) = &self.backend {
+            let name = segment_name(self.generation, segment.base_row_id());
+            backend.write(&name, &encode_segment(&segment))?;
+            // The manifest names the segment (tag 1) — written after the
+            // segment so a crash between the two leaves an orphan file
+            // the manifest never adopted (its rows still in the WAL),
+            // and before the WAL reset so the log is only truncated once
+            // the layout that covers it is committed. Adopted in memory
+            // only after the write succeeds, like compaction's commit.
+            let mut sections = self.manifest_sections.clone();
+            sections
+                .segments
+                .push(crate::format::SegmentRecord::of(name, &segment));
             backend.write(
-                &segment_name(self.generation, segment.base_row_id()),
-                &encode_segment(&segment),
+                MANIFEST,
+                &encode_manifest(&self.schema, self.ordering_key, self.generation, &sections),
             )?;
+            self.manifest_sections = sections;
         }
         // Built before the lock so adoption below cannot fail partway.
         let fresh = WriteBuffer::new(self.schema.clone(), self.ordering_key)?;
@@ -1762,6 +1901,18 @@ impl Store {
         // Persist the next generation and commit it atomically.
         if let Some(backend) = &self.backend {
             let next = self.generation + 1;
+            // The new generation's segment records, in base order — the
+            // manifest is the authoritative segment list (tag 1), so the
+            // commit below publishes layout and metadata in one write.
+            sections.segments = new_segments
+                .iter()
+                .map(|segment| {
+                    crate::format::SegmentRecord::of(
+                        segment_name(next, segment.base_row_id()),
+                        segment,
+                    )
+                })
+                .collect();
             // Pre-clean: a compaction that crashed after writing some
             // next-generation objects left strays under exactly this
             // generation — and possibly `hist-` files the manifest never

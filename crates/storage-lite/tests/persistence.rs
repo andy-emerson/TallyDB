@@ -188,6 +188,84 @@ fn missing_segment_is_loud() {
 }
 
 #[test]
+fn the_manifest_names_the_segments_and_a_stray_file_is_invisible() {
+    // The residency design (2026-07-30): the manifest's segment records
+    // (tag 1) are the authoritative layout. A stray segment file — a
+    // crash between a flush's segment write and its manifest write —
+    // is never adopted and never even read: reopen loads exactly the
+    // named files. The stray here is unreadable garbage, which is what
+    // proves it was ignored rather than decoded.
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..4); // two flushed segments
+        }
+        backend
+            .write("seg-g0000000000-00000000000000000004.tlyseg", b"garbage")
+            .unwrap();
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+        assert_eq!(store.len(), 4);
+        assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
+    // A manifest from a writer older than tag 1 names no segments;
+    // reopen falls back to scanning the backend (the original
+    // behavior), then writes the records so the next open takes the
+    // authoritative path. A read-only open on the legacy manifest works
+    // through the same fallback — without writing anything.
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..4);
+        }
+        // Rewind the manifest to its pre-records form.
+        let manifest = storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        assert!(
+            !manifest.sections.segments.is_empty(),
+            "records were written"
+        );
+        let mut legacy = manifest.sections.clone();
+        legacy.segments = Vec::new();
+        backend
+            .write(
+                "table.tlym",
+                &storage_lite::encode_manifest(
+                    &manifest.schema,
+                    manifest.ordering_key,
+                    manifest.generation,
+                    &legacy,
+                ),
+            )
+            .unwrap();
+        // A reader sees the rows through the scan fallback, read-only.
+        {
+            let reader = Store::open_read_only(backend.clone()).unwrap();
+            assert_eq!(reader.live_len(), 4);
+            let after =
+                storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+            assert!(
+                after.sections.segments.is_empty(),
+                "a read-only open writes nothing"
+            );
+        }
+        // The writer adopts by scan and earns the section.
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+        assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+        let upgraded = storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        assert_eq!(
+            upgraded.sections.segments.len(),
+            2,
+            "reopen recorded the layout it scanned"
+        );
+    });
+}
+
+#[test]
 fn corrupt_segment_is_loud() {
     each_backend(|backend| {
         {

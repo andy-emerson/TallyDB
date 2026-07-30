@@ -491,3 +491,108 @@ fn measure_wal_regimes() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A backend that fails every manifest write once armed — the crash
+/// injection for the window a flush opens between publishing a segment
+/// file and the manifest write that adopts it (tag 1, the residency
+/// design 2026-07-30).
+struct FailManifestWrites {
+    inner: Arc<dyn StorageBackend>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl StorageBackend for FailManifestWrites {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), storage_lite::IoError> {
+        if name == "table.tlym" && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(storage_lite::IoError::Backend(
+                "injected: manifest write lost".to_owned(),
+            ));
+        }
+        self.inner.write(name, bytes)
+    }
+    fn read(&self, name: &str) -> Result<Vec<u8>, storage_lite::IoError> {
+        self.inner.read(name)
+    }
+    fn list(&self) -> Result<Vec<String>, storage_lite::IoError> {
+        self.inner.list()
+    }
+    fn remove(&self, name: &str) -> Result<(), storage_lite::IoError> {
+        self.inner.remove(name)
+    }
+    fn open_log(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn storage_lite::LogWriter>, storage_lite::IoError> {
+        self.inner.open_log(name)
+    }
+}
+
+#[test]
+fn a_crash_between_the_segment_write_and_its_manifest_write_loses_nothing() {
+    // The flush order is segment file, then the manifest that names it,
+    // then the WAL reset. A crash between the first two leaves an
+    // orphan segment file the manifest never adopted — and every one of
+    // its rows still in the WAL, because the reset never ran. Reopen
+    // must serve each row exactly once: the orphan is invisible, the
+    // WAL replays, and the re-flush overwrites the orphan under the
+    // same deterministic name.
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    let failing = Arc::new(FailManifestWrites {
+        inner: inner.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    {
+        let backend: Arc<dyn StorageBackend> = failing.clone();
+        let mut store = Store::persistent_with(
+            backend,
+            schema(),
+            0,
+            StoreOptions {
+                segment_rows: Some(4),
+                wal_sync: WalSync::Full,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        append_n(&mut store, 0..3);
+        failing
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The fourth append reaches the threshold; its flush writes the
+        // segment file and then dies on the manifest write.
+        let result = store.append(&[RowValue::I64(3), RowValue::Key("B"), RowValue::F64(1.5)]);
+        assert!(result.is_err(), "the injected manifest failure surfaces");
+        std::mem::forget(store); // crash: drop never runs
+    }
+    // The window was real: the orphan segment file exists on disk...
+    assert!(
+        inner
+            .list()
+            .unwrap()
+            .iter()
+            .any(|name| name.starts_with("seg-")),
+        "the segment file was published before the manifest failure"
+    );
+    // ...and the manifest never adopted it.
+    let manifest = storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+    assert!(manifest.sections.segments.is_empty(), "no record adopted");
+    // Reopen on the healed backend: all four rows, exactly once.
+    let mut store = Store::persistent_with(
+        inner.clone(),
+        schema(),
+        0,
+        StoreOptions {
+            segment_rows: Some(4),
+            wal_sync: WalSync::Full,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(store.len(), 4);
+    assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+    // And the store is fully live: the next flush adopts the layout.
+    store.flush().unwrap();
+    let manifest = storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+    assert_eq!(manifest.sections.segments.len(), 1);
+    assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+}
