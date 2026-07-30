@@ -37,7 +37,7 @@
 //! decision #6 accepted).
 
 use crate::plan::{
-    AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
+    AggCall, AggFunction, AggItem, ArithOp, Frame, OrderBy, Plan, PlanItem, Projection, QueryError,
     ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
@@ -707,7 +707,7 @@ fn project_items(
                 args,
                 partition_by,
                 order_by,
-                preceding,
+                frame,
                 alias,
             } => window_aggregate(
                 schema,
@@ -717,7 +717,7 @@ fn project_items(
                 args,
                 partition_by.as_deref(),
                 order_by,
-                *preceding,
+                *frame,
                 alias.as_deref(),
             )?,
             PlanItem::WindowValue {
@@ -1545,9 +1545,24 @@ fn window_aggregate(
     arg_names: &[String],
     partition_by: Option<&str>,
     order_by: &str,
-    preceding: Option<usize>,
+    frame: Frame,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // RANGE frames are lowered but not yet executed: their bounds are
+    // value spans whose row counts vary, and — because standard SQL
+    // ends a RANGE frame at the current row's *last peer* — they are
+    // not even trailing in row-index terms. The executor's sweeps take
+    // a uniform row count, so RANGE is refused here rather than
+    // silently reinterpreted as ROWS, which would be a wrong answer on
+    // any table with tied ordering keys.
+    let preceding = match frame {
+        Frame::Rows(preceding) => preceding,
+        Frame::Range(_) => {
+            return Err(QueryError::Unsupported(
+                "RANGE frames are parsed but not yet executed — use ROWS for now".to_owned(),
+            ))
+        }
+    };
     // The embedder's registry wins (explicit beats implicit); the
     // standard aggregates are always available as window functions.
     let builtin;

@@ -105,9 +105,8 @@ pub enum PlanItem {
         partition_by: Option<String>,
         /// ORDER BY column — must be the data's ordering key.
         order_by: String,
-        /// Frame start: this many rows preceding (`None` = UNBOUNDED
-        /// PRECEDING), through the current row.
-        preceding: Option<usize>,
+        /// What rows the frame covers (see [`Frame`]).
+        frame: Frame,
         /// Output name, if aliased.
         alias: Option<String>,
     },
@@ -129,6 +128,23 @@ pub enum PlanItem {
         /// Output name, if aliased.
         alias: Option<String>,
     },
+}
+
+/// A window's frame — what rows one output row sees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Frame {
+    /// `ROWS BETWEEN n PRECEDING AND CURRENT ROW`, `None` = UNBOUNDED:
+    /// a **row count**, uniform across the column.
+    Rows(Option<usize>),
+    /// `RANGE BETWEEN v PRECEDING AND CURRENT ROW`: every row whose
+    /// ordering key is within `v` of the current row's — a **value**
+    /// span, so the row count varies from row to row.
+    ///
+    /// The bound is in the ordering key's own units (there is no
+    /// `INTERVAL` type — a five-minute span over nanosecond stamps is
+    /// `300000000000`), and it is unsigned because a frame extends
+    /// backward from the current row.
+    Range(u64),
 }
 
 /// A scalar arithmetic operator.
@@ -2017,13 +2033,13 @@ fn lower_window_call(
         });
     }
     let args = lower_args(&function.args)?;
-    let preceding = lower_frame(spec.window_frame.as_ref())?;
+    let frame = lower_frame(spec.window_frame.as_ref())?;
     Ok(PlanItem::WindowAgg {
         function: name,
         args,
         partition_by,
         order_by: ident(order_column),
-        preceding,
+        frame,
         alias,
     })
 }
@@ -2098,20 +2114,22 @@ fn lower_offset_args(
     Ok((column, offset.unwrap_or(1)))
 }
 
-/// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW`;
-/// `None` is the unbounded start.
-fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryError> {
+/// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW` and
+/// `RANGE BETWEEN <v> PRECEDING AND CURRENT ROW`. `GROUPS` is refused —
+/// it needs peer-group semantics nothing here has.
+fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Frame, QueryError> {
     let Some(frame) = frame else {
         return Err(QueryError::Unsupported(
             "window without a frame (write ROWS BETWEEN n PRECEDING AND CURRENT ROW)".to_owned(),
         ));
     };
-    if frame.units != ast::WindowFrameUnits::Rows {
+    if frame.units == ast::WindowFrameUnits::Groups {
         return Err(QueryError::Unsupported(
-            "RANGE / GROUPS frames (ROWS only)".to_owned(),
+            "GROUPS frames (ROWS or RANGE)".to_owned(),
         ));
     }
-    let preceding = match &frame.start_bound {
+    let range = frame.units == ast::WindowFrameUnits::Range;
+    let bound = match &frame.start_bound {
         ast::WindowFrameBound::Preceding(None) => None, // UNBOUNDED
         ast::WindowFrameBound::Preceding(Some(preceding)) => {
             let ast::Expr::Value(value) = preceding.as_ref() else {
@@ -2124,11 +2142,7 @@ fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryE
                     "frame bound must be a literal number".to_owned(),
                 ));
             };
-            Some(
-                number
-                    .parse::<usize>()
-                    .map_err(|_| QueryError::Unsupported(format!("frame bound '{number}'")))?,
-            )
+            Some(number.clone())
         }
         _ => {
             return Err(QueryError::Unsupported(
@@ -2136,11 +2150,31 @@ fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryE
             ))
         }
     };
-    match &frame.end_bound {
-        Some(ast::WindowFrameBound::CurrentRow) => Ok(preceding),
-        _ => Err(QueryError::Unsupported(
+    if !matches!(frame.end_bound, Some(ast::WindowFrameBound::CurrentRow)) {
+        return Err(QueryError::Unsupported(
             "frame must end at CURRENT ROW".to_owned(),
-        )),
+        ));
+    }
+    if range {
+        // UNBOUNDED PRECEDING under RANGE is the whole run either way —
+        // the row count and the value span agree — so it lowers to the
+        // ROWS form and keeps that path's incremental sweep.
+        let Some(number) = bound else {
+            return Ok(Frame::Rows(None));
+        };
+        let span = number.parse::<u64>().map_err(|_| {
+            QueryError::Unsupported(format!(
+                "RANGE bound '{number}' must be a non-negative integer in the \
+                 ordering key's own units (there is no INTERVAL type)"
+            ))
+        })?;
+        return Ok(Frame::Range(span));
+    }
+    match bound {
+        None => Ok(Frame::Rows(None)),
+        Some(number) => Ok(Frame::Rows(Some(number.parse::<usize>().map_err(
+            |_| QueryError::Unsupported(format!("frame bound '{number}'")),
+        )?))),
     }
 }
 
@@ -2208,7 +2242,7 @@ mod tests {
                     args: vec!["y".into(), "x".into()],
                     partition_by: Some("sym".into()),
                     order_by: "ts".into(),
-                    preceding: Some(19),
+                    frame: Frame::Rows(Some(19)),
                     alias: Some("beta".into()),
                 },
             ])
@@ -2228,7 +2262,7 @@ mod tests {
                 args: vec!["x".into()],
                 partition_by: None,
                 order_by: "ts".into(),
-                preceding: Some(2),
+                frame: Frame::Rows(Some(2)),
                 alias: None,
             }])
         );
@@ -2297,6 +2331,40 @@ mod tests {
     }
 
     #[test]
+    fn a_range_frame_parses_into_its_own_frame_kind() {
+        // RANGE lowers to a value span rather than a row count. The
+        // executor refuses it for now (its frames are not trailing —
+        // standard SQL ends a RANGE frame at the current row's last
+        // peer), but the planner must carry the distinction so that
+        // refusal is not silently reinterpreted as ROWS.
+        let ranged = plan(
+            "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 300 PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .unwrap();
+        let Projection::Items(items) = &ranged.projection else {
+            panic!("items")
+        };
+        let PlanItem::WindowAgg { frame, .. } = &items[0] else {
+            panic!("window")
+        };
+        assert_eq!(*frame, Frame::Range(300));
+        // UNBOUNDED PRECEDING means the whole run either way, so it
+        // lowers to the ROWS form and keeps that path's sweep.
+        let unbounded = plan(
+            "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t",
+        )
+        .unwrap();
+        let Projection::Items(items) = &unbounded.projection else {
+            panic!("items")
+        };
+        let PlanItem::WindowAgg { frame, .. } = &items[0] else {
+            panic!("window")
+        };
+        assert_eq!(*frame, Frame::Rows(None));
+    }
+
+    #[test]
     fn rejections_name_the_construct() {
         for (sql, needle) in [
             ("SELECT * FROM t", "wildcard"),
@@ -2327,8 +2395,8 @@ mod tests {
             // execution, where the registry lives — tested in engine)
             ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
             (
-                "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
-                "ROWS only",
+                "SELECT sum(x) OVER (ORDER BY ts GROUPS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
+                "GROUPS frames",
             ),
             ("SELECT sum(x) OVER (ORDER BY ts) FROM t", "without a frame"),
             ("INSERT INTO t VALUES (1)", "entry points"), // supported, elsewhere
