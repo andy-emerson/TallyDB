@@ -53,38 +53,54 @@ the default), #88 (streaming scans — unpruned full-table working
 set). Local toolchain **Rust 1.97.1** matching CI — keep it current
 so the gate sees what CI sees.
 
-### The Human's current plan (set 2026-07-30, replaces the old steps 8–10)
+### The plan (amended by the Human 2026-07-30, after step 1 landed)
+
+The research steps are **done for now**: step 1 shipped, and the
+Human deferred steps 3–6 ("enough research-grade stuff for today").
+The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
 
 1. ~~**Tables bigger than memory**~~ — DONE. Ruled 2026-07-30
    (option b; metadata home = manifest section; (c) + budget
    semantics + default deferred to #87) and built the same day —
    see the snapshot above and DESIGN.md *The residency design*.
-2. **Check with the Human.** ← WE ARE HERE.
-3. **Continuous queries (#83)** — true research: incremental view
-   maintenance under tombstones, corrections, and the knowledge
-   axis. The issue itself records: **needs a Plan conversation
-   before any build** — which query shapes are maintainable, and
-   what happens to a maintained result when its input is corrected.
-   Step 3 opens with that conversation.
-4. **Check with the Human.**
-5. **Incremental multi-factor (M5.4's deep end)** — K > 2 rolling
-   OLS incrementally (sliding-window factorization up/downdating is
-   the research; catastrophic-cancellation control per the existing
-   compensated-truth guard). Safety net: per-frame recompute on faer
-   ships the feature correct regardless — the research buys the
-   speed win. SQL surface per #77.2: scalar reductions only.
-6. **Check with the Human.**
-7. **M5.0–M5.4** per the recorded table: M5.0 streaming primitives
-   (rolling var/stddev, expanding, lag/diff/shift, returns, EWMA —
-   incremental compensated; NumPy oracle + bench per op; prelude
-   ships here, compiled-in per #77.3); M5.1 `LAG`/`LEAD` + `RANGE`
-   frames (DuckDB differential); M5.2 the as-of join as ruled (#65
-   hybrid); M5.3 bucketing (F1 = d, monotone ordering-key arithmetic
-   in GROUP BY) + `FIRST`/`LAST` **ruled (a)** + cross-sectional
-   partitioning; M5.4 matrix tier on faer (absorbs step 5's result).
-8. **Code pass** (repo-wide review + fixes).
-9. **Doc pass** (truth then clarity; README claims at evidence).
-10. **Merge** (the Human).
+   Proposed as PR #89; the Human merges.
+2. **M5.0–M5.4** ← NEXT, once #89 merges and `claude/dev` restarts
+   from the new `main`. Every design decision it needs is closed:
+   - **M5.0 streaming primitives** (#77 tranche 2a): rolling
+     var/stddev, expanding aggregates, lag/diff/shift, log/simple
+     returns, EWMA — O(n) incremental on the re-anchored compensated
+     discipline; NumPy oracle + bench row per op. **SQL surface per
+     #77.1 = (a)**: only standard-named ops reach SQL (`var_pop`,
+     `stddev_pop`); EWMA/`diff`/multi-factor stay script-side until
+     individually named. The **prelude ships here, compiled into the
+     binary with `.prelude` printing its source** (#77.3 = a).
+   - **M5.1** `LAG`/`LEAD` + `RANGE` frames — standard names, so in
+     by the #77.1 rule; DuckDB differential.
+   - **M5.2** the as-of join exactly as ruled (#65 hybrid): `ASOF`
+     lifted pre-parse by byte span, `ON` only, ordering keys are the
+     time axis (explicit inequality validated, not obeyed), bare
+     `ASOF JOIN` refused, no `TOLERANCE`. Ordered co-walk gated on
+     `is_ordered()` both sides. DuckDB differential + the
+     vanilla-SQL definitional reference.
+   - **M5.3** bucketing (F1 = d: monotone integer arithmetic on the
+     ordering key in `GROUP BY`, streaming O(1)) + `FIRST`/`LAST`
+     **ruled (a)** + cross-sectional partitioning.
+   - **M5.4** the matrix tier on faer — **SQL gets scalar reductions
+     only** (#77.2 = c): R², residual, fitted; vectors/matrices via
+     API and scripts. Per-frame recompute ships it correct; the
+     incremental up/downdating research is deferred (below).
+3. **Code pass** (repo-wide review + fixes).
+4. **Doc pass** (truth then clarity; README claims at evidence).
+5. **Merge** (the Human).
+
+**Deferred, not dropped** (the Human's research steps 3–6, to be
+rescheduled): **continuous queries (#83)** — opens with the Plan
+conversation the issue requires (which query shapes are maintainable;
+what a maintained result does when its input is corrected), never
+with code. **Incremental multi-factor** — K > 2 rolling OLS by
+sliding-window factorization up/downdating, with per-frame faer
+recompute as the shipped-correct safety net; it is M5.4's deep end,
+so M5.4 lands without it and gains it later.
 
 ### Rulings landed since the M5 ruling batch
 
