@@ -68,6 +68,7 @@ mod driver;
 mod ffi;
 mod host;
 mod log;
+mod prelude;
 mod state;
 mod values;
 mod vector;
@@ -75,6 +76,7 @@ mod vector;
 pub use driver::{ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 pub use host::HostFunction;
 pub use log::LogSink;
+pub use prelude::{PRELUDE, PRELUDE_NAMES};
 pub use state::{Chunk, LuaState};
 pub use values::{ColumnView, OutputColumn, ReturnType, ScalarValue};
 

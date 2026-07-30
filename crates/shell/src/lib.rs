@@ -306,6 +306,12 @@ impl Console {
                 }
                 Ok(Outcome::Note("flushed".to_owned()))
             }
+            "prelude" => {
+                // #77.3 (a): the prelude is compiled into the binary,
+                // and this prints its source — the read-copy-modify
+                // value of a shipped file, with no file to lose.
+                Ok(Outcome::Note(engine::PRELUDE.trim_end().to_owned()))
+            }
             "tables" => Ok(Outcome::Note(self.tables().join("\n"))),
             "schema" => {
                 let names = if argument.is_empty() {
@@ -639,9 +645,9 @@ fn render_schema(name: &str, schema: &Schema, ordering_key: &str) -> String {
 pub const HELP: &str = "\
 Statements end with ';' and may span lines. SQL surface: SELECT (WHERE,
 GROUP BY/HAVING, ORDER BY a numeric column [NULLS FIRST|LAST], LIMIT,
-DISTINCT, window functions, scalar expressions, CASE, IS NULL, LIKE on
-symbols), INSERT, UPDATE, DELETE, CREATE TABLE (BIGINT | DOUBLE |
-SYMBOL, one ORDERING KEY column).
+DISTINCT, window functions incl. var_pop/stddev_pop, scalar
+expressions, CASE, IS NULL, LIKE on symbols), INSERT, UPDATE, DELETE,
+CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
 
 Commands:
   .help                     this text
@@ -649,6 +655,9 @@ Commands:
                             the boundary readers and recovery see
   .refresh                  (read-only console) re-read what the writer
                             has flushed; picks up new tables too
+  .prelude                  print the shipped Lua prelude's source —
+                            the compositions (returns, expanding_*,
+                            zscore) every kernel and script can call
   .tables                   list tables
   .schema [TABLE]           show table definitions
   .import FILE TABLE        import a CSV (header row maps columns by name)
@@ -693,6 +702,40 @@ mod tests {
             Outcome::Table(text) => text,
             _ => panic!("expected a table for {line}"),
         }
+    }
+
+    #[test]
+    fn the_prelude_prints_its_source_and_its_functions_run() {
+        // #77.3 (a): compiled in, printable, and — the half that
+        // matters — the printed text is the text that ran, so a user
+        // who copies a line gets what the console is using.
+        let dir = scratch("prelude");
+        let mut console = Console::open(&dir).unwrap();
+        let printed = note(&mut console, ".prelude");
+        assert!(printed.contains("function returns(x)"), "{printed}");
+        assert!(printed.contains("function zscore(x, w)"), "{printed}");
+        assert_eq!(printed, engine::PRELUDE.trim_end());
+        // And they are callable: a scalar kernel composed from the
+        // prelude runs over a real table.
+        note(
+            &mut console,
+            "CREATE TABLE px (ts BIGINT ORDERING KEY, sym SYMBOL NOT NULL, v DOUBLE);",
+        );
+        note(
+            &mut console,
+            "INSERT INTO px VALUES (1,'A',2.0),(2,'A',4.0),(3,'A',8.0),(4,'A',16.0);",
+        );
+        note(&mut console, ".luascalar ret(v) return returns(v)");
+        let rendered = table(&mut console, "SELECT ret(v) AS r FROM px ORDER BY ts;");
+        // Doubling every row: a return of 1 a row, the first NULL
+        // because there is no prior row to return against.
+        assert!(rendered.contains("NULL"), "{rendered}");
+        let ones = rendered
+            .lines()
+            .filter(|line| line.trim() == "1" || line.trim() == "1.0")
+            .count();
+        assert_eq!(ones, 3, "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

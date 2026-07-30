@@ -86,7 +86,7 @@ mod script;
 pub mod table;
 
 #[cfg(feature = "lua")]
-pub use compute_lua::LogSink;
+pub use compute_lua::{LogSink, PRELUDE};
 pub use database::Database;
 pub use query_lite::{recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate};
 pub use storage_lite::{RowValue, StoreOptions, WalSync};

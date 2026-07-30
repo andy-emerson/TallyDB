@@ -33,16 +33,47 @@
 //!
 //! ## The rolling combinators
 //!
-//! `rolling_sum(x, w)`, `rolling_mean(x, w)`, `rolling_dot(x, y, w)`
-//! (names Lua-side only — SQL spells these with window frames, so
-//! nothing new enters the SQL surface). Frames are trailing, exactly
-//! the SQL shape `ROWS BETWEEN w-1 PRECEDING AND CURRENT ROW`: row `i`
-//! covers the last `min(i+1, w)` elements. Inputs must be dense
-//! (non-NULL) — the same loud rule the curated ops enforce. The sums
-//! run Neumaier-compensated and re-anchor with a fresh window
-//! recompute every `w` steps, the engine's incremental-window
-//! discipline — never the plain cumsum idiom, which is the
-//! catastrophic-cancellation form the engine rejected.
+//! `rolling_sum(x, w)`, `rolling_mean(x, w)`, `rolling_dot(x, y, w)`,
+//! and — since M5.0 — `rolling_var(x, w)` / `rolling_std(x, w)` (names
+//! Lua-side only — SQL spells these with window frames, so nothing new
+//! enters the SQL surface). Frames are trailing, exactly the SQL shape
+//! `ROWS BETWEEN w-1 PRECEDING AND CURRENT ROW`: row `i` covers the
+//! last `min(i+1, w)` elements. Inputs must be dense (non-NULL) — the
+//! same loud rule the curated ops enforce. The sums run
+//! Neumaier-compensated and re-anchor with a fresh window recompute
+//! every `w` steps, the engine's incremental-window discipline — never
+//! the plain cumsum idiom, which is the catastrophic-cancellation form
+//! the engine rejected. The dispersion pair additionally accumulates
+//! about a **shift taken from the data**, for the same reason
+//! `engine`'s pair statistics do.
+//!
+//! ## The series transforms (M5.0)
+//!
+//! `lag(x, k)`, `diff(x)`, `log_returns(x)`, `ewma(x, alpha)`. These
+//! read a whole column and write a whole column — a different shape
+//! from the registry statistics (`var_pop`, `covar_pop`, …), which
+//! reduce one *frame* to one number. Both shapes are reachable from a
+//! kernel; which one a name has is fixed by what it produces.
+//!
+//! None of the four bears a standard SQL name, which is why they live
+//! here and not in the SQL registry (#77.1 = a, ruled 2026-07-29:
+//! SQL exposes only operations with standard names). SQL's `LAG`/`LEAD`
+//! are a *different* thing arriving separately — window functions over
+//! a frame, not column transforms.
+//!
+//! The head rows a transform cannot define come back **NULL**, never
+//! filled with a stand-in: `lag(x, k)` and the differencing pair have
+//! no row to reference before the column's start. `ewma` defines every
+//! row from `y[0] = x[0]`, so it has no NULL head; its recurrence is
+//! the unadjusted `y[i] = α·x[i] + (1−α)·y[i−1]`, the form a live feed
+//! carries in O(1) state.
+//!
+//! Compositions belong in the prelude, not here: simple returns are
+//! `diff(px) / lag(px, 1)`, expanding aggregates are a rolling
+//! combinator at `w = #x`, and a z-score is
+//! `(x - rolling_mean(x, w)) / rolling_std(x, w)`. Each is one
+//! readable line over natives, so nothing per-element runs in the
+//! interpreter.
 
 use crate::ffi;
 use crate::values::{
@@ -488,6 +519,119 @@ unsafe fn window_argument(state: *mut ffi::lua_State, idx: c_int) -> Result<usiz
 const ROLL_SUM: i64 = 1;
 const ROLL_MEAN: i64 = 2;
 const ROLL_DOT: i64 = 3;
+const ROLL_VAR: i64 = 4;
+const ROLL_STD: i64 = 5;
+
+/// The one-column series transforms (M5.0): each reads a whole column
+/// and writes a whole column, unlike the registry statistics, which
+/// reduce one *frame* to one number. `lag`/`diff`/`log_returns` leave
+/// the head undefined (NULL) because the rows they would reference sit
+/// before the column's first row.
+const SERIES_LAG: i64 = 1;
+const SERIES_DIFF: i64 = 2;
+const SERIES_LOG_RETURNS: i64 = 3;
+const SERIES_EWMA: i64 = 4;
+
+/// A positive count argument (`lag`'s distance).
+unsafe fn count_argument(state: *mut ffi::lua_State, idx: c_int) -> Result<usize, ()> {
+    unsafe {
+        let mut is_integer = 0;
+        let count = ffi::lua_tointegerx(state, idx, &mut is_integer);
+        if is_integer == 0 || count < 1 {
+            raise(state, c"the lag distance must be a positive integer");
+            return Err(());
+        }
+        Ok(count as usize)
+    }
+}
+
+/// EWMA's smoothing factor: a number in (0, 1].
+unsafe fn alpha_argument(state: *mut ffi::lua_State, idx: c_int) -> Result<f64, ()> {
+    unsafe {
+        let mut is_number = 0;
+        let alpha = ffi::lua_tonumberx(state, idx, &mut is_number);
+        if is_number == 0 || !(alpha > 0.0 && alpha <= 1.0) {
+            raise(state, c"the EWMA smoothing factor must be in (0, 1]");
+            return Err(());
+        }
+        Ok(alpha)
+    }
+}
+
+/// The one-column series transforms. One native O(n) pass; the head
+/// rows a transform cannot define are marked NULL rather than filled
+/// with a stand-in, so a script cannot mistake "no prior row" for a
+/// value.
+unsafe extern "C" fn series(state: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let op = ffi::lua_tointegerx(state, ffi::lua_upvalueindex(1), std::ptr::null_mut());
+        let Ok(x) = dense_operand(state, 1) else {
+            return 0;
+        };
+        let Some(len) = x.len() else {
+            raise(state, c"series transforms take columns, not scalars");
+            return 0;
+        };
+        // `lag` takes a distance; `ewma` a smoothing factor; the rest
+        // take nothing. The head each one leaves undefined follows.
+        let (back, alpha) = match op {
+            SERIES_LAG => {
+                let Ok(count) = count_argument(state, 2) else {
+                    return 0;
+                };
+                (count, 0.0)
+            }
+            SERIES_EWMA => {
+                let Ok(alpha) = alpha_argument(state, 2) else {
+                    return 0;
+                };
+                (0, alpha)
+            }
+            _ => (1, 0.0),
+        };
+        let out = push_vector(state, len);
+        let dense = dense_f64(x);
+        let value = |offset: usize| -> Result<f64, ()> {
+            match dense {
+                Some(source) => Ok(source.at(offset)),
+                None => Ok(element(state, x, offset)?.expect("dense operand")),
+            }
+        };
+        if op == SERIES_EWMA {
+            // y[0] = x[0]; y[i] = α·x[i] + (1−α)·y[i−1] — the recursive
+            // (unadjusted) form, the one a live feed can carry in O(1)
+            // state. Every row is defined, so no NULL head.
+            let mut previous = 0.0;
+            for offset in 0..len {
+                let Ok(xi) = value(offset) else { return 0 };
+                previous = if offset == 0 {
+                    xi
+                } else {
+                    alpha * xi + (1.0 - alpha) * previous
+                };
+                *out.values.add(offset) = previous;
+            }
+            return 1;
+        }
+        for offset in 0..len {
+            if offset < back {
+                *out.validity.add(offset) = 0; // no row to reference
+                continue;
+            }
+            let (Ok(current), Ok(prior)) = (value(offset), value(offset - back)) else {
+                return 0;
+            };
+            *out.values.add(offset) = match op {
+                SERIES_LAG => prior,
+                SERIES_DIFF => current - prior,
+                // ln(current / prior): the ratio first, so a scale
+                // shared by both rows cancels before the logarithm.
+                _ => (current / prior).ln(),
+            };
+        }
+        1
+    }
+}
 
 /// The rolling core: one native O(n) sweep per call. Trailing frames
 /// (`min(i+1, w)` elements — SQL's `ROWS BETWEEN w-1 PRECEDING AND
@@ -520,7 +664,11 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
                 let a = xs.at(offset);
                 Ok(if op == ROLL_DOT { a * ys.at(offset) } else { a })
             };
-            let _ = rolling_sweep(op, out, len, window, term);
+            let _ = if op == ROLL_VAR || op == ROLL_STD {
+                rolling_spread_sweep(op, out, len, window, term)
+            } else {
+                rolling_sweep(op, out, len, window, term)
+            };
             return 1;
         }
         // The general path — i64 exactness raises per element inside
@@ -534,10 +682,93 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
                 Ok(a)
             }
         };
-        match rolling_sweep(op, out, len, window, term) {
+        let swept = if op == ROLL_VAR || op == ROLL_STD {
+            rolling_spread_sweep(op, out, len, window, term)
+        } else {
+            rolling_sweep(op, out, len, window, term)
+        };
+        match swept {
             Ok(()) => 1,
             Err(()) => 0,
         }
+    }
+}
+
+/// The rolling dispersion sweep: `rolling_var` / `rolling_std`, the
+/// column-shaped twins of SQL's `var_pop`/`stddev_pop` window
+/// functions (M5.0). O(n), one add and one remove per step.
+///
+/// Deviations are accumulated **about a shift taken from the data**,
+/// exactly as `engine`'s `ShiftedMoments` does for the pair
+/// statistics, and for the same reason: `E[x²] − E[x]²` over raw
+/// values is the catastrophic form (it cancels away the answer when
+/// the data sits at a large offset), while the same expression over
+/// deviations from a nearby shift keeps every accumulated term at the
+/// window's own scale. The shift is re-taken every `window` steps,
+/// which also bounds add/remove drift to one period — the same
+/// re-anchoring cadence `rolling_sweep` uses above. The two sweeps
+/// stay separate because this one carries second moments and a shift
+/// that the sum/mean/dot sweep has no use for.
+unsafe fn rolling_spread_sweep<F: Fn(usize) -> Result<f64, ()> + Copy>(
+    op: i64,
+    out: VectorParts,
+    len: usize,
+    window: usize,
+    term: F,
+) -> Result<(), ()> {
+    unsafe {
+        let mut shift = 0.0;
+        let mut count = 0.0f64;
+        let mut sum = Compensated::default();
+        let mut squares = Compensated::default();
+        let mut anchored: Option<usize> = None;
+        for offset in 0..len {
+            let lo = (offset + 1).saturating_sub(window);
+            let stale = anchored.is_none_or(|at| offset - at >= window);
+            if stale {
+                // Re-anchor on this row's own value and rebuild the
+                // live window about it.
+                shift = term(offset)?;
+                sum = Compensated::default();
+                squares = Compensated::default();
+                count = 0.0;
+                for inner in lo..=offset {
+                    let d = term(inner)? - shift;
+                    sum.add(d);
+                    squares.add(d * d);
+                    count += 1.0;
+                }
+                anchored = Some(offset);
+            } else {
+                let d = term(offset)? - shift;
+                sum.add(d);
+                squares.add(d * d);
+                count += 1.0;
+                if offset >= window {
+                    let gone = term(offset - window)? - shift;
+                    sum.add(-gone);
+                    squares.add(-(gone * gone));
+                    count -= 1.0;
+                }
+            }
+            let total = sum.value();
+            let variance = (squares.value() - total * total / count) / count;
+            // Rounding can push a non-negative variance just below
+            // zero, and `sqrt` of that is NaN. Clamp — but test NaN
+            // first, because `f64::max` discards a NaN operand and
+            // would report a confident zero for an undefined window.
+            let variance = if variance.is_nan() {
+                variance
+            } else {
+                variance.max(0.0)
+            };
+            *out.values.add(offset) = if op == ROLL_STD {
+                variance.sqrt()
+            } else {
+                variance
+            };
+        }
+        Ok(())
     }
 }
 
@@ -736,9 +967,25 @@ pub(crate) unsafe fn install(raw: *mut ffi::lua_State) {
             (c"rolling_sum".as_ptr(), ROLL_SUM),
             (c"rolling_mean".as_ptr(), ROLL_MEAN),
             (c"rolling_dot".as_ptr(), ROLL_DOT),
+            (c"rolling_var".as_ptr(), ROLL_VAR),
+            (c"rolling_std".as_ptr(), ROLL_STD),
         ] {
             ffi::lua_pushinteger(raw, op);
             ffi::lua_pushcclosure(raw, rolling, 1);
+            ffi::lua_setglobal(raw, name);
+        }
+
+        // The one-column series transforms (M5.0). These carry no
+        // standard SQL name, so by the #77.1 (a) ruling they live here
+        // rather than in the SQL registry.
+        for (name, op) in [
+            (c"lag".as_ptr(), SERIES_LAG),
+            (c"diff".as_ptr(), SERIES_DIFF),
+            (c"log_returns".as_ptr(), SERIES_LOG_RETURNS),
+            (c"ewma".as_ptr(), SERIES_EWMA),
+        ] {
+            ffi::lua_pushinteger(raw, op);
+            ffi::lua_pushcclosure(raw, series, 1);
             ffi::lua_setglobal(raw, name);
         }
     }

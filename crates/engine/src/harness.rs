@@ -344,6 +344,31 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
             &format!("return rolling_dot(a, b, {})", LUA_PRECEDING + 1),
         )
         .expect("lua_rdot registers");
+    // M5.0's streaming primitives and one prelude composition, over
+    // the same reopened multi-segment fixture: NumPy re-derives each.
+    for (name, chunk) in [
+        (
+            "lua_rvar",
+            format!("return rolling_var(a, {})", LUA_PRECEDING + 1),
+        ),
+        (
+            "lua_rstd",
+            format!("return rolling_std(a, {})", LUA_PRECEDING + 1),
+        ),
+        ("lua_lag", "return lag(a, 3)".to_owned()),
+        ("lua_diff", "return diff(a)".to_owned()),
+        ("lua_logret", "return log_returns(b)".to_owned()),
+        ("lua_ewma", "return ewma(a, 0.25)".to_owned()),
+        // The prelude, exercised through the same path as the natives.
+        (
+            "lua_zscore",
+            format!("return zscore(a, {})", LUA_PRECEDING + 1),
+        ),
+    ] {
+        table
+            .register_lua_scalar(name, &["a", "b"], &chunk)
+            .unwrap_or_else(|error| panic!("{name} registers: {error}"));
+    }
     let frame = format!(
         "OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN {LUA_PRECEDING} PRECEDING \
          AND CURRENT ROW)"
@@ -355,7 +380,14 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
          lua_npos(x) {frame} AS npos, \
          lua_spread(x) {frame} AS spread, \
          lua_rel(x, y) AS rel, \
-         lua_rdot(x, y) AS rdot \
+         lua_rdot(x, y) AS rdot, \
+         lua_rvar(x, y) AS rvar, \
+         lua_rstd(x, y) AS rstd, \
+         lua_lag(x, y) AS lagged, \
+         lua_diff(x, y) AS differenced, \
+         lua_logret(x, y) AS logret, \
+         lua_ewma(x, y) AS ewma, \
+         lua_zscore(x, y) AS zscore \
          FROM trades"
     );
     match table.query_stream(&sql) {

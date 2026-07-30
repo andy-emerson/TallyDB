@@ -25,6 +25,14 @@ in this fixture):
               combinator, continuous across the fixture's 64-row
               segment boundaries
 
+M5.0's streaming primitives ride the same stream, each re-derived
+independently in NumPy: rolling_var/rolling_std (population form),
+lag/diff/log_returns (whose undefined head rows must arrive as SQL
+NULL, not as a filled-in stand-in), ewma (the unadjusted recurrence),
+and zscore — the shipped prelude's own composition, checked against
+its documented definition rather than assumed correct because it is
+one line.
+
 Usage: m2_lua_window_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
 """
@@ -109,6 +117,71 @@ def main():
         expected = float(np.dot(x[lo : i + 1], y[lo : i + 1]))
         if not np.isclose(got_rdot[i], expected, rtol=1e-12, atol=1e-9):
             sys.exit(f"lua_rdot row {i}: {got_rdot[i]} != {expected}")
+
+    # NaN is a *value* here (the D2 ruling), not a failure: log returns
+    # over a series that changes sign are genuinely undefined, and the
+    # fixture's `y` does change sign. Agreement therefore means "both
+    # NaN" as much as "both close" — comparing with isclose alone would
+    # report a disagreement where the two engines in fact agree.
+    def same(got, expected, rtol=1e-12, atol=1e-12):
+        if got is None or expected is None:
+            return got is None and expected is None
+        if np.isnan(expected):
+            return bool(np.isnan(got))
+        return bool(np.isclose(got, expected, rtol=rtol, atol=atol))
+
+    # M5.0's streaming primitives, each re-derived independently. The
+    # frames are the same trailing shape SQL's ROWS clause describes,
+    # so NumPy slices reproduce them directly.
+    got_rvar = table.column("rvar").to_numpy(zero_copy_only=False)
+    got_rstd = table.column("rstd").to_numpy(zero_copy_only=False)
+    got_lag = table.column("lagged").to_pylist()
+    got_diff = table.column("differenced").to_pylist()
+    got_logret = table.column("logret").to_pylist()
+    got_ewma = table.column("ewma").to_numpy(zero_copy_only=False)
+    got_zscore = table.column("zscore").to_numpy(zero_copy_only=False)
+    for i in range(len(x)):
+        lo = max(0, i - window + 1)
+        frame = x[lo : i + 1]
+        variance = float(np.var(frame))  # NumPy's var is the population form
+        if not np.isclose(got_rvar[i], variance, rtol=1e-12, atol=1e-12):
+            sys.exit(f"lua_rvar row {i}: {got_rvar[i]} != {variance}")
+        if not np.isclose(got_rstd[i], np.sqrt(variance), rtol=1e-12, atol=1e-12):
+            sys.exit(f"lua_rstd row {i}: {got_rstd[i]} != {np.sqrt(variance)}")
+        # zscore(x, w) = (x - rolling_mean) / rolling_std, the prelude's
+        # own definition, re-derived here rather than assumed.
+        spread = np.sqrt(variance)
+        expected_z = (x[i] - float(np.mean(frame))) / spread if spread > 0 else np.nan
+        if np.isnan(expected_z):
+            if not np.isnan(got_zscore[i]):
+                sys.exit(f"lua_zscore row {i}: {got_zscore[i]} != NaN")
+        elif not np.isclose(got_zscore[i], expected_z, rtol=1e-11, atol=1e-11):
+            sys.exit(f"lua_zscore row {i}: {got_zscore[i]} != {expected_z}")
+        # The head rows a transform cannot define come back as SQL NULL
+        # (None here), never as a filled-in stand-in.
+        if i < 3:
+            if got_lag[i] is not None:
+                sys.exit(f"lua_lag row {i}: {got_lag[i]}, expected NULL")
+        elif not np.isclose(got_lag[i], x[i - 3], rtol=0, atol=0):
+            sys.exit(f"lua_lag row {i}: {got_lag[i]} != {x[i - 3]}")
+        if i == 0:
+            if got_diff[i] is not None or got_logret[i] is not None:
+                sys.exit(f"row 0: diff/log_returns should be NULL")
+        else:
+            if not np.isclose(got_diff[i], x[i] - x[i - 1], rtol=1e-15, atol=0):
+                sys.exit(f"lua_diff row {i}: {got_diff[i]} != {x[i] - x[i - 1]}")
+            with np.errstate(invalid="ignore"):
+                expected_log = float(np.log(y[i] / y[i - 1]))
+            if not same(got_logret[i], expected_log):
+                sys.exit(f"lua_logret row {i}: {got_logret[i]} != {expected_log}")
+    # EWMA's unadjusted recurrence, carried the same way a feed would.
+    expected_ewma = np.empty(len(x))
+    expected_ewma[0] = x[0]
+    for i in range(1, len(x)):
+        expected_ewma[i] = 0.25 * x[i] + 0.75 * expected_ewma[i - 1]
+    if not np.allclose(got_ewma, expected_ewma, rtol=1e-12, atol=1e-12):
+        worst = float(np.nanmax(np.abs(got_ewma - expected_ewma)))
+        sys.exit(f"lua_ewma differs from the recurrence (worst {worst})")
 
     checked = 0
     for symbol in sorted(set(symbols)):

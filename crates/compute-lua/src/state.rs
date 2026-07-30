@@ -112,7 +112,7 @@ impl LuaState {
             log::install(raw, sink);
             let driver_slot = Box::into_raw(Box::new(DriverSlot(std::ptr::null_mut())));
             driver::install(raw, driver_slot);
-            Ok(LuaState {
+            let mut state = LuaState {
                 raw,
                 generation,
                 sink,
@@ -120,7 +120,20 @@ impl LuaState {
                 driver: driver_slot,
                 id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 next_chunk: 0,
-            })
+            };
+            // The shipped prelude, compiled into the binary (#77.3 = a):
+            // every state gets the compositions, so a kernel and a
+            // driver script see the same vocabulary. It runs *after*
+            // the native vocabulary is installed, because it composes
+            // over it. A failure here is a bug in our own source, not
+            // in anything a caller passed — hence the message.
+            let prelude = state
+                .compile(crate::prelude::PRELUDE)
+                .and_then(|chunk| state.run(&chunk, 0));
+            if let Err(error) = prelude {
+                return Err(format!("the shipped prelude failed to load: {error}"));
+            }
+            Ok(state)
         }
     }
 
@@ -2033,6 +2046,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rolling_dispersion_holds_its_accuracy_at_a_large_offset() {
+        // M5.0's column-shaped twins of `var_pop`/`stddev_pop`. The
+        // offset is the whole point: at 1e12 the raw `E[x²] − E[x]²`
+        // form cancels the answer away, so this checks the shifted
+        // accumulation against a per-window recompute of the same
+        // corrected two-pass the engine's statistics run.
+        let n = 400usize;
+        let window = 7usize;
+        let x: Vec<f64> = (0..n)
+            .map(|i| 1.0e12 + f64::from(i as u32).sin() * 3.0)
+            .collect();
+        let variance_of = |lo: usize, hi: usize| -> f64 {
+            let slice = &x[lo..hi];
+            let count = slice.len() as f64;
+            let mean = slice.iter().sum::<f64>() / count;
+            let (mut sum_d, mut squares) = (0.0f64, 0.0f64);
+            for &xi in slice {
+                let d = xi - mean;
+                sum_d += d;
+                squares += d * d;
+            }
+            (squares - sum_d * sum_d / count) / count
+        };
+        let mut state = LuaState::new().unwrap();
+        for (chunk, reference) in [
+            (
+                "return rolling_var(x, 7)",
+                Box::new(variance_of) as Box<dyn Fn(usize, usize) -> f64>,
+            ),
+            (
+                "return rolling_std(x, 7)",
+                Box::new(|lo: usize, hi: usize| variance_of(lo, hi).sqrt()),
+            ),
+        ] {
+            let mut out = vec![0.0f64; n];
+            let mut validity = Bitmap::new_unset(n);
+            eval_col(
+                &mut state,
+                chunk,
+                &[(c"x", f64s(&x))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap();
+            for (i, got) in out.iter().enumerate() {
+                let lo = (i + 1).saturating_sub(window);
+                let expected = reference(lo, i + 1);
+                let scale = expected.abs().max(1e-9);
+                assert!(
+                    ((got - expected) / scale).abs() < 1e-9,
+                    "{chunk}: row {i}: {got} vs {expected}"
+                );
+                assert!(validity.get(i), "{chunk}: row {i} came back NULL");
+            }
+            // A single-element first frame has zero spread, never NULL.
+            assert_eq!(out[0], 0.0, "{chunk}: first frame");
+        }
+    }
+
+    #[test]
+    fn series_transforms_leave_an_undefined_head_null() {
+        // `lag`/`diff`/`log_returns` reference a row before the
+        // column's start for their first outputs; those come back NULL
+        // rather than filled with a stand-in a script could mistake
+        // for data. `ewma` defines every row, so it has no NULL head.
+        let x = [2.0f64, 4.0, 8.0, 16.0, 32.0];
+        let mut state = LuaState::new().unwrap();
+        let run = |state: &mut LuaState, chunk: &str| -> (Vec<f64>, Bitmap) {
+            let mut out = vec![0.0f64; x.len()];
+            let mut validity = Bitmap::new_unset(x.len());
+            eval_col(
+                state,
+                chunk,
+                &[(c"x", f64s(&x))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap();
+            (out, validity)
+        };
+        let (values, validity) = run(&mut state, "return lag(x, 2)");
+        assert!(!validity.get(0) && !validity.get(1), "the head is NULL");
+        assert_eq!(&values[2..], &[2.0, 4.0, 8.0]);
+        let (values, validity) = run(&mut state, "return diff(x)");
+        assert!(!validity.get(0));
+        assert_eq!(&values[1..], &[2.0, 4.0, 8.0, 16.0]);
+        // Doubling every step: ln 2 each row, exactly.
+        let (values, validity) = run(&mut state, "return log_returns(x)");
+        assert!(!validity.get(0));
+        for value in &values[1..] {
+            assert!((value - std::f64::consts::LN_2).abs() < 1e-15, "{value}");
+        }
+        // EWMA's recurrence, hand-rolled: y0 = x0, then the blend.
+        let (values, validity) = run(&mut state, "return ewma(x, 0.25)");
+        let mut expected = x[0];
+        assert!(validity.get(0));
+        assert_eq!(values[0], expected);
+        for (i, &xi) in x.iter().enumerate().skip(1) {
+            expected = 0.25 * xi + 0.75 * expected;
+            assert!((values[i] - expected).abs() < 1e-15, "row {i}");
+            assert!(validity.get(i));
+        }
+    }
+
+    #[test]
+    fn every_prelude_name_is_callable_and_composes_the_documented_expression() {
+        // The prelude is documentation that runs, so this checks both
+        // halves: every name it advertises exists in a fresh state, and
+        // each one equals the composition its source shows — so the
+        // printed text a user copies cannot drift from what runs.
+        let x = [2.0f64, 4.0, 8.0, 16.0, 32.0, 64.0];
+        let mut state = LuaState::new().unwrap();
+        let run = |state: &mut LuaState, chunk: &str| -> (Vec<f64>, Bitmap) {
+            let mut out = vec![0.0f64; x.len()];
+            let mut validity = Bitmap::new_unset(x.len());
+            eval_col(
+                state,
+                chunk,
+                &[(c"x", f64s(&x))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap();
+            (out, validity)
+        };
+        // Every advertised name resolves to a function.
+        for name in compute_lua_prelude_names() {
+            let mut out = vec![0.0f64; x.len()];
+            let mut validity = Bitmap::new_unset(x.len());
+            let chunk =
+                format!("if type({name}) ~= 'function' then error('{name} missing') end\nreturn x");
+            eval_col(
+                &mut state,
+                &chunk,
+                &[(c"x", f64s(&x))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+        // returns(x) == diff(x) / lag(x, 1): doubling gives 1.0 a row.
+        let (values, validity) = run(&mut state, "return returns(x)");
+        assert!(!validity.get(0), "no prior row for the first return");
+        for value in &values[1..] {
+            assert!((value - 1.0).abs() < 1e-15, "{value}");
+        }
+        // The expanding pair against the rolling one at full width.
+        let (expanding, _) = run(&mut state, "return expanding_mean(x)");
+        let (rolling, _) = run(&mut state, "return rolling_mean(x, #x)");
+        assert_eq!(expanding, rolling);
+        let (expanding, _) = run(&mut state, "return expanding_std(x)");
+        let (rolling, _) = run(&mut state, "return rolling_std(x, #x)");
+        assert_eq!(expanding, rolling);
+        // And expanding_mean really does grow: row i is the mean of the
+        // first i+1 elements, not of a fixed tail.
+        for (i, got) in expanding_means(&x).iter().enumerate() {
+            let (means, _) = run(&mut state, "return expanding_mean(x)");
+            assert!((means[i] - got).abs() < 1e-12, "row {i}");
+        }
+        // zscore(x, w) == (x - rolling_mean) / rolling_std.
+        let (zscore, _) = run(&mut state, "return zscore(x, 3)");
+        let (mean, _) = run(&mut state, "return rolling_mean(x, 3)");
+        let (deviation, _) = run(&mut state, "return rolling_std(x, 3)");
+        for (i, got) in zscore.iter().enumerate() {
+            let expected = (x[i] - mean[i]) / deviation[i];
+            if expected.is_nan() {
+                assert!(got.is_nan(), "row {i}: {got} vs NaN");
+            } else {
+                assert!(
+                    (got - expected).abs() < 1e-12,
+                    "row {i}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// The prelude's advertised names, read from the crate constant so
+    /// the list cannot drift from the source it describes.
+    fn compute_lua_prelude_names() -> &'static [&'static str] {
+        crate::PRELUDE_NAMES
+    }
+
+    /// Expanding means, computed plainly for comparison.
+    fn expanding_means(x: &[f64]) -> Vec<f64> {
+        (0..x.len())
+            .map(|i| x[..=i].iter().sum::<f64>() / (i + 1) as f64)
+            .collect()
+    }
+
+    #[test]
+    fn series_transforms_refuse_bad_arguments() {
+        let x = [1.0f64, 2.0, 3.0];
+        let mut state = LuaState::new().unwrap();
+        let mut refuse = |chunk: &str, wanted: &str| {
+            let mut out = [0.0f64; 3];
+            let mut validity = Bitmap::new_unset(3);
+            let error = eval_col(
+                &mut state,
+                chunk,
+                &[(c"x", f64s(&x))],
+                OutputColumn::F64 {
+                    values: &mut out,
+                    validity: &mut validity,
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(wanted), "{chunk}: {error}");
+        };
+        refuse("return lag(x, 0)", "positive integer");
+        refuse("return lag(x, -1)", "positive integer");
+        refuse("return ewma(x, 0)", "(0, 1]");
+        refuse("return ewma(x, 1.5)", "(0, 1]");
+        refuse("return diff(7)", "columns, not scalars");
     }
 
     #[test]
