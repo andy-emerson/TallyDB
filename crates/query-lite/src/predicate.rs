@@ -505,15 +505,36 @@ fn evaluate_3vl(
         Predicate::CompareExpr { left, op, right } => {
             let (left, left_valid) = scalars.eval(left)?;
             let (right, right_valid) = scalars.eval(right)?;
-            // NULL on either side is UNKNOWN, not false — the same
-            // three-valued rule every other leaf follows. NaN compares
-            // under `cmp_f64`, the one relation sorting and pruning use.
-            Ok(leaf_result(rows, |row| {
-                (
-                    left_valid[row] && right_valid[row],
-                    op.holds_ordering(cmp_f64(left[row], right[row])),
-                )
-            }))
+            // The two row spaces this leaf straddles, and the reason it
+            // is the only leaf that has to. Every other one reads a
+            // stored column, indexed by STORED row. A scalar expression
+            // is evaluated over the view's LIVE rows — it must be, that
+            // is what the projection pipeline hands kernels — so its
+            // results are indexed by live position and have to be
+            // scattered back before joining a predicate tree that
+            // speaks stored rows.
+            //
+            // Getting this wrong is not a wrong answer but an index
+            // panic, and only over a view carrying tombstones: on a
+            // compacted table live == stored and it hides completely.
+            let mut live_position = 0usize;
+            let mut verdict = vec![(false, false); rows];
+            for (row, slot) in verdict.iter_mut().enumerate() {
+                if !view.is_live(row) {
+                    continue; // a dead row's verdict is never read
+                }
+                // NULL on either side is UNKNOWN, not false — the same
+                // three-valued rule every other leaf follows. NaN
+                // compares under `cmp_f64`, the one relation sorting
+                // and pruning share.
+                *slot = (
+                    left_valid[live_position] && right_valid[live_position],
+                    op.holds_ordering(cmp_f64(left[live_position], right[live_position])),
+                );
+                live_position += 1;
+            }
+            debug_assert_eq!(live_position, left.len(), "one verdict per live row");
+            Ok(leaf_result(rows, |row| verdict[row]))
         }
         Predicate::Compare { column, op, value } => {
             let index = column_index(schema, column)?;

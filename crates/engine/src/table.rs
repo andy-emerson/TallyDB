@@ -2820,6 +2820,46 @@ mod mutation_tests {
     }
 
     #[test]
+    fn an_expression_predicate_survives_tombstones() {
+        // #95's comparison between expressions is the ONE predicate
+        // leaf whose operands are computed over the view's LIVE rows,
+        // while the predicate tree itself is indexed by STORED row.
+        // On a compacted table the two spaces coincide and nothing
+        // shows; with tombstones they do not, and the mismatch is an
+        // index panic rather than a wrong answer.
+        //
+        // A mutation is how a user gets there, so a mutation is how
+        // this reaches it — then a SELECT's WHERE, a CASE condition,
+        // and a second mutation's own filter, the three places the
+        // leaf can be reached.
+        let mut table = small_table();
+        assert_eq!(table.mutate("DELETE FROM t WHERE ts < 4").unwrap(), 4);
+        // linear_row alternates y = 2x + 5 and y = -1.5x + 40, so over
+        // the survivors y > x holds throughout while `y - x > 20`
+        // splits them — the point being a predicate that is neither
+        // vacuous nor total.
+        let kept = table.query("SELECT ts FROM t WHERE y > x").unwrap();
+        assert_eq!(kept.num_rows(), 6, "every survivor, none of the dead");
+        let split = table.query("SELECT ts FROM t WHERE y - x > 20").unwrap();
+        assert!(
+            (1..6).contains(&split.num_rows()),
+            "a real split of the survivors, got {}",
+            split.num_rows()
+        );
+        // The same leaf through a CASE condition.
+        let flagged = table
+            .query("SELECT CASE WHEN y > x THEN 1 ELSE 0 END AS c FROM t")
+            .unwrap();
+        assert_eq!(flatten(&flagged, 0), vec![Some(1.0); 6]);
+        // And through a mutation's own filter, over the tombstones the
+        // first DELETE left behind.
+        assert_eq!(
+            table.mutate("DELETE FROM t WHERE y - x > 20").unwrap(),
+            split.num_rows() as u64
+        );
+    }
+
+    #[test]
     fn delete_removes_matched_rows_everywhere() {
         let mut table = small_table();
         let affected = table.mutate("DELETE FROM t WHERE sym = 'B'").unwrap();
