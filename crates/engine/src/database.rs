@@ -109,6 +109,34 @@ impl Database {
         self.views.keys().cloned().collect()
     }
 
+    /// Refreshes the named maintained view — folds everything its
+    /// stamp does not cover and advances the stamp (see
+    /// [`MaterializedView::refresh`]). Returns the number of buckets
+    /// re-folded. When to call it is the embedder's choice: TallyDB is
+    /// a library and owns no clock, so refresh cadence — after a batch,
+    /// on a timer, before a read — belongs to the application.
+    pub fn refresh_view(&mut self, name: &str) -> Result<u64, EngineError> {
+        let view = self
+            .views
+            .get_mut(name)
+            .ok_or_else(|| EngineError::UnknownTable(name.to_owned()))?;
+        let source = self
+            .tables
+            .get(view.source())
+            .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
+        view.refresh(source)
+    }
+
+    /// Refreshes every maintained view, in arbitrary order — the
+    /// batch-boundary call an embedder makes after landing a batch.
+    pub fn refresh_views(&mut self) -> Result<(), EngineError> {
+        let names = self.view_names();
+        for name in names {
+            self.refresh_view(&name)?;
+        }
+        Ok(())
+    }
+
     /// One namespace across tables and views: a name may be claimed by
     /// at most one of them, or `query` routing would be ambiguous.
     fn claim_name(&self, name: &str) -> Result<(), EngineError> {

@@ -983,6 +983,69 @@ impl Table {
         Ok(())
     }
 
+    /// Calls `touch` with the ordering-key value of every row born or
+    /// killed after `since` — the maintained-view refresh's dirty
+    /// derivation (see [`KnowledgeSnapshot::touched_ordering_keys`]).
+    ///
+    /// [`KnowledgeSnapshot::touched_ordering_keys`]:
+    ///     storage_lite::store::KnowledgeSnapshot::touched_ordering_keys
+    pub(crate) fn touched_ordering_keys(
+        &self,
+        since: u64,
+        touch: impl FnMut(i64),
+    ) -> Result<(), EngineError> {
+        Ok(self
+            .store
+            .knowledge_snapshot()?
+            .touched_ordering_keys(since, touch)?)
+    }
+
+    /// Supersedes every live row matching `predicate` with the rows of
+    /// `replacements` — the maintained-view refresh's write half: the
+    /// old buckets out, the re-folded ones in. Where both sides are
+    /// non-empty this is one knowledge event (issue #73's supersede);
+    /// a first fold (no victims) appends, and an emptied bucket (no
+    /// replacements) tombstones.
+    pub(crate) fn replace_matching(
+        &mut self,
+        predicate: Option<&query_lite::Predicate>,
+        replacements: &QueryOutput,
+    ) -> Result<(), EngineError> {
+        let views = materialize(&self.store.snapshot()?)?;
+        let victims = self.matched_row_ids(&views, predicate)?;
+        let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
+        for batch in &replacements.batches {
+            for row in 0..batch.num_rows() {
+                corrected.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| OwnedValue::from_cell(column, row))
+                        .collect(),
+                );
+            }
+        }
+        if corrected.is_empty() {
+            if !victims.is_empty() {
+                self.store.tombstone(&victims)?;
+            }
+            return Ok(());
+        }
+        if victims.is_empty() {
+            for cells in &corrected {
+                let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
+                self.append(&row)?;
+            }
+            return Ok(());
+        }
+        let rows: Vec<Vec<RowValue<'_>>> = corrected
+            .iter()
+            .map(|cells| cells.iter().map(OwnedValue::as_row_value).collect())
+            .collect();
+        self.store.supersede(&rows, &victims)?;
+        Ok(())
+    }
+
     /// Live row ids matching `predicate` (all live rows when `None`).
     fn matched_row_ids(
         &self,

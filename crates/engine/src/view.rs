@@ -44,7 +44,10 @@
 
 use crate::table::{EngineError, Table};
 use arrow_lite::{ColumnType, Field, Schema};
-use query_lite::{plan as lower_plan, GroupKey, Plan, Projection, QueryError, SEQUENCE_COLUMN};
+use query_lite::{
+    plan as lower_plan, CmpOp, GroupKey, Number, Plan, Predicate, Projection, QueryError,
+    SEQUENCE_COLUMN,
+};
 use std::path::Path;
 use storage_lite::format::crc32c;
 use storage_lite::StoreOptions;
@@ -70,6 +73,9 @@ pub struct MaterializedView {
     /// a freshly created view materializes nothing; the first refresh
     /// folds everything below the then-current watermark.
     stamp: u64,
+    /// Where the definition record persists; `None` for in-memory
+    /// views, whose stamp lives only as long as they do.
+    dir: Option<std::path::PathBuf>,
 }
 
 impl MaterializedView {
@@ -84,6 +90,7 @@ impl MaterializedView {
             sql: sql.to_owned(),
             source: source.name().to_owned(),
             stamp: 0,
+            dir: None,
         })
     }
 
@@ -103,6 +110,7 @@ impl MaterializedView {
             sql: sql.to_owned(),
             source: source.name().to_owned(),
             stamp: 0,
+            dir: Some(dir.as_ref().to_path_buf()),
         };
         view.write_definition(dir.as_ref())?;
         Ok(view)
@@ -136,6 +144,7 @@ impl MaterializedView {
             sql,
             source: source_name,
             stamp,
+            dir: Some(dir.as_ref().to_path_buf()),
         })
     }
 
@@ -168,6 +177,99 @@ impl MaterializedView {
         &self.table
     }
 
+    /// Folds everything the stamp does not cover — new appends and
+    /// corrections alike — and advances the stamp. This is the
+    /// maintenance pass, and it is deliberately *one* mechanism for
+    /// both kinds of change (uniform repair, ruled 2026-08-02 on #83):
+    ///
+    /// 1. Derive the touched buckets — the buckets of every row born
+    ///    or killed by a coordinate in `(stamp, now]` — from the
+    ///    source's knowledge history. A correction that moves a row
+    ///    across buckets touches both: the kill names the old value,
+    ///    the reinsert's birth the new one.
+    /// 2. Run the stored definition over exactly those buckets (the
+    ///    range predicate is prunable, so untouched segments are
+    ///    skipped by their zone maps).
+    /// 3. Supersede those buckets' rows in the materialization — one
+    ///    knowledge event where buckets are replaced (#73's rule) —
+    ///    and advance the stamp to `now`.
+    ///
+    /// Cost is proportional to what changed, never to the table. A
+    /// crash anywhere leaves the stamp old (it persists only after the
+    /// materialization is durable), and the next refresh re-derives
+    /// and re-folds: the view self-heals, which is why the dirty list
+    /// needs no durability of its own.
+    ///
+    /// Returns the number of buckets re-folded.
+    pub fn refresh(&mut self, source: &Table) -> Result<u64, EngineError> {
+        if source.name() != self.source {
+            return Err(EngineError::WrongTable {
+                expected: self.source.clone(),
+                got: source.name().to_owned(),
+            });
+        }
+        let now = source.next_sequence();
+        if now == self.stamp {
+            return Ok(0);
+        }
+        let plan = lower_plan(&self.sql).map_err(EngineError::Query)?;
+        let (bucket, bucket_name) = eligible_shape(&plan, source)?;
+        let (divide, view_scale) = bucket_arithmetic(&bucket);
+        let mut buckets = std::collections::BTreeSet::new();
+        source.touched_ordering_keys(self.stamp, |value| {
+            buckets.insert(value / divide);
+        })?;
+        if buckets.is_empty() {
+            // Coordinates were spent (a DELETE that matched nothing,
+            // say) but no row changed: nothing to fold, and the stamp
+            // still advances past them.
+            self.advance_stamp(now)?;
+            return Ok(0);
+        }
+        let folded = buckets.len() as u64;
+        let runs = contiguous_runs(&buckets);
+        // The re-fold: the definition, restricted to the touched
+        // buckets, over the source's latest state.
+        let mut restricted = plan.clone();
+        let source_ranges = ranges_predicate(
+            source.ordering_key(),
+            runs.iter()
+                .map(|&(first, last)| (bucket_low(first, divide), bucket_high(last, divide))),
+        );
+        restricted.predicate = Some(match restricted.predicate {
+            Some(own) => Predicate::And(Box::new(source_ranges), Box::new(own)),
+            None => source_ranges,
+        });
+        let replacement = source.execute_plan(&restricted)?;
+        // The write half: those buckets' materialized rows out, the
+        // re-folded ones in. The view-side ordering key stores the
+        // bucket index scaled by the definition's multiplier (or the
+        // raw key for a bare-`ts` bucket), so a run of indices maps to
+        // one scaled range.
+        let victims = ranges_predicate(
+            &bucket_name,
+            runs.iter().map(|&(first, last)| {
+                (
+                    first.saturating_mul(view_scale),
+                    last.saturating_mul(view_scale),
+                )
+            }),
+        );
+        self.table.replace_matching(Some(&victims), &replacement)?;
+        self.advance_stamp(now)?;
+        Ok(folded)
+    }
+
+    /// Moves the stamp forward and, for a persistent view, makes it
+    /// durable — strictly after the materialization it describes.
+    fn advance_stamp(&mut self, now: u64) -> Result<(), EngineError> {
+        self.stamp = now;
+        if let Some(dir) = self.dir.clone() {
+            self.write_definition(&dir)?;
+        }
+        Ok(())
+    }
+
     /// Persists the definition record — called at create and after
     /// every stamp advance. The stamp is the one piece of view state
     /// whose durability matters: it only ever advances *after* the
@@ -194,7 +296,7 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
             got: plan.table,
         });
     }
-    let bucket = eligible_shape(&plan, source)?;
+    let (_, bucket) = eligible_shape(&plan, source)?;
     let schema = output_schema(&plan, source)?;
     // The bucket column is the view table's ordering key; the executor
     // may mark aggregate outputs nullable, but a bucket of a NOT NULL
@@ -215,9 +317,9 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
 
 /// The tranche-1 eligibility check: refuses, by name, every definition
 /// shape outside "single-table bucketed aggregate" — naming the tranche
-/// that will admit it where one is planned. Returns the bucket term's
-/// output column name.
-fn eligible_shape(plan: &Plan, source: &Table) -> Result<String, EngineError> {
+/// that will admit it where one is planned. Returns the bucket term and
+/// its output column name.
+fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), EngineError> {
     let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
     if plan.as_of.is_some() {
         return refuse(
@@ -299,7 +401,7 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<String, EngineError> {
     // The bucket is the view table's ordering key, so it must be a
     // SELECT output — and its output name is the alias when the query
     // wrote one.
-    items
+    let name = items
         .iter()
         .find_map(|item| match item {
             query_lite::AggItem::Key { key, alias } if key == bucket => {
@@ -313,7 +415,84 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<String, EngineError> {
                  the view's ordering key, so select it (alias it to taste)"
                     .to_owned(),
             ))
-        })
+        })?;
+    Ok((bucket.clone(), name))
+}
+
+/// The bucket term's arithmetic: `(divide, view_scale)`. `divide` maps
+/// an ordering-key value to its bucket index with the executor's own
+/// truncating `/`; `view_scale` maps a bucket index to the value the
+/// view's ordering-key column stores — the multiplier for a
+/// bucket-start definition, `1` for a bucket index, and (with
+/// `divide = 1`) the identity for a bare-`ts` bucket.
+fn bucket_arithmetic(bucket: &GroupKey) -> (i64, i64) {
+    match bucket {
+        GroupKey::Column(_) => (1, 1),
+        GroupKey::Bucket {
+            divide, multiply, ..
+        } => (*divide, multiply.unwrap_or(1)),
+    }
+}
+
+/// The smallest ordering-key value in bucket `index` under truncating
+/// division. Truncation makes bucket 0 double-width — every value in
+/// `(-divide, divide)` truncates to 0 — so its low edge is negative.
+/// Saturating: an edge clamped at i64's end can only widen the range,
+/// and a wider range only re-folds more, never wrongly.
+fn bucket_low(index: i64, divide: i64) -> i64 {
+    match index.cmp(&0) {
+        std::cmp::Ordering::Greater => index.saturating_mul(divide),
+        std::cmp::Ordering::Equal => -(divide - 1),
+        std::cmp::Ordering::Less => index.saturating_mul(divide).saturating_sub(divide - 1),
+    }
+}
+
+/// The largest ordering-key value in bucket `index` — `bucket_low`'s
+/// mirror.
+fn bucket_high(index: i64, divide: i64) -> i64 {
+    match index.cmp(&0) {
+        std::cmp::Ordering::Greater => index.saturating_mul(divide).saturating_add(divide - 1),
+        std::cmp::Ordering::Equal => divide - 1,
+        std::cmp::Ordering::Less => index.saturating_mul(divide),
+    }
+}
+
+/// Collapses a sorted bucket set into maximal `(first, last)` runs of
+/// consecutive indices, so a burst of appends becomes one range
+/// predicate instead of one arm per bucket.
+fn contiguous_runs(buckets: &std::collections::BTreeSet<i64>) -> Vec<(i64, i64)> {
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for &bucket in buckets {
+        match runs.last_mut() {
+            Some((_, last)) if *last + 1 == bucket => *last = bucket,
+            _ => runs.push((bucket, bucket)),
+        }
+    }
+    runs
+}
+
+/// An OR-chain of closed ranges over one i64 column — the prunable
+/// shape, so zone maps skip every segment outside the touched buckets.
+fn ranges_predicate(column: &str, ranges: impl Iterator<Item = (i64, i64)>) -> Predicate {
+    let arm = |(low, high): (i64, i64)| {
+        Predicate::And(
+            Box::new(Predicate::Compare {
+                column: column.to_owned(),
+                op: CmpOp::Ge,
+                value: Number::Int(low),
+            }),
+            Box::new(Predicate::Compare {
+                column: column.to_owned(),
+                op: CmpOp::Le,
+                value: Number::Int(high),
+            }),
+        )
+    };
+    let mut arms = ranges.map(arm);
+    let first = arms.next().expect("at least one touched bucket");
+    arms.fold(first, |or, next| {
+        Predicate::Or(Box::new(or), Box::new(next))
+    })
 }
 
 /// The view table's schema: the definition executed over zero segments
@@ -618,5 +797,317 @@ mod tests {
             db.add_view(orphan).map(|_| ()).unwrap_err(),
             EngineError::UnknownTable(_)
         ));
+    }
+
+    /// Every row of `output`, rendered to a sortable string — the
+    /// comparison currency for "view equals recompute": the view table
+    /// may hold its rows in refresh order, so equality is up to row
+    /// order, never up to values.
+    fn sorted_rows(output: &query_lite::QueryOutput) -> Vec<String> {
+        use arrow_lite::{Column, NumericData};
+        let mut rows = Vec::new();
+        for batch in &output.batches {
+            for row in 0..batch.num_rows() {
+                let mut cells = Vec::new();
+                for column in batch.columns() {
+                    cells.push(match column {
+                        Column::Key(keys) => format!("{:?}", keys.value_at(row)),
+                        Column::Numeric(NumericData::F64(values)) => {
+                            format!("{:?}", values.is_valid(row).then(|| values.values()[row]))
+                        }
+                        Column::Numeric(NumericData::I64(values)) => {
+                            format!("{:?}", values.is_valid(row).then(|| values.values()[row]))
+                        }
+                    });
+                }
+                rows.push(cells.join("|"));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// The subsuming check of the refresh: after it, the
+    /// materialization holds exactly what recomputing the definition
+    /// from the source holds.
+    fn assert_matches_recompute(db: &Database, view: &str) {
+        let sql = db.view(view).unwrap().sql().to_owned();
+        let recomputed = db
+            .table(db.view(view).unwrap().source())
+            .unwrap()
+            .query(&sql)
+            .unwrap();
+        let columns = db
+            .view(view)
+            .unwrap()
+            .table()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let materialized = db.query(&format!("SELECT {columns} FROM {view}")).unwrap();
+        assert_eq!(
+            sorted_rows(&materialized),
+            sorted_rows(&recomputed),
+            "view '{view}' diverged from recompute"
+        );
+    }
+
+    #[test]
+    fn refresh_folds_appends_and_only_what_moved() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..12 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        // First fold: everything below the watermark, 3 buckets.
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 3);
+        assert_matches_recompute(&db, "ohlc");
+        // Nothing changed: nothing folds, the stamp already covers it.
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 0);
+        // New appends land in one new bucket: exactly one bucket folds.
+        for i in 12..16 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 1);
+        assert_matches_recompute(&db, "ohlc");
+    }
+
+    #[test]
+    fn refresh_repairs_corrections_by_re_folding_their_buckets() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..16 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 4);
+        // A correction to an already-folded bucket: one bucket refolds
+        // and the view converges — uniform repair, no delta arithmetic.
+        db.mutate("UPDATE trades SET x = 100.0 WHERE ts = 5")
+            .unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 1);
+        assert_matches_recompute(&db, "ohlc");
+        // A DELETE that empties a whole bucket: its view rows go too —
+        // no ghost group survives.
+        db.mutate("DELETE FROM trades WHERE ts >= 12").unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 1);
+        assert_matches_recompute(&db, "ohlc");
+        assert_eq!(
+            db.query("SELECT c FROM ohlc").unwrap().num_rows(),
+            db.table("trades").unwrap().query(OHLC).unwrap().num_rows()
+        );
+        // A correction that MOVES a row across buckets dirties both:
+        // the kill names the old bucket, the reinsert the new one.
+        db.mutate("UPDATE trades SET ts = 9 WHERE ts = 1").unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 2);
+        assert_matches_recompute(&db, "ohlc");
+        // A DELETE matching nothing spends a coordinate but touches no
+        // bucket: the stamp advances, nothing folds.
+        db.mutate("DELETE FROM trades WHERE ts = 9999").unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 0);
+    }
+
+    #[test]
+    fn bucket_ranges_are_exact_under_truncating_division() {
+        // Truncating `/` makes bucket 0 double-width — every value in
+        // (-4, 4) truncates to 0 — and negative buckets sit on the
+        // other side of their multiples. The fold must agree with the
+        // executor over exactly these edges, so the source carries
+        // negative, zero, and positive keys spanning all three cases.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for ts in [-9i64, -7, -4, -3, -1, 0, 2, 3, 4, 7, 8] {
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::Key("A"),
+                    storage_lite::RowValue::F64(ts as f64),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view(
+            "bars",
+            "SELECT ts / 4 AS bar, count(*) AS n, sum(x) AS s FROM trades GROUP BY ts / 4",
+        )
+        .unwrap();
+        db.refresh_view("bars").unwrap();
+        assert_matches_recompute(&db, "bars");
+        // Corrections on the edges of bucket 0 and a negative bucket.
+        db.mutate("UPDATE trades SET x = 50.0 WHERE ts = -3")
+            .unwrap();
+        db.mutate("DELETE FROM trades WHERE ts = -7").unwrap();
+        db.refresh_view("bars").unwrap();
+        assert_matches_recompute(&db, "bars");
+        // The bucket-start spelling scales the view-side key by the
+        // multiplier; same convergence.
+        db.create_materialized_view(
+            "starts",
+            "SELECT (ts / 4) * 4 AS bar, sum(x) AS s FROM trades GROUP BY (ts / 4) * 4",
+        )
+        .unwrap();
+        db.refresh_view("starts").unwrap();
+        assert_matches_recompute(&db, "starts");
+        db.mutate("UPDATE trades SET x = -50.0 WHERE ts = 8")
+            .unwrap();
+        db.refresh_view("starts").unwrap();
+        db.refresh_view("bars").unwrap();
+        assert_matches_recompute(&db, "starts");
+        assert_matches_recompute(&db, "bars");
+        // A correction touching ONLY bucket 0, so its run is [0, 0] and
+        // both of the double-width bucket's edges are load-bearing —
+        // a merged run never consults them, and an edge quietly
+        // narrowed to [0, divide) would drop the negative half here.
+        db.mutate("UPDATE trades SET x = 9.0 WHERE ts = -1")
+            .unwrap();
+        assert_eq!(db.refresh_view("bars").unwrap(), 1);
+        assert_matches_recompute(&db, "bars");
+        // And one touching only a negative bucket, isolating ITS edges.
+        db.mutate("UPDATE trades SET x = 9.5 WHERE ts = -9")
+            .unwrap();
+        assert_eq!(db.refresh_view("bars").unwrap(), 1);
+        assert_matches_recompute(&db, "bars");
+    }
+
+    #[test]
+    fn a_filtered_definition_folds_through_its_own_where() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..12 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view(
+            "a_bars",
+            "SELECT ts / 4 AS bar, sum(x) AS s FROM trades WHERE sym = 'A' GROUP BY ts / 4",
+        )
+        .unwrap();
+        db.refresh_view("a_bars").unwrap();
+        assert_matches_recompute(&db, "a_bars");
+        // A correction to a row the WHERE excludes still re-folds its
+        // bucket (the touched set is definition-blind), and the re-fold
+        // — running the definition — leaves the view right.
+        db.mutate("UPDATE trades SET x = 100.0 WHERE ts = 5")
+            .unwrap();
+        assert_eq!(db.refresh_view("a_bars").unwrap(), 1);
+        assert_matches_recompute(&db, "a_bars");
+    }
+
+    #[test]
+    fn a_stale_stamp_self_heals_across_reopen() {
+        // The crash story: the stamp persists only after the
+        // materialization it describes, so a crash between a source
+        // mutation and the next refresh — or between the refresh's
+        // write and its stamp advance — leaves an old stamp, and the
+        // next refresh re-derives and re-folds. Simulated exactly:
+        // reopen with a stamp rewritten backwards.
+        let dir = std::env::temp_dir().join(format!("tallydb-view-heal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("ohlc");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut source = Table::persistent("trades", m1_schema(), "ts", &source_dir).unwrap();
+        for i in 0..12 {
+            source.append(&linear_row(i)).unwrap();
+        }
+        {
+            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
+            view.refresh(&source).unwrap();
+            let stamp = view.stamp();
+            // Mutate the source; crash before any refresh.
+            source
+                .mutate("UPDATE trades SET x = 77.0 WHERE ts = 2")
+                .unwrap();
+            assert!(source.next_sequence() > stamp);
+        }
+        // Reopen: the stamp is honest about what it covers, and one
+        // refresh converges the view.
+        let mut view =
+            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
+        assert_eq!(view.refresh(&source).unwrap(), 1);
+        let recomputed = source.query(OHLC).unwrap();
+        let view_columns = "sym, bar, o, h, l, c";
+        let materialized = view
+            .table()
+            .query(&format!("SELECT {view_columns} FROM ohlc"))
+            .unwrap();
+        assert_eq!(sorted_rows(&materialized), sorted_rows(&recomputed));
+        // And a stamp rewound on disk (the crash-mid-refresh shape) is
+        // only ever conservative: the re-fold is idempotent. (Drop
+        // first: one writer per store directory.)
+        drop(view);
+        let record = encode_definition(0, "trades", OHLC);
+        std::fs::write(view_dir.join(DEFINITION_FILE), record).unwrap();
+        let mut view =
+            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
+        assert_eq!(view.stamp(), 0);
+        view.refresh(&source).unwrap();
+        let materialized = view
+            .table()
+            .query(&format!("SELECT {view_columns} FROM ohlc"))
+            .unwrap();
+        assert_eq!(sorted_rows(&materialized), sorted_rows(&recomputed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_walks_frozen_segments_and_compacted_history() {
+        // Everything above ran in the write buffer (the default freeze
+        // threshold is far larger than these fixtures). This is the
+        // segmented shape: 4 rows per segment, so the fold crosses
+        // frozen segments, the sequence-end skip has real segments to
+        // skip — and, after a compaction lands between the correction
+        // and the refresh, the kill lives in a HISTORY segment, which
+        // is the history walk's only route to being exercised.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        for i in 0..16 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 4);
+        assert_matches_recompute(&db, "ohlc");
+        // Correction, then compaction, THEN refresh: the pending
+        // tombstone is gone — resolved into history — before the
+        // refresh ever sees it. The touched bucket must come from the
+        // history segment's kill coordinates.
+        db.mutate("UPDATE trades SET x = 200.0 WHERE ts = 6")
+            .unwrap();
+        db.compact("trades").unwrap();
+        assert!(db.refresh_view("ohlc").unwrap() >= 1);
+        assert_matches_recompute(&db, "ohlc");
+        // A pure DELETE compacted before the refresh is the case where
+        // the history walk alone is load-bearing: an UPDATE's reinsert
+        // touches the same bucket by birth, but a DELETE leaves no
+        // reinsert — the kill in the history segment is the ONLY
+        // record that its bucket changed.
+        db.mutate("DELETE FROM trades WHERE ts = 10").unwrap();
+        db.compact("trades").unwrap();
+        assert!(db.refresh_view("ohlc").unwrap() >= 1);
+        assert_matches_recompute(&db, "ohlc");
+        // And the ordinary order — correction, refresh, compaction,
+        // refresh — stays converged: the post-compaction refresh
+        // re-derives from history what it already folded from the
+        // pending map, which over-folds (idempotently) rather than
+        // diverging.
+        db.mutate("DELETE FROM trades WHERE ts = 11").unwrap();
+        assert!(db.refresh_view("ohlc").unwrap() >= 1);
+        assert_matches_recompute(&db, "ohlc");
+        db.compact("trades").unwrap();
+        db.refresh_view("ohlc").unwrap();
+        assert_matches_recompute(&db, "ohlc");
+        // New appends after all of that land in their own buckets.
+        for i in 16..20 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_eq!(db.refresh_view("ohlc").unwrap(), 1);
+        assert_matches_recompute(&db, "ohlc");
     }
 }
