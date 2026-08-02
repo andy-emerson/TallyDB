@@ -81,8 +81,8 @@ pub use exec::{
 };
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, AsOfMatch, Assignment, ColumnSpec,
-    CreateTablePlan, DeletePlan, Frame, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem,
-    Projection, QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
+    CreateTablePlan, DeletePlan, Frame, GroupKey, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan,
+    PlanItem, Projection, QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
 };
 pub use predicate::{
     can_match, evaluate as evaluate_predicate, CmpOp, NoScalars, Number, Predicate, ScalarEval,

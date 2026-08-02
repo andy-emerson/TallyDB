@@ -8,6 +8,7 @@
 //! where star-schema joins resolve their dimension tables.
 
 use crate::table::{EngineError, Table};
+use crate::view::MaterializedView;
 use arrow_lite::{ArrowArrayStream, Schema};
 use query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use std::collections::HashMap;
@@ -32,6 +33,9 @@ use storage_lite::RowValue;
 #[derive(Default)]
 pub struct Database {
     tables: HashMap<String, Table>,
+    /// Maintained views (#83), by name. A view's name shares the
+    /// table namespace — `query` routes to either.
+    views: HashMap<String, MaterializedView>,
     /// The `log(...)` destination for driver scripts (`run_script`);
     /// kernels use their table's sink.
     #[cfg(feature = "lua")]
@@ -51,9 +55,7 @@ impl Database {
         schema: Schema,
         ordering_key: &str,
     ) -> Result<(), EngineError> {
-        if self.tables.contains_key(name) {
-            return Err(EngineError::DuplicateTable(name.to_owned()));
-        }
+        self.claim_name(name)?;
         let table = Table::new(name, schema, ordering_key)?;
         self.tables.insert(name.to_owned(), table);
         Ok(())
@@ -62,10 +64,57 @@ impl Database {
     /// Adds an already-built table (for embedders that configured it —
     /// segment thresholds, for instance); the name must be unused.
     pub fn add_table(&mut self, table: Table) -> Result<(), EngineError> {
-        if self.tables.contains_key(table.name()) {
-            return Err(EngineError::DuplicateTable(table.name().to_owned()));
-        }
+        self.claim_name(table.name())?;
         self.tables.insert(table.name().to_owned(), table);
+        Ok(())
+    }
+
+    /// Creates an in-memory maintained view (#83, tranche 1) over the
+    /// named source table — a bucketed single-table aggregate kept
+    /// fresh by refresh; see [`MaterializedView`] for the model and
+    /// what the definition may contain. The name shares the table
+    /// namespace.
+    pub fn create_materialized_view(&mut self, name: &str, sql: &str) -> Result<(), EngineError> {
+        self.claim_name(name)?;
+        let source_name = plan(sql)?.table;
+        let source = self
+            .tables
+            .get(&source_name)
+            .ok_or_else(|| EngineError::UnknownTable(source_name.clone()))?;
+        let view = MaterializedView::new(name, sql, source)?;
+        self.views.insert(name.to_owned(), view);
+        Ok(())
+    }
+
+    /// Adds an already-built maintained view (persistent ones — see
+    /// [`MaterializedView::persistent`] / [`MaterializedView::open`]);
+    /// its source table must already be in the database, and the name
+    /// must be unused.
+    pub fn add_view(&mut self, view: MaterializedView) -> Result<(), EngineError> {
+        self.claim_name(view.name())?;
+        if !self.tables.contains_key(view.source()) {
+            return Err(EngineError::UnknownTable(view.source().to_owned()));
+        }
+        self.views.insert(view.name().to_owned(), view);
+        Ok(())
+    }
+
+    /// The named maintained view, if it exists.
+    pub fn view(&self, name: &str) -> Option<&MaterializedView> {
+        self.views.get(name)
+    }
+
+    /// The maintained views' names, in arbitrary order.
+    pub fn view_names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
+    }
+
+    /// One namespace across tables and views: a name may be claimed by
+    /// at most one of them, or `query` routing would be ambiguous.
+    fn claim_name(&self, name: &str) -> Result<(), EngineError> {
+        if self.tables.contains_key(name) || self.views.contains_key(name) {
+            return Err(EngineError::DuplicateTable(name.to_owned()));
+        }
         Ok(())
     }
 
@@ -96,6 +145,9 @@ impl Database {
 
     /// Appends one row to the named table; returns its internal row id.
     pub fn append(&mut self, table: &str, row: &[RowValue<'_>]) -> Result<u64, EngineError> {
+        if self.views.contains_key(table) {
+            return Err(derived_refusal(table, "append to"));
+        }
         self.tables
             .get_mut(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
@@ -104,12 +156,29 @@ impl Database {
 
     /// Runs one SQL query against the table(s) it names — including
     /// star-schema joins, which resolve their dimension table here.
+    ///
+    /// A query naming a maintained view answers from its
+    /// materialization — the view **as of its stamp**. (The union read
+    /// that tops the answer up over the unfolded tail is #83's cycle 3;
+    /// until it lands, the stamp says exactly how current the answer
+    /// is.)
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
-        let table = self
-            .tables
-            .get(&plan.table)
-            .ok_or_else(|| EngineError::UnknownTable(plan.table.clone()))?;
+        if let Some(join) = &plan.join {
+            if self.views.contains_key(&plan.table) || self.views.contains_key(&join.dimension) {
+                return Err(EngineError::Query(QueryError::Unsupported(
+                    "a maintained view in a join — query the view alone, or \
+                     join the base tables (views in joins are tranche 3 of #83)"
+                        .to_owned(),
+                )));
+            }
+        }
+        let Some(table) = self.tables.get(&plan.table) else {
+            if let Some(view) = self.views.get(&plan.table) {
+                return view.table().execute_plan(&plan);
+            }
+            return Err(EngineError::UnknownTable(plan.table.clone()));
+        };
         match &plan.join {
             None => table.execute_plan(&plan),
             Some(join) => {
@@ -149,6 +218,9 @@ impl Database {
                 )))
             }
         };
+        if self.views.contains_key(&table) {
+            return Err(derived_refusal(&table, "mutate"));
+        }
         self.tables
             .get_mut(&table)
             .ok_or_else(|| EngineError::UnknownTable(table.clone()))?
@@ -247,6 +319,15 @@ impl Database {
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?
             .compact()
     }
+}
+
+/// The refusal every write path gives a maintained view: derived data
+/// is corrected by correcting its source.
+fn derived_refusal(name: &str, verb: &str) -> EngineError {
+    EngineError::Query(QueryError::Unsupported(format!(
+        "{verb} '{name}' — it is a maintained view, and a view is derived: \
+         correct the base table and the view follows"
+    )))
 }
 
 #[cfg(test)]

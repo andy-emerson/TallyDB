@@ -434,6 +434,21 @@ impl Table {
         self.execute_plan(&plan)
     }
 
+    /// Runs an already-planned query over **zero segments** — no rows
+    /// read, no fault-in paid. What comes back is the executor's own
+    /// output schema for the plan, which is how a maintained view
+    /// derives its table schema at create (and re-validates its
+    /// definition at open) without scanning the source.
+    pub(crate) fn execute_plan_empty(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
+        Ok(execute_with_ordering_key(
+            self.store.schema(),
+            &[],
+            self.store.ordering_key(),
+            plan,
+            &self.current_registry(),
+        )?)
+    }
+
     /// Runs an already-planned query (the database handle plans once to
     /// route by table name, then calls this).
     pub(crate) fn execute_plan(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
@@ -1799,11 +1814,11 @@ fn shifted_sweep(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow_lite::{Column, ColumnType, Field, NumericColumn, NumericData, RecordBatch};
 
-    pub(super) fn m1_schema() -> Schema {
+    pub(crate) fn m1_schema() -> Schema {
         Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
             Field::new("sym", ColumnType::Key, false),
@@ -1838,7 +1853,7 @@ mod tests {
         }
     }
 
-    pub(super) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
+    pub(crate) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
         let x = i as f64;
         let (sym, y) = if i % 2 == 0 {
             ("A", 2.0 * x + 5.0)

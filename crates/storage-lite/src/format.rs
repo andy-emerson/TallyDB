@@ -172,7 +172,11 @@ impl From<CodecError> for FormatError {
 /// form defines the function; a hardware implementation (SSE4.2 /
 /// ARMv8 CRC instructions compute exactly this polynomial) is a future
 /// additive optimization, never a format change.
-fn crc32c(bytes: &[u8]) -> u32 {
+///
+/// Public because it is the storage layer's one checksum: sidecar
+/// records (a maintained view's definition, #83) reuse it rather than
+/// growing a second CRC implementation.
+pub fn crc32c(bytes: &[u8]) -> u32 {
     const TABLE: [u32; 256] = {
         let mut table = [0u32; 256];
         let mut i = 0;

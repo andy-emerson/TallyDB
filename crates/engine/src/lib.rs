@@ -84,6 +84,7 @@ pub mod harness;
 #[cfg(feature = "lua")]
 mod script;
 pub mod table;
+pub mod view;
 
 #[cfg(feature = "lua")]
 pub use compute_lua::{LogSink, PRELUDE};
@@ -91,6 +92,7 @@ pub use database::Database;
 pub use query_lite::{recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate};
 pub use storage_lite::{RowValue, StoreOptions, WalSync};
 pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
+pub use view::MaterializedView;
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`
 // runs application-registered Lua kernels as SQL window functions
