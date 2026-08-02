@@ -586,6 +586,28 @@ CROSS_SECTIONAL_FAMILIES = [
         "SELECT ts, x - avg(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
         "ORDER BY ts",
     ),
+    # Several PARTITION BY terms intersect: per symbol, per bar — the
+    # two directions at once.
+    (
+        "SELECT ts, sum(x) OVER (PARTITION BY sym, ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, sum(x) OVER (PARTITION BY sym, ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, x / sum(x) OVER (PARTITION BY sym, ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x / sum(x) OVER (PARTITION BY sym, ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # Ordered within the intersection: a frame that resets at each
+    # symbol's bar boundary.
+    (
+        "SELECT ts, avg(x) OVER (PARTITION BY sym, ts / 300000000000 ORDER BY ts "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, avg(x) OVER (PARTITION BY sym, ts // 300000000000 ORDER BY ts "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    ),
     # A bucket partition is not restricted to the cross-sectional
     # reading: ordered inside the bucket, it is a frame that resets at
     # each bar boundary.

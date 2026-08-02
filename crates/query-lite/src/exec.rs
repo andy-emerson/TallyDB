@@ -1178,7 +1178,7 @@ fn evaluate_window_call(
             registry,
             function,
             args,
-            partition_by.as_ref(),
+            partition_by,
             order_by.as_deref(),
             *frame,
             alias,
@@ -1195,7 +1195,7 @@ fn evaluate_window_call(
             *lead,
             column,
             *offset,
-            partition_by.as_ref(),
+            partition_by,
             order_by,
             alias,
         ),
@@ -1754,7 +1754,7 @@ fn window_value(
     lead: bool,
     column: &str,
     offset: usize,
-    partition_by: Option<&GroupKey>,
+    partition_by: &[GroupKey],
     order_by: &str,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
@@ -1849,9 +1849,9 @@ fn window_value(
 fn value_runs(
     schema: &Schema,
     views: &[&SegmentView],
-    partition_by: Option<&GroupKey>,
+    partition_by: &[GroupKey],
 ) -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
-    let Some(key) = partition_by else {
+    if partition_by.is_empty() {
         let mut run = Vec::new();
         for (view_index, view) in views.iter().enumerate() {
             for live_position in 0..view.live_rows() {
@@ -1859,18 +1859,13 @@ fn value_runs(
             }
         }
         return Ok(vec![run]);
-    };
-    let term = resolve_partition_key(schema, views, key)?;
-    let mut unified: HashMap<String, usize> = HashMap::new();
-    let mut slots: HashMap<GroupCode, usize> = HashMap::new();
+    }
+    let mut space = PartitionSpace::new(schema, views, partition_by)?;
     let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
-        let columns = view.segment.batch().columns();
-        let remap = partition_remap(&term, columns, view, &mut unified)?;
+        let remaps = space.remaps(view)?;
         for (live_position, row) in live_rows(view).enumerate() {
-            let code = term.code(columns, remap.as_ref(), row);
-            let next = slots.len();
-            let slot = *slots.entry(code).or_insert(next);
+            let slot = space.slot(view, &remaps, row);
             if runs.len() <= slot {
                 runs.resize_with(slot + 1, Vec::new);
             }
@@ -1878,6 +1873,63 @@ fn value_runs(
         }
     }
     Ok(runs)
+}
+
+/// The partition space a window's `PARTITION BY` terms define: how to
+/// read each term, and which slot a row's combination of them lands in.
+///
+/// Several terms intersect — `PARTITION BY sym, ts / 60` is one
+/// partition per symbol per bar — so a slot is keyed by the whole
+/// tuple, exactly as `GROUP BY` keys a group.
+struct PartitionSpace {
+    terms: Vec<GroupTerm>,
+    /// Symbol value → unified code, keyed by VALUE because dictionary
+    /// codes are per-segment interning ranks (decision #6). One space
+    /// per term, so two symbol columns cannot collide.
+    unified: Vec<HashMap<String, usize>>,
+    slots: HashMap<Vec<GroupCode>, usize>,
+}
+
+/// One view's dictionary remap per term (`None` for a bucket).
+type PartitionRemaps<'a> = Vec<Option<(&'a KeyColumn, Vec<usize>)>>;
+
+impl PartitionSpace {
+    fn new(
+        schema: &Schema,
+        views: &[&SegmentView],
+        partition_by: &[GroupKey],
+    ) -> Result<PartitionSpace, QueryError> {
+        let terms = partition_by
+            .iter()
+            .map(|key| resolve_partition_key(schema, views, key))
+            .collect::<Result<Vec<GroupTerm>, QueryError>>()?;
+        Ok(PartitionSpace {
+            unified: vec![HashMap::new(); terms.len()],
+            slots: HashMap::new(),
+            terms,
+        })
+    }
+
+    fn remaps<'a>(&mut self, view: &'a SegmentView) -> Result<PartitionRemaps<'a>, QueryError> {
+        let columns = view.segment.batch().columns();
+        self.terms
+            .iter()
+            .zip(&mut self.unified)
+            .map(|(term, unified)| partition_remap(term, columns, view, unified))
+            .collect()
+    }
+
+    fn slot(&mut self, view: &SegmentView, remaps: &PartitionRemaps<'_>, row: usize) -> usize {
+        let columns = view.segment.batch().columns();
+        let key: Vec<GroupCode> = self
+            .terms
+            .iter()
+            .zip(remaps)
+            .map(|(term, remap)| term.code(columns, remap.as_ref(), row))
+            .collect();
+        let next = self.slots.len();
+        *self.slots.entry(key).or_insert(next)
+    }
 }
 
 /// Resolves a `PARTITION BY` term, with the type rules that decide
@@ -1978,7 +2030,7 @@ fn window_aggregate(
     registry: &Registry,
     function: &str,
     arg_names: &[String],
-    partition_by: Option<&GroupKey>,
+    partition_by: &[GroupKey],
     order_by: Option<&str>,
     frame: Frame,
     alias: Option<&str>,
@@ -2032,18 +2084,19 @@ fn window_aggregate(
             .map(|view| vec![0i64; view.live_rows()])
             .collect(),
     };
-    match partition_by {
-        None => unpartitioned(aggregate.as_ref(), &args, &keys, frame, &mut results)?,
-        Some(partition_column) => partitioned(
+    if partition_by.is_empty() {
+        unpartitioned(aggregate.as_ref(), &args, &keys, frame, &mut results)?;
+    } else {
+        partitioned(
             schema,
             views,
             aggregate.as_ref(),
             &args,
             &keys,
-            partition_column,
+            partition_by,
             frame,
             &mut results,
-        )?,
+        )?;
     }
     let name = alias.unwrap_or(function);
     let output_type = aggregate.output_type();
@@ -2118,15 +2171,11 @@ fn partitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
     ordering: &[Vec<i64>],
-    partition_by: &GroupKey,
+    partition_by: &[GroupKey],
     frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
-    let term = resolve_partition_key(schema, views, partition_by)?;
-    // The query-lifetime symbol space (value → unified code), and the
-    // partition slot per distinct key value, in first-seen order.
-    let mut unified: HashMap<String, usize> = HashMap::new();
-    let mut slots: HashMap<GroupCode, usize> = HashMap::new();
+    let mut space = PartitionSpace::new(schema, views, partition_by)?;
     // Per partition: scratch per argument, plus where each row came from
     // (view index, live position within the view).
     let mut scratch: Vec<Vec<Vec<f64>>> = Vec::new();
@@ -2135,13 +2184,9 @@ fn partitioned(
     // what a RANGE frame measures its span against.
     let mut partition_keys: Vec<Vec<i64>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
-        let columns = view.segment.batch().columns();
-        let remap = partition_remap(&term, columns, view, &mut unified)?;
+        let remaps = space.remaps(view)?;
         for (live_position, row) in live_rows(view).enumerate() {
-            let next = slots.len();
-            let partition = *slots
-                .entry(term.code(columns, remap.as_ref(), row))
-                .or_insert(next);
+            let partition = space.slot(view, &remaps, row);
             if scratch.len() <= partition {
                 scratch.resize_with(partition + 1, || vec![Vec::new(); args.len()]);
                 origins.resize_with(partition + 1, Vec::new);
@@ -4885,6 +4930,55 @@ mod query1_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("needs an ORDER BY"), "{error}");
+    }
+
+    #[test]
+    fn several_partition_terms_intersect() {
+        // `PARTITION BY sym, ts / 60` — per symbol, per bar. The two
+        // directions at once, which is what a bar chart per instrument
+        // needs and what a single-term PARTITION BY cannot say.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (61, "A", 4.0),
+            (62, "B", 20.0),
+            (63, "A", 8.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym, ts / 60) AS s FROM t",
+            )
+            .unwrap();
+            // (A,bar0)=1+2=3, (B,bar0)=10, (A,bar1)=4+8=12, (B,bar1)=20.
+            assert_eq!(
+                flatten(&output, 1),
+                [
+                    Some(3.0),
+                    Some(10.0),
+                    Some(3.0),
+                    Some(12.0),
+                    Some(20.0),
+                    Some(12.0)
+                ]
+            );
+            // Each term alone is coarser than both together, which is
+            // what "intersect" has to mean.
+            let by_symbol = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&by_symbol, 1)[0], Some(15.0), "A's whole column");
+            let by_bar = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts / 60) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&by_bar, 1)[0], Some(13.0), "bar 0, both symbols");
+        }
     }
 
     #[test]

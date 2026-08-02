@@ -119,11 +119,14 @@ pub enum WindowCall {
         function: String,
         /// Argument column names, in call order.
         args: Vec<String>,
-        /// PARTITION BY term, if present: a symbol column (the
+        /// PARTITION BY terms, in order (empty = one partition over
+        /// the whole snapshot). Each is a symbol column (the
         /// time-series direction, one partition per symbol) or the
         /// ordering key / a bucket of it (the cross-sectional
-        /// direction, one partition per instant).
-        partition_by: Option<GroupKey>,
+        /// direction, one partition per instant); several together give
+        /// the intersection — `PARTITION BY sym, ts / 60` is one
+        /// partition per symbol per bar.
+        partition_by: Vec<GroupKey>,
         /// ORDER BY column — must be the data's ordering key. `None`
         /// for a cross-sectional window, which has no order *within*
         /// an instant and therefore takes the whole partition as its
@@ -143,8 +146,8 @@ pub enum WindowCall {
         column: String,
         /// How many rows away, `>= 1`.
         offset: usize,
-        /// PARTITION BY term, if present (see [`WindowCall::Agg`]).
-        partition_by: Option<GroupKey>,
+        /// PARTITION BY terms (see [`WindowCall::Agg`]).
+        partition_by: Vec<GroupKey>,
         /// ORDER BY column — must be the data's ordering key. Required
         /// here: a positional lookup with no order has no meaning.
         order_by: String,
@@ -2493,20 +2496,18 @@ fn lower_window_call(function: &ast::Function) -> Result<WindowCall, QueryError>
     // or a bucket of the ordering key. Which direction the window runs
     // in is decided by which column it names — down one symbol through
     // time, or across every symbol at one instant.
-    let partition_by = match spec.partition_by.as_slice() {
-        [] => None,
-        [expr] => Some(lower_group_key(expr).map_err(|_| {
-            QueryError::Unsupported(format!(
-                "PARTITION BY '{expr}' — a column, or a bucket of the ordering \
-                 key (ts / <width>) for a cross-sectional window"
-            ))
-        })?),
-        _ => {
-            return Err(QueryError::Unsupported(
-                "PARTITION BY must be a single column".to_owned(),
-            ))
-        }
-    };
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|expr| {
+            lower_group_key(expr).map_err(|_| {
+                QueryError::Unsupported(format!(
+                    "PARTITION BY '{expr}' — a column, or a bucket of the ordering \
+                     key (ts / <width>) for a cross-sectional window"
+                ))
+            })
+        })
+        .collect::<Result<Vec<GroupKey>, QueryError>>()?;
     // ORDER BY is optional, and its absence is meaningful rather than
     // sloppy: standard SQL gives an unordered window the whole
     // partition as its frame, which is exactly a cross-sectional
@@ -2779,7 +2780,7 @@ mod tests {
                     call: WindowCall::Agg {
                         function: "regr_slope".into(),
                         args: vec!["y".into(), "x".into()],
-                        partition_by: Some(GroupKey::Column("sym".into())),
+                        partition_by: vec![GroupKey::Column("sym".into())],
                         order_by: Some("ts".into()),
                         frame: Frame::Rows(Some(19)),
                     },
@@ -2801,7 +2802,7 @@ mod tests {
                 call: WindowCall::Agg {
                     function: "mean".into(),
                     args: vec!["x".into()],
-                    partition_by: None,
+                    partition_by: Vec::new(),
                     order_by: Some("ts".into()),
                     frame: Frame::Rows(Some(2)),
                 },
