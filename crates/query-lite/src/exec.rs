@@ -37,8 +37,8 @@
 //! decision #6 accepted).
 
 use crate::plan::{
-    AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, JoinPlan, OrderBy, Plan, PlanItem,
-    Projection, QueryError, ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
+    AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
+    PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
@@ -2054,6 +2054,11 @@ impl WindowAggregate for BuiltinWindow {
                 .copied()
                 .max_by(|left, right| cmp_f64(*left, *right))
                 .expect("window is non-empty"),
+            // Windows arrive oldest-first, so the frame's ends *are*
+            // its earliest and latest ordering keys — no clock needed
+            // here, unlike the group form.
+            AggFunction::First => window[0],
+            AggFunction::Last => window[window.len() - 1],
         }))
     }
 }
@@ -2065,14 +2070,87 @@ fn builtin_window(function: &str) -> Option<Arc<dyn WindowAggregate>> {
         "avg" => AggFunction::Avg,
         "min" => AggFunction::Min,
         "max" => AggFunction::Max,
+        "first" => AggFunction::First,
+        "last" => AggFunction::Last,
         _ => return None,
     };
     Some(Arc::new(BuiltinWindow(function)))
 }
 
-/// A group key's per-row code: a unified dictionary code, or the null
-/// group.
-type GroupCode = Option<usize>;
+/// A group key's per-row code.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GroupCode {
+    /// A symbol column's unified dictionary code; `None` = the null
+    /// group (SQL groups nulls together).
+    Label(Option<usize>),
+    /// A bucket of the ordering key: the integer the arithmetic
+    /// produced. Never null — the ordering key is `NOT NULL`.
+    Bucket(i64),
+}
+
+/// One resolved `GROUP BY` term: where to read it and how to read it.
+enum GroupTerm {
+    /// A symbol column, grouped by value through the unified key space.
+    Label {
+        /// Column index in the stored schema.
+        index: usize,
+    },
+    /// The ordering key, grouped by a monotone integer bucket of its
+    /// value (F1 = d). A bare `GROUP BY ts` is this with width 1.
+    Bucket {
+        /// Column index in the stored schema.
+        index: usize,
+        /// Bucket width, in the key's own units.
+        divide: i64,
+        /// Multiplier back to the bucket's start value, if written.
+        multiply: Option<i64>,
+    },
+}
+
+impl GroupTerm {
+    /// This term's value for one row.
+    fn code(
+        &self,
+        columns: &[Column],
+        remap: Option<&(&KeyColumn, Vec<usize>)>,
+        row: usize,
+    ) -> GroupCode {
+        match self {
+            GroupTerm::Label { .. } => {
+                let (column, remap) = remap.expect("label terms carry a remap");
+                GroupCode::Label(
+                    column
+                        .is_valid(row)
+                        .then(|| remap[column.codes().as_slice()[row] as usize]),
+                )
+            }
+            GroupTerm::Bucket {
+                index,
+                divide,
+                multiply,
+            } => {
+                let value = ordering_clocks(&columns[*index])[row];
+                // Truncating division, which is what SQL's `/` on
+                // integers means. Negative keys therefore bucket toward
+                // zero rather than toward minus infinity — monotone
+                // either way, which is all the streaming needs.
+                let bucket = value / divide;
+                GroupCode::Bucket(match multiply {
+                    None => bucket,
+                    Some(multiply) => bucket * multiply,
+                })
+            }
+        }
+    }
+
+    /// The Arrow type this term's output column takes.
+    fn column_type(&self) -> ColumnType {
+        match self {
+            GroupTerm::Label { .. } => ColumnType::Key,
+            GroupTerm::Bucket { .. } => ColumnType::I64,
+        }
+    }
+}
 
 /// One aggregate accumulator. The variant is chosen from the call and
 /// its argument column's type; every variant tracks whether it has seen
@@ -2082,11 +2160,43 @@ type GroupCode = Option<usize>;
 enum Accumulator {
     CountStar(i64),
     CountColumn(i64),
-    SumF64 { sum: f64, seen: bool },
-    SumI64 { sum: i64, seen: bool },
-    Avg { sum: f64, count: i64 },
-    MinMaxF64 { value: f64, seen: bool, max: bool },
-    MinMaxI64 { value: i64, seen: bool, max: bool },
+    SumF64 {
+        sum: f64,
+        seen: bool,
+    },
+    SumI64 {
+        sum: i64,
+        seen: bool,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    MinMaxF64 {
+        value: f64,
+        seen: bool,
+        max: bool,
+    },
+    MinMaxI64 {
+        value: i64,
+        seen: bool,
+        max: bool,
+    },
+    /// `FIRST`/`LAST`: the value carried by the row with the smallest
+    /// (or largest) ordering key in the group, so `clock` travels
+    /// beside the value.
+    FirstLastF64 {
+        clock: i64,
+        value: f64,
+        seen: bool,
+        last: bool,
+    },
+    FirstLastI64 {
+        clock: i64,
+        value: i64,
+        seen: bool,
+        last: bool,
+    },
 }
 
 impl Accumulator {
@@ -2127,10 +2237,28 @@ impl Accumulator {
                     max: call.function == AggFunction::Max,
                 }
             }
+            (AggFunction::First | AggFunction::Last, Some(ColumnType::F64)) => {
+                Accumulator::FirstLastF64 {
+                    clock: 0,
+                    value: 0.0,
+                    seen: false,
+                    last: call.function == AggFunction::Last,
+                }
+            }
+            (AggFunction::First | AggFunction::Last, Some(ColumnType::I64)) => {
+                Accumulator::FirstLastI64 {
+                    clock: 0,
+                    value: 0,
+                    seen: false,
+                    last: call.function == AggFunction::Last,
+                }
+            }
             (AggFunction::Sum, _) => return Err(type_error("SUM")),
             (AggFunction::Avg, _) => return Err(type_error("AVG")),
             (AggFunction::Min, _) => return Err(type_error("MIN")),
             (AggFunction::Max, _) => return Err(type_error("MAX")),
+            (AggFunction::First, _) => return Err(type_error("FIRST")),
+            (AggFunction::Last, _) => return Err(type_error("LAST")),
         })
     }
 
@@ -2143,10 +2271,12 @@ impl Accumulator {
             Accumulator::CountStar(_)
             | Accumulator::CountColumn(_)
             | Accumulator::SumI64 { .. }
-            | Accumulator::MinMaxI64 { .. } => ColumnType::I64,
+            | Accumulator::MinMaxI64 { .. }
+            | Accumulator::FirstLastI64 { .. } => ColumnType::I64,
             Accumulator::SumF64 { .. }
             | Accumulator::Avg { .. }
-            | Accumulator::MinMaxF64 { .. } => ColumnType::F64,
+            | Accumulator::MinMaxF64 { .. }
+            | Accumulator::FirstLastF64 { .. } => ColumnType::F64,
         }
     }
 
@@ -2156,7 +2286,8 @@ impl Accumulator {
         match self {
             Accumulator::CountStar(count) | Accumulator::CountColumn(count) => Some(*count),
             Accumulator::SumI64 { sum, seen } => seen.then_some(*sum),
-            Accumulator::MinMaxI64 { value, seen, .. } => seen.then_some(*value),
+            Accumulator::MinMaxI64 { value, seen, .. }
+            | Accumulator::FirstLastI64 { value, seen, .. } => seen.then_some(*value),
             _ => None,
         }
     }
@@ -2167,14 +2298,17 @@ impl Accumulator {
         match self {
             Accumulator::SumF64 { sum, seen } => seen.then_some(*sum),
             Accumulator::Avg { sum, count } => (*count > 0).then(|| sum / *count as f64),
-            Accumulator::MinMaxF64 { value, seen, .. } => seen.then_some(*value),
+            Accumulator::MinMaxF64 { value, seen, .. }
+            | Accumulator::FirstLastF64 { value, seen, .. } => seen.then_some(*value),
             _ => None,
         }
     }
 
     /// Folds in one row's cell (`None` = the cell is null, or the call
-    /// is `COUNT(*)` and there is no cell).
-    fn update(&mut self, cell: Option<CellNumber>) -> Result<(), QueryError> {
+    /// is `COUNT(*)` and there is no cell), at ordering-key value
+    /// `clock` — which only the positional variants (`FIRST`/`LAST`)
+    /// read, every other aggregate being order-independent.
+    fn update(&mut self, cell: Option<CellNumber>, clock: i64) -> Result<(), QueryError> {
         match (self, cell) {
             (Accumulator::CountStar(count), _) => *count += 1,
             (Accumulator::CountColumn(_), None) => {}
@@ -2214,10 +2348,52 @@ impl Accumulator {
                 }
                 *seen = true;
             }
+            (
+                Accumulator::FirstLastF64 {
+                    clock: at,
+                    value,
+                    seen,
+                    last,
+                },
+                Some(cell),
+            ) => {
+                if first_last_replaces(*seen, *last, clock, *at) {
+                    *at = clock;
+                    *value = cell.as_f64();
+                }
+                *seen = true;
+            }
+            (
+                Accumulator::FirstLastI64 {
+                    clock: at,
+                    value,
+                    seen,
+                    last,
+                },
+                Some(CellNumber::I64(candidate)),
+            ) => {
+                if first_last_replaces(*seen, *last, clock, *at) {
+                    *at = clock;
+                    *value = candidate;
+                }
+                *seen = true;
+            }
             _ => unreachable!("accumulator variant chosen from the argument type"),
         }
         Ok(())
     }
+}
+
+/// Whether a `FIRST`/`LAST` accumulator holding a value at `held`
+/// should take one arriving at `clock`.
+///
+/// Ties are what this exists to pin down. A group can hold several rows
+/// on one ordering-key value, and then "the last" has to mean
+/// something: it means the last of them in **storage order**, the same
+/// rule the as-of join and corrections follow. `LAST` therefore takes
+/// an equal clock and `FIRST` keeps the one it has.
+fn first_last_replaces(seen: bool, last: bool, clock: i64, held: i64) -> bool {
+    !seen || if last { clock >= held } else { clock < held }
 }
 
 /// One numeric cell, typed.
@@ -2236,6 +2412,62 @@ impl CellNumber {
     }
 }
 
+/// Resolves one `GROUP BY` term against the schema and the snapshot's
+/// ordering key — the step the planner cannot do, because it has
+/// neither.
+fn resolve_group_key(
+    schema: &Schema,
+    key: &GroupKey,
+    ordering_key: Option<usize>,
+) -> Result<GroupTerm, QueryError> {
+    let (index, field) = resolve(schema, key.column())?;
+    // A bucket divides the time axis. On any other column the same
+    // arithmetic is just arithmetic: it proves nothing about the order
+    // groups come out in, which is the whole reason this form is
+    // admitted where general expressions are not.
+    let is_ordering_key = ordering_key.is_none_or(|ordering| ordering == index);
+    match key {
+        GroupKey::Column(name) => match field.column_type() {
+            ColumnType::Key => Ok(GroupTerm::Label { index }),
+            // The ordering key groups by value — `GROUP BY ts` is the
+            // finest bucket there is, one per distinct timestamp.
+            ColumnType::I64 if is_ordering_key => Ok(GroupTerm::Bucket {
+                index,
+                divide: 1,
+                multiply: None,
+            }),
+            ColumnType::I64 => Err(QueryError::TypeError(format!(
+                "GROUP BY '{name}': grouping is what symbol columns are for, \
+                 and the one number that groups is the ordering key (whole or \
+                 bucketed: {name} / <width>)"
+            ))),
+            ColumnType::F64 => Err(QueryError::TypeError(format!(
+                "GROUP BY '{name}': a DOUBLE cannot key a group — equality on \
+                 floats is not group identity. Group by a symbol column or a \
+                 bucket of the ordering key"
+            ))),
+        },
+        GroupKey::Bucket {
+            column,
+            divide,
+            multiply,
+        } => {
+            if field.column_type() != ColumnType::I64 || !is_ordering_key {
+                return Err(QueryError::TypeError(format!(
+                    "GROUP BY '{column} / {divide}': a bucket divides the \
+                     declared ordering key, which is what makes the buckets \
+                     come out in order — '{column}' is not it"
+                )));
+            }
+            Ok(GroupTerm::Bucket {
+                index,
+                divide: *divide,
+                multiply: *multiply,
+            })
+        }
+    }
+}
+
 /// The aggregate projection: group live rows by key columns in the
 /// query-lifetime unified key space (decision #6 — codes remap per
 /// segment), fold the accumulators, and emit one batch with one row per
@@ -2245,22 +2477,19 @@ impl CellNumber {
 fn project_aggregate(
     schema: &Schema,
     views: &[&SegmentView],
-    keys: &[String],
+    keys: &[GroupKey],
     items: &[AggItem],
 ) -> Result<QueryOutput, QueryError> {
-    // Resolve keys (must be key columns) and calls (typed accumulators).
-    let key_indices: Vec<usize> = keys
+    // Which column ingest is ordered on — the axis a bucket is allowed
+    // to divide. Read from the snapshot rather than the schema, which
+    // cannot say it. With no segments there are no rows and therefore
+    // no groups, so there is nothing a wrong column could answer
+    // wrongly and the check is vacuous.
+    let ordering_key = views.first().map(|view| view.segment.ordering_key());
+    let terms: Vec<GroupTerm> = keys
         .iter()
-        .map(|key| {
-            let (index, field) = resolve(schema, key)?;
-            if field.column_type() != ColumnType::Key {
-                return Err(QueryError::TypeError(format!(
-                    "GROUP BY '{key}' must be a key column — grouping is what keys are for"
-                )));
-            }
-            Ok(index)
-        })
-        .collect::<Result<Vec<usize>, QueryError>>()?;
+        .map(|key| resolve_group_key(schema, key, ordering_key))
+        .collect::<Result<Vec<GroupTerm>, QueryError>>()?;
     let calls: Vec<(&AggCall, Option<usize>, Option<ColumnType>)> = items
         .iter()
         .filter_map(|item| match item {
@@ -2298,8 +2527,14 @@ fn project_aggregate(
         let batch = view.segment.batch();
         // This view's key columns, with per-segment codes remapped into
         // the unified space (decision #6's query-time remap).
-        let mut remaps: Vec<(&KeyColumn, Vec<usize>)> = Vec::with_capacity(key_indices.len());
-        for (position, &index) in key_indices.iter().enumerate() {
+        let mut remaps: Vec<Option<(&KeyColumn, Vec<usize>)>> = Vec::with_capacity(terms.len());
+        for (position, term) in terms.iter().enumerate() {
+            let &GroupTerm::Label { index } = term else {
+                // A bucket reads its value straight from the ordering
+                // key; there is no dictionary to unify.
+                remaps.push(None);
+                continue;
+            };
             let Column::Key(column) = &batch.columns()[index] else {
                 unreachable!("validated as a key column above")
             };
@@ -2317,16 +2552,17 @@ fn project_aggregate(
                     }
                 })
                 .collect();
-            remaps.push((column, remap));
+            remaps.push(Some((column, remap)));
         }
+        // `FIRST`/`LAST` are positional on the time axis, so they need
+        // the ordering key's value beside each cell. Fetched once per
+        // view; the column exists and is `NOT NULL` by construction.
+        let clocks = ordering_key.map(|index| ordering_clocks(&batch.columns()[index]));
         for row in live_rows(view) {
-            let group_key: Vec<GroupCode> = remaps
+            let group_key: Vec<GroupCode> = terms
                 .iter()
-                .map(|(column, remap)| {
-                    column
-                        .is_valid(row)
-                        .then(|| remap[column.codes().as_slice()[row] as usize])
-                })
+                .zip(&remaps)
+                .map(|(term, remap)| term.code(batch.columns(), remap.as_ref(), row))
                 .collect();
             let group = *groups.entry(group_key.clone()).or_insert_with(|| {
                 group_keys.push(group_key.clone());
@@ -2352,7 +2588,7 @@ fn project_aggregate(
                         }
                     },
                 };
-                accumulator.update(cell)?;
+                accumulator.update(cell, clocks.map_or(0, |clocks| clocks[row]))?;
             }
         }
     }
@@ -2363,21 +2599,39 @@ fn project_aggregate(
     let mut next_call = 0usize;
     for item in items {
         match item {
-            AggItem::Key { name, alias } => {
-                let position = keys.iter().position(|key| key == name).expect("validated");
+            AggItem::Key { key, alias } => {
+                let position = keys.iter().position(|term| term == key).expect("validated");
+                let default_name = key.output_name();
+                let name = alias.as_deref().unwrap_or(&default_name);
+                if terms[position].column_type() == ColumnType::I64 {
+                    // A bucket: its integer value, one per group.
+                    let values: Buffer<i64> = group_keys
+                        .iter()
+                        .map(|group_key| match group_key[position] {
+                            GroupCode::Bucket(value) => value,
+                            GroupCode::Label(_) => unreachable!("bucket term, bucket code"),
+                        })
+                        .collect();
+                    fields.push(Field::new(name, ColumnType::I64, false));
+                    columns.push(Column::Numeric(NumericData::I64(
+                        NumericColumn::new_non_null(values),
+                    )));
+                    continue;
+                }
                 let mut dictionary = Dictionary::new();
                 let mut codes: Buffer<u32> = Buffer::with_capacity(group_count);
                 let mut validity: Vec<bool> = Vec::with_capacity(group_count);
                 for group_key in &group_keys {
                     match group_key[position] {
-                        Some(code) => {
+                        GroupCode::Label(Some(code)) => {
                             codes.push(dictionary.intern(&unified_values[position][code]));
                             validity.push(true);
                         }
-                        None => {
+                        GroupCode::Label(None) => {
                             codes.push(0);
                             validity.push(false);
                         }
+                        GroupCode::Bucket(_) => unreachable!("label term, label code"),
                     }
                 }
                 let nullable = validity.iter().any(|&valid| !valid);
@@ -2390,11 +2644,7 @@ fn project_aggregate(
                 } else {
                     KeyColumn::new_non_null(codes, dictionary)
                 };
-                fields.push(Field::new(
-                    alias.as_deref().unwrap_or(name),
-                    ColumnType::Key,
-                    nullable,
-                ));
+                fields.push(Field::new(name, ColumnType::Key, nullable));
                 columns.push(Column::Key(column));
             }
             AggItem::Call(call) => {
@@ -2404,6 +2654,8 @@ fn project_aggregate(
                     AggFunction::Avg => "avg",
                     AggFunction::Min => "min",
                     AggFunction::Max => "max",
+                    AggFunction::First => "first",
+                    AggFunction::Last => "last",
                 };
                 let name = call.alias.as_deref().unwrap_or(default_name);
                 // Output type from the plan (the template accumulator), so
@@ -4157,12 +4409,163 @@ mod query1_tests {
         }
     }
 
+    /// The i64 column of an output batch, as `Option<i64>` per row.
+    fn i64s(output: &QueryOutput, index: usize) -> Vec<Option<i64>> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
+                    panic!("expected i64 column")
+                };
+                (0..column.len())
+                    .map(|row| column.is_valid(row).then(|| column.values()[row]))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     #[test]
-    fn grouping_by_numeric_is_refused_by_design() {
+    fn a_bucket_groups_the_ordering_key_by_width_and_names_itself() {
+        // Ten seconds of a two-symbol tape, bucketed into 5s bars.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (4, "A", 3.0),
+            (5, "A", 4.0),
+            (7, "B", 20.0),
+            (9, "A", 5.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            // The bucket INDEX: ts / 5 is 0 for ts 0-4, 1 for ts 5-9.
+            let output = run(
+                &views,
+                "SELECT ts / 5 AS bar, count(*) AS n, sum(x) AS total \
+                 FROM t GROUP BY ts / 5",
+            )
+            .unwrap();
+            assert_eq!(output.schema.fields()[0].name(), "bar");
+            assert_eq!(i64s(&output, 0), [Some(0), Some(1)]);
+            assert_eq!(i64s(&output, 1), [Some(4), Some(3)]);
+            assert_eq!(flatten(&output, 2), [Some(16.0), Some(29.0)]);
+            // The bucket START: (ts / 5) * 5 relabels the same groups
+            // with the value the bar opens at, which is what a chart
+            // axis wants. The aggregates must not move.
+            let started = run(
+                &views,
+                "SELECT (ts / 5) * 5 AS bar, sum(x) AS total FROM t GROUP BY (ts / 5) * 5",
+            )
+            .unwrap();
+            assert_eq!(i64s(&started, 0), [Some(0), Some(5)]);
+            assert_eq!(flatten(&started, 1), flatten(&output, 2));
+            // Unaliased, a bucket names itself after the arithmetic.
+            let unnamed = run(&views, "SELECT ts / 5, count(*) FROM t GROUP BY ts / 5").unwrap();
+            assert_eq!(unnamed.schema.fields()[0].name(), "ts / 5");
+            // A bare ordering key is the finest bucket: one per stamp.
+            let finest = run(&views, "SELECT ts, count(*) FROM t GROUP BY ts").unwrap();
+            assert_eq!(finest.num_rows(), 7);
+            // `//` is DuckDB's spelling for the truncating division `/`
+            // already means here; both write the same bucket.
+            let duck = run(
+                &views,
+                "SELECT ts // 5 AS bar, sum(x) AS total FROM t GROUP BY ts // 5",
+            )
+            .unwrap();
+            assert_eq!(i64s(&duck, 0), i64s(&output, 0));
+            assert_eq!(flatten(&duck, 1), flatten(&output, 2));
+        }
+    }
+
+    #[test]
+    fn a_bucket_composes_with_a_symbol_key_for_the_ohlc_shape() {
+        // The canonical bar query: per symbol, per bucket, the open and
+        // close — which is what FIRST/LAST are for, and why they need
+        // the ordering key rather than row order.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (4, "A", 3.0),
+            (5, "A", 4.0),
+            (7, "B", 20.0),
+            (9, "A", 5.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(
+                &views,
+                "SELECT sym, ts / 5 AS bar, first(x) AS open, max(x) AS high, \
+                 min(x) AS low, last(x) AS close \
+                 FROM t GROUP BY sym, ts / 5",
+            )
+            .unwrap();
+            // Groups in first-seen order: (A,0), (B,0), (A,1), (B,1).
+            assert_eq!(i64s(&output, 1), [Some(0), Some(0), Some(1), Some(1)]);
+            assert_eq!(
+                flatten(&output, 2),
+                [Some(1.0), Some(10.0), Some(4.0), Some(20.0)],
+                "open"
+            );
+            assert_eq!(
+                flatten(&output, 5),
+                [Some(3.0), Some(10.0), Some(5.0), Some(20.0)],
+                "close"
+            );
+            assert_eq!(
+                flatten(&output, 3),
+                [Some(3.0), Some(10.0), Some(5.0), Some(20.0)],
+                "high"
+            );
+            assert_eq!(
+                flatten(&output, 4),
+                [Some(1.0), Some(10.0), Some(4.0), Some(20.0)],
+                "low"
+            );
+        }
+    }
+
+    #[test]
+    fn first_and_last_read_the_time_axis_not_the_row_order() {
+        // Rows arriving out of order, and two rows sharing a stamp.
+        // FIRST/LAST must answer by ordering key, so the late row
+        // cannot become the "last" just by arriving last; and the tie
+        // resolves to the last of the tied rows in storage order, the
+        // rule the as-of join follows.
+        let views = segment(&[
+            (5, "A", 50.0),
+            (1, "A", 10.0), // late: earliest stamp, arrives second
+            (9, "A", 90.0),
+            (9, "A", 91.0), // ties with the row before it
+            (3, "A", 30.0), // late again
+        ]);
+        let output = run(
+            &views,
+            "SELECT sym, first(x) AS open, last(x) AS close FROM t GROUP BY sym",
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 1), [Some(10.0)], "earliest stamp wins");
+        assert_eq!(flatten(&output, 2), [Some(91.0)], "the later of the tie");
+    }
+
+    #[test]
+    fn only_symbols_and_the_time_axis_can_key_a_group() {
         let views = segment(&[(1, "A", 1.0)]);
+        // A DOUBLE never keys a group: equality on floats is not group
+        // identity, which is the same reason F1 rejected general
+        // GROUP BY expressions.
         let error = run(&views, "SELECT x, count(*) FROM t GROUP BY x")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("keys"), "{error}");
+        assert!(error.contains("not group identity"), "{error}");
+        // The ordering key does, whole or bucketed — that is F1 = d,
+        // and it is what makes bucketed aggregation expressible at all.
+        assert!(run(&views, "SELECT ts, count(*) FROM t GROUP BY ts").is_ok());
+        assert!(run(
+            &views,
+            "SELECT ts / 60 AS bucket, count(*) FROM t GROUP BY ts / 60"
+        )
+        .is_ok());
     }
 }

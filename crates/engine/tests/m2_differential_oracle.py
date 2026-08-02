@@ -444,6 +444,69 @@ ASOF_FAMILIES = [
     ),
 ]
 
+# M5.3 (F1 = d): bucketed aggregation, and FIRST/LAST.
+#
+# Two spellings differ from DuckDB's and both are deliberate, so these
+# families carry their own oracle SQL rather than running the same text
+# on both sides:
+#
+#  - Integer division. TallyDB's `/` between integers truncates, which
+#    is ISO and PostgreSQL; DuckDB's `/` returns a DOUBLE and its `//`
+#    truncates. TallyDB accepts `//` as a synonym, so the *engine* side
+#    could be written either way — the ORACLE side must say `//`.
+#  - FIRST/LAST have no ISO spelling. DuckDB's own `first`/`last` are
+#    arrival-order aggregates, which is a different question. The
+#    definition wanted here is "the value at the group's earliest/latest
+#    ordering key", and DuckDB spells that `arg_min(x, ts)` /
+#    `arg_max(x, ts)` — a definitional reference, not a name match.
+#
+# Row order is engine-arbitrary for grouped results, so the referee
+# re-sorts both sides (as UNORDERED_FAMILIES does).
+BUCKET_FAMILIES = [
+    # A minute of nanoseconds. The corpus's 1s cadence puts ~60 rows in
+    # each bucket, so the groups are neither singletons nor one blob.
+    (
+        "SELECT ts / 60000000000 AS bar, count(*) AS n, sum(x) AS s FROM corpus "
+        "GROUP BY ts / 60000000000",
+        "SELECT ts // 60000000000 AS bar, count(*) AS n, sum(x) AS s FROM corpus "
+        "GROUP BY ts // 60000000000",
+    ),
+    # The bucket's START value — the same groups, relabelled.
+    (
+        "SELECT (ts / 60000000000) * 60000000000 AS bar, count(*) AS n FROM corpus "
+        "GROUP BY (ts / 60000000000) * 60000000000",
+        "SELECT (ts // 60000000000) * 60000000000 AS bar, count(*) AS n FROM corpus "
+        "GROUP BY (ts // 60000000000) * 60000000000",
+    ),
+    # The OHLC shape: per symbol, per bar, open/high/low/close.
+    (
+        "SELECT sym, ts / 300000000000 AS bar, first(x) AS o, max(x) AS h, "
+        "min(x) AS l, last(x) AS c FROM corpus GROUP BY sym, ts / 300000000000",
+        "SELECT sym, ts // 300000000000 AS bar, arg_min(x, ts) AS o, max(x) AS h, "
+        "min(x) AS l, arg_max(x, ts) AS c FROM corpus GROUP BY sym, ts // 300000000000",
+    ),
+    # FIRST/LAST over a nullable column: both sides skip nulls, so the
+    # answer is the earliest/latest row that HAS a value — not NULL
+    # because the earliest row happened to be missing one.
+    (
+        "SELECT sym, first(y) AS o, last(y) AS c FROM corpus GROUP BY sym",
+        "SELECT sym, arg_min(y, ts) AS o, arg_max(y, ts) AS c FROM corpus GROUP BY sym",
+    ),
+    # A bare ordering key is the finest bucket there is.
+    (
+        "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
+        "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
+    ),
+    # Buckets compose with everything grouping already did: WHERE
+    # before, HAVING after.
+    (
+        "SELECT ts / 60000000000 AS bar, avg(x) AS a FROM corpus WHERE x > 100 "
+        "GROUP BY ts / 60000000000 HAVING count(*) > 20",
+        "SELECT ts // 60000000000 AS bar, avg(x) AS a FROM corpus WHERE x > 100 "
+        "GROUP BY ts // 60000000000 HAVING count(*) > 20",
+    ),
+]
+
 EIGEN_PRECEDING = 19
 
 
@@ -614,6 +677,30 @@ def main() -> None:
             f"FAIL the quote history has only {ties} tied (sym, qts) "
             "timestamps — the as-of families cannot cover the tie rule"
         )
+    for sql, definition in BUCKET_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        if engine.column_names != oracle.column_names:
+            sys.exit(
+                f"FAIL {sql}\n  columns: engine {engine.column_names} "
+                f"vs duckdb {oracle.column_names}"
+            )
+        engine_rows = sorted_rows(engine)
+        oracle_rows = sorted_rows(oracle)
+        if len(engine_rows) != len(oracle_rows):
+            sys.exit(
+                f"FAIL {sql}\n  group count: engine {len(engine_rows)} "
+                f"vs duckdb {len(oracle_rows)}"
+            )
+        for row, (mine, theirs) in enumerate(zip(engine_rows, oracle_rows)):
+            for column, (a, b) in enumerate(zip(mine, theirs)):
+                equal = close(a, b) if isinstance(a, float) or isinstance(b, float) else a == b
+                if not equal:
+                    sys.exit(
+                        f"FAIL {sql}\n  row {row} column "
+                        f"{engine.column_names[column]}: engine {a!r} vs duckdb {b!r}"
+                    )
+        passed += 1
     for sql, definition in ASOF_FAMILIES:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(definition).to_arrow_table()

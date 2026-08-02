@@ -263,6 +263,10 @@ pub enum AggFunction {
     Min,
     /// `MAX(col)`.
     Max,
+    /// `FIRST(col)` — the value at the group's earliest ordering key.
+    First,
+    /// `LAST(col)` — the value at the group's latest ordering key.
+    Last,
 }
 
 impl AggFunction {
@@ -273,8 +277,23 @@ impl AggFunction {
             "avg" => Some(AggFunction::Avg),
             "min" => Some(AggFunction::Min),
             "max" => Some(AggFunction::Max),
+            // The de-facto TSDB names (ruled (a) 2026-07-29). There is
+            // no ISO spelling, but every time-series engine that has
+            // this concept calls it this, and it is well defined here
+            // for the reason it is ill defined in general SQL: the
+            // ordering key is declared, so "first" is not a question
+            // about physical row order.
+            "first" => Some(AggFunction::First),
+            "last" => Some(AggFunction::Last),
             _ => None,
         }
+    }
+
+    /// Whether this aggregate reads the ordering key as well as its
+    /// argument — `FIRST`/`LAST` are positional on the time axis, the
+    /// group-level counterpart of `LAG`/`LEAD`.
+    pub fn is_positional(self) -> bool {
+        matches!(self, AggFunction::First | AggFunction::Last)
     }
 }
 
@@ -295,13 +314,73 @@ pub enum AggItem {
     /// A GROUP BY key, passed through (must appear in the GROUP BY
     /// list).
     Key {
-        /// The key column.
-        name: String,
+        /// What the group is keyed on.
+        key: GroupKey,
         /// Output name, if aliased.
         alias: Option<String>,
     },
     /// An aggregate call.
     Call(AggCall),
+}
+
+/// One `GROUP BY` term.
+///
+/// The planner has no schema, so it cannot tell a symbol column from
+/// the ordering key — both are bare identifiers. It records the
+/// *shape* and the executor, which knows the column types and which
+/// column ingest is ordered on, decides what the shape means.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GroupKey {
+    /// A bare column: a symbol column (grouped by value) or the
+    /// declared ordering key (grouped by its integer value).
+    Column(String),
+    /// A time bucket — monotone integer arithmetic on the ordering key
+    /// (F1 = d, ruled 2026-07-29): `ts / 60` is the bucket index and
+    /// `(ts / 60) * 60` the bucket's start. Because the arithmetic is
+    /// monotone on a column the data is already clustered by, the
+    /// buckets come out in order and grouping streams.
+    ///
+    /// The executor refuses this on any column but the ordering key:
+    /// on anything else the arithmetic proves nothing about order.
+    Bucket {
+        /// The column the arithmetic reads (must be the ordering key).
+        column: String,
+        /// The divisor — the bucket width, in the key's own units.
+        /// Positive; `1` for a bare `ts` read as a bucket.
+        divide: i64,
+        /// The multiplier that turns a bucket index back into the
+        /// bucket's start value, when the query wrote one.
+        multiply: Option<i64>,
+    },
+}
+
+impl GroupKey {
+    /// The column this term reads.
+    pub fn column(&self) -> &str {
+        match self {
+            GroupKey::Column(name) | GroupKey::Bucket { column: name, .. } => name,
+        }
+    }
+
+    /// The output name when the query writes no alias: the column's own
+    /// name, or the bucket arithmetic in canonical form (`ts / 60`,
+    /// `(ts / 60) * 60`) — whatever spacing the query used. Alias a
+    /// bucket to name it anything else.
+    pub fn output_name(&self) -> String {
+        match self {
+            GroupKey::Column(name) => name.clone(),
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply: None,
+            } => format!("{column} / {divide}"),
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply: Some(multiply),
+            } => format!("({column} / {divide}) * {multiply}"),
+        }
+    }
 }
 
 /// What the SELECT list computes.
@@ -311,8 +390,8 @@ pub enum Projection {
     Items(Vec<PlanItem>),
     /// `GROUP BY` keys and aggregate calls, one output row per group.
     Aggregate {
-        /// The GROUP BY key columns (empty = one global group).
-        keys: Vec<String>,
+        /// The GROUP BY terms (empty = one global group).
+        keys: Vec<GroupKey>,
         /// The SELECT list.
         items: Vec<AggItem>,
         /// The `HAVING` filter, if present.
@@ -478,11 +557,11 @@ impl Plan {
                 items,
                 having,
             } => {
-                names.extend(keys.iter().cloned());
+                names.extend(keys.iter().map(|key| key.column().to_owned()));
                 let agg_item =
                     |item: &AggItem, names: &mut std::collections::HashSet<String>| match item {
-                        AggItem::Key { name, .. } => {
-                            names.insert(name.clone());
+                        AggItem::Key { key, .. } => {
+                            names.insert(key.column().to_owned());
                         }
                         AggItem::Call(call) => names.extend(call.argument.iter().cloned()),
                     };
@@ -1553,7 +1632,7 @@ fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryErro
             // ones; a visible column occupying a `__having` name would
             // shadow the filter's target and filter on the wrong value.
             let output_name = |item: &AggItem| match item {
-                AggItem::Key { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+                AggItem::Key { key, alias } => alias.clone().unwrap_or_else(|| key.output_name()),
                 AggItem::Call(call) => call.alias.clone().unwrap_or_default(),
             };
             if let Some(taken) = items
@@ -1893,7 +1972,7 @@ fn lower_asof_inequality(
     Ok((matching, named))
 }
 
-fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError> {
+fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<GroupKey>, QueryError> {
     let ast::GroupByExpr::Expressions(exprs, modifiers) = group_by else {
         return Err(QueryError::Unsupported("GROUP BY ALL".to_owned()));
     };
@@ -1902,18 +1981,121 @@ fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError
             "GROUP BY ROLLUP / CUBE / GROUPING SETS".to_owned(),
         ));
     }
-    exprs
-        .iter()
-        .map(|expr| match expr {
-            ast::Expr::Identifier(column) => Ok(ident(column)),
-            other => Err(QueryError::Unsupported(format!(
-                "GROUP BY '{other}' (plain key columns only)"
-            ))),
-        })
-        .collect()
+    exprs.iter().map(lower_group_key).collect()
 }
 
-fn lower_agg_item(item: &ast::SelectItem, keys: &[String]) -> Result<AggItem, QueryError> {
+/// Lowers one `GROUP BY` term: a bare column, or the monotone integer
+/// arithmetic on the ordering key that F1 = d admits (`ts / 60`,
+/// `(ts / 60) * 60`) and nothing else.
+///
+/// "Nothing else" is the point, not a shortcut. A general expression
+/// would have to be evaluated per row into a hash table, which is the
+/// cost this whole shape exists to avoid; and a general expression over
+/// floats would make group identity float equality. So the admitted
+/// forms are recognised **structurally** — a column, integer literals,
+/// `/` then optionally `*` — and everything else keeps the teaching
+/// error.
+fn lower_group_key(expr: &ast::Expr) -> Result<GroupKey, QueryError> {
+    // `(ts / 60) * 60` — the bucket's start value. The parenthesised
+    // left side arrives as `Nested`; a query that omits the parens gets
+    // the same tree by precedence, so both spellings land here.
+    if let ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::Multiply,
+        right,
+    } = expr
+    {
+        let inner = match left.as_ref() {
+            ast::Expr::Nested(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let GroupKey::Bucket {
+            column,
+            divide,
+            multiply: None,
+        } = lower_group_key(inner)?
+        {
+            return Ok(GroupKey::Bucket {
+                column,
+                divide,
+                multiply: Some(bucket_literal(right)?),
+            });
+        }
+        return Err(QueryError::Unsupported(format!(
+            "GROUP BY '{expr}' — the only arithmetic GROUP BY admits is a \
+             bucket of the ordering key: ts / <width>, or (ts / <width>) * \
+             <width> for the bucket's start"
+        )));
+    }
+    match expr {
+        ast::Expr::Identifier(column) => Ok(GroupKey::Column(ident(column))),
+        ast::Expr::Nested(inner) => lower_group_key(inner),
+        // `/` and `//` both mean truncating integer division here, and
+        // that is not a fudge: a bucket divides an integer by an
+        // integer, and a DOUBLE cannot key a group, so there is exactly
+        // one meaning available in this position. Accepting both
+        // spellings means the ISO/PostgreSQL habit (`/` truncates) and
+        // the DuckDB habit (`/` is float, `//` truncates) each write
+        // what they mean and get it.
+        //
+        // It does constrain #40: when exact integer expression
+        // arithmetic reaches projection, `ts / 60` there must truncate
+        // too, or the same text would mean two things in two clauses.
+        // ISO says truncate, so that is where #40 should land anyway.
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Divide | ast::BinaryOperator::DuckIntegerDivide,
+            right,
+        } => match left.as_ref() {
+            ast::Expr::Identifier(column) => Ok(GroupKey::Bucket {
+                column: ident(column),
+                divide: bucket_literal(right)?,
+                multiply: None,
+            }),
+            other => Err(QueryError::Unsupported(format!(
+                "GROUP BY '{other} / …' — a bucket divides the ordering key \
+                 itself, not an expression"
+            ))),
+        },
+        other => Err(QueryError::Unsupported(format!(
+            "GROUP BY '{other}' (a column, or a bucket of the ordering key: \
+             ts / <width>)"
+        ))),
+    }
+}
+
+/// A bucket width or multiplier: a **positive** integer literal.
+///
+/// Positive because that is what makes the arithmetic monotone, which
+/// is the entire licence for streaming the grouping; zero would divide
+/// by zero and a negative would reverse the order the buckets come out
+/// in. In the key's own units — there is no `INTERVAL` type, so a
+/// minute over nanosecond stamps is `60000000000`.
+fn bucket_literal(expr: &ast::Expr) -> Result<i64, QueryError> {
+    let ast::Expr::Value(value) = expr else {
+        return Err(QueryError::Unsupported(format!(
+            "bucket width '{expr}' must be an integer literal"
+        )));
+    };
+    let ast::Value::Number(number, _) = &value.value else {
+        return Err(QueryError::Unsupported(format!(
+            "bucket width '{expr}' must be an integer literal"
+        )));
+    };
+    match number.parse::<i64>() {
+        Ok(width) if width > 0 => Ok(width),
+        Ok(_) => Err(QueryError::Unsupported(format!(
+            "bucket width '{number}' must be positive — a bucket's width is \
+             what makes the arithmetic monotone"
+        ))),
+        Err(_) => Err(QueryError::Unsupported(format!(
+            "bucket width '{number}' must be an integer (in the ordering \
+             key's own units — no INTERVAL type)"
+        ))),
+    }
+}
+
+fn lower_agg_item(item: &ast::SelectItem, keys: &[GroupKey]) -> Result<AggItem, QueryError> {
     let (expr, alias) = match item {
         ast::SelectItem::UnnamedExpr(expr) => (expr, None),
         ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident(alias))),
@@ -1924,14 +2106,17 @@ fn lower_agg_item(item: &ast::SelectItem, keys: &[String]) -> Result<AggItem, Qu
         }
     };
     match expr {
-        ast::Expr::Identifier(name) => {
-            let name = ident(name);
-            if !keys.contains(&name) {
+        // A bare column or a bucket: either way it must be one of the
+        // GROUP BY terms, matched as a whole — `SELECT ts / 60 … GROUP
+        // BY ts / 300` names two different buckets, not one.
+        ast::Expr::Identifier(_) | ast::Expr::BinaryOp { .. } | ast::Expr::Nested(_) => {
+            let key = lower_group_key(expr)?;
+            if !keys.contains(&key) {
                 return Err(QueryError::Unsupported(format!(
-                    "column '{name}' must appear in GROUP BY or an aggregate"
+                    "'{expr}' must appear in GROUP BY or an aggregate"
                 )));
             }
-            Ok(AggItem::Key { name, alias })
+            Ok(AggItem::Key { key, alias })
         }
         ast::Expr::Function(function) if function.over.is_none() => {
             let name = object_name(&function.name)?.to_lowercase();
@@ -2712,9 +2897,11 @@ mod tests {
                 "SELECT DISTINCT count(x) FROM t",
                 "DISTINCT over window or aggregate projections",
             ),
+            // `x + 1` is arithmetic, but not the one monotone shape
+            // GROUP BY admits (a bucket of the ordering key).
             (
                 "SELECT x, sum(y) FROM t GROUP BY x, x + 1",
-                "plain key columns",
+                "a bucket of the ordering key",
             ),
             ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
             // (an unknown plain call like nope_agg(x) now lowers to a
