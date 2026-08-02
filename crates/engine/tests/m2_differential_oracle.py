@@ -18,6 +18,10 @@ Known, deliberate divergences the generator avoids:
     NumPy) use NULL; window comparisons normalize NaN to None.
   - `ORDER BY <symbol column>`: DuckDB sorts, TallyDB refuses (#58 = B).
     Checked as a refusal rather than avoided.
+  - Division by zero: TallyDB is IEEE (NaN, a value — decision D2),
+    DuckDB returns NULL. Only reachable where a family divides by a
+    window result, so IEEE_DIVISION_FAMILIES normalizes both sides and
+    says so; every other family keeps the strict comparison.
 
 Usage: m2_differential_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
@@ -372,6 +376,19 @@ WINDOW_QUERIES = [
     # The whole snapshot as one partition — `OVER ()`, the grand total
     # beside every row.
     "SELECT ts, sum(x) OVER () AS w FROM corpus ORDER BY ts",
+    # #94: scalar expressions OVER window results. These are the idioms
+    # the window surface exists to serve — a row against its own frame —
+    # and each is one expression, not a second query.
+    "SELECT ts, x - lag(x) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, x - avg(x) OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, x / sum(x) OVER () AS w FROM corpus ORDER BY ts",
+    # Two windows in one expression, computed independently.
+    "SELECT ts, lead(x) OVER (ORDER BY ts) - lag(x) OVER (ORDER BY ts) AS w "
+    "FROM corpus ORDER BY ts",
+    # A window inside a scalar function call, and partitioned.
+    "SELECT ts, abs(x - avg(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)) AS w FROM corpus ORDER BY ts",
 ]
 
 
@@ -554,6 +571,21 @@ CROSS_SECTIONAL_FAMILIES = [
         "SELECT ts, var_pop(x) OVER (PARTITION BY ts // 300000000000) AS w FROM corpus "
         "ORDER BY ts",
     ),
+    # The cross-sectional weight: each row's share of its own bar.
+    # This needs the partition (M5.3) and the composition (#94) at once.
+    (
+        "SELECT ts, x / sum(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x / sum(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # Cross-sectional demeaning, the other half of a z-score.
+    (
+        "SELECT ts, x - avg(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x - avg(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
     # A bucket partition is not restricted to the cross-sectional
     # reading: ordered inside the bucket, it is a frame that resets at
     # each bar boundary.
@@ -563,6 +595,32 @@ CROSS_SECTIONAL_FAMILIES = [
         "SELECT ts, sum(x) OVER (PARTITION BY ts // 60000000000 ORDER BY ts "
         "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
     ),
+]
+
+# Families that DIVIDE by a window result, where the two engines'
+# division-by-zero rules differ and the difference is by ruling, not by
+# accident. TallyDB's arithmetic is IEEE — `x/0` is ±inf or NaN, and NaN
+# is a value (decision D2, DESIGN.md *Null, NaN, and ordering
+# semantics*). DuckDB returns NULL for division by zero. A rolling
+# z-score hits this on every partition's first row, where the frame is
+# one row, the deviation is 0 and the spread is 0.
+#
+# So the referee normalizes NaN to NULL on BOTH sides here, and only
+# here: that compares the numbers both engines agree are numbers,
+# without either pretending the other's zero-division rule is its own.
+# Every other window family keeps the one-sided normalization, so a
+# stray engine NaN still fails them.
+IEEE_DIVISION_FAMILIES = [
+    # The rolling z-score, expressible in SQL at all only because M5.0
+    # added stddev_pop and #94 added the composition.
+    "SELECT ts, (x - avg(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)) / stddev_pop(x) OVER "
+    "(PARTITION BY sym ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) "
+    "AS w FROM corpus ORDER BY ts",
+    # The same shape unpartitioned, over a wider frame.
+    "SELECT ts, (x - avg(x) OVER (ORDER BY ts ROWS BETWEEN 49 PRECEDING "
+    "AND CURRENT ROW)) / stddev_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
 ]
 
 EIGEN_PRECEDING = 19
@@ -735,6 +793,26 @@ def main() -> None:
             f"FAIL the quote history has only {ties} tied (sym, qts) "
             "timestamps — the as-of families cannot cover the tie rule"
         )
+    for sql in IEEE_DIVISION_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(sql).to_arrow_table()
+        engine_w = nan_to_none(engine["w"].to_pylist())
+        oracle_w = nan_to_none(oracle["w"].to_pylist())
+        if len(engine_w) != len(oracle_w):
+            sys.exit(f"FAIL {sql}\n  row counts differ")
+        # A sanity floor: if the normalization swallowed everything the
+        # family would pass vacuously, so require most rows to be real
+        # numbers that actually got compared.
+        compared = sum(1 for value in oracle_w if value is not None)
+        if compared < len(oracle_w) // 2:
+            sys.exit(
+                f"FAIL {sql}\n  only {compared}/{len(oracle_w)} rows are "
+                "non-NULL — the NaN normalization would hide disagreement"
+            )
+        for row, (mine, theirs) in enumerate(zip(engine_w, oracle_w)):
+            if not close(mine, theirs):
+                sys.exit(f"FAIL {sql}\n  w row {row}: engine {mine!r} vs duckdb {theirs!r}")
+        passed += 1
     for sql, definition in CROSS_SECTIONAL_FAMILIES:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(definition).to_arrow_table()

@@ -91,12 +91,30 @@ pub enum PlanItem {
     Computed {
         /// The expression.
         expr: ScalarExpr,
+        /// The window calls hoisted out of `expr`, in the order
+        /// [`ScalarExpr::Window`] indexes them.
+        windows: Vec<WindowCall>,
         /// The output column name: the alias, or the expression's SQL
         /// text when unaliased.
         name: String,
     },
-    /// A window aggregate over a trailing frame.
-    WindowAgg {
+    /// A window call, whole: `sum(x) OVER (...)` as a SELECT item.
+    Window {
+        /// What to compute.
+        call: WindowCall,
+        /// Output name, if aliased.
+        alias: Option<String>,
+    },
+}
+
+/// One window call — an aggregate over a frame, or a positional
+/// lookup. Shared by the whole-item form ([`PlanItem::Window`]) and by
+/// calls hoisted out of a scalar expression, so composing a window into
+/// arithmetic reuses the call rather than restating it.
+#[derive(Clone, PartialEq, Debug)]
+pub enum WindowCall {
+    /// An aggregate over the frame: `sum(x) OVER (...)`.
+    Agg {
         /// Function name, lower-cased (resolved against the registry).
         function: String,
         /// Argument column names, in call order.
@@ -113,28 +131,63 @@ pub enum PlanItem {
         order_by: Option<String>,
         /// What rows the frame covers (see [`Frame`]).
         frame: Frame,
-        /// Output name, if aliased.
-        alias: Option<String>,
     },
     /// `LAG(x, k)` / `LEAD(x, k)` — a positional lookup, **not** an
     /// aggregate: it reads another *row* rather than reducing a frame,
     /// which is why standard SQL gives it no frame clause and why it
     /// carries the source column's type instead of computing in `f64`.
-    WindowValue {
+    Value {
         /// `true` for `LEAD` (look forward), `false` for `LAG`.
         lead: bool,
         /// The column read.
         column: String,
         /// How many rows away, `>= 1`.
         offset: usize,
-        /// PARTITION BY term, if present (see [`PlanItem::WindowAgg`]).
+        /// PARTITION BY term, if present (see [`WindowCall::Agg`]).
         partition_by: Option<GroupKey>,
         /// ORDER BY column — must be the data's ordering key. Required
         /// here: a positional lookup with no order has no meaning.
         order_by: String,
-        /// Output name, if aliased.
-        alias: Option<String>,
     },
+}
+
+impl WindowCall {
+    /// The output name this call takes when the query writes no alias.
+    pub fn default_name(&self) -> &str {
+        match self {
+            WindowCall::Agg { function, .. } => function,
+            WindowCall::Value { lead: true, .. } => "lead",
+            WindowCall::Value { lead: false, .. } => "lag",
+        }
+    }
+
+    /// Every stored column this call reads.
+    pub fn columns(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        match self {
+            WindowCall::Agg {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                names.extend(args.iter().cloned());
+                names.extend(order_by.iter().cloned());
+                names.extend(partition_by.iter().map(|key| key.column().to_owned()));
+            }
+            WindowCall::Value {
+                column,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                names.push(column.clone());
+                names.push(order_by.clone());
+                names.extend(partition_by.iter().map(|key| key.column().to_owned()));
+            }
+        }
+        names
+    }
 }
 
 /// A window's frame — what rows one output row sees.
@@ -221,6 +274,17 @@ impl ScalarFunction {
 pub enum ScalarExpr {
     /// A stored `f64` column's value.
     Column(String),
+    /// One of this item's window calls, by position in its `windows`
+    /// list — the placeholder a window call leaves behind when it is
+    /// hoisted out of a scalar expression (#94).
+    ///
+    /// Hoisting is how standard SQL's evaluation order is honoured
+    /// rather than reimplemented: windows compute over the whole
+    /// partition first, and the SELECT list's arithmetic then runs over
+    /// their results, one row at a time. A window cannot be evaluated
+    /// row-by-row from inside a scalar, because its partition spans
+    /// segments the scalar walks one at a time.
+    Window(usize),
     /// A numeric literal.
     Literal(f64),
     /// Unary minus.
@@ -538,28 +602,12 @@ impl Plan {
                         PlanItem::Column { name, .. } => {
                             names.insert(name.clone());
                         }
-                        PlanItem::Computed { expr, .. } => scalar_columns(expr, &mut names),
-                        PlanItem::WindowAgg {
-                            args,
-                            partition_by,
-                            order_by,
-                            ..
-                        } => {
-                            names.extend(args.iter().cloned());
-                            names.extend(partition_by.iter().map(|key| key.column().to_owned()));
-                            names.extend(order_by.iter().cloned());
+                        PlanItem::Computed { expr, windows, .. } => {
+                            scalar_columns(expr, &mut names);
+                            names.extend(windows.iter().flat_map(WindowCall::columns));
                         }
-                        PlanItem::WindowValue {
-                            column,
-                            partition_by,
-                            order_by,
-                            ..
-                        } => {
-                            names.insert(column.clone());
-                            names.insert(order_by.clone());
-                            if let Some(partition) = partition_by {
-                                names.insert(partition.column().to_owned());
-                            }
+                        PlanItem::Window { call, .. } => {
+                            names.extend(call.columns());
                         }
                     }
                 }
@@ -617,7 +665,9 @@ fn scalar_columns(expr: &ScalarExpr, names: &mut std::collections::HashSet<Strin
         ScalarExpr::Column(name) => {
             names.insert(name.clone());
         }
-        ScalarExpr::Literal(_) => {}
+        // A hoisted window's own columns are collected from the
+        // item's `windows` list, not from here.
+        ScalarExpr::Literal(_) | ScalarExpr::Window(_) => {}
         ScalarExpr::Negate(inner) => scalar_columns(inner, names),
         ScalarExpr::Binary { left, right, .. } => {
             scalar_columns(left, names);
@@ -1607,7 +1657,7 @@ fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryErro
         };
     let select_projection = &projection_exprs;
     let predicate = selection_expr.as_ref().map(lower_predicate).transpose()?;
-    let keys = lower_group_by(&select.group_by)?;
+    let keys = resolve_group_aliases(lower_group_by(&select.group_by)?, select_projection);
     // An aggregate projection is signaled by GROUP BY or by any plain
     // (no OVER) call to a standard aggregate in the SELECT list.
     let aggregate_shaped = !keys.is_empty()
@@ -1996,6 +2046,40 @@ fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<GroupKey>, QueryErr
     exprs.iter().map(lower_group_key).collect()
 }
 
+/// Lets `GROUP BY` name a bucket by the alias the SELECT list gave it:
+/// `SELECT ts / 60 AS bar … GROUP BY bar` rather than repeating the
+/// arithmetic. PostgreSQL and DuckDB both accept the output name here,
+/// so this follows convention rather than coining.
+///
+/// Deliberately narrow: only an alias whose expression is a **bucket**
+/// is substituted. Aliases of plain columns are left alone, because
+/// there the alias and the column mean the same thing anyway and
+/// substituting could only introduce a way to disagree. If a stored
+/// column shares a bucket alias's name the alias wins — which is what
+/// PostgreSQL does, and the query said the name after writing it.
+fn resolve_group_aliases(keys: Vec<GroupKey>, projection: &[ast::SelectItem]) -> Vec<GroupKey> {
+    let aliased = |name: &str| -> Option<GroupKey> {
+        projection.iter().find_map(|item| {
+            let ast::SelectItem::ExprWithAlias { expr, alias } = item else {
+                return None;
+            };
+            if ident(alias) != name {
+                return None;
+            }
+            match lower_group_key(expr) {
+                Ok(key @ GroupKey::Bucket { .. }) => Some(key),
+                _ => None,
+            }
+        })
+    };
+    keys.into_iter()
+        .map(|key| match &key {
+            GroupKey::Column(name) => aliased(name).unwrap_or(key),
+            GroupKey::Bucket { .. } => key,
+        })
+        .collect()
+}
+
 /// Lowers one `GROUP BY` term: a bare column, or the monotone integer
 /// arithmetic on the ordering key that F1 = d admits (`ts / 60`,
 /// `(ts / 60) * 60`) and nothing else.
@@ -2233,13 +2317,16 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
             name: ident(name),
             alias,
         }),
-        ast::Expr::Function(function) if function.over.is_some() => {
-            lower_window_call(function, alias)
-        }
+        ast::Expr::Function(function) if function.over.is_some() => Ok(PlanItem::Window {
+            call: lower_window_call(function)?,
+            alias,
+        }),
         other => {
-            let scalar = lower_scalar_expr(other)?;
+            let mut windows = Vec::new();
+            let scalar = lower_scalar_expr(other, &mut windows)?;
             Ok(PlanItem::Computed {
                 expr: scalar,
+                windows,
                 name: alias.unwrap_or_else(|| other.to_string()),
             })
         }
@@ -2249,9 +2336,12 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
 /// Lowers a scalar expression for the computed-projection slot (#49):
 /// arithmetic, the built-in scalar functions, and `CASE` with WHERE
 /// grammar conditions. Anything else is refused loudly.
-fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
+fn lower_scalar_expr(
+    expr: &ast::Expr,
+    windows: &mut Vec<WindowCall>,
+) -> Result<ScalarExpr, QueryError> {
     match expr {
-        ast::Expr::Nested(inner) => lower_scalar_expr(inner),
+        ast::Expr::Nested(inner) => lower_scalar_expr(inner, windows),
         ast::Expr::Identifier(name) => Ok(ScalarExpr::Column(ident(name))),
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(text, _) => {
@@ -2268,11 +2358,13 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
             expr,
-        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(expr)?))),
+        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(
+            expr, windows,
+        )?))),
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Plus,
             expr,
-        } => lower_scalar_expr(expr),
+        } => lower_scalar_expr(expr, windows),
         ast::Expr::BinaryOp { left, op, right } => {
             let op = match op {
                 ast::BinaryOperator::Plus => ArithOp::Add,
@@ -2288,16 +2380,20 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             };
             Ok(ScalarExpr::Binary {
                 op,
-                left: Box::new(lower_scalar_expr(left)?),
-                right: Box::new(lower_scalar_expr(right)?),
+                left: Box::new(lower_scalar_expr(left, windows)?),
+                right: Box::new(lower_scalar_expr(right, windows)?),
             })
         }
         ast::Expr::Function(function) => {
             let name = object_name(&function.name)?.to_lowercase();
+            // A window call inside arithmetic: hoist it, leaving a
+            // placeholder. Standard SQL computes windows first and runs
+            // the SELECT list's expressions over their results, so this
+            // honours the existing order rather than inventing one.
             if function.over.is_some() {
-                return Err(QueryError::Unsupported(
-                    "a window call inside a scalar expression".to_owned(),
-                ));
+                let call = lower_window_call(function)?;
+                windows.push(call);
+                return Ok(ScalarExpr::Window(windows.len() - 1));
             }
             let ast::FunctionArguments::List(list) = &function.args else {
                 return Err(QueryError::Unsupported(format!(
@@ -2311,7 +2407,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                         "argument '{arg}' in {name}"
                     )));
                 };
-                args.push(lower_scalar_expr(expr)?);
+                args.push(lower_scalar_expr(expr, windows)?);
             }
             let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
                 if AggFunction::from_name(&name).is_some() {
@@ -2350,7 +2446,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             };
             Ok(ScalarExpr::Call {
                 function,
-                args: vec![lower_scalar_expr(expr)?],
+                args: vec![lower_scalar_expr(expr, windows)?],
             })
         }
         ast::Expr::Case {
@@ -2368,12 +2464,12 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             for case_when in conditions {
                 whens.push((
                     crate::predicate::lower_predicate(&case_when.condition)?,
-                    lower_scalar_expr(&case_when.result)?,
+                    lower_scalar_expr(&case_when.result, windows)?,
                 ));
             }
             let otherwise = else_result
                 .as_ref()
-                .map(|expr| lower_scalar_expr(expr).map(Box::new))
+                .map(|expr| lower_scalar_expr(expr, windows).map(Box::new))
                 .transpose()?;
             Ok(ScalarExpr::Case { whens, otherwise })
         }
@@ -2383,10 +2479,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
     }
 }
 
-fn lower_window_call(
-    function: &ast::Function,
-    alias: Option<String>,
-) -> Result<PlanItem, QueryError> {
+fn lower_window_call(function: &ast::Function) -> Result<WindowCall, QueryError> {
     let name = object_name(&function.name)?.to_lowercase();
     let Some(over) = &function.over else {
         return Err(QueryError::Unsupported(format!(
@@ -2457,13 +2550,12 @@ fn lower_window_call(
             )));
         }
         let (column, offset) = lower_offset_args(&name, &function.args)?;
-        return Ok(PlanItem::WindowValue {
+        return Ok(WindowCall::Value {
             lead,
             column,
             offset,
             partition_by,
             order_by: order_column,
-            alias,
         });
     }
     let args = lower_args(&function.args)?;
@@ -2481,13 +2573,12 @@ fn lower_window_call(
         }
         None => Frame::Partition,
     };
-    Ok(PlanItem::WindowAgg {
+    Ok(WindowCall::Agg {
         function: name,
         args,
         partition_by,
         order_by: order_column,
         frame,
-        alias,
     })
 }
 
@@ -2684,12 +2775,14 @@ mod tests {
                     name: "sym".into(),
                     alias: None
                 },
-                PlanItem::WindowAgg {
-                    function: "regr_slope".into(),
-                    args: vec!["y".into(), "x".into()],
-                    partition_by: Some(GroupKey::Column("sym".into())),
-                    order_by: Some("ts".into()),
-                    frame: Frame::Rows(Some(19)),
+                PlanItem::Window {
+                    call: WindowCall::Agg {
+                        function: "regr_slope".into(),
+                        args: vec!["y".into(), "x".into()],
+                        partition_by: Some(GroupKey::Column("sym".into())),
+                        order_by: Some("ts".into()),
+                        frame: Frame::Rows(Some(19)),
+                    },
                     alias: Some("beta".into()),
                 },
             ])
@@ -2704,12 +2797,14 @@ mod tests {
         .expect("plans");
         assert_eq!(
             plan.projection,
-            Projection::Items(vec![PlanItem::WindowAgg {
-                function: "mean".into(),
-                args: vec!["x".into()],
-                partition_by: None,
-                order_by: Some("ts".into()),
-                frame: Frame::Rows(Some(2)),
+            Projection::Items(vec![PlanItem::Window {
+                call: WindowCall::Agg {
+                    function: "mean".into(),
+                    args: vec!["x".into()],
+                    partition_by: None,
+                    order_by: Some("ts".into()),
+                    frame: Frame::Rows(Some(2)),
+                },
                 alias: None,
             }])
         );
@@ -2908,7 +3003,11 @@ mod tests {
         let Projection::Items(items) = &ranged.projection else {
             panic!("items")
         };
-        let PlanItem::WindowAgg { frame, .. } = &items[0] else {
+        let PlanItem::Window {
+            call: WindowCall::Agg { frame, .. },
+            ..
+        } = &items[0]
+        else {
             panic!("window")
         };
         assert_eq!(*frame, Frame::Range(300));
@@ -2922,7 +3021,11 @@ mod tests {
         let Projection::Items(items) = &unbounded.projection else {
             panic!("items")
         };
-        let PlanItem::WindowAgg { frame, .. } = &items[0] else {
+        let PlanItem::Window {
+            call: WindowCall::Agg { frame, .. },
+            ..
+        } = &items[0]
+        else {
             panic!("window")
         };
         assert_eq!(*frame, Frame::Rows(None));

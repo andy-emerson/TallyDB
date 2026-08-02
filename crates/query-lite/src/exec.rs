@@ -38,7 +38,7 @@
 
 use crate::plan::{
     AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
-    PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
+    PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, WindowCall, SEQUENCE_COLUMN,
 };
 use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
 use arrow_lite::{
@@ -762,17 +762,11 @@ fn execute_single(
     // shapes keep today's refusal, as standard SQL refuses them.
     let hidden_order = match (&plan.projection, plan.distinct, &plan.order_by) {
         (Projection::Items(items), false, Some(order_by)) => !items.iter().any(|item| {
-            let output_name =
-                match item {
-                    PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
-                    PlanItem::Computed { name, .. } => name,
-                    PlanItem::WindowAgg {
-                        function, alias, ..
-                    } => alias.as_deref().unwrap_or(function),
-                    PlanItem::WindowValue { lead, alias, .. } => alias
-                        .as_deref()
-                        .unwrap_or(if *lead { "lead" } else { "lag" }),
-                };
+            let output_name = match item {
+                PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
+                PlanItem::Computed { name, .. } => name,
+                PlanItem::Window { call, alias } => alias.as_deref().unwrap_or(call.default_name()),
+            };
             output_name == order_by.column
         }),
         _ => false,
@@ -908,44 +902,14 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
-            PlanItem::Computed { expr, name } => {
-                computed_column(schema, views, expr, name, registry)?
+            PlanItem::Computed {
+                expr,
+                windows,
+                name,
+            } => computed_column(schema, views, expr, windows, name, registry)?,
+            PlanItem::Window { call, alias } => {
+                evaluate_window_call(schema, views, registry, call, alias.as_deref())?
             }
-            PlanItem::WindowAgg {
-                function,
-                args,
-                partition_by,
-                order_by,
-                frame,
-                alias,
-            } => window_aggregate(
-                schema,
-                views,
-                registry,
-                function,
-                args,
-                partition_by.as_ref(),
-                order_by.as_deref(),
-                *frame,
-                alias.as_deref(),
-            )?,
-            PlanItem::WindowValue {
-                lead,
-                column,
-                offset,
-                partition_by,
-                order_by,
-                alias,
-            } => window_value(
-                schema,
-                views,
-                *lead,
-                column,
-                *offset,
-                partition_by.as_ref(),
-                order_by,
-                alias.as_deref(),
-            )?,
         };
         fields.push(field);
         for (out, column) in columns_per_view.iter_mut().zip(columns) {
@@ -1003,9 +967,19 @@ fn computed_column(
     schema: &Schema,
     views: &[&SegmentView],
     expr: &ScalarExpr,
+    window_calls: &[WindowCall],
     name: &str,
     registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // Hoisted windows compute first, and whole (#94): a partition can
+    // span segments, so a window cannot be folded into the per-view
+    // walk below — which is exactly why the call is hoisted rather than
+    // evaluated where it was written.
+    let mut window_columns: Vec<Vec<Column>> = Vec::with_capacity(window_calls.len());
+    for call in window_calls {
+        let (_, columns) = evaluate_window_call(schema, views, registry, call, None)?;
+        window_columns.push(columns);
+    }
     // A registered kernel must see the query's rows as ONE column:
     // storage segmentation is an internal detail, and a kernel with
     // window semantics (a rolling combinator) would otherwise reset at
@@ -1017,11 +991,12 @@ fn computed_column(
     // internal detail, so a one-segment table takes the same path (and
     // meets the same refusals) as a hundred-segment one.
     if uses_registered(expr) {
-        return computed_column_whole(schema, views, expr, name, registry);
+        return computed_column_whole(schema, views, expr, &window_columns, name, registry);
     }
     let mut columns = Vec::with_capacity(views.len());
-    for view in views {
-        let (values, validity) = evaluate_scalar(expr, schema, view, registry)?;
+    for (view_index, view) in views.iter().enumerate() {
+        let windows = window_results(&window_columns, view_index);
+        let (values, validity) = evaluate_scalar(expr, schema, view, registry, &windows)?;
         columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
             values, validity,
         ))));
@@ -1033,7 +1008,7 @@ fn computed_column(
 fn uses_registered(expr: &ScalarExpr) -> bool {
     match expr {
         ScalarExpr::Registered { .. } => true,
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Window(_) => false,
         ScalarExpr::Negate(inner) => uses_registered(inner),
         ScalarExpr::Binary { left, right, .. } => uses_registered(left) || uses_registered(right),
         ScalarExpr::Call { args, .. } => args.iter().any(uses_registered),
@@ -1053,7 +1028,9 @@ fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), Qu
             out.push(name.clone());
             Ok(())
         }
-        ScalarExpr::Literal(_) => Ok(()),
+        // A hoisted window is already a value by the time the gather
+        // runs, so it contributes no stored column to collect.
+        ScalarExpr::Literal(_) | ScalarExpr::Window(_) => Ok(()),
         ScalarExpr::Negate(inner) => registered_columns(inner, out),
         ScalarExpr::Binary { left, right, .. } => {
             registered_columns(left, out)?;
@@ -1082,9 +1059,26 @@ fn computed_column_whole(
     schema: &Schema,
     views: &[&SegmentView],
     expr: &ScalarExpr,
+    window_columns: &[Vec<Column>],
     name: &str,
     registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // This path gathers every view into one synthetic segment, so the
+    // window results have to be gathered the same way to line up with
+    // it, row for row.
+    let whole: Vec<(Vec<f64>, Vec<bool>)> = window_columns
+        .iter()
+        .map(|per_view| {
+            let mut values = Vec::new();
+            let mut validity = Vec::new();
+            for column in per_view {
+                let (mut v, mut m) = column_as_f64(column);
+                values.append(&mut v);
+                validity.append(&mut m);
+            }
+            (values, validity)
+        })
+        .collect();
     let mut names = Vec::new();
     registered_columns(expr, &mut names)?;
     names.sort();
@@ -1102,7 +1096,7 @@ fn computed_column_whole(
         let mut validity = Vec::with_capacity(total);
         for view in views {
             let column = ScalarExpr::Column(column_name.clone());
-            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry)?;
+            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry, &[])?;
             values.append(&mut v);
             validity.append(&mut m);
         }
@@ -1114,7 +1108,7 @@ fn computed_column_whole(
     let batch = RecordBatch::new(Schema::new(fields), gathered);
     let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(batch, 0, false)));
     let reduced = synthetic.segment.batch().schema().clone();
-    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry)?;
+    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry, &whole)?;
     let mut columns = Vec::with_capacity(views.len());
     let mut offset = 0;
     for view in views {
@@ -1128,6 +1122,86 @@ fn computed_column_whole(
     Ok((Field::new(name, ColumnType::F64, true), columns))
 }
 
+/// One view's slice of each hoisted window's result, as the scalar
+/// evaluator's `(values, validity)` pair.
+fn window_results(window_columns: &[Vec<Column>], view: usize) -> Vec<(Vec<f64>, Vec<bool>)> {
+    window_columns
+        .iter()
+        .map(|per_view| column_as_f64(&per_view[view]))
+        .collect()
+}
+
+/// A window result column as `f64` values plus validity. Window outputs
+/// are numeric by construction; `COUNT`'s `i64` widens exactly, because
+/// the scalar pipeline computes in `f64` throughout.
+fn column_as_f64(column: &Column) -> (Vec<f64>, Vec<bool>) {
+    match column {
+        Column::Numeric(NumericData::F64(numeric)) => (
+            numeric.values().as_slice().to_vec(),
+            (0..numeric.len())
+                .map(|row| numeric.is_valid(row))
+                .collect(),
+        ),
+        Column::Numeric(NumericData::I64(numeric)) => (
+            numeric
+                .values()
+                .as_slice()
+                .iter()
+                .map(|&v| v as f64)
+                .collect(),
+            (0..numeric.len())
+                .map(|row| numeric.is_valid(row))
+                .collect(),
+        ),
+        Column::Key(_) => unreachable!("window outputs are numeric"),
+    }
+}
+
+/// Dispatches one window call to the machinery that answers it.
+fn evaluate_window_call(
+    schema: &Schema,
+    views: &[&SegmentView],
+    registry: &Registry,
+    call: &WindowCall,
+    alias: Option<&str>,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    match call {
+        WindowCall::Agg {
+            function,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        } => window_aggregate(
+            schema,
+            views,
+            registry,
+            function,
+            args,
+            partition_by.as_ref(),
+            order_by.as_deref(),
+            *frame,
+            alias,
+        ),
+        WindowCall::Value {
+            lead,
+            column,
+            offset,
+            partition_by,
+            order_by,
+        } => window_value(
+            schema,
+            views,
+            *lead,
+            column,
+            *offset,
+            partition_by.as_ref(),
+            order_by,
+            alias,
+        ),
+    }
+}
+
 /// One view's worth of a scalar expression: `(values, validity)` over
 /// the live rows, in stored order.
 fn evaluate_scalar(
@@ -1135,9 +1209,12 @@ fn evaluate_scalar(
     schema: &Schema,
     view: &SegmentView,
     registry: &Registry,
+    windows: &[(Vec<f64>, Vec<bool>)],
 ) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
     let rows = view.live_rows();
     match expr {
+        // Already computed, whole, before this walk started (#94).
+        ScalarExpr::Window(index) => Ok(windows[*index].clone()),
         ScalarExpr::Column(name) => {
             let (index, field) = resolve(schema, name)?;
             match &view.segment.batch().columns()[index] {
@@ -1173,15 +1250,15 @@ fn evaluate_scalar(
         }
         ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
         ScalarExpr::Negate(inner) => {
-            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry)?;
+            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry, windows)?;
             for value in &mut values {
                 *value = -*value;
             }
             Ok((values, validity))
         }
         ScalarExpr::Binary { op, left, right } => {
-            let (lv, lval) = evaluate_scalar(left, schema, view, registry)?;
-            let (rv, rval) = evaluate_scalar(right, schema, view, registry)?;
+            let (lv, lval) = evaluate_scalar(left, schema, view, registry, windows)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view, registry, windows)?;
             let values = lv
                 .iter()
                 .zip(&rv)
@@ -1199,7 +1276,7 @@ fn evaluate_scalar(
         ScalarExpr::Call { function, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry, windows)?);
             }
             let mut values = Vec::with_capacity(rows);
             let mut validity = Vec::with_capacity(rows);
@@ -1228,11 +1305,11 @@ fn evaluate_scalar(
             let mut arms = Vec::with_capacity(whens.len());
             for (predicate, arm) in whens {
                 conditions.push(evaluate_predicate(predicate, schema, view)?);
-                arms.push(evaluate_scalar(arm, schema, view, registry)?);
+                arms.push(evaluate_scalar(arm, schema, view, registry, windows)?);
             }
             let fallback = otherwise
                 .as_ref()
-                .map(|expr| evaluate_scalar(expr, schema, view, registry))
+                .map(|expr| evaluate_scalar(expr, schema, view, registry, windows))
                 .transpose()?;
             let mut values = vec![0.0f64; rows];
             let mut validity = vec![false; rows];
@@ -1273,7 +1350,7 @@ fn evaluate_scalar(
             // kernel then runs once for the whole view.
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry, windows)?);
             }
             let dense: Vec<(&[f64], &[bool])> = evaluated
                 .iter()
@@ -4659,18 +4736,52 @@ mod query1_tests {
                     Some(20.0)
                 ]
             );
-            // NOT YET: the portfolio weight, `x / sum(x) OVER
-            // (PARTITION BY ts)`. The cross-section is computable and
-            // sits beside every row, but dividing by it needs a scalar
-            // expression over a window result, which the projection
-            // does not compose (#94). Recorded as the refusal it is, so
-            // that building the composition flips a test rather than
-            // discovering an assumption.
-            let error =
-                crate::plan::plan("SELECT ts, x / sum(x) OVER (PARTITION BY ts) AS w FROM t")
-                    .unwrap_err()
-                    .to_string();
-            assert!(error.contains("window call inside a scalar"), "{error}");
+            // The portfolio weight: each row's share of its own
+            // instant. This is what cross-sectional partitioning is
+            // FOR, and it needs a scalar expression over a window
+            // result (#94) as much as it needs the partition.
+            let weights = run(
+                &views,
+                "SELECT ts, x / sum(x) OVER (PARTITION BY ts) AS w FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&weights, 1),
+                [
+                    Some(0.1),
+                    Some(0.2),
+                    Some(0.7),
+                    Some(0.2),
+                    Some(0.3),
+                    Some(0.5)
+                ]
+            );
+            // Weights sum to 1 within each instant — the property that
+            // makes them weights, checked rather than assumed.
+            for instant in [0..3, 3..6] {
+                let total: f64 = flatten(&weights, 1)[instant]
+                    .iter()
+                    .map(|value| value.expect("no nulls"))
+                    .sum();
+                assert!((total - 1.0).abs() < 1e-12, "{total}");
+            }
+            // Cross-sectional demeaning, the other half of a z-score.
+            let demeaned = run(
+                &views,
+                "SELECT ts, x - avg(x) OVER (PARTITION BY ts) AS d FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&demeaned, 1),
+                [
+                    Some(1.0 - 10.0 / 3.0),
+                    Some(2.0 - 10.0 / 3.0),
+                    Some(7.0 - 10.0 / 3.0),
+                    Some(4.0 - 20.0 / 3.0),
+                    Some(6.0 - 20.0 / 3.0),
+                    Some(10.0 - 20.0 / 3.0)
+                ]
+            );
             // A bucket partitions coarser: one cross-section per bar,
             // so both instants fall in the same partition.
             let bucketed = run(
@@ -4698,6 +4809,58 @@ mod query1_tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn a_scalar_expression_composes_over_window_results() {
+        // #94: windows compute first, whole, and the SELECT list's
+        // arithmetic then runs over their results — standard SQL's own
+        // evaluation order. Without this a window can only BE a
+        // projection, never feed one.
+        let views = segment(&[(1, "A", 2.0), (2, "A", 5.0), (3, "A", 9.0)]);
+        // The difference idiom: subtract the previous row.
+        let diff = run(
+            &views,
+            "SELECT ts, x - lag(x) OVER (ORDER BY ts) AS d FROM t",
+        )
+        .unwrap();
+        assert_eq!(flatten(&diff, 1), [None, Some(3.0), Some(4.0)]);
+        // Two windows in one expression, each computed independently.
+        let span = run(
+            &views,
+            "SELECT ts, lead(x) OVER (ORDER BY ts) - lag(x) OVER (ORDER BY ts) AS s FROM t",
+        )
+        .unwrap();
+        assert_eq!(flatten(&span, 1), [None, Some(7.0), None]);
+        // A window inside a scalar function call, not just arithmetic.
+        let deviation = run(
+            &views,
+            "SELECT ts, abs(x - avg(x) OVER (ORDER BY ts \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) AS a FROM t",
+        )
+        .unwrap();
+        // Frames [2], [2,5], [5,9] → means 2, 3.5, 7.
+        assert_eq!(flatten(&deviation, 1), [Some(0.0), Some(1.5), Some(2.0)]);
+        // A window's NULL propagates through the arithmetic as a NULL,
+        // rather than becoming a number.
+        assert_eq!(flatten(&diff, 1)[0], None);
+    }
+
+    #[test]
+    fn a_group_by_may_name_a_bucket_by_its_select_alias() {
+        let views = segment(&[(0, "A", 1.0), (61, "A", 2.0), (130, "A", 4.0)]);
+        let aliased = run(
+            &views,
+            "SELECT ts / 60 AS bar, sum(x) AS s FROM t GROUP BY bar",
+        )
+        .unwrap();
+        let spelled = run(
+            &views,
+            "SELECT ts / 60 AS bar, sum(x) AS s FROM t GROUP BY ts / 60",
+        )
+        .unwrap();
+        assert_eq!(i64s(&aliased, 0), [Some(0), Some(1), Some(2)]);
+        assert_eq!(flatten(&aliased, 1), flatten(&spelled, 1));
     }
 
     #[test]
