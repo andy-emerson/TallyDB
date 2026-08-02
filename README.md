@@ -24,8 +24,11 @@
 > `WindowAggregate` trait as the primary extension path, Lua behind an
 > off-by-default feature the console turns on, corrections on a
 > knowledge axis (`AS OF` reads the table as it was known), and
-> SQL-in-Lua driver scripts. M5 (desk adoption) is under way on the
-> working branch. The settled
+> SQL-in-Lua driver scripts. M5 (desk adoption) is built on the
+> working branch: the ordered-axis dividends — as-of joins, time
+> bucketing, `RANGE` frames, `LAG`/`LEAD`, cross-sectional
+> partitioning, `regr_r2` — and lazy residency, so a table need not
+> fit in memory. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -207,7 +210,8 @@ buffers, `u32`-dictionary key columns, the two-variant column enum with
 zero-copy views, logical-type export annotations, and the C Data Interface
 including `ArrowArrayStream` — every piece round-trip-tested against
 arrow-rs and PyArrow in CI, with the unsafe core additionally checked
-under Miri by hand (not yet wired into CI — issue #63).
+under Miri in CI on every change (issue #63) — `arrow-lite` concentrates
+the workspace's unsafe, so that is where the interpreter is pointed.
 
 On top of it runs the vertical slice, now past its M1 write-then-read
 shape: `storage-lite` appends validated rows into a per-table store —
@@ -230,6 +234,10 @@ log with sync levels (default: group commit every 100ms, measured at
 ~1µs added per append; `Full` for a zero loss window; `Off` restoring
 the flush boundary for replayable upstreams), crash-tested down to
 torn-record and stale-generation windows.
+A table need not fit in memory: segments fault in lazily under a byte
+budget (`tallydb --cache MiB`), zone pruning runs on segment-handle
+metadata *before* the fault, so a pruned segment's file is never read,
+and a table bigger than its budget answers exactly like a resident one.
 Mutation is real: `UPDATE`/`DELETE` run as tombstone + reinsert against
 row-id delete logs, each mutation spending exactly one coordinate on the
 ingest-sequence axis — so `AS OF` the last spent one is the latest
@@ -241,25 +249,39 @@ in CI. `query-lite` speaks a real query subset via sqlparser-rs: SELECT with
 WHERE (the predicate fragment — numeric comparisons, key string
 equality, `IN` and `LIKE` evaluated once per distinct dictionary value,
 `IS [NOT] NULL`, `AND`/`OR`/`NOT` — with zone-map pruning skipping
-segments that cannot match), GROUP BY over key columns with
-`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` under SQL null semantics (`SUM` over
-`i64` stays exact and errors loudly on overflow rather than silently
-widening), top-level ORDER BY and LIMIT/OFFSET (bounded, the sort runs
-top-k: a ten-row answer holds ten rows, not the whole sorted result),
-equi-joins (one large table
+segments that cannot match, plus comparisons between whole expressions
+such as `x * 2 > y + 1`, which no zone map can rule out: those prune
+nothing, and pruning degrades **per conjunct**, so `WHERE ts > 1000 AND
+x > y` still skips segments on `ts`), GROUP BY over key columns and
+over monotone buckets of the ordering key (`ts / 60`, `(ts / 60) * 60`,
+bare `ts`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`FIRST`/`LAST` under
+SQL null semantics (`SUM` over `i64` stays exact and errors loudly on
+overflow rather than silently widening; a bucket grouping streams,
+holding only the open bucket's state rather than a hash table over
+every group), top-level ORDER BY and LIMIT/OFFSET (bounded, the sort
+runs top-k: a ten-row answer holds ten rows, not the whole sorted
+result), equi-joins (one large table
 against small key-unique dimension tables — the star-schema family —
 INNER or LEFT, run fact-driven through the same pipeline as everything
-else, gathering only the dimension columns the query reads), the standard
-aggregates as window functions over `ROWS BETWEEN n | UNBOUNDED
-PRECEDING AND CURRENT ROW` frames, and `UPDATE`/`DELETE`. It
+else, gathering only the dimension columns the query reads), as-of
+joins (`ASOF LEFT|INNER JOIN ... ON f.sym = q.sym AND f.ts >= q.ts` —
+each fact row against the last dimension row at or before it), the
+standard aggregates as window functions over `ROWS` and `RANGE` frames
+and over the whole partition, `LAG`/`LEAD`, cross-sectional
+`PARTITION BY` (one or several terms, including an unordered partition
+that ranks peers within a timestamp), scalar expressions over window
+results, and `UPDATE`/`DELETE`. It
 executes across all segments of a snapshot, returning one Arrow batch
-per segment with per-segment key dictionaries remapped at query time
+per segment for a plain scan — the collapsing stages (`ORDER BY`,
+`LIMIT`, `DISTINCT`, `HAVING`, `GROUP BY`) materialize a single batch
+instead — with per-segment key dictionaries remapped at query time
 where grouping or partitioning needs them, and a generated
 differential harness diffs query families against DuckDB over the
 corpus in CI;
 `engine` ties them together behind a
-multi-table `Database` handle, registering `regr_slope` / `regr_intercept`,
-`covar_pop` / `corr`, and `eigen_max` (the window's first
+multi-table `Database` handle, registering `regr_slope` /
+`regr_intercept` / `regr_r2`, `covar_pop` / `corr`, `var_pop` /
+`stddev_pop`, and `eigen_max` (the window's first
 principal-component variance) as SQL window functions — every window
 re-derived independently by NumPy and DuckDB in CI, over a fixture that
 spans several segments and a storage round trip. **These are solved in
@@ -384,10 +406,12 @@ The repo-specific half lives here:
   — M0 layout locked · M1 compute proven · M2 feature-complete · M3 native
   GA · M4 extension model · M5 desk adoption · M6 WASM parity · M7 served
   product + workbench.
-- **Checks:** GitHub Actions on every push to `main` — fmt, clippy, build,
-  tests including doctests, rustdoc with warnings as errors, the Python
-  oracle suite (PyArrow round trip; DuckDB and NumPy differentials,
-  the Lua-window family included), the Lua `apicheck` build, and an
+- **Checks:** GitHub Actions on every pull request and every push to
+  `main` — fmt, clippy, build, tests including doctests, rustdoc with
+  warnings as errors, the Python oracle suite (PyArrow round trip;
+  DuckDB and NumPy differentials, the Lua-window family included), the
+  Lua `apicheck` build, Miri over `arrow-lite`, the official Lua 5.4.7
+  test suite (`ltests`) over the vendored interpreter, and an
   ASan/UBSan job over the C boundary. Doctests are this repository's
   preferred executable evidence.
 - **Audience:** documentation is written for a reader with a BS in applied

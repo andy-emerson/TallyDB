@@ -7,7 +7,9 @@
 //! SELECT [DISTINCT] <columns | scalar expressions | CASE | window calls
 //!                    | GROUP BY keys + aggregates>
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
-//! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
+//!           [ASOF LEFT|INNER JOIN dim ON fact.key = dim.key
+//!                                    AND fact.ts >= dim.ts]
+//! [WHERE predicate] [GROUP BY keys | buckets [HAVING predicate]]
 //! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
 //! CREATE TABLE t (col BIGINT|DOUBLE|SYMBOL [NOT NULL|ORDERING KEY], ...);
 //! INSERT INTO t [(columns)] VALUES (literals), ...;
@@ -15,14 +17,23 @@
 //! DELETE FROM table [WHERE predicate];
 //! ```
 //!
-//! (the predicate fragment is documented in [`crate::predicate`];
-//! window calls are `fn(args) OVER ([PARTITION BY key] ORDER BY
-//! ordering_key ROWS BETWEEN n PRECEDING AND CURRENT ROW)`; aggregates
-//! are `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over plain columns). Everything
-//! else — extra joins, subqueries, CTEs, other frame shapes — is
-//! rejected with a message naming what was rejected. The rejection is
-//! scope honesty, not a parser limit: what the inclusion principle
-//! admits arrives through this same lowering.
+//! The predicate fragment is documented in [`crate::predicate`]. A
+//! `GROUP BY` key is a symbol column or a monotone bucket of the
+//! ordering key (`ts / 60`, `(ts / 60) * 60`, bare `ts`), optionally
+//! named by its `SELECT` alias; aggregates are `COUNT` / `SUM` / `AVG`
+//! / `MIN` / `MAX` / `FIRST` / `LAST`. A window call is
+//! `fn(args) OVER ([PARTITION BY term, ...] [ORDER BY ordering_key]
+//! [ROWS|RANGE BETWEEN n|UNBOUNDED PRECEDING AND CURRENT ROW])`: the
+//! frame may be omitted for the whole partition, `LAG`/`LEAD` take no
+//! frame at all, an unordered partition ranks peers within one instant,
+//! and a scalar expression may be written over a window result (#94).
+//!
+//! Everything else — extra joins, subqueries, CTEs, frame shapes
+//! outside the two above — is rejected with a message naming what was
+//! rejected. The rejection is scope honesty, not a parser limit: what
+//! the inclusion principle admits arrives through this same lowering.
+//! The per-item documentation below is the authority on any detail;
+//! this block is the shape.
 
 use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;

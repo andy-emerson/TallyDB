@@ -524,11 +524,16 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
 
 **M5 (desk adoption)** then builds what the target user needs, chosen
 by the moat test: multi-factor curated compute (K > 2 — the recorded
-LAPACK-class-returns trigger firing, served by faer), the ordered-axis
+LAPACK-class-returns trigger firing; **re-ruled 2026-07-30**, this now
+goes to MatLua in the Lua tier rather than to a faer dependency of our
+own — see the decision record *where non-standard compute lives*,
+below), the ordered-axis
 dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
 2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
-`LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — design ruled, see *The
-M5 ruling batch*), segment-lazy open (F3), cross-process readers (F4 —
+`LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — **all built
+2026-08-01**, see *The M5 ruling batch* for the rulings and the
+stdlib table for what shipped), segment-lazy open (F3), cross-process
+readers (F4 —
 **built 2026-07-29**: read-only opens over a live writer's directory
 see the durable prefix consistently, old-or-new per mutation;
 `tallydb DIR --read-only` with `.refresh`/`.flush` is the console
@@ -830,14 +835,21 @@ is a streaming co-walk — a cursor per side plus the current match window
 — so its memory does not scale with input size; that is exactly why it
 may admit large ⋈ large, and why only on the ordering key, where the
 storage layout guarantees the clustering (assumption 2 plays for clause
-2 the role the size invariant plays for clause 1). Its runtime guard is
-`Segment::is_ordered` — the check the window executor already relies on;
-a transiently disordered table (UPDATE reappends before compaction)
-refuses the merge loudly rather than serving a wrong answer. Dispatch
+2 the role the size invariant plays for clause 1). Its runtime guard
+would be `Segment::is_ordered` — the check the window executor already
+relies on; a transiently disordered table (UPDATE reappends before
+compaction) would refuse the merge loudly rather than serve a wrong
+answer. (Design, not code: per the build note above, the co-walk is
+unbuilt, and what shipped needs no such gate.) Dispatch
 never estimates: an embedded single-machine snapshot knows every table's
 **exact** row count and every dictionary's exact cardinality, so "small
-enough" is a measurement against a stated threshold, not a cost model —
-the fixed-strategy planner stays fixed. A join with *neither* guarding
+enough" *can* be a measurement rather than a cost model — the
+fixed-strategy planner stays fixed. That measurement is **not yet
+enforced**: `execute_join` materializes both sides unconditionally and
+no size check refuses an oversized dimension, so the size invariant is
+today stated, not checked. A threshold belongs in the contract when the
+executor generalizes; the as-of join riding clause 1 (#92) is what
+makes it start to matter. A join with *neither* guarding
 fact — two large tables on a non-ordering key, or join-*order* search —
 is **refused loudly, naming the missing structure**: serving it needs
 spilling, partitioning, or an optimizer, i.e. a different product.
@@ -879,7 +891,14 @@ early drafts named it):
 
 Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
 exact and errors loudly on overflow; query output is one Arrow batch
-per segment; window frames are `ROWS`-only for now. The two sibling cadence
+per segment; window frames are `ROWS`-only for now. Two of the three
+have since been superseded by later work rather than reopened: M5.1
+added `RANGE` and whole-partition frames, so the frame shape is no
+longer `ROWS`-only; and batch count is not a contract — a plain scan
+still yields one batch per segment, but the collapsing stages
+(`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `HAVING`, `GROUP BY`)
+materialize a single batch, as `QueryOutput`'s own documentation says.
+The `SUM(i64)` half stands. The two sibling cadence
 questions closed together, both ruled by the Human 2026-07-27 on a
 measurement (recorded in #43/#44 and built in M3.2/M3.3):
 
@@ -923,11 +942,12 @@ DuckDB differential family; the shell's help cites this table.
 |---|---|---|
 | `SELECT` projection, aliases | in, built | |
 | `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
+| `WHERE` comparing two expressions (`x > y`, `x * 2 > y + 1`) | in, built (#95) | a zone map knows a column's range, not an expression's over several of them, so this leaf **prunes nothing**. Pruning therefore degrades **per conjunct** — `WHERE ts > 1000 AND x > y` still skips segments on `ts` — which is why it is a separate predicate variant, not a generalisation of the prunable one. `40 < x` is mirrored to `x > 40` before lowering, so which side the column sits on changes nothing. A registered kernel is refused here by name: it must see the query's rows as one column, and a filter is evaluated per segment |
 | regex on keys | deferred by ruling (2026-07-29) | menu incl. the Lua-pattern house option on #57 |
 | `IS NULL` / `IS NOT NULL` | in, built | one predicate arm over the validity bitmap; the only *total* leaf (never UNKNOWN); `IS NOT NULL` prunes an all-null segment |
 | `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
 | `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, built (M5.3) | bucket index, `(ts / 60) * 60` for the bucket start, bare `ts` for the finest bucket. `/` truncates (ISO); `//` accepted (DuckDB's spelling). May be named by its SELECT alias. Over ordered data the grouping **streams** — accumulator state is the open bucket, not the result (measured 1.65× less than the hash path over 160k groups); unordered data falls back to hashing with the same answers, and `compact()` restores the fast path |
-| `FIRST` / `LAST` aggregates | in, built (M5.3) | the de-facto TSDB names (ruled (a)); positional on the **time axis**, not row order, so a late-arriving row cannot become "last". Ties on the clock go to the last row in storage order; nulls skipped, which coincides with DuckDB's `arg_min`/`arg_max` |
+| `FIRST` / `LAST` aggregates | in, built (M5.3) | the de-facto TSDB names (ruled (a)); positional on the **time axis**, not row order, so a late-arriving row cannot become "last". Ties on the clock go to the last row in storage order; nulls skipped, which coincides with DuckDB's `arg_min`/`arg_max`. Also available as window functions, where — being positional — they **refuse an unordered window**: with no order there is no first |
 | cross-sectional `PARTITION BY` (the ordering key, or a bucket of it) | in, built (M5.3) | the transpose of `PARTITION BY sym` — one partition per instant, across every symbol. Unordered windows (`OVER (PARTITION BY ts)`) take the whole partition, per standard SQL; several terms intersect (`sym, ts / 60` = per symbol per bar); any `BIGINT` partitions, `DOUBLE` never |
 | scalar expressions over window results | in, built (#94) | `x / sum(x) OVER (PARTITION BY ts)`, `x - lag(x) OVER (ORDER BY ts)`, the rolling z-score. Window calls hoist out of the scalar and compute first — standard SQL's evaluation order |
 | `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
@@ -939,6 +959,7 @@ DuckDB differential family; the shell's help cites this table.
 | `LIMIT`/`OFFSET` | in, built | |
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
 | `var_pop` / `stddev_pop` as windows | in, built (M5.0) | one column; variance *is* self-covariance, so they share `covar_pop`'s corrected two-pass and incremental sweep. Population forms only, matching the `_pop` family; sample forms and the group-level (non-window) surface are additive and unbuilt — as they are for `covar_pop`/`corr` |
+| `regr_r2` as a window | in, built (M5.4) | the squared correlation of the simple fit, `covar² / (var_x·var_y)`, riding the same corrected two-pass and incremental sweep as `regr_slope`. Undefined — SQL NULL, not a fabricated 1.0 — where either column is flat, and clamped to [0, 1] because the correction can push a perfect fit a rounding step past 1. The only member of #77.2's scalar-reduction list with a standard SQL name; residual and fitted value have none, so under #77.1 they go to the Lua tier |
 | `LAG` / `LEAD` | in, built (M5.1) | positional, not aggregates: they copy a neighbouring row, so the output keeps the **source column's type** — a lagged `BIGINT` stays `BIGINT`, because a nanosecond stamp is past 2^53 where `f64` stops being exact. Frameless (standard SQL gives them no frame; a frame clause is refused, not ignored); optional offset defaults to 1; the third `default` argument and symbol columns are refused by name |
 | `RANGE` frames | in, built (M5.1) | bounded by ordering-key **value**, in the key's own units (no `INTERVAL` type: a 5-minute span over ns stamps is `300000000000`). Ends at the current row's **last peer**, per standard SQL, so tied rows share one window. Answers via per-frame recompute today; the incremental sweep over these bounds is the tracked follow-up |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
@@ -1112,6 +1133,14 @@ none is built unless its row in the stdlib table says so.
    the API and scripts, which receive them from one evaluation.
    Per-component SQL functions rejected; multi-output projection
    plumbing deliberately unbuilt until demanded.
+
+   **What that meant at build (M5.4).** Item 3's mechanical rule
+   decides which of the three reach SQL, and only one does: `regr_r2`
+   has a standard SQL name and shipped; residual and fitted value have
+   none, so they are script-side. Read items 3 and 4 in that order —
+   item 4 says a scalar reduction *may* enter SQL, item 3 says only a
+   standard name *does*. As first written item 4 read as a promise of
+   all three, which item 3 forbids.
 5. **The prelude (#77.3): compiled into the binary**, `.prelude`
    prints the source — single-file deployment holds; read-copy-modify
    is preserved by printing, not by an editable side file.
@@ -1365,6 +1394,41 @@ reference LAPACK's `dgels` at k = 2–4 in the same-run three-way
 measurement (see the kernel decision record below) and compiles to
 wasm32. The engine's ops should then dispatch on parameter count:
 closed form at two, a solver above it.
+
+**Decision record — where non-standard compute lives: the Lua tier,
+via MatLua (Human-ruled 2026-07-30).** The reopen trigger above fired
+at M5.4: multi-factor regression is the first committed op needing more
+than two parameters. The answer is **not** a faer dependency of our
+own, and **not** new SQL names. SQL stays standard — item 3 of the M5
+ruling batch, unchanged — and a user who wants more than the standard
+spells turns to the Lua tier, where [MatLua](https://github.com/andy-emerson/MatLua)
+is the matrix and linear-algebra vehicle. Two things follow. TallyDB
+does not coin `regr_multi`, `pca`, or their relatives into SQL: had we
+built the solver ourselves, the pressure to expose it would have been
+immediate, and item 3 would have had to bend. And TallyDB does not take
+faer directly: MatLua already depends on it, and Cargo unifies
+semver-compatible versions, so reaching linear algebra *through* MatLua
+costs no second copy.
+
+*Status: ruled, not built.* Nothing in the tree depends on MatLua
+today. A requirements letter is out — what would break TallyDB if
+MatLua chose otherwise (a Lua face that works against a host-owned
+interpreter, no `Drop` value live across a `longjmp`, no panic across
+the C boundary, `i64` exactness with no implicit widening at the
+boundary, a documented contract for absence, and an Arrow **C Data
+Interface** path so neither side links the other's Arrow stack) versus
+what is theirs to decide (NaN or mask internally, indexing, which
+factorization backs `lstsq`, behaviour on singular input, error
+taxonomy, dtype order). The split follows the Human's standing
+principle: **a decision made ad hoc to an emerging need while building
+our own tools is revisitable; only a decision that would undermine what
+TallyDB *is* is not.** MatLua are the linear-algebra experts; we are
+the time-series-database ones, and where the two overlap we take their
+design.
+
+*What could reopen this:* MatLua declining the embedding or exactness
+requirements, at which point the choice returns to a faer dependency of
+our own with the SQL surface still frozen at standard names.
 
 The design-critical part survives the removal and must keep surviving:
 compute stays behind **distinct traits with independently gated

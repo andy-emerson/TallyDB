@@ -6,6 +6,12 @@
 //! `IS [NOT] NULL`, `AND` / `OR` / `NOT` — evaluated per segment into a
 //! row bitmap.
 //!
+//! One leaf is different in kind: [`Predicate::CompareExpr`] compares
+//! two whole scalar expressions (`x > y`, `x * 2 > y + 1`), and no zone
+//! map can rule it out, so it prunes nothing. Pruning therefore
+//! degrades **per conjunct** rather than per query — see that variant's
+//! documentation.
+//!
 //! String predicates follow the design's rule for keys: the string test
 //! runs **once per distinct dictionary value**, producing a set of
 //! allowed codes; rows are then matched by integer set-membership, never

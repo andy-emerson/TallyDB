@@ -643,10 +643,16 @@ fn render_schema(name: &str, schema: &Schema, ordering_key: &str) -> String {
 
 /// `.help`'s text; the SQL surface itself is DESIGN.md's stdlib table.
 pub const HELP: &str = "\
-Statements end with ';' and may span lines. SQL surface: SELECT (WHERE,
-GROUP BY/HAVING, ORDER BY a numeric column [NULLS FIRST|LAST], LIMIT,
-DISTINCT, window functions incl. var_pop/stddev_pop, scalar
-expressions, CASE, IS NULL, LIKE on symbols), INSERT, UPDATE, DELETE,
+Statements end with ';' and may span lines. SQL surface: SELECT (WHERE
+— comparisons between columns, literals or whole expressions; GROUP BY
+symbols or monotone buckets of the ordering key (ts / 60), with
+COUNT/SUM/AVG/MIN/MAX/FIRST/LAST; HAVING; ORDER BY a numeric column
+[NULLS FIRST|LAST]; LIMIT; DISTINCT; star-schema JOIN and ASOF
+LEFT|INNER JOIN; window functions over ROWS or RANGE frames or a whole
+PARTITION, incl. var_pop/stddev_pop, regr_slope/intercept/r2,
+covar_pop/corr/eigen_max and LAG/LEAD, with PARTITION BY over symbols
+or the ordering key; scalar expressions, incl. over window results;
+CASE; IS NULL; LIKE on symbols), INSERT, UPDATE, DELETE,
 CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
 
 Commands:

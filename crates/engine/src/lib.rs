@@ -96,8 +96,10 @@ pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, 
 // runs application-registered Lua kernels as SQL window functions
 // through the same seam as the curated native windows (the `script`
 // module; whole window per call, never per-row), and kernels call the
-// curated ops — dot, regr_slope/intercept, covar_pop/corr/eigen_max —
-// over the same views, no copy.
+// curated ops — dot, regr_slope/intercept/r2, covar_pop/corr/eigen_max,
+// var_pop/stddev_pop — over the same views, no copy. The list grows by
+// registration, not by editing the Lua binding: the vocabulary
+// invariant makes every registered op reachable from a kernel.
 //
 // TODO: expose the remaining compute-linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced

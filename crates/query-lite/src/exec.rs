@@ -13,8 +13,10 @@
 //! ## One batch per segment
 //!
 //! A query runs over a storage snapshot — one [`SegmentView`] per
-//! segment of one table, in append order — and produces one output batch
-//! per view with any live rows, Arrow's own model for a chunked result.
+//! segment of one table, in append order — and a plain scan produces one
+//! output batch per view with any live rows, Arrow's own model for a
+//! chunked result. (How many batches is not a contract: the collapsing
+//! stages materialize a single one — see [`QueryOutput`].)
 //! That shape is what keeps passthrough zero-copy: each batch's
 //! passthrough columns share its segment's buffers (copy-on-write
 //! clones), and each batch's key columns keep their segment's own
@@ -35,6 +37,17 @@
 //! BY` across segments, each segment's dictionary codes are first
 //! remapped into a query-lifetime key space (the query-time remap
 //! decision #6 accepted).
+//!
+//! Two later shapes add copies of their own, and they are the largest
+//! here. A **join** materializes both sides up front; the as-of join
+//! additionally builds one ascending `(clock, row)` index per key over
+//! the whole dimension, which is what binds it to the size invariant
+//! rather than to the streaming co-walk its design describes (#92).
+//! **Bucket grouping** is the one shape that avoids a copy: over
+//! ordered data it streams, holding only the open bucket's
+//! accumulators and emitting each group as its bucket closes, and falls
+//! back to hashing — same answers, state proportional to the result —
+//! when the data is not ordered.
 
 use crate::plan::{
     AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,

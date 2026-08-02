@@ -36,9 +36,9 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-30: M5.0–M5.4 BUILT; reviews then merge)
+## Snapshot (2026-08-02: M5.0–M5.4 BUILT; reviews done, awaiting merge)
 
-**State:** `main` = `8103306`. `claude/dev` rebased onto it, 16
+**State:** `main` = `8103306`. `claude/dev` rebased onto it, 21
 commits, full gate green at every push. M5.0 through M5.4 are built —
 the whole ordered-axis dividend plus two gaps found on the way:
 
@@ -53,6 +53,8 @@ the whole ordered-axis dividend plus two gaps found on the way:
 | streaming | bucketed grouping holds the open bucket (measured 1.65×) |
 | #95 | predicates compare expressions, not only column-vs-literal |
 | `regr_r2` | the one M5.4 reduction with a standard name |
+| review ×2 | repo-wide code review, then a second pass: the expression-predicate panic over tombstoned rows, a kernel hiding in a CASE condition or a row filter, `40 < x` losing its pruning, an UPDATE matching nothing, `-'A'` losing its minus |
+| doc pass | README's built-state inventory, three module docs, the console help, the MatLua ruling and #95 into DESIGN |
 
 **Evidence:** 143 → **146 differential families** vs DuckDB, 29 test
 suites, six oracles. Every guard added was shown to trip; two
@@ -148,9 +150,15 @@ The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
      #77.1 — and by the Human's ruling they go to **MatLua** rather
      than being built here. Nothing further is TallyDB's until
      MatLua answers the requirements letter.
-3. **Code pass** (repo-wide review + fixes) ← HERE.
-4. **Doc pass** (truth then clarity; README claims at evidence).
-5. **Merge** (the Human).
+3. **Code pass** (repo-wide review + fixes) — **done**: two review
+   rounds, nine findings fixed, every guard shown to trip.
+4. **Doc pass** (truth then clarity; README claims at evidence) —
+   **done**: the review found the code claims well-evidenced and the
+   gap to be coverage, so this pass was mostly catching README's
+   built-state inventory, `plan.rs`/`predicate.rs`/`exec.rs` module
+   docs and the console help up to M5, plus giving `regr_r2`, #95 and
+   the MatLua ruling their first durable records.
+5. **Merge** (the Human) ← HERE.
 
 **Deferred, not dropped** (the Human's research steps 3–6, to be
 rescheduled): **continuous queries (#83)** — opens with the Plan
@@ -190,9 +198,13 @@ so M5.4 lands without it and gains it later.
 - Gate = fmt · clippy both legs `-D warnings` · test both legs ·
   rustdoc both legs · six oracle scripts (pyarrow_roundtrip via
   `-p arrow-lite --features oracle-harness`; the other five via
-  `-p engine --features oracle-harness`). 402 tests at the merge.
+  `-p engine --features oracle-harness`). **453 tests pass on the
+  default leg and 68 on the off-leg** at the merge (re-run
+  2026-08-02, not carried arithmetic).
   Doc-only (.md) pushes have gone without the full gate.
-- CI runs on pull-request events only; CI stable moves — if clippy
+- CI runs on every pull request **and** on every push to `main`; the
+  jobs are check, miri (`arrow-lite`), lua-suite (official 5.4.7 +
+  `ltests`), sanitize. CI stable moves — if clippy
   fails there and not here, `rustup update stable` and re-run.
 - The scratchpad probe crate lives under the session scratchpad
   (path-deps on real crates); rebuild if needed, never in-repo.
@@ -227,7 +239,10 @@ table). The ledger stays here as the working reference.**
 1. **F1 = (d), time bucketing:** `GROUP BY` admits monotone integer
    arithmetic on the ordering key only (`ts / 60`, `(ts / 60) * 60`) —
    no coined `bucket()` function; monotone => streaming aggregation,
-   O(1) state, no hash table. Everything else in GROUP BY keeps the
+   O(1) state, no hash table. (**Narrowed at build** — the state is
+   the *open bucket's*, not O(1) absolutely; measured 1.65× less than
+   the hash path over 160k groups. See DESIGN's F1 build note; the
+   ruling is recorded here as it was given.) Everything else in GROUP BY keeps the
    teaching error. Pending sub-ruling at M5.3: `FIRST`/`LAST`
    aggregates for OHLC (de-facto names, no ISO spelling).
 2. **#65 as-of join, the hybrid (fully ruled):** the single `ASOF`
