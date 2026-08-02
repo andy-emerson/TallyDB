@@ -931,17 +931,21 @@ impl Table {
         Ok(())
     }
 
-    /// Live row ids matching `predicate` (all live rows when `None`).
-    fn matched_row_ids(
+    /// Visits every live row matching `predicate` (all live rows when
+    /// `None`), in row-id order, as `(view, row, id)`. The one place a
+    /// mutation decides what it hit: `DELETE` keeps the id, `UPDATE`
+    /// also copies the row out, and neither gets its own copy of the
+    /// liveness-and-mask rule.
+    fn for_each_match(
         &self,
         views: &[SegmentView],
         predicate: Option<&query_lite::Predicate>,
-    ) -> Result<Vec<u64>, EngineError> {
+        mut visit: impl FnMut(&SegmentView, usize, u64),
+    ) -> Result<(), EngineError> {
         let schema = self.store.schema();
         // A mutation filter may compare expressions (#95), so it needs
         // the same evaluator a SELECT's WHERE gets — kernels included.
         let registry = self.current_registry();
-        let mut ids = Vec::new();
         for view in views {
             let matches = predicate
                 .map(|predicate| {
@@ -957,10 +961,21 @@ impl Table {
             for row in 0..view.segment.batch().num_rows() {
                 let hit = view.is_live(row) && matches.as_ref().is_none_or(|mask| mask.get(row));
                 if hit {
-                    ids.push(base + row as u64);
+                    visit(view, row, base + row as u64);
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Live row ids matching `predicate` (all live rows when `None`).
+    fn matched_row_ids(
+        &self,
+        views: &[SegmentView],
+        predicate: Option<&query_lite::Predicate>,
+    ) -> Result<Vec<u64>, EngineError> {
+        let mut ids = Vec::new();
+        self.for_each_match(views, predicate, |_, _, id| ids.push(id))?;
         Ok(ids)
     }
 
@@ -1014,40 +1029,28 @@ impl Table {
         }
         // Build the corrected copies of every matched live row.
         let views = materialize(&self.store.snapshot()?)?;
-        let registry = self.current_registry();
         let mut matched_ids: Vec<u64> = Vec::new();
         let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
-        for view in &views {
-            let matches = update
-                .predicate
-                .as_ref()
-                .map(|predicate| {
-                    evaluate_predicate(
-                        predicate,
-                        &schema,
-                        view,
-                        &ViewScalars::new(&schema, view, &registry),
-                    )
-                })
-                .transpose()?;
-            let batch = view.segment.batch();
-            let base = view.segment.base_row_id();
-            for row in 0..batch.num_rows() {
-                let hit = view.is_live(row) && matches.as_ref().is_none_or(|mask| mask.get(row));
-                if !hit {
-                    continue;
-                }
-                matched_ids.push(base + row as u64);
-                let mut cells: Vec<OwnedValue> = batch
-                    .columns()
-                    .iter()
-                    .map(|column| OwnedValue::from_cell(column, row))
-                    .collect();
-                for (index, value) in &assigned {
-                    cells[*index] = value.clone();
-                }
-                corrected.push(cells);
+        self.for_each_match(&views, update.predicate.as_ref(), |view, row, id| {
+            matched_ids.push(id);
+            let mut cells: Vec<OwnedValue> = view
+                .segment
+                .batch()
+                .columns()
+                .iter()
+                .map(|column| OwnedValue::from_cell(column, row))
+                .collect();
+            for (index, value) in &assigned {
+                cells[*index] = value.clone();
             }
+            corrected.push(cells);
+        })?;
+        // Matching nothing is a normal SQL outcome, not a misuse:
+        // `UPDATE ... WHERE <false>` affects zero rows. Storage refuses
+        // a supersession with no victims (rightly — that shape is an
+        // append), so the empty case never reaches it.
+        if matched_ids.is_empty() {
+            return Ok(0);
         }
         // One knowledge event (issue #73): the replacements and the
         // tombstones land together at a single ingest sequence —
@@ -2750,20 +2753,20 @@ mod snapshot_concurrency {
     }
 
     #[test]
-    fn a_kernel_in_a_case_condition_is_refused_not_silently_resegmented() {
+    fn a_kernel_in_a_predicate_is_refused_not_silently_resegmented() {
         // Found by the repo-wide code review. A registered kernel must
         // see the query's rows as ONE column — segmentation is an
         // internal detail, and a kernel with running semantics would
         // otherwise reset at every segment boundary. CASE combined
         // with a kernel is refused for exactly that reason.
         //
-        // #95 opened a new door: a CASE *condition* can now hold a
-        // full expression, so a kernel can hide there — and the
-        // routing test was only looking at the arms. The kernel took
-        // the per-view path and its answer changed with the segment
-        // size. It now meets the same refusal the arms do, which is
-        // the point: whether a query is accepted must not turn on how
-        // the rows happen to be split.
+        // #95 opened two new doors: a CASE *condition* and a row
+        // filter can now hold a full expression, so a kernel can hide
+        // in either — and the routing test was only looking at the
+        // CASE arms. The kernel took the per-view path and its answer
+        // changed with the segment size. Both now meet the same
+        // refusal the arms do, which is the point: whether a query is
+        // accepted must not turn on how the rows happen to be split.
         struct RunningSum;
         impl ColumnFunction for RunningSum {
             fn arity(&self) -> usize {
@@ -2798,9 +2801,30 @@ mod snapshot_concurrency {
                 error.contains("lift the function out"),
                 "refused the same way at {segment_rows} rows per segment: {error}"
             );
+            // A row filter is the same door by another name, and the
+            // one the reviewer measured: `WHERE running(x) > 6`
+            // answered 2 rows at 8 rows per segment and 0 at 2,
+            // because WHERE builds each view's live mask per segment.
+            for filter in [
+                "SELECT x FROM t WHERE running(x) > 6",
+                "DELETE FROM t WHERE running(x) > 6",
+                "UPDATE t SET x = 0 WHERE running(x) > 6",
+            ] {
+                let error = table.query(filter).unwrap_err().to_string();
+                assert!(
+                    error.contains("a registered function in a row filter"),
+                    "refused at {segment_rows} rows per segment: {filter}: {error}"
+                );
+            }
             // The kernel alone is fine, and segment-independent.
             let plain = table.query("SELECT running(x) AS c FROM t").unwrap();
             assert_eq!(flatten(&plain, 0).last().copied().flatten(), Some(28.0));
+            // And the workaround the refusal names actually works:
+            // compute it in the SELECT list, filter on that.
+            let lifted = table
+                .query("SELECT running(x) AS c FROM t WHERE x > -1")
+                .unwrap();
+            assert_eq!(flatten(&lifted, 0).len(), 8);
         }
     }
 
@@ -3429,6 +3453,27 @@ mod mutation_tests {
     }
 
     #[test]
+    fn a_mutation_matching_nothing_affects_zero_rows() {
+        // Found by the repo-wide code review. Storage refuses a
+        // supersession with no victims — that shape is an append, not
+        // a correction — but an UPDATE whose WHERE selects nothing is
+        // ordinary SQL and must report 0, not an error. DELETE already
+        // did; UPDATE surfaced the storage refusal to the user.
+        let mut table = small_table();
+        assert_eq!(
+            table.mutate("UPDATE t SET x = 0 WHERE ts = 9999").unwrap(),
+            0
+        );
+        assert_eq!(table.mutate("DELETE FROM t WHERE ts = 9999").unwrap(), 0);
+        // And the table is untouched, including by the UPDATE: no
+        // half-applied correction, no spare knowledge event.
+        assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 10);
+        // The matching case still works, so the short-circuit is not
+        // swallowing real work.
+        assert_eq!(table.mutate("UPDATE t SET x = 0 WHERE ts = 1").unwrap(), 1);
+    }
+
+    #[test]
     fn update_can_rewrite_keys_and_set_null() {
         let schema = Schema::new(vec![
             arrow_lite::Field::new("ts", ColumnType::I64, false),
@@ -3550,6 +3595,11 @@ mod window_truth {
         pub(crate) var_x: f64,
         pub(crate) covar: f64,
         pub(crate) corr: f64,
+        /// The coefficient of determination — `covar² / (var_x·var_y)`,
+        /// computed from the same compensated moments rather than by
+        /// squaring `corr`, so it is a reference in its own right and
+        /// not a second reading of one.
+        pub(crate) r2: f64,
         pub(crate) eigen_max: f64,
         pub(crate) slope: f64,
         pub(crate) intercept: f64,
@@ -3570,6 +3620,11 @@ mod window_truth {
             var_x,
             covar,
             corr,
+            r2: if var_y > 0.0 && var_x > 0.0 {
+                covar * covar / (var_x * var_y)
+            } else {
+                f64::NAN
+            },
             eigen_max: half_trace + radius,
             slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
             intercept: f64::NAN,
@@ -3783,6 +3838,7 @@ mod window_numerics_guard {
                 for (output, expected) in [
                     (RegressionOutput::Slope, truth.slope),
                     (RegressionOutput::Intercept, truth.intercept),
+                    (RegressionOutput::R2, truth.r2),
                 ] {
                     let got = RollingRegression { output }
                         .evaluate(&window)
@@ -3827,6 +3883,12 @@ mod window_numerics_guard {
                 "regr_intercept",
                 Box::new(RollingRegression {
                     output: RegressionOutput::Intercept,
+                }),
+            ),
+            (
+                "regr_r2",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::R2,
                 }),
             ),
             (
@@ -3961,6 +4023,7 @@ mod window_numerics_guard {
                 (RegressionOutput::Intercept, "intercept", &|s: &Stats| {
                     s.intercept
                 }),
+                (RegressionOutput::R2, "r2", &|s: &Stats| s.r2),
             ] {
                 let results = RollingRegression { output }
                     .evaluate_frames(&columns, Some(w - 1))

@@ -2052,7 +2052,50 @@ fn lower_row_predicate(expr: Option<&ast::Expr>) -> Result<Option<Predicate>, Qu
                 .to_owned(),
         ));
     }
+    // A registered kernel sees the query's rows as ONE column, which a
+    // predicate cannot give it: WHERE is evaluated per segment, to
+    // build each view's live mask, so a kernel with running semantics
+    // would restart at every boundary and the answer would depend on
+    // how the rows happened to be split. Before expression comparisons
+    // (#95) a call could not appear here at all; this keeps that.
+    if predicate_calls_a_kernel(&predicate) {
+        return Err(QueryError::Unsupported(
+            "a registered function in a row filter — it must see the query's \
+             rows as one column, and a filter is evaluated per segment; \
+             compute it in the SELECT list and filter on that"
+                .to_owned(),
+        ));
+    }
     Ok(Some(predicate))
+}
+
+/// Whether any expression comparison in `predicate` calls a registered
+/// kernel. Only [`Predicate::CompareExpr`] can hold one; every other
+/// leaf compares a stored column to a literal.
+fn predicate_calls_a_kernel(predicate: &Predicate) -> bool {
+    fn in_expr(expr: &ScalarExpr) -> bool {
+        match expr {
+            ScalarExpr::Registered { .. } => true,
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Window(_) => false,
+            ScalarExpr::Negate(inner) => in_expr(inner),
+            ScalarExpr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
+            ScalarExpr::Call { args, .. } => args.iter().any(in_expr),
+            ScalarExpr::Case { whens, otherwise } => {
+                whens
+                    .iter()
+                    .any(|(condition, value)| predicate_calls_a_kernel(condition) || in_expr(value))
+                    || otherwise.as_deref().is_some_and(in_expr)
+            }
+        }
+    }
+    match predicate {
+        Predicate::CompareExpr { left, right, .. } => in_expr(left) || in_expr(right),
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_calls_a_kernel(left) || predicate_calls_a_kernel(right)
+        }
+        Predicate::Not(inner) => predicate_calls_a_kernel(inner),
+        _ => false,
+    }
 }
 
 fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<GroupKey>, QueryError> {

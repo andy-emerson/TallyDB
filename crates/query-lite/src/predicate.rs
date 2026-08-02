@@ -326,6 +326,14 @@ fn lower_comparison(
     right: &ast::Expr,
     windows: &mut Vec<crate::plan::WindowCall>,
 ) -> Result<Predicate, QueryError> {
+    // `40 < x` is `x > 40` written backwards. Mirror it before anything
+    // else, so it reaches the prunable shape below: otherwise an
+    // identical predicate would prune or not depending on which side
+    // the user put the column, and `40 < ts` would meet #40's
+    // integer-arithmetic refusal while `ts > 40` answered.
+    if is_literal_operand(left) && matches!(right, ast::Expr::Identifier(_)) {
+        return lower_comparison(right, &flip(op), left, windows);
+    }
     let op = match op {
         ast::BinaryOperator::Eq => CmpOp::Eq,
         ast::BinaryOperator::NotEq => CmpOp::Ne,
@@ -339,10 +347,10 @@ fn lower_comparison(
             )))
         }
     };
-    // The prunable shape first — a bare column against a literal is
-    // what a zone map can rule out, so it keeps its own variant. Any
-    // other operand shape falls through to the general comparison
-    // below, which is correct but unprunable (#95).
+    // The prunable shape — a bare column against a literal is what a
+    // zone map can rule out, so it keeps its own variant. Any other
+    // operand shape falls through to the general comparison below,
+    // which is correct but unprunable (#95).
     let ast::Expr::Identifier(column) = left else {
         return compare_expressions(left, op, right, windows);
     };
@@ -374,6 +382,13 @@ fn lower_comparison(
                 value,
             })
         }
+        // A minus sign belongs to a number. On a string literal it is
+        // not a negative key — there is no such thing — so it is
+        // refused rather than quietly dropped, which would read
+        // `sym = -'A'` as `sym = 'A'`.
+        ast::Value::SingleQuotedString(_) if negated_literal => Err(QueryError::TypeError(
+            "unary minus on a string literal (keys are labels, not numbers)".to_owned(),
+        )),
         ast::Value::SingleQuotedString(text) => match op {
             CmpOp::Eq | CmpOp::Ne => Ok(Predicate::KeyEquals {
                 column: column.value.clone(),
@@ -386,6 +401,33 @@ fn lower_comparison(
             )),
         },
         _ => compare_expressions(left, op, whole_right, windows),
+    }
+}
+
+/// Whether an operand is a literal, including the unary minus a
+/// negative number parses as. Only used to spot a backwards
+/// comparison; the mirrored call puts an identifier on the left, so
+/// the recursion is one deep.
+fn is_literal_operand(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Value(_) => true,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => matches!(expr.as_ref(), ast::Expr::Value(_)),
+        _ => false,
+    }
+}
+
+/// The mirror of a comparison operator, for reading `40 < x` as
+/// `x > 40`. Equality and inequality are their own mirrors.
+fn flip(op: &ast::BinaryOperator) -> ast::BinaryOperator {
+    match op {
+        ast::BinaryOperator::Lt => ast::BinaryOperator::Gt,
+        ast::BinaryOperator::LtEq => ast::BinaryOperator::GtEq,
+        ast::BinaryOperator::Gt => ast::BinaryOperator::Lt,
+        ast::BinaryOperator::GtEq => ast::BinaryOperator::LtEq,
+        other => other.clone(),
     }
 }
 
@@ -1065,6 +1107,30 @@ mod tests {
         assert_eq!(matched("sym IN ('MSFT', 'TSLA')"), [1, 3]);
         assert_eq!(matched("sym NOT IN ('MSFT', 'TSLA')"), [0, 2]);
         assert_eq!(matched("sym = 'UNKNOWN'"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_minus_sign_on_a_string_literal_is_refused_not_dropped() {
+        // Found by the repo-wide code review. `-'AAPL'` parses as unary
+        // minus over a string; the arm that strips the minus for
+        // negative numbers passed the bare text through, so this read
+        // as `sym = 'AAPL'` and quietly matched rows.
+        let sql = "SELECT ts FROM t WHERE sym = -'AAPL'";
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                .unwrap();
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("not a query")
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select")
+        };
+        let error = lower_predicate(select.selection.as_ref().unwrap(), &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unary minus on a string literal"), "{error}");
+        // The unsigned form still works, and still matches.
+        assert_eq!(matched("sym = 'AAPL'"), [0, 2]);
     }
 
     #[test]

@@ -5198,6 +5198,60 @@ mod query1_tests {
     }
 
     #[test]
+    fn a_backwards_comparison_is_the_same_predicate_as_the_forwards_one() {
+        // Found by the repo-wide code review. `40 < ts` is `ts > 40`
+        // with the operands swapped, but before this it fell through
+        // to the general expression comparison of #95: same answer
+        // where both work, yet no pruning, and on an i64 column no
+        // answer at all — `40 < ts` met #40's refusal while `ts > 40`
+        // answered. Which side the user puts the column on must not
+        // change what the engine can do.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "A", 2.0), (50, "A", 3.0), (51, "A", 4.0)],
+            2,
+        );
+        let schema = schema();
+        let predicate = |sql: &str| {
+            crate::plan::plan(sql)
+                .unwrap()
+                .predicate
+                .expect("has a WHERE")
+        };
+        // Same lowered predicate, not merely the same answer.
+        assert_eq!(
+            format!("{:?}", predicate("SELECT x FROM t WHERE 40 < ts")),
+            format!("{:?}", predicate("SELECT x FROM t WHERE ts > 40")),
+        );
+        // So the backwards form prunes the segment the forwards one does.
+        let early = &views[0]; // ts 1..2
+        assert!(
+            !can_match(&predicate("SELECT x FROM t WHERE 40 < ts"), &schema, early),
+            "the backwards form must prune what the forwards one prunes"
+        );
+        // And it answers on an i64 column rather than meeting #40.
+        let output = run(&views, "SELECT x FROM t WHERE 40 < ts").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(4.0)]);
+        // Every operator, including the ones that are their own mirror,
+        // and a negative literal (unary minus over a value).
+        for (backwards, forwards) in [
+            ("40 <= ts", "ts >= 40"),
+            ("40 > ts", "ts < 40"),
+            ("40 >= ts", "ts <= 40"),
+            ("50 = ts", "ts = 50"),
+            ("50 <> ts", "ts <> 50"),
+            ("-1 < x", "x > -1"),
+        ] {
+            let backwards = run(&views, &format!("SELECT x FROM t WHERE {backwards}")).unwrap();
+            let forwards = run(&views, &format!("SELECT x FROM t WHERE {forwards}")).unwrap();
+            assert_eq!(flatten(&backwards, 0), flatten(&forwards, 0));
+        }
+        // Literal-on-both-sides and expression operands are untouched:
+        // the mirror only fires when the other side is a bare column.
+        let output = run(&views, "SELECT x FROM t WHERE 40 < x * 20").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(4.0)]);
+    }
+
+    #[test]
     fn a_window_in_a_row_predicate_is_refused_by_name() {
         // Standard SQL runs WHERE before the window phase, so there is
         // no window result to test against — a refusal, not a gap.
