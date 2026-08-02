@@ -36,22 +36,54 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-30: step 1 BUILT — the residency design; step 2 is the check-in)
+## Snapshot (2026-08-02: M5.0–M5.4 BUILT; reviews done, awaiting merge)
 
-**State:** `main` = `cfeba35` (PR #86: AGENTS.md v2.4.0 +
-CONTRIBUTING.md + vector logo). `claude/dev` rebased onto it and
-carries step 1, built and pushed: the residency ruling (option b,
-manifest-section metadata, advisory budget, unbounded interim
-default) in three code commits (`322974b` manifest tag 1 +
-authoritative layout; `177b75b` lazy fault-in + budget + handle API
-sweep; `cb2a6d6` refresh retention + the budget differential) plus
-the decision-record doc commit. Full gate green at the push: fmt,
-clippy both legs, 28 suites (all guards verified tripping),
-rustdoc both legs, all six oracles over the faulting path. New
-issues: #87 (residency deferrals: column granularity, hard budget,
-the default), #88 (streaming scans — unpruned full-table working
-set). Local toolchain **Rust 1.97.1** matching CI — keep it current
-so the gate sees what CI sees.
+**State:** `main` = `8103306`. `claude/dev` rebased onto it, 21
+commits, full gate green at every push. M5.0 through M5.4 are built —
+the whole ordered-axis dividend plus two gaps found on the way:
+
+| Commit | What |
+|---|---|
+| `…` M5.0/M5.1 | dispersion windows, prelude, `LAG`/`LEAD`, `RANGE` frames |
+| as-of join ×2 | grammar + executor (#65) |
+| bucketing | `GROUP BY ts / 60`, `FIRST`/`LAST` (F1 = d) |
+| cross-sectional | `PARTITION BY ts` and buckets of it |
+| #94 | scalar expressions over window results |
+| PARTITION ×N | several partition terms intersect |
+| streaming | bucketed grouping holds the open bucket (measured 1.65×) |
+| #95 | predicates compare expressions, not only column-vs-literal |
+| `regr_r2` | the one M5.4 reduction with a standard name |
+| review ×2 | repo-wide code review, then a second pass: the expression-predicate panic over tombstoned rows, a kernel hiding in a CASE condition or a row filter, `40 < x` losing its pruning, an UPDATE matching nothing, `-'A'` losing its minus |
+| doc pass | README's built-state inventory, three module docs, the console help, the MatLua ruling and #95 into DESIGN |
+
+**Evidence:** 143 → **146 differential families** vs DuckDB, 29 test
+suites, six oracles. Every guard added was shown to trip; two
+sabotages this stretch passed *silently* because the pattern matched
+nothing, which is now a standing lesson — a sabotage that does not
+fail is not a verified guard, it is an unverified edit.
+
+**Issues opened:** #92 (as-of streaming co-walk — clause 2 of the join
+constraint is designed, not built), #93 (**open decision for the
+Human**: `quotes.ts` beside `trades.ts` is refused; rename today),
+#94 (built, closed), #95 (built, closed).
+
+**M5.4 is done on TallyDB's side, and its centre of gravity moved.**
+`regr_r2` is ISO-named and shipped. Residual, fitted value and
+multi-factor have no standard SQL name, so #77.1 puts them
+script-side — and the Human ruled (2026-07-30) that they go to
+**MatLua** (github.com/andy-emerson/MatLua), a Lua array + linalg
+crate over faer and arrow-rs. SQL keeps only standard names; #77 was
+**not** amended. A requirements letter for the MatLua team is drafted
+at `scratchpad/matlua-requirements.md` — send it as an issue there.
+
+**Standing ruling from the Human (2026-07-30), important:** decisions
+made ad-hoc while building internal tools are *revisitable*; only
+decisions that undermine **what TallyDB is** are non-negotiable. Do
+not defend a choice by citing that it was ruled — give the reason, or
+concede. (Applied: D2's NaN half is ours and revisitable; D2's NULL
+half is SQL's and therefore identity-level.)
+
+**Toolchain:** Rust 1.97.1, matching CI.
 
 ### The plan (amended by the Human 2026-07-30, after step 1 landed)
 
@@ -76,22 +108,57 @@ The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
      binary with `.prelude` printing its source** (#77.3 = a).
    - **M5.1** `LAG`/`LEAD` + `RANGE` frames — standard names, so in
      by the #77.1 rule; DuckDB differential.
-   - **M5.2** the as-of join exactly as ruled (#65 hybrid): `ASOF`
-     lifted pre-parse by byte span, `ON` only, ordering keys are the
-     time axis (explicit inequality validated, not obeyed), bare
-     `ASOF JOIN` refused, no `TOLERANCE`. Ordered co-walk gated on
-     `is_ordered()` both sides. DuckDB differential + the
-     vanilla-SQL definitional reference.
-   - **M5.3** bucketing (F1 = d: monotone integer arithmetic on the
-     ordering key in `GROUP BY`, streaming O(1)) + `FIRST`/`LAST`
-     **ruled (a)** + cross-sectional partitioning.
-   - **M5.4** the matrix tier on faer — **SQL gets scalar reductions
-     only** (#77.2 = c): R², residual, fitted; vectors/matrices via
-     API and scripts. Per-frame recompute ships it correct; the
-     incremental up/downdating research is deferred (below).
-3. **Code pass** (repo-wide review + fixes).
-4. **Doc pass** (truth then clarity; README claims at evidence).
-5. **Merge** (the Human).
+   - ~~**M5.2** the as-of join~~ — DONE (2026-07-30), as ruled (#65
+     hybrid): `ASOF` lifted pre-parse by byte span, `ON` only,
+     ordering keys are the time axis (explicit inequality validated,
+     not obeyed), bare `ASOF JOIN` refused, no `TOLERANCE`. Evidence
+     as ruled: seven differential families against a vanilla-SQL
+     **definitional** oracle (a correlated subquery, not DuckDB's own
+     `ASOF JOIN`). Three build notes for the Human, all in DESIGN.md
+     *M5 ruling batch* item 2: it is **not** the ordered co-walk the
+     ruling described — a per-key sorted index plus binary search,
+     which needs no `is_ordered()` gate and is correct over late
+     arrivals, but materializes the dimension (**#92**: clause 2 of
+     the join constraint stays designed, not built); ties on the
+     dimension's clock go to the **last row in storage order**; and
+     the inequality's sides are assigned by qualifier, not operator,
+     so a backwards comparison is refused. **Open decision #93** (not
+     gating): both tables are timestamped, and a dimension attribute
+     sharing a fact column's name is refused, so `quotes.ts` beside
+     `trades.ts` must be renamed today.
+   - ~~**M5.3** bucketing + `FIRST`/`LAST` + cross-sectional~~ — DONE
+     (2026-07-30). Bucketed `GROUP BY` (`ts / 60`, `(ts / 60) * 60`,
+     bare `ts`; `//` accepted; nameable by SELECT alias);
+     `FIRST`/`LAST` positional on the time axis; cross-sectional
+     `PARTITION BY` including multi-term intersection; and **#94**,
+     scalar expressions over window results, without which the
+     cross-sectional weight could be computed but not used.
+     The streaming dividend is built and **measured** — accumulator
+     state is the open bucket, 1.65× less than hashing over 160k
+     groups — with unordered data falling back to hashing rather than
+     refusing (`compact()` restores it). Two new decisions recorded in
+     DESIGN.md's F1 build note: `/` truncates between integers (ISO;
+     constrains #40) and the `GROUP BY`/`PARTITION BY` type asymmetry.
+     Opened on the way: **#95** (`WHERE x > y` — comparisons between
+     expressions, refused since `WHERE` landed).
+   - ~~**M5.4** the matrix tier~~ — DONE on TallyDB's side
+     (2026-07-30). `regr_r2(y, x)` shipped: ISO-named, two-variable,
+     so #77.1 admits it without coining anything; NULL where the fit
+     is undefined; both the recompute and incremental paths, each
+     guard shown to trip. Residual, fitted value and multi-factor
+     have **no** standard SQL name, so they went script-side per
+     #77.1 — and by the Human's ruling they go to **MatLua** rather
+     than being built here. Nothing further is TallyDB's until
+     MatLua answers the requirements letter.
+3. **Code pass** (repo-wide review + fixes) — **done**: two review
+   rounds, nine findings fixed, every guard shown to trip.
+4. **Doc pass** (truth then clarity; README claims at evidence) —
+   **done**: the review found the code claims well-evidenced and the
+   gap to be coverage, so this pass was mostly catching README's
+   built-state inventory, `plan.rs`/`predicate.rs`/`exec.rs` module
+   docs and the console help up to M5, plus giving `regr_r2`, #95 and
+   the MatLua ruling their first durable records.
+5. **Merge** (the Human) ← HERE.
 
 **Deferred, not dropped** (the Human's research steps 3–6, to be
 rescheduled): **continuous queries (#83)** — opens with the Plan
@@ -131,9 +198,13 @@ so M5.4 lands without it and gains it later.
 - Gate = fmt · clippy both legs `-D warnings` · test both legs ·
   rustdoc both legs · six oracle scripts (pyarrow_roundtrip via
   `-p arrow-lite --features oracle-harness`; the other five via
-  `-p engine --features oracle-harness`). 402 tests at the merge.
+  `-p engine --features oracle-harness`). **453 tests pass on the
+  default leg and 68 on the off-leg** at the merge (re-run
+  2026-08-02, not carried arithmetic).
   Doc-only (.md) pushes have gone without the full gate.
-- CI runs on pull-request events only; CI stable moves — if clippy
+- CI runs on every pull request **and** on every push to `main`; the
+  jobs are check, miri (`arrow-lite`), lua-suite (official 5.4.7 +
+  `ltests`), sanitize. CI stable moves — if clippy
   fails there and not here, `rustup update stable` and re-run.
 - The scratchpad probe crate lives under the session scratchpad
   (path-deps on real crates); rebuild if needed, never in-repo.
@@ -168,7 +239,10 @@ table). The ledger stays here as the working reference.**
 1. **F1 = (d), time bucketing:** `GROUP BY` admits monotone integer
    arithmetic on the ordering key only (`ts / 60`, `(ts / 60) * 60`) —
    no coined `bucket()` function; monotone => streaming aggregation,
-   O(1) state, no hash table. Everything else in GROUP BY keeps the
+   O(1) state, no hash table. (**Narrowed at build** — the state is
+   the *open bucket's*, not O(1) absolutely; measured 1.65× less than
+   the hash path over 160k groups. See DESIGN's F1 build note; the
+   ruling is recorded here as it was given.) Everything else in GROUP BY keeps the
    teaching error. Pending sub-ruling at M5.3: `FIRST`/`LAST`
    aggregates for OHLC (de-facto names, no ISO spelling).
 2. **#65 as-of join, the hybrid (fully ruled):** the single `ASOF`

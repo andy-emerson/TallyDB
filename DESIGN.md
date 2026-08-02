@@ -175,7 +175,8 @@ type — and (b) no general-purpose cost-based optimizer.
 | SQL capability | In / Out | Bounding invariant |
 |---|---|---|
 | `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, equi-joins against small key-unique tables (the star-schema family), window functions, `UPDATE`/`DELETE`, scalar math, `CASE`, `HAVING`, `DISTINCT`, `LIKE` on keys, `NULLS FIRST`/`LAST`, `CREATE TABLE`/`INSERT` | **in** (built) | — |
-| regex on keys (#57), `RANGE` frames, `ASOF JOIN` and ordered-merge relatives (#65) | **in** (not yet built) | — |
+| `RANGE` frames, `ASOF JOIN` (#65) | **in** (built, M5.1–M5.2) | — |
+| regex on keys (#57), ordered-merge relatives beyond `ASOF JOIN` | **in** (not yet built) | — |
 | `SUBSTRING`/`CONCAT`/`CAST AS VARCHAR`/`GROUP_CONCAT` — string *production* | **out** | (a): would need a text column |
 | joins no structural fact licenses — neither side small enough to materialize, inputs not co-ordered on the join key, join-*order* search | **out** | (b): would need a cost-based optimizer (see *the join constraint, completed*) |
 | a third column type (text, blob, boolean) | **out** | (a): numeric-or-key |
@@ -523,11 +524,16 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
 
 **M5 (desk adoption)** then builds what the target user needs, chosen
 by the moat test: multi-factor curated compute (K > 2 — the recorded
-LAPACK-class-returns trigger firing, served by faer), the ordered-axis
+LAPACK-class-returns trigger firing; **re-ruled 2026-07-30**, this now
+goes to MatLua in the Lua tier rather than to a faer dependency of our
+own — see the decision record *where non-standard compute lives*,
+below), the ordered-axis
 dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
 2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
-`LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — design ruled, see *The
-M5 ruling batch*), segment-lazy open (F3), cross-process readers (F4 —
+`LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — **all built
+2026-08-01**, see *The M5 ruling batch* for the rulings and the
+stdlib table for what shipped), segment-lazy open (F3), cross-process
+readers (F4 —
 **built 2026-07-29**: read-only opens over a live writer's directory
 see the durable prefix consistently, old-or-new per mutation;
 `tallydb DIR --read-only` with `.refresh`/`.flush` is the console
@@ -677,6 +683,25 @@ rebuild, being wrong about the additive one costs a later layer.
 | Schema | The hardest cut: numeric-or-key, enforced in the type system (assumption 3) | Every column is a number or a label | Foundational |
 | Durability | Not cut: publish is atomic **and synced**, and the write buffer sits behind a sidecar WAL with sync levels (#43, ruled on measurement: default group commit ≤ 100ms, `Full` for a zero loss window, `Off` restoring the flush boundary) | — | — |
 
+**`RANGE` frames, and what they cost.** Every `ROWS` frame is a
+trailing row count, uniform across the column, which is what lets
+`WindowAggregate::evaluate_frames` slide one add and one remove per
+step. A `RANGE` frame is bounded by ordering-key *value*, so its width
+varies row to row — and, because standard SQL ends such a frame at the
+current row's **last peer**, it is not even trailing in row-index
+terms: a frame can extend forward over rows sharing the current row's
+key. The executor therefore computes explicit `(start, end)` bounds per
+row (one O(rows) pass, both pointers monotone) and hands them to
+`WindowAggregate::evaluate_bounded_frames`, whose default recomputes
+each frame. That default is why `RANGE` is correct for every
+aggregate, including embedders' and Lua kernels', the day it ships.
+What it is not yet is *incremental*: an aggregate with sliding state
+can override that method with a two-pointer sweep, and until it does,
+a wide `RANGE` frame costs O(rows x window) where the equivalent
+`ROWS` frame costs O(rows). Tracked, with the safety net that a
+statistic whose override cannot hold its accuracy simply keeps the
+default and stays correct.
+
 Refusals are design decisions too: the write axis and the query
 surface are kept deliberately, and a reader should be able to tell
 refusal from oversight.
@@ -788,6 +813,21 @@ safe at any scale without estimation:
 | Broadcast/hash lookup | one side small enough to materialize, key-unique | unbounded memory |
 | Ordered merge (`ASOF JOIN` and relatives, #65) | both sides ordered on the join key — their declared ordering key | unbounded memory *and* sorting |
 
+**Build note (2026-07-30, M5.2): what shipped is clause 1's shape, not
+clause 2's.** The as-of join as built indexes the dimension side in
+memory — one ascending `(clock, row)` list per key — and binary-searches
+it per fact row. That is correct at any ordering (the index is stably
+sorted, so a late-arriving quote still matches), and it needs no
+`is_ordered()` gate; but it materializes the dimension, so it is
+guarded by clause 1's size invariant, not clause 2's streaming
+property. The co-walk clause 2 describes — a cursor per side, memory
+independent of both inputs, licensing large ⋈ large — is **not built**:
+`execute_join` materializes both sides up front, and making the
+dimension streaming is the same work as streaming scans generally
+(#88). Until then, the ordered-merge row above states a *design*, and
+the as-of join's actual reach is "dimension fits in memory". Tracked as
+#92; the trigger to close it is a quote history that does not fit.
+
 Clause 1 is the size invariant, unchanged, guarding the strategy that
 materializes a build side. Clause 2 needs no size bound as a *property,
 not an exemption*: a merge over inputs already clustered on the join key
@@ -795,14 +835,21 @@ is a streaming co-walk — a cursor per side plus the current match window
 — so its memory does not scale with input size; that is exactly why it
 may admit large ⋈ large, and why only on the ordering key, where the
 storage layout guarantees the clustering (assumption 2 plays for clause
-2 the role the size invariant plays for clause 1). Its runtime guard is
-`Segment::is_ordered` — the check the window executor already relies on;
-a transiently disordered table (UPDATE reappends before compaction)
-refuses the merge loudly rather than serving a wrong answer. Dispatch
+2 the role the size invariant plays for clause 1). Its runtime guard
+would be `Segment::is_ordered` — the check the window executor already
+relies on; a transiently disordered table (UPDATE reappends before
+compaction) would refuse the merge loudly rather than serve a wrong
+answer. (Design, not code: per the build note above, the co-walk is
+unbuilt, and what shipped needs no such gate.) Dispatch
 never estimates: an embedded single-machine snapshot knows every table's
 **exact** row count and every dictionary's exact cardinality, so "small
-enough" is a measurement against a stated threshold, not a cost model —
-the fixed-strategy planner stays fixed. A join with *neither* guarding
+enough" *can* be a measurement rather than a cost model — the
+fixed-strategy planner stays fixed. That measurement is **not yet
+enforced**: `execute_join` materializes both sides unconditionally and
+no size check refuses an oversized dimension, so the size invariant is
+today stated, not checked. A threshold belongs in the contract when the
+executor generalizes; the as-of join riding clause 1 (#92) is what
+makes it start to matter. A join with *neither* guarding
 fact — two large tables on a non-ordering key, or join-*order* search —
 is **refused loudly, naming the missing structure**: serving it needs
 spilling, partitioning, or an optimizer, i.e. a different product.
@@ -844,7 +891,14 @@ early drafts named it):
 
 Ratified as deliberate under rule 3 (2026-07-24): `SUM(i64)` stays
 exact and errors loudly on overflow; query output is one Arrow batch
-per segment; window frames are `ROWS`-only for now. The two sibling cadence
+per segment; window frames are `ROWS`-only for now. Two of the three
+have since been superseded by later work rather than reopened: M5.1
+added `RANGE` and whole-partition frames, so the frame shape is no
+longer `ROWS`-only; and batch count is not a contract — a plain scan
+still yields one batch per segment, but the collapsing stages
+(`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `HAVING`, `GROUP BY`)
+materialize a single batch, as `QueryOutput`'s own documentation says.
+The `SUM(i64)` half stands. The two sibling cadence
 questions closed together, both ruled by the Human 2026-07-27 on a
 measurement (recorded in #43/#44 and built in M3.2/M3.3):
 
@@ -888,10 +942,14 @@ DuckDB differential family; the shell's help cites this table.
 |---|---|---|
 | `SELECT` projection, aliases | in, built | |
 | `WHERE` (numeric compares, key `=`/`IN`/`LIKE`, `AND`/`OR`/`NOT`) | in, built | NaN-aware; zone-map pruning; LIKE per distinct value |
+| `WHERE` comparing two expressions (`x > y`, `x * 2 > y + 1`) | in, built (#95) | a zone map knows a column's range, not an expression's over several of them, so this leaf **prunes nothing**. Pruning therefore degrades **per conjunct** — `WHERE ts > 1000 AND x > y` still skips segments on `ts` — which is why it is a separate predicate variant, not a generalisation of the prunable one. `40 < x` is mirrored to `x > 40` before lowering, so which side the column sits on changes nothing. A registered kernel is refused here by name: it must see the query's rows as one column, and a filter is evaluated per segment |
 | regex on keys | deferred by ruling (2026-07-29) | menu incl. the Lua-pattern house option on #57 |
 | `IS NULL` / `IS NOT NULL` | in, built | one predicate arm over the validity bitmap; the only *total* leaf (never UNKNOWN); `IS NOT NULL` prunes an all-null segment |
 | `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
-| `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, ruled (F1 = d), M5.3 | streams O(1); `FIRST`/`LAST` naming pending |
+| `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, built (M5.3) | bucket index, `(ts / 60) * 60` for the bucket start, bare `ts` for the finest bucket. `/` truncates (ISO); `//` accepted (DuckDB's spelling). May be named by its SELECT alias. Over ordered data the grouping **streams** — accumulator state is the open bucket, not the result (measured 1.65× less than the hash path over 160k groups); unordered data falls back to hashing with the same answers, and `compact()` restores the fast path |
+| `FIRST` / `LAST` aggregates | in, built (M5.3) | the de-facto TSDB names (ruled (a)); positional on the **time axis**, not row order, so a late-arriving row cannot become "last". Ties on the clock go to the last row in storage order; nulls skipped, which coincides with DuckDB's `arg_min`/`arg_max`. Also available as window functions, where — being positional — they **refuse an unordered window**: with no order there is no first |
+| cross-sectional `PARTITION BY` (the ordering key, or a bucket of it) | in, built (M5.3) | the transpose of `PARTITION BY sym` — one partition per instant, across every symbol. Unordered windows (`OVER (PARTITION BY ts)`) take the whole partition, per standard SQL; several terms intersect (`sym, ts / 60` = per symbol per bar); any `BIGINT` partitions, `DOUBLE` never |
+| scalar expressions over window results | in, built (#94) | `x / sum(x) OVER (PARTITION BY ts)`, `x - lag(x) OVER (ORDER BY ts)`, the rolling z-score. Window calls hoist out of the scalar and compute first — standard SQL's evaluation order |
 | `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
 | `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
 | scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
@@ -900,9 +958,13 @@ DuckDB differential family; the shell's help cites this table.
 | multi-column `ORDER BY` | in, later | additive lowering |
 | `LIMIT`/`OFFSET` | in, built | |
 | window functions over `ROWS` frames | in, built | curated + Lua kernels; incremental sweep |
-| `RANGE` frames | in, later | needs ordering-key-typed ranges |
+| `var_pop` / `stddev_pop` as windows | in, built (M5.0) | one column; variance *is* self-covariance, so they share `covar_pop`'s corrected two-pass and incremental sweep. Population forms only, matching the `_pop` family; sample forms and the group-level (non-window) surface are additive and unbuilt — as they are for `covar_pop`/`corr` |
+| `regr_r2` as a window | in, built (M5.4) | the squared correlation of the simple fit, `covar² / (var_x·var_y)`, riding the same corrected two-pass and incremental sweep as `regr_slope`. Undefined — SQL NULL, not a fabricated 1.0 — where either column is flat, and clamped to [0, 1] because the correction can push a perfect fit a rounding step past 1. The only member of #77.2's scalar-reduction list with a standard SQL name; residual and fitted value have none, so under #77.1 they go to the Lua tier |
+| `LAG` / `LEAD` | in, built (M5.1) | positional, not aggregates: they copy a neighbouring row, so the output keeps the **source column's type** — a lagged `BIGINT` stays `BIGINT`, because a nanosecond stamp is past 2^53 where `f64` stops being exact. Frameless (standard SQL gives them no frame; a frame clause is refused, not ignored); optional offset defaults to 1; the third `default` argument and symbol columns are refused by name |
+| `RANGE` frames | in, built (M5.1) | bounded by ordering-key **value**, in the key's own units (no `INTERVAL` type: a 5-minute span over ns stamps is `300000000000`). Ends at the current row's **last peer**, per standard SQL, so tied rows share one window. Answers via per-frame recompute today; the incremental sweep over these bounds is the tracked follow-up |
 | star-schema equi-joins (`INNER`/`LEFT`) | in, built | structural-fact rule; gathers only the dimension columns the query reads |
-| `ASOF` / ordered-merge joins | in, design ruled 2026-07-29, build at M5.2 | the hybrid — see *The M5 ruling batch*, item 2 |
+| `ASOF LEFT` / `ASOF INNER JOIN` | in, built (M5.2) | the hybrid — see *The M5 ruling batch*, item 2, and its build note. Each fact row takes the most recent of its key's dimension rows on the two **declared ordering keys**; an explicit inequality is validated, not obeyed. Ties on the dimension's clock go to the last row in storage order. The dimension side is indexed in memory, not co-walked — see the join-constraint note |
+| ordered-merge relatives beyond `ASOF` (`LT`, `SPLICE`, …) | in, later | nothing coined; the same lift mechanism serves them |
 | `UPDATE`/`DELETE` | in, built | tombstone + reinsert |
 | DDL (`CREATE TABLE`), `INSERT`, bulk import | in, built | #39; `BIGINT`/`DOUBLE`/`SYMBOL`, `ORDERING KEY` constraint; `VARCHAR`, `PRIMARY KEY` and the retired `KEY` spelling refused with teaching errors |
 | non-correlated subqueries / CTEs | in, later | named subplans |
@@ -928,6 +990,82 @@ none is built unless its row in the stdlib table says so.
    float-equality group identity); refusal (concedes the workload's
    most common query). `FIRST`/`LAST` aggregates (OHLC's open/close)
    surface a naming sub-ruling when M5.3 builds this.
+
+   **Build note (M5.3, 2026-07-30).** Built, and the streaming dividend
+   with it — but the claim above needed narrowing to what the code
+   earns:
+
+   - **"O(1) state, no hash table" is now "the open bucket's state".**
+     Once a bucket is left it cannot come back, so its groups close and
+     reduce to cells there and then; what stays live is the groups
+     *inside one bucket* (the symbols trading in this minute), not
+     every group the query will produce. The result itself, and the
+     keys labelling it, are one per group either way — so the honest
+     claim is that the accumulator state stops scaling, not that
+     memory does. Measured on a 200,000-row fixture over 160,000
+     groups: **40.4 MB streaming vs 66.7 MB hashing, a ratio of 1.65**
+     (`bucket_grouping_memory`, 2026-07-30). Truly constant state
+     would need streaming *output* too, which is #88.
+   - **Unordered data falls back rather than refusing.** Whether the
+     grouping can stream is read from segment metadata before a byte
+     is touched, so dispatch stays structural — but a table whose
+     order an `UPDATE` disturbed takes the hash path and gets the same
+     answer more expensively, with `compact()` restoring the fast
+     path. Correct always, fast when the data behaves: the same
+     bargain tombstones make. Refusing was considered and rejected —
+     it would make a correction change which queries *run*, not just
+     how fast they run.
+   - **`/` between integers truncates**, which is ISO and PostgreSQL;
+     `//` is accepted as a synonym because DuckDB spells it that way.
+     In this position only one meaning is available (a `DOUBLE` cannot
+     key a group), so accepting both costs nothing. It does constrain
+     #40: when exact integer arithmetic reaches projection, `ts / 60`
+     must truncate there too, or one text means two things.
+   - **`GROUP BY` may name a bucket by its SELECT alias**, as
+     PostgreSQL and DuckDB both allow. Narrow by design: only aliases
+     of buckets substitute.
+   - **`FIRST`/`LAST` = the de-facto TSDB names** (the pending
+     sub-ruling, closed (a) 2026-07-29). Positional on the time axis,
+     not on row order — the group-level counterpart of `LAG`/`LEAD` —
+     so a late-arriving row cannot become "last" by arriving last.
+     Ties on the clock go to the last row in storage order, the rule
+     the as-of join follows; nulls are skipped, as every other
+     aggregate here skips them, which coincides exactly with DuckDB's
+     `arg_min`/`arg_max` and is how the differential checks them.
+
+   **Cross-sectional partitioning — a later ruling (2026-07-30), built
+   in the same milestone and recorded here because it completes the
+   same axis.** The transpose of `PARTITION BY sym`: partitioning on the ordering
+   key, or a monotone bucket of it, gives each row its own *instant*
+   across every symbol instead of its own symbol across time. An
+   unordered window (`OVER (PARTITION BY ts)`, no `ORDER BY`) takes its
+   whole partition, which is standard SQL and is exactly a
+   cross-section; a frame clause beside it is refused as the
+   contradiction it is. Several terms intersect — `PARTITION BY sym,
+   ts / 60` is one partition per symbol per bar.
+
+   `PARTITION BY` admits any `BIGINT`, not only symbols; `DOUBLE` is
+   refused because float equality is not partition identity (the same
+   reason F1 rejected general expressions), and bucket arithmetic stays
+   ordering-key-only, where monotonicity means something. Which column
+   is named decides the direction, and which path runs is decided by
+   declared structure plus segment metadata — never by cost.
+
+   *Note the asymmetry, deliberate and flagged:* `GROUP BY` stays
+   restricted to the ordering key (F1's ruling), while `PARTITION BY`
+   admits any `BIGINT`. Different clauses, different rulings; revisit
+   F1 if the difference ever bites.
+
+   **The idiom this exists for needed a second thing.** A
+   cross-section is only useful if a row can be compared *to* it, and
+   that meant scalar expressions over window results (#94, built the
+   same day): `x / sum(x) OVER (PARTITION BY ts)` is the weight, `x -
+   avg(x) OVER (...)` the demeaning. Window calls are hoisted out of
+   the scalar at lowering and computed first — standard SQL's own
+   evaluation order, and forced rather than chosen, since a partition
+   spans segments while a scalar walks one at a time. The same change
+   made `x - lag(x) OVER (ORDER BY ts)` and the rolling z-score
+   expressible.
 2. **The as-of join (#65) — the hybrid.** Grammar from ClickHouse,
    authority from the schema: the single `ASOF` token is lifted
    pre-parse (byte-span splice, comments skipped — the hardened
@@ -950,6 +1088,41 @@ none is built unless its row in the stdlib table says so.
    (the row with `MAX(ts) <=` the fact's), which checks the definition
    rather than another vendor's implementation. The executor is an
    ordered co-walk gated on `is_ordered()` for **both** sides.
+
+   **Build note (M5.2, 2026-07-30).** Built, and the evidence landed
+   as ruled: seven differential families whose oracle side is a
+   correlated scalar subquery in vanilla SQL — the definition of "the
+   latest quote at or before" — rather than DuckDB's own `ASOF JOIN`.
+   Three things about the build differ from or extend the ruling, and
+   are recorded here rather than left in a conversation:
+
+   - **Not a co-walk.** The executor indexes the dimension side per key
+     (an ascending `(clock, row)` list, stably sorted) and binary-
+     searches it per fact row. That is correct whatever order the data
+     arrived in — a late-arriving quote still matches — so it needs no
+     `is_ordered()` gate on either side, where a co-walk would have to
+     refuse a transiently disordered table. The cost is that the
+     dimension materializes: the streaming property clause 2 of the
+     join constraint claims is **designed, not built** (#92, and see
+     the build note there).
+   - **Ties on the dimension's clock go to the last row in storage
+     order** — the same "newest version wins" rule corrections follow.
+     The alternative (refusing a duplicate `(key, clock)`) was rejected:
+     a quote table legitimately prints twice on one stamp, and kdb+'s
+     `aj` takes the last such row too. The differential covers this on
+     purpose: the fixture injects per-symbol tied timestamps and the
+     oracle counts them before trusting the families.
+   - **The inequality's sides are assigned by qualifier, not by
+     operator.** `t.ts <= q.ts` and `q.ts <= t.ts` are the same
+     operator and opposite questions; reading the operator alone would
+     have answered the first (the quote *after* each trade) with the
+     one before it. Written backwards, it is refused.
+
+   One limitation the build meets rather than creates: both tables are
+   timestamped, and a dimension attribute sharing a fact column's name
+   is refused, so `quotes.ts` beside `trades.ts` must be renamed. That
+   is the pre-existing equi-join rule, not a new choice — the open
+   decision about whether to change it is #93.
 3. **Library naming (#77.1): SQL exposes only operations bearing
    standard names.** `var_pop`, `stddev_pop`, `LAG`/`LEAD` pass into
    SQL freely; EWMA, `diff`, multi-factor regression have no standard
@@ -960,6 +1133,14 @@ none is built unless its row in the stdlib table says so.
    the API and scripts, which receive them from one evaluation.
    Per-component SQL functions rejected; multi-output projection
    plumbing deliberately unbuilt until demanded.
+
+   **What that meant at build (M5.4).** Item 3's mechanical rule
+   decides which of the three reach SQL, and only one does: `regr_r2`
+   has a standard SQL name and shipped; residual and fitted value have
+   none, so they are script-side. Read items 3 and 4 in that order —
+   item 4 says a scalar reduction *may* enter SQL, item 3 says only a
+   standard name *does*. As first written item 4 read as a promise of
+   all three, which item 3 forbids.
 5. **The prelude (#77.3): compiled into the binary**, `.prelude`
    prints the source — single-file deployment holds; read-copy-modify
    is preserved by printing, not by an editable side file.
@@ -1213,6 +1394,41 @@ reference LAPACK's `dgels` at k = 2–4 in the same-run three-way
 measurement (see the kernel decision record below) and compiles to
 wasm32. The engine's ops should then dispatch on parameter count:
 closed form at two, a solver above it.
+
+**Decision record — where non-standard compute lives: the Lua tier,
+via MatLua (Human-ruled 2026-07-30).** The reopen trigger above fired
+at M5.4: multi-factor regression is the first committed op needing more
+than two parameters. The answer is **not** a faer dependency of our
+own, and **not** new SQL names. SQL stays standard — item 3 of the M5
+ruling batch, unchanged — and a user who wants more than the standard
+spells turns to the Lua tier, where [MatLua](https://github.com/andy-emerson/MatLua)
+is the matrix and linear-algebra vehicle. Two things follow. TallyDB
+does not coin `regr_multi`, `pca`, or their relatives into SQL: had we
+built the solver ourselves, the pressure to expose it would have been
+immediate, and item 3 would have had to bend. And TallyDB does not take
+faer directly: MatLua already depends on it, and Cargo unifies
+semver-compatible versions, so reaching linear algebra *through* MatLua
+costs no second copy.
+
+*Status: ruled, not built.* Nothing in the tree depends on MatLua
+today. A requirements letter is out — what would break TallyDB if
+MatLua chose otherwise (a Lua face that works against a host-owned
+interpreter, no `Drop` value live across a `longjmp`, no panic across
+the C boundary, `i64` exactness with no implicit widening at the
+boundary, a documented contract for absence, and an Arrow **C Data
+Interface** path so neither side links the other's Arrow stack) versus
+what is theirs to decide (NaN or mask internally, indexing, which
+factorization backs `lstsq`, behaviour on singular input, error
+taxonomy, dtype order). The split follows the Human's standing
+principle: **a decision made ad hoc to an emerging need while building
+our own tools is revisitable; only a decision that would undermine what
+TallyDB *is* is not.** MatLua are the linear-algebra experts; we are
+the time-series-database ones, and where the two overlap we take their
+design.
+
+*What could reopen this:* MatLua declining the embedding or exactness
+requirements, at which point the choice returns to a faer dependency of
+our own with the SQL surface still frozen at standard names.
 
 The design-critical part survives the removal and must keep surviving:
 compute stays behind **distinct traits with independently gated

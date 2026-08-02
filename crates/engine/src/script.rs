@@ -555,6 +555,27 @@ mod tests {
                 )
                 .unwrap();
         }
+        // M5.0's one-column statistics reach kernels the same way, and
+        // the invariant is checked by *value*, not just by registering:
+        // a kernel calling `stddev_pop` must get what SQL gets.
+        for name in ["var_pop", "stddev_pop"] {
+            table
+                .register_lua_window(
+                    &format!("via_{name}"),
+                    &["x"],
+                    &format!("return {name}(x)"),
+                    ColumnType::F64,
+                )
+                .unwrap();
+        }
+        let frame = "OVER (ORDER BY ts ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)";
+        let native = table
+            .query(&format!("SELECT stddev_pop(x) {frame} AS s FROM t"))
+            .unwrap();
+        let through_lua = table
+            .query(&format!("SELECT via_stddev_pop(x) {frame} AS s FROM t"))
+            .unwrap();
+        assert_eq!(f64s(&native, 0), f64s(&through_lua, 0));
     }
 
     #[test]

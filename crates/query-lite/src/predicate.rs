@@ -6,6 +6,12 @@
 //! `IS [NOT] NULL`, `AND` / `OR` / `NOT` — evaluated per segment into a
 //! row bitmap.
 //!
+//! One leaf is different in kind: [`Predicate::CompareExpr`] compares
+//! two whole scalar expressions (`x > y`, `x * 2 > y + 1`), and no zone
+//! map can rule it out, so it prunes nothing. Pruning therefore
+//! degrades **per conjunct** rather than per query — see that variant's
+//! documentation.
+//!
 //! String predicates follow the design's rule for keys: the string test
 //! runs **once per distinct dictionary value**, producing a set of
 //! allowed codes; rows are then matched by integer set-membership, never
@@ -140,6 +146,24 @@ pub enum Predicate {
         /// The literal.
         value: Number,
     },
+    /// A comparison between two **expressions** — `x > y`,
+    /// `x * 2 > y + 1`, or (inside `CASE`) a window result.
+    ///
+    /// Unlike every other variant this one cannot be pruned: a zone map
+    /// knows a column's range, not the range of an expression over
+    /// several of them, so [`can_match`] answers "might match" and the
+    /// rows are read. Pruning therefore degrades **per conjunct** —
+    /// `WHERE ts > 1000 AND x > y` still skips segments on `ts` — which
+    /// is why this is a separate variant rather than a generalisation
+    /// of `Compare`.
+    CompareExpr {
+        /// Left operand.
+        left: crate::plan::ScalarExpr,
+        /// The operator.
+        op: CmpOp,
+        /// Right operand.
+        right: crate::plan::ScalarExpr,
+    },
     /// `column = 'v'` / `column <> 'v'` on a key column.
     KeyEquals {
         /// The key column.
@@ -191,13 +215,16 @@ pub enum Predicate {
 
 /// Lowers a parsed WHERE expression into a [`Predicate`], rejecting —
 /// by name — anything outside the supported fragment.
-pub fn lower_predicate(expr: &ast::Expr) -> Result<Predicate, QueryError> {
+pub fn lower_predicate(
+    expr: &ast::Expr,
+    windows: &mut Vec<crate::plan::WindowCall>,
+) -> Result<Predicate, QueryError> {
     match expr {
-        ast::Expr::Nested(inner) => lower_predicate(inner),
+        ast::Expr::Nested(inner) => lower_predicate(inner, windows),
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Not,
             expr,
-        } => Ok(Predicate::Not(Box::new(lower_predicate(expr)?))),
+        } => Ok(Predicate::Not(Box::new(lower_predicate(expr, windows)?))),
         ast::Expr::IsNull(inner) => Ok(Predicate::IsNull {
             column: null_test_column(inner)?,
             negated: false,
@@ -241,14 +268,14 @@ pub fn lower_predicate(expr: &ast::Expr) -> Result<Predicate, QueryError> {
         }
         ast::Expr::BinaryOp { left, op, right } => match op {
             ast::BinaryOperator::And => Ok(Predicate::And(
-                Box::new(lower_predicate(left)?),
-                Box::new(lower_predicate(right)?),
+                Box::new(lower_predicate(left, windows)?),
+                Box::new(lower_predicate(right, windows)?),
             )),
             ast::BinaryOperator::Or => Ok(Predicate::Or(
-                Box::new(lower_predicate(left)?),
-                Box::new(lower_predicate(right)?),
+                Box::new(lower_predicate(left, windows)?),
+                Box::new(lower_predicate(right, windows)?),
             )),
-            _ => lower_comparison(left, op, right),
+            _ => lower_comparison(left, op, right, windows),
         },
         ast::Expr::InList {
             expr,
@@ -303,7 +330,16 @@ fn lower_comparison(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
     right: &ast::Expr,
+    windows: &mut Vec<crate::plan::WindowCall>,
 ) -> Result<Predicate, QueryError> {
+    // `40 < x` is `x > 40` written backwards. Mirror it before anything
+    // else, so it reaches the prunable shape below: otherwise an
+    // identical predicate would prune or not depending on which side
+    // the user put the column, and `40 < ts` would meet #40's
+    // integer-arithmetic refusal while `ts > 40` answered.
+    if is_literal_operand(left) && matches!(right, ast::Expr::Identifier(_)) {
+        return lower_comparison(right, &flip(op), left, windows);
+    }
     let op = match op {
         ast::BinaryOperator::Eq => CmpOp::Eq,
         ast::BinaryOperator::NotEq => CmpOp::Ne,
@@ -317,12 +353,16 @@ fn lower_comparison(
             )))
         }
     };
+    // The prunable shape — a bare column against a literal is what a
+    // zone map can rule out, so it keeps its own variant. Any other
+    // operand shape falls through to the general comparison below,
+    // which is correct but unprunable (#95).
     let ast::Expr::Identifier(column) = left else {
-        return Err(QueryError::Unsupported(
-            "predicate must compare a plain column to a literal".to_owned(),
-        ));
+        return compare_expressions(left, op, right, windows);
     };
-    // A negative number parses as unary minus over a literal.
+    // A negative number parses as unary minus over a literal. Keep the
+    // original: the fallback below must see `-x`, not `x`.
+    let whole_right = right;
     let (negated_literal, right) = match right {
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
@@ -331,9 +371,7 @@ fn lower_comparison(
         other => (false, other),
     };
     let ast::Expr::Value(value) = right else {
-        return Err(QueryError::Unsupported(
-            "predicate must compare a plain column to a literal".to_owned(),
-        ));
+        return compare_expressions(left, op, whole_right, windows);
     };
     match &value.value {
         ast::Value::Number(text, _) => {
@@ -350,6 +388,13 @@ fn lower_comparison(
                 value,
             })
         }
+        // A minus sign belongs to a number. On a string literal it is
+        // not a negative key — there is no such thing — so it is
+        // refused rather than quietly dropped, which would read
+        // `sym = -'A'` as `sym = 'A'`.
+        ast::Value::SingleQuotedString(_) if negated_literal => Err(QueryError::TypeError(
+            "unary minus on a string literal (keys are labels, not numbers)".to_owned(),
+        )),
         ast::Value::SingleQuotedString(text) => match op {
             CmpOp::Eq | CmpOp::Ne => Ok(Predicate::KeyEquals {
                 column: column.value.clone(),
@@ -361,10 +406,49 @@ fn lower_comparison(
                     .to_owned(),
             )),
         },
-        other => Err(QueryError::Unsupported(format!(
-            "literal '{other}' in a predicate"
-        ))),
+        _ => compare_expressions(left, op, whole_right, windows),
     }
+}
+
+/// Whether an operand is a literal, including the unary minus a
+/// negative number parses as. Only used to spot a backwards
+/// comparison; the mirrored call puts an identifier on the left, so
+/// the recursion is one deep.
+fn is_literal_operand(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Value(_) => true,
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOperator::Minus,
+            expr,
+        } => matches!(expr.as_ref(), ast::Expr::Value(_)),
+        _ => false,
+    }
+}
+
+/// The mirror of a comparison operator, for reading `40 < x` as
+/// `x > 40`. Equality and inequality are their own mirrors.
+fn flip(op: &ast::BinaryOperator) -> ast::BinaryOperator {
+    match op {
+        ast::BinaryOperator::Lt => ast::BinaryOperator::Gt,
+        ast::BinaryOperator::LtEq => ast::BinaryOperator::GtEq,
+        ast::BinaryOperator::Gt => ast::BinaryOperator::Lt,
+        ast::BinaryOperator::GtEq => ast::BinaryOperator::LtEq,
+        other => other.clone(),
+    }
+}
+
+/// The general comparison: both sides lowered as scalar expressions.
+fn compare_expressions(
+    left: &ast::Expr,
+    op: CmpOp,
+    right: &ast::Expr,
+    windows: &mut Vec<crate::plan::WindowCall>,
+) -> Result<Predicate, QueryError> {
+    Ok(Predicate::CompareExpr {
+        left: crate::plan::lower_scalar_expr(left, windows)?,
+        op,
+        right: crate::plan::lower_scalar_expr(right, windows)?,
+    })
 }
 
 /// Parses a SQL number literal, preserving integer exactness.
@@ -425,8 +509,33 @@ pub fn evaluate(
     predicate: &Predicate,
     schema: &Schema,
     view: &SegmentView,
+    scalars: &dyn ScalarEval,
 ) -> Result<Bitmap, QueryError> {
-    Ok(evaluate_3vl(predicate, schema, view)?.truth)
+    Ok(evaluate_3vl(predicate, schema, view, scalars)?.truth)
+}
+
+/// Evaluates a scalar expression over one view's rows.
+///
+/// Supplied by the caller rather than implemented here, because a
+/// predicate tree knows nothing about the compute registry or about
+/// window results — and must not have to, or `WHERE` would depend on
+/// the projection machinery.
+pub trait ScalarEval {
+    /// `(values, validity)` over the view's rows, in stored order.
+    fn eval(&self, expr: &crate::plan::ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError>;
+}
+
+/// A `ScalarEval` for predicates that cannot contain expressions —
+/// used where a caller has no expression evaluator to offer, and any
+/// `CompareExpr` reaching it is a bug rather than a user error.
+pub struct NoScalars;
+
+impl ScalarEval for NoScalars {
+    fn eval(&self, _expr: &crate::plan::ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+        Err(QueryError::Unsupported(
+            "an expression comparison in a position that cannot evaluate one".to_owned(),
+        ))
+    }
 }
 
 /// The three-valued recursion beneath [`evaluate`]: only the composition
@@ -436,10 +545,45 @@ fn evaluate_3vl(
     predicate: &Predicate,
     schema: &Schema,
     view: &SegmentView,
+    scalars: &dyn ScalarEval,
 ) -> Result<ThreeValued, QueryError> {
     let batch = view.segment.batch();
     let rows = batch.num_rows();
     match predicate {
+        Predicate::CompareExpr { left, op, right } => {
+            let (left, left_valid) = scalars.eval(left)?;
+            let (right, right_valid) = scalars.eval(right)?;
+            // The two row spaces this leaf straddles, and the reason it
+            // is the only leaf that has to. Every other one reads a
+            // stored column, indexed by STORED row. A scalar expression
+            // is evaluated over the view's LIVE rows — it must be, that
+            // is what the projection pipeline hands kernels — so its
+            // results are indexed by live position and have to be
+            // scattered back before joining a predicate tree that
+            // speaks stored rows.
+            //
+            // Getting this wrong is not a wrong answer but an index
+            // panic, and only over a view carrying tombstones: on a
+            // compacted table live == stored and it hides completely.
+            let mut live_position = 0usize;
+            let mut verdict = vec![(false, false); rows];
+            for (row, slot) in verdict.iter_mut().enumerate() {
+                if !view.is_live(row) {
+                    continue; // a dead row's verdict is never read
+                }
+                // NULL on either side is UNKNOWN, not false — the same
+                // three-valued rule every other leaf follows. NaN
+                // compares under `cmp_f64`, the one relation sorting
+                // and pruning share.
+                *slot = (
+                    left_valid[live_position] && right_valid[live_position],
+                    op.holds_ordering(cmp_f64(left[live_position], right[live_position])),
+                );
+                live_position += 1;
+            }
+            debug_assert_eq!(live_position, left.len(), "one verdict per live row");
+            Ok(leaf_result(rows, |row| verdict[row]))
+        }
         Predicate::Compare { column, op, value } => {
             let index = column_index(schema, column)?;
             match &batch.columns()[index] {
@@ -498,13 +642,11 @@ fn evaluate_3vl(
         } => key_predicate(schema, view, column, *negated, |value| {
             like_match(pattern, value)
         }),
-        Predicate::And(left, right) => {
-            Ok(evaluate_3vl(left, schema, view)?.and(evaluate_3vl(right, schema, view)?))
-        }
-        Predicate::Or(left, right) => {
-            Ok(evaluate_3vl(left, schema, view)?.or(evaluate_3vl(right, schema, view)?))
-        }
-        Predicate::Not(inner) => Ok(evaluate_3vl(inner, schema, view)?.not()),
+        Predicate::And(left, right) => Ok(evaluate_3vl(left, schema, view, scalars)?
+            .and(evaluate_3vl(right, schema, view, scalars)?)),
+        Predicate::Or(left, right) => Ok(evaluate_3vl(left, schema, view, scalars)?
+            .or(evaluate_3vl(right, schema, view, scalars)?)),
+        Predicate::Not(inner) => Ok(evaluate_3vl(inner, schema, view, scalars)?.not()),
     }
 }
 
@@ -545,6 +687,10 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentHandle) -
         return true;
     }
     match predicate {
+        // A zone map bounds a column, not an expression over several of
+        // them, so this conjunct prunes nothing — and only this one:
+        // its siblings in an AND still do (#95).
+        Predicate::CompareExpr { .. } => true,
         Predicate::Compare { column, op, value } => {
             let Some(index) = schema
                 .fields()
@@ -804,7 +950,7 @@ mod tests {
                 op,
                 value: Number::Float(target),
             };
-            let bitmap = evaluate(&predicate, &schema, &view).unwrap();
+            let bitmap = evaluate(&predicate, &schema, &view, &NoScalars).unwrap();
             for (row, &want) in expected.iter().enumerate() {
                 assert_eq!(bitmap.get(row), want, "{op:?} {target} row {row}");
             }
@@ -897,7 +1043,7 @@ mod tests {
             &schema,
             &handle_of(&view)
         ));
-        let matched = evaluate(&compare(CmpOp::Gt, 100.0), &schema, &view).unwrap();
+        let matched = evaluate(&compare(CmpOp::Gt, 100.0), &schema, &view, &NoScalars).unwrap();
         assert!(matched.get(0) && matched.get(1));
     }
 
@@ -941,8 +1087,9 @@ mod tests {
         let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("not a select")
         };
-        let predicate = lower_predicate(select.selection.as_ref().unwrap()).unwrap();
-        let bitmap = evaluate(&predicate, &schema, &view).unwrap();
+        let predicate =
+            lower_predicate(select.selection.as_ref().unwrap(), &mut Vec::new()).unwrap();
+        let bitmap = evaluate(&predicate, &schema, &view, &NoScalars).unwrap();
         (0..4).filter(|&row| bitmap.get(row)).collect()
     }
 
@@ -966,6 +1113,30 @@ mod tests {
         assert_eq!(matched("sym IN ('MSFT', 'TSLA')"), [1, 3]);
         assert_eq!(matched("sym NOT IN ('MSFT', 'TSLA')"), [0, 2]);
         assert_eq!(matched("sym = 'UNKNOWN'"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_minus_sign_on_a_string_literal_is_refused_not_dropped() {
+        // Found by the repo-wide code review. `-'AAPL'` parses as unary
+        // minus over a string; the arm that strips the minus for
+        // negative numbers passed the bare text through, so this read
+        // as `sym = 'AAPL'` and quietly matched rows.
+        let sql = "SELECT ts FROM t WHERE sym = -'AAPL'";
+        let statements =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                .unwrap();
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("not a query")
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select")
+        };
+        let error = lower_predicate(select.selection.as_ref().unwrap(), &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unary minus on a string literal"), "{error}");
+        // The unsigned form still works, and still matches.
+        assert_eq!(matched("sym = 'AAPL'"), [0, 2]);
     }
 
     #[test]
@@ -1017,7 +1188,7 @@ mod tests {
         let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
             panic!("not a select")
         };
-        let error = lower_predicate(select.selection.as_ref().unwrap())
+        let error = lower_predicate(select.selection.as_ref().unwrap(), &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(error.contains("IS NULL on"), "{error}");
@@ -1044,7 +1215,7 @@ mod tests {
     fn type_and_scope_errors_are_specific() {
         let (schema, view) = view();
         let check = |predicate: Predicate, needle: &str| {
-            let error = evaluate(&predicate, &schema, &view)
+            let error = evaluate(&predicate, &schema, &view, &NoScalars)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(needle), "{error}");
@@ -1088,7 +1259,7 @@ mod tests {
             op: CmpOp::Eq,
             value: Number::Int(big),
         };
-        let bitmap = evaluate(&predicate, &schema, &view).unwrap();
+        let bitmap = evaluate(&predicate, &schema, &view, &NoScalars).unwrap();
         assert!(bitmap.get(0));
         assert!(!bitmap.get(1)); // an f64 round trip would match both
     }
@@ -1110,7 +1281,7 @@ mod tests {
             op: CmpOp::Gt,
             value: Number::Float(9_007_199_254_740_992.0), // exactly 2^53
         };
-        let bitmap = evaluate(&gt, &schema, &view).unwrap();
+        let bitmap = evaluate(&gt, &schema, &view, &NoScalars).unwrap();
         assert!(bitmap.get(0)); // 2^53 + 1 > 2^53
         assert!(!bitmap.get(1)); // 2^53 - 1 is not > 2^53 (a cast says it is)
     }
@@ -1234,7 +1405,7 @@ mod pruning_tests {
         let view = SegmentView::all_live(std::sync::Arc::new(buffer.freeze().unwrap()));
         let ge = compare("y", CmpOp::Ge, Number::Float(0.0));
         assert!(can_match(&ge, &schema, &handle_of(&view)));
-        let matched = evaluate(&ge, &schema, &view).unwrap();
+        let matched = evaluate(&ge, &schema, &view, &NoScalars).unwrap();
         assert!(!matched.get(0) && matched.get(1));
         // The <-side still prunes: NaN is never below a number.
         assert!(!can_match(

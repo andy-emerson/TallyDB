@@ -18,6 +18,10 @@ Known, deliberate divergences the generator avoids:
     NumPy) use NULL; window comparisons normalize NaN to None.
   - `ORDER BY <symbol column>`: DuckDB sorts, TallyDB refuses (#58 = B).
     Checked as a refusal rather than avoided.
+  - Division by zero: TallyDB is IEEE (NaN, a value — decision D2),
+    DuckDB returns NULL. Only reachable where a family divides by a
+    window result, so IEEE_DIVISION_FAMILIES normalizes both sides and
+    says so; every other family keeps the strict comparison.
 
 Usage: m2_differential_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.
@@ -291,6 +295,20 @@ WINDOW_QUERIES = [
     "SELECT ts, regr_intercept(y, x) OVER (ORDER BY ts "
     "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "WHERE y > -100000 ORDER BY ts",
+    # M5.4: regr_r2 — ISO's own name, two-variable, so it reaches SQL
+    # by the #77.1 rule without coining anything. DuckDB implements it
+    # too, so it is born cross-checked like the rest of the regr family.
+    # Both the incremental sweep (trailing frames) and the recompute
+    # path (unbounded) must match the same oracle.
+    "SELECT ts, regr_r2(y, x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, regr_r2(y, x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, regr_r2(y, x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
     # M2.6: the pair statistics DuckDB also implements.
     "SELECT ts, covar_pop(y, x) OVER (PARTITION BY sym ORDER BY ts "
     "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
@@ -301,6 +319,398 @@ WINDOW_QUERIES = [
     "SELECT ts, covar_pop(y, x) OVER (ORDER BY ts "
     "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "WHERE y > -100000 ORDER BY ts",
+    # M5.0: the one-column dispersion pair, which DuckDB also
+    # implements. `x` is the ordering key's own scale (no offset in the
+    # corpus, but a wide range), and the unbounded frame exercises the
+    # recompute path while the trailing frames exercise the incremental
+    # sweep — both must match the same oracle.
+    "SELECT ts, var_pop(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, stddev_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, var_pop(y) OVER (ORDER BY ts "
+    "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, stddev_pop(y) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    # A single-row frame: population spread of one point is 0, not NULL
+    # — the edge where a "needs two rows" reading would diverge.
+    "SELECT ts, var_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 0 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "ORDER BY ts",
+    # M5.1: LAG/LEAD, positional and frameless. The head/tail rows a
+    # lookup cannot define must be NULL in both engines, and the
+    # partitioned forms must not read across a partition boundary.
+    "SELECT ts, lag(x, 1) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lead(x, 1) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lag(x, 5) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, lag(x, 1) OVER (PARTITION BY sym ORDER BY ts) AS w FROM corpus "
+    "ORDER BY ts",
+    "SELECT ts, lead(x, 3) OVER (PARTITION BY sym ORDER BY ts) AS w FROM corpus "
+    "ORDER BY ts",
+    # The default offset is 1, in both engines.
+    "SELECT ts, lag(x) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    # M5.1: RANGE frames — bounded by ordering-key VALUE, not row count.
+    # NOTE ON COVERAGE: this corpus has 5000 rows and 5000 DISTINCT
+    # timestamps, so these families do NOT exercise the peer rule
+    # (standard SQL ends a RANGE frame at the current row's last peer,
+    # so tied rows all share one frame). What they do cover is the
+    # value-span arithmetic against irregular spacing, which the row
+    # cadence's jitter provides. The peer rule is covered instead by
+    # `range_frames_share_one_window_across_tied_timestamps` in engine,
+    # whose expected values were taken from DuckDB directly.
+    "SELECT ts, sum(x) OVER (ORDER BY ts RANGE BETWEEN 500 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, avg(x) OVER (ORDER BY ts RANGE BETWEEN 0 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, count(x) OVER (ORDER BY ts RANGE BETWEEN 100 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, min(x) OVER (PARTITION BY sym ORDER BY ts "
+    "RANGE BETWEEN 2000 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, var_pop(x) OVER (ORDER BY ts RANGE BETWEEN 1000 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    # A span wider than the whole corpus: every frame starts at row 1.
+    "SELECT ts, sum(x) OVER (ORDER BY ts RANGE BETWEEN 100000000 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    # M5.3: cross-sectional windows over the raw time axis — PARTITION
+    # BY the instant rather than the symbol, so each row sees its own
+    # instant across every symbol. Standard SQL gives an ORDER BY-less
+    # window its whole partition, and DuckDB agrees, so these run the
+    # same text on both sides.
+    #
+    # The corpus has one row per distinct ts, so `PARTITION BY ts` is a
+    # partition per row — a real edge (every partition a singleton), not
+    # an interesting cross-section. The bucketed forms, which do put
+    # several rows in a partition, need DuckDB's `//` and so live in
+    # CROSS_SECTIONAL_FAMILIES below.
+    "SELECT ts, sum(x) OVER (PARTITION BY ts) AS w FROM corpus ORDER BY ts",
+    # The whole snapshot as one partition — `OVER ()`, the grand total
+    # beside every row.
+    "SELECT ts, sum(x) OVER () AS w FROM corpus ORDER BY ts",
+    # #94: scalar expressions OVER window results. These are the idioms
+    # the window surface exists to serve — a row against its own frame —
+    # and each is one expression, not a second query.
+    "SELECT ts, x - lag(x) OVER (ORDER BY ts) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, x - avg(x) OVER (ORDER BY ts ROWS BETWEEN 9 PRECEDING "
+    "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    "SELECT ts, x / sum(x) OVER () AS w FROM corpus ORDER BY ts",
+    # Two windows in one expression, computed independently.
+    "SELECT ts, lead(x) OVER (ORDER BY ts) - lag(x) OVER (ORDER BY ts) AS w "
+    "FROM corpus ORDER BY ts",
+    # A window inside a scalar function call, and partitioned.
+    "SELECT ts, abs(x - avg(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)) AS w FROM corpus ORDER BY ts",
+]
+
+
+# M5.2 (#65): as-of joins, checked against the DEFINITION rather than
+# against DuckDB's own ASOF JOIN.
+#
+# Every other family here runs identical SQL on both sides, so DuckDB's
+# implementation is the reference. That is the wrong reference for this
+# one: two implementations of "the latest quote at or before" can agree
+# with each other and both be wrong about ties, about the empty prefix,
+# or about which side the inequality binds. So the oracle side is a
+# correlated scalar subquery — the textbook definition, in vanilla SQL,
+# with no ASOF anything in it — and agreement means the engine computes
+# what the phrase means.
+#
+# Ties matter and are not avoided: the fixture repeats timestamps
+# deliberately, and the definition breaks the tie the way the engine
+# does, by taking the last of them in storage order. `seq` is that
+# order, attached by the referee when it replicates the table.
+ASOF_MATCH = """
+    (SELECT r.q FROM quotes r
+      WHERE r.sym = t.sym AND r.qts {operator} t.ts
+      ORDER BY r.qts DESC, r.seq DESC LIMIT 1)
+"""
+
+# (engine sql, oracle sql). Both must project the same column names.
+ASOF_FAMILIES = [
+    # The plain shapes: LEFT keeps the corpus rows whose symbol has no
+    # quote yet, INNER drops them.
+    (
+        "SELECT ts, corpus.sym, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT t.ts AS ts, t.sym AS sym, " + ASOF_MATCH.format(operator="<=") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    (
+        "SELECT ts, corpus.sym, q FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT * FROM (SELECT t.ts AS ts, t.sym AS sym, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL ORDER BY ts",
+    ),
+    # An explicit inequality restating the ordering keys, both ways
+    # round: it selects the comparison and nothing else.
+    (
+        "SELECT ts, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym AND quotes.qts < corpus.ts ORDER BY ts",
+        "SELECT t.ts AS ts, " + ASOF_MATCH.format(operator="<") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    (
+        "SELECT ts, q FROM corpus ASOF LEFT JOIN quotes "
+        "ON corpus.sym = quotes.sym AND corpus.ts >= quotes.qts ORDER BY ts",
+        "SELECT t.ts AS ts, " + ASOF_MATCH.format(operator="<=") + " AS q "
+        "FROM corpus t ORDER BY t.ts",
+    ),
+    # The joined rows are ordinary rows: filters, arithmetic, aggregates
+    # and windows run over them exactly as they would over one table.
+    (
+        "SELECT ts, x * q AS scaled FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym WHERE x > 5 ORDER BY ts",
+        "SELECT ts, x * q AS scaled FROM (SELECT t.ts AS ts, t.x AS x, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL AND x > 5 ORDER BY ts",
+    ),
+    (
+        "SELECT ts, sum(q) OVER (PARTITION BY corpus.sym ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w "
+        "FROM corpus ASOF INNER JOIN quotes ON corpus.sym = quotes.sym ORDER BY ts",
+        "SELECT ts, sum(q) OVER (PARTITION BY sym ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM "
+        "(SELECT t.ts AS ts, t.sym AS sym, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q IS NOT NULL ORDER BY ts",
+    ),
+    # A join whose dimension column the SELECT never names still has to
+    # match, because the WHERE reads it (#81's pushdown must not drop
+    # the column the as-of match produced).
+    (
+        "SELECT ts FROM corpus ASOF INNER JOIN quotes "
+        "ON corpus.sym = quotes.sym WHERE q > 0 ORDER BY ts",
+        "SELECT ts FROM (SELECT t.ts AS ts, "
+        + ASOF_MATCH.format(operator="<=")
+        + " AS q FROM corpus t) WHERE q > 0 ORDER BY ts",
+    ),
+]
+
+# M5.3 (F1 = d): bucketed aggregation, and FIRST/LAST.
+#
+# Two spellings differ from DuckDB's and both are deliberate, so these
+# families carry their own oracle SQL rather than running the same text
+# on both sides:
+#
+#  - Integer division. TallyDB's `/` between integers truncates, which
+#    is ISO and PostgreSQL; DuckDB's `/` returns a DOUBLE and its `//`
+#    truncates. TallyDB accepts `//` as a synonym, so the *engine* side
+#    could be written either way — the ORACLE side must say `//`.
+#  - FIRST/LAST have no ISO spelling. DuckDB's own `first`/`last` are
+#    arrival-order aggregates, which is a different question. The
+#    definition wanted here is "the value at the group's earliest/latest
+#    ordering key", and DuckDB spells that `arg_min(x, ts)` /
+#    `arg_max(x, ts)` — a definitional reference, not a name match.
+#
+# Row order is engine-arbitrary for grouped results, so the referee
+# re-sorts both sides (as UNORDERED_FAMILIES does).
+BUCKET_FAMILIES = [
+    # A minute of nanoseconds. The corpus's 1s cadence puts ~60 rows in
+    # each bucket, so the groups are neither singletons nor one blob.
+    (
+        "SELECT ts / 60000000000 AS bar, count(*) AS n, sum(x) AS s FROM corpus "
+        "GROUP BY ts / 60000000000",
+        "SELECT ts // 60000000000 AS bar, count(*) AS n, sum(x) AS s FROM corpus "
+        "GROUP BY ts // 60000000000",
+    ),
+    # The bucket's START value — the same groups, relabelled.
+    (
+        "SELECT (ts / 60000000000) * 60000000000 AS bar, count(*) AS n FROM corpus "
+        "GROUP BY (ts / 60000000000) * 60000000000",
+        "SELECT (ts // 60000000000) * 60000000000 AS bar, count(*) AS n FROM corpus "
+        "GROUP BY (ts // 60000000000) * 60000000000",
+    ),
+    # The OHLC shape: per symbol, per bar, open/high/low/close.
+    (
+        "SELECT sym, ts / 300000000000 AS bar, first(x) AS o, max(x) AS h, "
+        "min(x) AS l, last(x) AS c FROM corpus GROUP BY sym, ts / 300000000000",
+        "SELECT sym, ts // 300000000000 AS bar, arg_min(x, ts) AS o, max(x) AS h, "
+        "min(x) AS l, arg_max(x, ts) AS c FROM corpus GROUP BY sym, ts // 300000000000",
+    ),
+    # FIRST/LAST over a nullable column: both sides skip nulls, so the
+    # answer is the earliest/latest row that HAS a value — not NULL
+    # because the earliest row happened to be missing one.
+    (
+        "SELECT sym, first(y) AS o, last(y) AS c FROM corpus GROUP BY sym",
+        "SELECT sym, arg_min(y, ts) AS o, arg_max(y, ts) AS c FROM corpus GROUP BY sym",
+    ),
+    # A bare ordering key is the finest bucket there is.
+    (
+        "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
+        "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
+    ),
+    # The SAME bucket query over the quote history, which is
+    # deliberately NOT compacted and carries late arrivals — so its
+    # segments are unordered and the grouping falls back from the
+    # streaming path to the hash path. Same answers, other branch.
+    (
+        "SELECT qts / 60000000000 AS bar, count(*) AS n, sum(q) AS s FROM quotes "
+        "GROUP BY qts / 60000000000",
+        "SELECT qts // 60000000000 AS bar, count(*) AS n, sum(q) AS s FROM quotes "
+        "GROUP BY qts // 60000000000",
+    ),
+    # FIRST/LAST over a history that CONTAINS TIED timestamps, so the
+    # tie rule is what is being checked, not just the extremes. The
+    # oracle keys arg_min/arg_max on the pair `(qts, seq)` — DuckDB
+    # compares tuples lexicographically — which spells TallyDB's rule
+    # exactly: latest stamp, and among equal stamps the later row in
+    # storage order. Keyed on `qts` alone, DuckDB's tie-breaking is
+    # unspecified and the comparison would be meaningless.
+    (
+        "SELECT sym, qts / 300000000000 AS bar, first(q) AS o, last(q) AS c FROM quotes "
+        "GROUP BY sym, qts / 300000000000",
+        "SELECT sym, qts // 300000000000 AS bar, arg_min(q, (qts, seq)) AS o, "
+        "arg_max(q, (qts, seq)) AS c FROM quotes GROUP BY sym, qts // 300000000000",
+    ),
+    # Buckets compose with everything grouping already did: WHERE
+    # before, HAVING after.
+    (
+        "SELECT ts / 60000000000 AS bar, avg(x) AS a FROM corpus WHERE x > 100 "
+        "GROUP BY ts / 60000000000 HAVING count(*) > 20",
+        "SELECT ts // 60000000000 AS bar, avg(x) AS a FROM corpus WHERE x > 100 "
+        "GROUP BY ts // 60000000000 HAVING count(*) > 20",
+    ),
+]
+
+# The cross-sectional families whose partition is a BUCKET of the time
+# axis. Paired SQL for the same reason BUCKET_FAMILIES is paired:
+# TallyDB's `/` between integers truncates, DuckDB's returns a DOUBLE.
+# That difference is not cosmetic here — a float bucket of a nanosecond
+# stamp keeps its fractional part, so DuckDB would partition per ROW
+# rather than per bar, and the two engines would be answering different
+# questions. The oracle side says `//`.
+CROSS_SECTIONAL_FAMILIES = [
+    (
+        "SELECT ts, avg(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, avg(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, count(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, count(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, max(x) OVER (PARTITION BY ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, max(x) OVER (PARTITION BY ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, var_pop(x) OVER (PARTITION BY ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, var_pop(x) OVER (PARTITION BY ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # The cross-sectional weight: each row's share of its own bar.
+    # This needs the partition (M5.3) and the composition (#94) at once.
+    (
+        "SELECT ts, x / sum(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x / sum(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # Cross-sectional demeaning, the other half of a z-score.
+    (
+        "SELECT ts, x - avg(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x - avg(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # Several PARTITION BY terms intersect: per symbol, per bar — the
+    # two directions at once.
+    (
+        "SELECT ts, sum(x) OVER (PARTITION BY sym, ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, sum(x) OVER (PARTITION BY sym, ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, x / sum(x) OVER (PARTITION BY sym, ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, x / sum(x) OVER (PARTITION BY sym, ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # Ordered within the intersection: a frame that resets at each
+    # symbol's bar boundary.
+    (
+        "SELECT ts, avg(x) OVER (PARTITION BY sym, ts / 300000000000 ORDER BY ts "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, avg(x) OVER (PARTITION BY sym, ts // 300000000000 ORDER BY ts "
+        "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    ),
+    # A bucket partition is not restricted to the cross-sectional
+    # reading: ordered inside the bucket, it is a frame that resets at
+    # each bar boundary.
+    (
+        "SELECT ts, sum(x) OVER (PARTITION BY ts / 60000000000 ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, sum(x) OVER (PARTITION BY ts // 60000000000 ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    ),
+]
+
+# Families that DIVIDE by a window result, where the two engines'
+# division-by-zero rules differ and the difference is by ruling, not by
+# accident. TallyDB's arithmetic is IEEE — `x/0` is ±inf or NaN, and NaN
+# is a value (decision D2, DESIGN.md *Null, NaN, and ordering
+# semantics*). DuckDB returns NULL for division by zero. A rolling
+# z-score hits this on every partition's first row, where the frame is
+# one row, the deviation is 0 and the spread is 0.
+#
+# So the referee normalizes NaN to NULL on BOTH sides here, and only
+# here: that compares the numbers both engines agree are numbers,
+# without either pretending the other's zero-division rule is its own.
+# Every other window family keeps the one-sided normalization, so a
+# stray engine NaN still fails them.
+IEEE_DIVISION_FAMILIES = [
+    # The rolling z-score, expressible in SQL at all only because M5.0
+    # added stddev_pop and #94 added the composition.
+    "SELECT ts, (x - avg(x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)) / stddev_pop(x) OVER "
+    "(PARTITION BY sym ORDER BY ts ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) "
+    "AS w FROM corpus ORDER BY ts",
+    # The same shape unpartitioned, over a wider frame.
+    "SELECT ts, (x - avg(x) OVER (ORDER BY ts ROWS BETWEEN 49 PRECEDING "
+    "AND CURRENT ROW)) / stddev_pop(x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+]
+
+# #95: comparisons between EXPRESSIONS, not just column-vs-literal.
+#
+# These carry their own list because they carry their own guard. The
+# corpus's `y` runs about 1.3x its `x`, so the obvious family — `WHERE
+# x > y` — selects ZERO rows and would agree with DuckDB about nothing
+# at all. Every predicate here is therefore checked to leave both
+# branches non-empty before its answers are compared, which is the same
+# discipline the as-of tie count follows: a coverage claim that
+# re-earns itself on every run rather than being asserted once.
+#
+# `y` is nullable, so these also exercise three-valued logic on both
+# operands — NULL either side is UNKNOWN and the row drops, in both
+# engines.
+EXPRESSION_PREDICATE_FAMILIES = [
+    "SELECT ts, x, y FROM corpus WHERE x * 1.3 > y ORDER BY ts",
+    "SELECT ts, x, y FROM corpus WHERE y - x > 40 ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE abs(x - y) > 30 ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE x + 30 > y ORDER BY ts",
+    # Mixed with a prunable conjunct: same answers, and the prunable
+    # half must still prune (checked in-engine by `can_match`, which is
+    # the only place that difference is observable).
+    "SELECT ts, x FROM corpus WHERE ts > 1700002000000000000 AND x * 1.3 > y ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE x * 1.3 > y AND sym IN ('K000', 'K003') ORDER BY ts",
+    # In a CASE condition — the shape that prompted this, since a CASE
+    # condition is evaluated per row and never prunes anything.
+    "SELECT ts, CASE WHEN x * 1.3 > y THEN 1 ELSE 0 END AS c FROM corpus ORDER BY ts",
+    # And over a window result, which only #94 made reachable.
+    "SELECT ts, CASE WHEN x > avg(x) OVER () THEN 1 ELSE 0 END AS c "
+    "FROM corpus ORDER BY ts",
 ]
 
 EIGEN_PRECEDING = 19
@@ -400,6 +810,15 @@ def main() -> None:
     connection.execute("CREATE TABLE corpus AS SELECT * FROM corpus_input")
     connection.register("sensors_input", dimension)
     connection.execute("CREATE TABLE sensors AS SELECT * FROM sensors_input")
+    # The quote history, numbered in the order the engine stores it —
+    # `seq` is what breaks a tie between quotes sharing a timestamp, so
+    # it has to be attached here, before DuckDB is free to reorder.
+    quotes = read_stream_hook(lib, "tallydb_corpus_quotes_stream")
+    quotes = quotes.append_column(
+        "seq", pa.array(range(quotes.num_rows), type=pa.int64())
+    )
+    connection.register("quotes_input", quotes)
+    connection.execute("CREATE TABLE quotes AS SELECT * FROM quotes_input")
 
     passed = 0
     for sql in families():
@@ -451,10 +870,101 @@ def main() -> None:
         oracle = connection.execute(sql).to_arrow_table()
         compare_tables(sql, engine, oracle, window=True)
         passed += 1
+    # The as-of families claim to cover the tie rule; check that before
+    # trusting them. (The M5.1 lesson: a corpus with 5000 distinct
+    # timestamps cannot exercise a rule about equal ones, and a comment
+    # saying otherwise is just a comment.)
+    ties = connection.execute(
+        "SELECT count(*) FROM (SELECT sym, qts FROM quotes "
+        "GROUP BY sym, qts HAVING count(*) > 1)"
+    ).fetchone()[0]
+    if ties < 50:
+        sys.exit(
+            f"FAIL the quote history has only {ties} tied (sym, qts) "
+            "timestamps — the as-of families cannot cover the tie rule"
+        )
+    for sql in EXPRESSION_PREDICATE_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(sql).to_arrow_table()
+        # Non-vacuity first: a predicate matching none of the corpus (or
+        # all of it) would agree trivially and prove nothing about the
+        # comparison it is meant to exercise.
+        if "CASE" in sql:
+            flags = engine["c"].to_pylist()
+            selected = sum(1 for value in flags if value)
+            total = len(flags)
+        else:
+            selected, total = engine.num_rows, inputs.num_rows
+        # Both outcomes must actually occur, and by enough rows that
+        # agreement means something. Not a demand for a BALANCED split
+        # — a deliberately narrow conjunction is a fine thing to test —
+        # only that neither branch is empty or near-empty.
+        if selected < 50 or total - selected < 50:
+            sys.exit(
+                f"FAIL {sql}\n  selects {selected}/{total} rows — one branch is "
+                "too near empty for agreement to mean anything"
+            )
+        compare_tables(sql, engine, oracle, window=False)
+        passed += 1
+    for sql in IEEE_DIVISION_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(sql).to_arrow_table()
+        engine_w = nan_to_none(engine["w"].to_pylist())
+        oracle_w = nan_to_none(oracle["w"].to_pylist())
+        if len(engine_w) != len(oracle_w):
+            sys.exit(f"FAIL {sql}\n  row counts differ")
+        # A sanity floor: if the normalization swallowed everything the
+        # family would pass vacuously, so require most rows to be real
+        # numbers that actually got compared.
+        compared = sum(1 for value in oracle_w if value is not None)
+        if compared < len(oracle_w) // 2:
+            sys.exit(
+                f"FAIL {sql}\n  only {compared}/{len(oracle_w)} rows are "
+                "non-NULL — the NaN normalization would hide disagreement"
+            )
+        for row, (mine, theirs) in enumerate(zip(engine_w, oracle_w)):
+            if not close(mine, theirs):
+                sys.exit(f"FAIL {sql}\n  w row {row}: engine {mine!r} vs duckdb {theirs!r}")
+        passed += 1
+    for sql, definition in CROSS_SECTIONAL_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        compare_tables(sql, engine, oracle, window=True)
+        passed += 1
+    for sql, definition in BUCKET_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        if engine.column_names != oracle.column_names:
+            sys.exit(
+                f"FAIL {sql}\n  columns: engine {engine.column_names} "
+                f"vs duckdb {oracle.column_names}"
+            )
+        engine_rows = sorted_rows(engine)
+        oracle_rows = sorted_rows(oracle)
+        if len(engine_rows) != len(oracle_rows):
+            sys.exit(
+                f"FAIL {sql}\n  group count: engine {len(engine_rows)} "
+                f"vs duckdb {len(oracle_rows)}"
+            )
+        for row, (mine, theirs) in enumerate(zip(engine_rows, oracle_rows)):
+            for column, (a, b) in enumerate(zip(mine, theirs)):
+                equal = close(a, b) if isinstance(a, float) or isinstance(b, float) else a == b
+                if not equal:
+                    sys.exit(
+                        f"FAIL {sql}\n  row {row} column "
+                        f"{engine.column_names[column]}: engine {a!r} vs duckdb {b!r}"
+                    )
+        passed += 1
+    for sql, definition in ASOF_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        compare_tables(sql, engine, oracle, window=True)
+        passed += 1
     numpy_eigen_check(lib, inputs)
     print(
         f"Differential: {passed} generated queries agree with DuckDB "
-        f"{duckdb.__version__} over {inputs.num_rows} corpus rows"
+        f"{duckdb.__version__} over {inputs.num_rows} corpus rows "
+        f"and {quotes.num_rows} quotes"
     )
 
 

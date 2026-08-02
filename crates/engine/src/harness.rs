@@ -168,15 +168,79 @@ fn corpus_table() -> Table {
     table
 }
 
-/// The corpus database: the fact table plus a `sensors` dimension —
+/// The corpus's quote history: the as-of join's dimension side (#65).
+///
+/// A second telemetry draw (seed 91, half the rows) over the same eight
+/// sensor labels, so it interleaves with the corpus in time without
+/// lining up with it: most corpus rows fall strictly between two
+/// quotes, which is the case an as-of join exists for. Its time column
+/// is `qts`, not `ts` — a dimension attribute sharing a fact column's
+/// name is refused, and renaming is how a desk gets past that today.
+///
+/// Two shapes are injected, both **per symbol**, because that is the
+/// only place either one means anything — the generator interleaves
+/// eight keys, so its own 1s-scale disorder almost never displaces a
+/// row past another row of the same key.
+///
+/// - Every 17th row repeats its symbol's previous timestamp, so the
+///   tie rule (the last of them wins) is exercised rather than avoided.
+/// - Every 29th row arrives 30s stale, well behind several of its own
+///   symbol's earlier quotes, so the history reaches the join out of
+///   order and the sort inside the index does real work.
+///
+/// The oracle script counts the ties before it trusts the families, so
+/// the first claim re-earns itself every run; the second is covered by
+/// the differential itself, which fails if the sort is removed.
+fn quotes_table() -> Table {
+    let schema = Schema::new(vec![
+        Field::new("qts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("q", ColumnType::F64, false),
+    ]);
+    let mut table =
+        Table::with_segment_rows("quotes", schema, "qts", 256).expect("quote schema is valid");
+    // How stale a late quote is: ~30s, several of its own symbol's
+    // quotes back at this family's ~8s per-symbol spacing.
+    const LATE: i64 = 30_000_000_000;
+    let mut latest: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+    for (index, row) in corpus::Spec::telemetry(2_500, 91)
+        .generate()
+        .into_iter()
+        .enumerate()
+    {
+        let label = corpus::key_label(row.key);
+        let previous = latest.get(&row.key).copied();
+        let qts = match previous {
+            Some(earlier) if index % 17 == 0 => earlier,
+            Some(_) if index % 29 == 0 => row.ts - LATE,
+            _ => row.ts,
+        };
+        // A late arrival does not move the symbol's clock forward.
+        latest.insert(row.key, previous.map_or(qts, |earlier| earlier.max(qts)));
+        table
+            .append(&[
+                RowValue::I64(qts),
+                RowValue::Key(&label),
+                RowValue::F64(row.value),
+            ])
+            .expect("quote rows are valid");
+    }
+    table
+}
+
+/// The corpus database: the fact table, a `sensors` dimension —
 /// seven of the eight sensors (K007 is deliberately missing, so INNER
 /// and LEFT joins differ), each with a site label and a calibration
-/// factor, split across segments so dictionary codes differ per side.
+/// factor, split across segments so dictionary codes differ per side —
+/// and the `quotes` history the as-of families join against.
 fn corpus_database() -> Database {
     let mut database = Database::new();
     database
         .add_table(corpus_table())
         .expect("fact table registers");
+    database
+        .add_table(quotes_table())
+        .expect("quote history registers");
     let schema = Schema::new(vec![
         Field::new("id", ColumnType::I64, false),
         Field::new("sym", ColumnType::Key, false),
@@ -212,6 +276,25 @@ pub unsafe extern "C" fn tallydb_corpus_dimension_stream(out: *mut ArrowArrayStr
         // SAFETY: the caller provides a valid, writable destination.
         Ok(stream) => unsafe { out.write(stream) },
         Err(error) => panic!("dimension export failed: {error}"),
+    }
+}
+
+/// Exports the quote history's rows **in storage order**, for the
+/// differential script to replicate into DuckDB.
+///
+/// Storage order is load-bearing here, not incidental: it is what
+/// breaks a tie between quotes sharing a timestamp, so the referee has
+/// to number the rows the same way the engine sees them.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_corpus_quotes_stream(out: *mut ArrowArrayStream) {
+    let database = corpus_database();
+    match database.query_stream("SELECT qts, sym, q FROM quotes") {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("quote export failed: {error}"),
     }
 }
 
@@ -344,6 +427,31 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
             &format!("return rolling_dot(a, b, {})", LUA_PRECEDING + 1),
         )
         .expect("lua_rdot registers");
+    // M5.0's streaming primitives and one prelude composition, over
+    // the same reopened multi-segment fixture: NumPy re-derives each.
+    for (name, chunk) in [
+        (
+            "lua_rvar",
+            format!("return rolling_var(a, {})", LUA_PRECEDING + 1),
+        ),
+        (
+            "lua_rstd",
+            format!("return rolling_std(a, {})", LUA_PRECEDING + 1),
+        ),
+        ("lua_lag", "return lag(a, 3)".to_owned()),
+        ("lua_diff", "return diff(a)".to_owned()),
+        ("lua_logret", "return log_returns(b)".to_owned()),
+        ("lua_ewma", "return ewma(a, 0.25)".to_owned()),
+        // The prelude, exercised through the same path as the natives.
+        (
+            "lua_zscore",
+            format!("return zscore(a, {})", LUA_PRECEDING + 1),
+        ),
+    ] {
+        table
+            .register_lua_scalar(name, &["a", "b"], &chunk)
+            .unwrap_or_else(|error| panic!("{name} registers: {error}"));
+    }
     let frame = format!(
         "OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN {LUA_PRECEDING} PRECEDING \
          AND CURRENT ROW)"
@@ -355,7 +463,14 @@ pub unsafe extern "C" fn tallydb_lua_window_stream(out: *mut ArrowArrayStream) {
          lua_npos(x) {frame} AS npos, \
          lua_spread(x) {frame} AS spread, \
          lua_rel(x, y) AS rel, \
-         lua_rdot(x, y) AS rdot \
+         lua_rdot(x, y) AS rdot, \
+         lua_rvar(x, y) AS rvar, \
+         lua_rstd(x, y) AS rstd, \
+         lua_lag(x, y) AS lagged, \
+         lua_diff(x, y) AS differenced, \
+         lua_logret(x, y) AS logret, \
+         lua_ewma(x, y) AS ewma, \
+         lua_zscore(x, y) AS zscore \
          FROM trades"
     );
     match table.query_stream(&sql) {

@@ -79,8 +79,11 @@
 //! Built: the write buffer and append path ([`mem`]), the multi-segment
 //! per-table [`store::Store`] with internal row ids, the deterministic
 //! golden-locked on-disk format with zone maps and per-column codec
-//! tags ([`mod@format`]), delta-of-delta for the ordered ordering key
-//! ([`codec`], measurement cited there), persistence with
+//! tags ([`mod@format`]), the codec family ([`codec`], measurements
+//! cited there) — delta-of-delta for the ordered ordering key, ALP with
+//! its ALP-RD and raw fallbacks for `f64` values ([`alp`]), and
+//! frame-of-reference plus bit-packing for symbol codes and non-clock
+//! integers — persistence with
 //! reopen-and-verify behind the backend trait ([`io`]), row-id
 //! tombstones with append-only delete logs ([`tombstone`]), live-masked
 //! snapshots, crash-safe generational compaction that resolves
@@ -94,8 +97,9 @@
 //! flush is the boundary. (Zone maps feed query-time pruning in
 //! `query-lite`.)
 //!
-//! Still ahead: the general-`f64` codec (#30, deferred by ruling —
-//! uncompressed behind the tag is the shipped interim answer).
+//! The general-`f64` codec (#30) is no longer ahead: ALP shipped
+//! 2026-07-29, and the raw fallback behind the tag is now the floor
+//! rather than the answer.
 //!
 //! ## Explicitly NOT in scope for this crate
 //! No SQL, no query planning — that's `query-lite`. No schema-level

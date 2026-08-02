@@ -30,9 +30,9 @@ use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schem
 #[cfg(feature = "lua")]
 use compute_lua::LogSink;
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, recompute_frames, ColumnFunction,
-    DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan,
-    WindowAggregate,
+    evaluate_predicate, execute_with_ordering_key, parse_statement, plan, recompute_frames,
+    ColumnFunction, DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue,
+    Statement, UpdatePlan, ViewScalars, WindowAggregate,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -333,6 +333,12 @@ impl Table {
             }),
         );
         registry.register(
+            "regr_r2",
+            Arc::new(RollingRegression {
+                output: RegressionOutput::R2,
+            }),
+        );
+        registry.register(
             "covar_pop",
             Arc::new(PairStatistic {
                 kind: PairKind::CovarPop,
@@ -348,6 +354,18 @@ impl Table {
             "eigen_max",
             Arc::new(PairStatistic {
                 kind: PairKind::EigenMax,
+            }),
+        );
+        registry.register(
+            "var_pop",
+            Arc::new(SpreadStatistic {
+                kind: SpreadKind::VarPop,
+            }),
+        );
+        registry.register(
+            "stddev_pop",
+            Arc::new(SpreadStatistic {
+                kind: SpreadKind::StddevPop,
             }),
         );
         Table {
@@ -428,9 +446,10 @@ impl Table {
             Some(cut) => self.store.knowledge_snapshot()?.as_of(cut)?,
             None => self.store.snapshot()?,
         };
-        Ok(execute(
+        Ok(execute_with_ordering_key(
             self.store.schema(),
             &segments,
+            self.store.ordering_key(),
             plan,
             &self.current_registry(),
         )?)
@@ -463,10 +482,16 @@ impl Table {
         let fact_views = self.store.snapshot()?;
         let dimension_views = dimension.store.snapshot()?;
         Ok(query_lite::execute_join(
-            self.store.schema(),
-            &fact_views,
-            dimension.store.schema(),
-            &dimension_views,
+            query_lite::JoinSide {
+                schema: self.store.schema(),
+                handles: &fact_views,
+                ordering_key: self.store.ordering_key(),
+            },
+            query_lite::JoinSide {
+                schema: dimension.store.schema(),
+                handles: &dimension_views,
+                ordering_key: dimension.store.ordering_key(),
+            },
             plan,
             &self.current_registry(),
         )?)
@@ -504,6 +529,7 @@ impl Table {
         TableReader {
             name: self.name.clone(),
             schema: self.store.schema().clone(),
+            ordering_key: self.store.ordering_key(),
             store: self.store.reader(),
             registry: Arc::clone(&self.registry),
         }
@@ -905,26 +931,51 @@ impl Table {
         Ok(())
     }
 
+    /// Visits every live row matching `predicate` (all live rows when
+    /// `None`), in row-id order, as `(view, row, id)`. The one place a
+    /// mutation decides what it hit: `DELETE` keeps the id, `UPDATE`
+    /// also copies the row out, and neither gets its own copy of the
+    /// liveness-and-mask rule.
+    fn for_each_match(
+        &self,
+        views: &[SegmentView],
+        predicate: Option<&query_lite::Predicate>,
+        mut visit: impl FnMut(&SegmentView, usize, u64),
+    ) -> Result<(), EngineError> {
+        let schema = self.store.schema();
+        // A mutation filter may compare expressions (#95), so it needs
+        // the same evaluator a SELECT's WHERE gets — kernels included.
+        let registry = self.current_registry();
+        for view in views {
+            let matches = predicate
+                .map(|predicate| {
+                    evaluate_predicate(
+                        predicate,
+                        schema,
+                        view,
+                        &ViewScalars::new(schema, view, &registry),
+                    )
+                })
+                .transpose()?;
+            let base = view.segment.base_row_id();
+            for row in 0..view.segment.batch().num_rows() {
+                let hit = view.is_live(row) && matches.as_ref().is_none_or(|mask| mask.get(row));
+                if hit {
+                    visit(view, row, base + row as u64);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Live row ids matching `predicate` (all live rows when `None`).
     fn matched_row_ids(
         &self,
         views: &[SegmentView],
         predicate: Option<&query_lite::Predicate>,
     ) -> Result<Vec<u64>, EngineError> {
-        let schema = self.store.schema();
         let mut ids = Vec::new();
-        for view in views {
-            let matches = predicate
-                .map(|predicate| evaluate_predicate(predicate, schema, view))
-                .transpose()?;
-            let base = view.segment.base_row_id();
-            for row in 0..view.segment.batch().num_rows() {
-                let hit = view.is_live(row) && matches.as_ref().is_none_or(|mask| mask.get(row));
-                if hit {
-                    ids.push(base + row as u64);
-                }
-            }
-        }
+        self.for_each_match(views, predicate, |_, _, id| ids.push(id))?;
         Ok(ids)
     }
 
@@ -980,30 +1031,26 @@ impl Table {
         let views = materialize(&self.store.snapshot()?)?;
         let mut matched_ids: Vec<u64> = Vec::new();
         let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
-        for view in &views {
-            let matches = update
-                .predicate
-                .as_ref()
-                .map(|predicate| evaluate_predicate(predicate, &schema, view))
-                .transpose()?;
-            let batch = view.segment.batch();
-            let base = view.segment.base_row_id();
-            for row in 0..batch.num_rows() {
-                let hit = view.is_live(row) && matches.as_ref().is_none_or(|mask| mask.get(row));
-                if !hit {
-                    continue;
-                }
-                matched_ids.push(base + row as u64);
-                let mut cells: Vec<OwnedValue> = batch
-                    .columns()
-                    .iter()
-                    .map(|column| OwnedValue::from_cell(column, row))
-                    .collect();
-                for (index, value) in &assigned {
-                    cells[*index] = value.clone();
-                }
-                corrected.push(cells);
+        self.for_each_match(&views, update.predicate.as_ref(), |view, row, id| {
+            matched_ids.push(id);
+            let mut cells: Vec<OwnedValue> = view
+                .segment
+                .batch()
+                .columns()
+                .iter()
+                .map(|column| OwnedValue::from_cell(column, row))
+                .collect();
+            for (index, value) in &assigned {
+                cells[*index] = value.clone();
             }
+            corrected.push(cells);
+        })?;
+        // Matching nothing is a normal SQL outcome, not a misuse:
+        // `UPDATE ... WHERE <false>` affects zero rows. Storage refuses
+        // a supersession with no victims (rightly — that shape is an
+        // append), so the empty case never reaches it.
+        if matched_ids.is_empty() {
+            return Ok(0);
         }
         // One knowledge event (issue #73): the replacements and the
         // tombstones land together at a single ingest sequence —
@@ -1159,6 +1206,9 @@ pub fn type_name(column_type: ColumnType) -> &'static str {
 pub struct TableReader {
     name: String,
     schema: Schema,
+    /// The declared ordering key's column index — carried because the
+    /// schema cannot say it and a snapshot may have no segment to ask.
+    ordering_key: usize,
     store: StoreReader,
     registry: Arc<Mutex<Arc<Registry>>>,
 }
@@ -1172,6 +1222,7 @@ impl TableReader {
         Ok(TableSnapshot {
             name: self.name.clone(),
             schema: self.schema.clone(),
+            ordering_key: self.ordering_key,
             knowledge,
             registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
         })
@@ -1192,6 +1243,11 @@ impl TableReader {
 pub struct TableSnapshot {
     name: String,
     schema: Schema,
+    /// The declared ordering key's column index, carried so a query
+    /// over an empty snapshot refuses exactly what a populated one
+    /// would — the schema cannot say it and there may be no segment
+    /// to ask.
+    ordering_key: usize,
     /// The latest-knowledge views plus what an `AS OF` query needs —
     /// history and pending kill stamps — captured at the same instant.
     knowledge: storage_lite::KnowledgeSnapshot,
@@ -1218,7 +1274,13 @@ impl TableSnapshot {
             }
             None => self.knowledge.latest(),
         };
-        Ok(execute(&self.schema, segments, &plan, &self.registry)?)
+        Ok(execute_with_ordering_key(
+            &self.schema,
+            segments,
+            self.ordering_key,
+            &plan,
+            &self.registry,
+        )?)
     }
 
     /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
@@ -1238,6 +1300,9 @@ impl TableSnapshot {
 pub(crate) enum RegressionOutput {
     Slope,
     Intercept,
+    /// `regr_r2(y, x)` — the coefficient of determination, ISO's own
+    /// name for the fit's explained fraction of `y`'s variance.
+    R2,
 }
 
 /// Rolling least-squares of `y` on `x`, solved in closed form.
@@ -1290,7 +1355,8 @@ impl WindowAggregate for RollingRegression {
         // Second pass about the means. `sum_dx` and `sum_dy` are zero in
         // exact arithmetic and merely small in floating point; carrying
         // them is what makes this the corrected form.
-        let (mut sum_dx, mut sum_dy, mut sxy, mut sxx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut sum_dx, mut sum_dy, mut sxy, mut sxx, mut syy) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for (&xi, &yi) in x.iter().zip(y) {
             let dx = xi - mean_x;
             let dy = yi - mean_y;
@@ -1298,9 +1364,11 @@ impl WindowAggregate for RollingRegression {
             sum_dy += dy;
             sxy += dx * dy;
             sxx += dx * dx;
+            syy += dy * dy;
         }
         let sxx = sxx - sum_dx * sum_dx / count;
         let sxy = sxy - sum_dx * sum_dy / count;
+        let syy = syy - sum_dy * sum_dy / count;
         // Zero variance in x — or negative, which rounding can produce
         // from the correction — leaves the regression undefined: SQL
         // NULL, exactly `regr_slope`'s definition. NaN is tested for
@@ -1309,6 +1377,16 @@ impl WindowAggregate for RollingRegression {
         if sxx <= 0.0 || sxx.is_nan() {
             return Ok(None);
         }
+        // R² is the squared correlation, which needs `y`'s spread too;
+        // a flat `y` leaves it undefined (0/0), so it is NULL rather
+        // than a fabricated 1.0. Clamped to [0, 1] because the
+        // correction can push a perfect fit a rounding step past 1.
+        if matches!(self.output, RegressionOutput::R2) {
+            if syy <= 0.0 || syy.is_nan() {
+                return Ok(None);
+            }
+            return Ok(Some((sxy * sxy / (sxx * syy)).clamp(0.0, 1.0)));
+        }
         let slope = sxy / sxx;
         // The fit is `a + slope·(x − x̄)` with `a` correcting for the
         // leftover offset; the reported intercept is its value at x = 0.
@@ -1316,6 +1394,7 @@ impl WindowAggregate for RollingRegression {
         Ok(Some(match self.output {
             RegressionOutput::Slope => slope,
             RegressionOutput::Intercept => centered_intercept - slope * mean_x,
+            RegressionOutput::R2 => unreachable!("handled above"),
         }))
     }
 
@@ -1355,14 +1434,119 @@ impl RollingRegression {
         if moments.rows() < 2 {
             return None;
         }
-        let (_, var_x, covar) = moments.population();
+        let (var_y, var_x, covar) = moments.population();
         if var_x <= 0.0 || var_x.is_nan() {
             return None;
+        }
+        // R² rides the same incremental moments: it is the squared
+        // correlation, so it needs y's spread as well, and is undefined
+        // where y is flat.
+        if matches!(self.output, RegressionOutput::R2) {
+            if var_y <= 0.0 || var_y.is_nan() {
+                return None;
+            }
+            return Some((covar * covar / (var_x * var_y)).clamp(0.0, 1.0));
         }
         let slope = covar / var_x;
         Some(match self.output {
             RegressionOutput::Slope => slope,
             RegressionOutput::Intercept => moments.mean_y() - slope * moments.mean_x(),
+            RegressionOutput::R2 => unreachable!("handled above"),
+        })
+    }
+}
+
+/// Which one-column dispersion statistic an instance computes (M5.0).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SpreadKind {
+    /// Population variance — 0 for a single point, matching `var_pop`.
+    VarPop,
+    /// Population standard deviation: the root of [`SpreadKind::VarPop`].
+    StddevPop,
+}
+
+/// One-column dispersion over a window: `var_pop(x)` and
+/// `stddev_pop(x)`, the two standard-named members of M5.0's streaming
+/// tranche (#77.1 = a — only ops bearing standard SQL names reach SQL).
+///
+/// Variance *is* the covariance of a column with itself, so this shares
+/// [`PairStatistic`]'s machinery rather than duplicating it: the
+/// per-window path runs the same corrected two-pass, and the
+/// incremental path runs the same [`shifted_sweep`] with the column
+/// passed as both series, reading `var_y` off the shared moments. One
+/// algorithm, one set of numerics guarantees, two surfaces.
+pub(crate) struct SpreadStatistic {
+    pub(crate) kind: SpreadKind,
+}
+
+impl WindowAggregate for SpreadStatistic {
+    fn arity(&self) -> usize {
+        1
+    }
+
+    fn evaluate(&self, args: &[&[f64]]) -> Result<Option<f64>, String> {
+        let x = args[0];
+        let n = x.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let count = n as f64;
+        let mean = x.iter().sum::<f64>() / count;
+        // The corrected two-pass (Chan–Golub–LeVeque), exactly as
+        // `PairStatistic::evaluate` runs it: `sum_d` is zero in exact
+        // arithmetic and merely small in floating point, and carrying
+        // it is what holds the noise floor at a large offset.
+        let (mut sum_d, mut var) = (0.0f64, 0.0f64);
+        for &xi in x {
+            let d = xi - mean;
+            sum_d += d;
+            var += d * d;
+        }
+        var = (var - sum_d * sum_d / count) / count;
+        Ok(self.value_from_variance(var))
+    }
+
+    fn evaluate_frames(
+        &self,
+        columns: &[&[f64]],
+        preceding: Option<usize>,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let Some(preceding) = preceding else {
+            // Unbounded frames only grow — no slide to make incremental.
+            return recompute_frames(self, columns, None);
+        };
+        let x = columns[0];
+        let mut results = Vec::with_capacity(x.len());
+        // The column as both series: `var_y` of (x, x) is x's variance.
+        shifted_sweep(x, x, preceding + 1, |lo, i, moments| {
+            results.push(match moments {
+                Some(moments) => self.value_from_variance(moments.population().0),
+                // Non-finite frame: the reference arithmetic, exactly
+                // as the recompute path would run it.
+                None => self
+                    .evaluate(&[&x[lo..=i]])
+                    .expect("the dispersion statistics do not error"),
+            });
+        });
+        Ok(results)
+    }
+}
+
+impl SpreadStatistic {
+    /// The statistic's value from a finished population variance — one
+    /// finalization shared by the per-window and incremental paths, so
+    /// their semantics cannot diverge.
+    fn value_from_variance(&self, var: f64) -> Option<f64> {
+        // A mathematically non-negative variance can land just below
+        // zero through rounding, and `sqrt` of that is NaN — a wrong
+        // answer, not a loud one. Clamp first. NaN is checked
+        // explicitly because `f64::max` *discards* a NaN operand
+        // (`NaN.max(0.0) == 0.0`), which would turn a genuinely
+        // undefined window into a confident zero.
+        let var = if var.is_nan() { var } else { var.max(0.0) };
+        Some(match self.kind {
+            SpreadKind::VarPop => var,
+            SpreadKind::StddevPop => var.sqrt(),
         })
     }
 }
@@ -2569,6 +2753,82 @@ mod snapshot_concurrency {
     }
 
     #[test]
+    fn a_kernel_in_a_predicate_is_refused_not_silently_resegmented() {
+        // Found by the repo-wide code review. A registered kernel must
+        // see the query's rows as ONE column — segmentation is an
+        // internal detail, and a kernel with running semantics would
+        // otherwise reset at every segment boundary. CASE combined
+        // with a kernel is refused for exactly that reason.
+        //
+        // #95 opened two new doors: a CASE *condition* and a row
+        // filter can now hold a full expression, so a kernel can hide
+        // in either — and the routing test was only looking at the
+        // CASE arms. The kernel took the per-view path and its answer
+        // changed with the segment size. Both now meet the same
+        // refusal the arms do, which is the point: whether a query is
+        // accepted must not turn on how the rows happen to be split.
+        struct RunningSum;
+        impl ColumnFunction for RunningSum {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+                let (x, valid) = args[0];
+                let mut total = 0.0;
+                Ok((0..x.len())
+                    .map(|i| {
+                        valid[i].then(|| {
+                            total += x[i];
+                            total
+                        })
+                    })
+                    .collect())
+            }
+        }
+        for segment_rows in [8usize, 3] {
+            let mut table = Table::with_segment_rows("t", m1_schema(), "ts", segment_rows).unwrap();
+            for i in 0..8i64 {
+                table.append(&linear_row(i)).unwrap();
+            }
+            table
+                .register_column_function("running", RunningSum)
+                .unwrap();
+            let error = table
+                .query("SELECT CASE WHEN running(x) > 6 THEN 1 ELSE 0 END AS c FROM t")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lift the function out"),
+                "refused the same way at {segment_rows} rows per segment: {error}"
+            );
+            // A row filter is the same door by another name, and the
+            // one the reviewer measured: `WHERE running(x) > 6`
+            // answered 2 rows at 8 rows per segment and 0 at 2,
+            // because WHERE builds each view's live mask per segment.
+            for filter in [
+                "SELECT x FROM t WHERE running(x) > 6",
+                "DELETE FROM t WHERE running(x) > 6",
+                "UPDATE t SET x = 0 WHERE running(x) > 6",
+            ] {
+                let error = table.query(filter).unwrap_err().to_string();
+                assert!(
+                    error.contains("a registered function in a row filter"),
+                    "refused at {segment_rows} rows per segment: {filter}: {error}"
+                );
+            }
+            // The kernel alone is fine, and segment-independent.
+            let plain = table.query("SELECT running(x) AS c FROM t").unwrap();
+            assert_eq!(flatten(&plain, 0).last().copied().flatten(), Some(28.0));
+            // And the workaround the refusal names actually works:
+            // compute it in the SELECT list, filter on that.
+            let lifted = table
+                .query("SELECT running(x) AS c FROM t WHERE x > -1")
+                .unwrap();
+            assert_eq!(flatten(&lifted, 0).len(), 8);
+        }
+    }
+
+    #[test]
     fn a_registered_column_function_runs_in_projection() {
         // The native half of the vectorized scalar slot (#53): one
         // call per view, dense arguments, NULL decided by the kernel.
@@ -2653,6 +2913,46 @@ mod mutation_tests {
             table.append(&linear_row(i)).unwrap();
         }
         table
+    }
+
+    #[test]
+    fn an_expression_predicate_survives_tombstones() {
+        // #95's comparison between expressions is the ONE predicate
+        // leaf whose operands are computed over the view's LIVE rows,
+        // while the predicate tree itself is indexed by STORED row.
+        // On a compacted table the two spaces coincide and nothing
+        // shows; with tombstones they do not, and the mismatch is an
+        // index panic rather than a wrong answer.
+        //
+        // A mutation is how a user gets there, so a mutation is how
+        // this reaches it — then a SELECT's WHERE, a CASE condition,
+        // and a second mutation's own filter, the three places the
+        // leaf can be reached.
+        let mut table = small_table();
+        assert_eq!(table.mutate("DELETE FROM t WHERE ts < 4").unwrap(), 4);
+        // linear_row alternates y = 2x + 5 and y = -1.5x + 40, so over
+        // the survivors y > x holds throughout while `y - x > 20`
+        // splits them — the point being a predicate that is neither
+        // vacuous nor total.
+        let kept = table.query("SELECT ts FROM t WHERE y > x").unwrap();
+        assert_eq!(kept.num_rows(), 6, "every survivor, none of the dead");
+        let split = table.query("SELECT ts FROM t WHERE y - x > 20").unwrap();
+        assert!(
+            (1..6).contains(&split.num_rows()),
+            "a real split of the survivors, got {}",
+            split.num_rows()
+        );
+        // The same leaf through a CASE condition.
+        let flagged = table
+            .query("SELECT CASE WHEN y > x THEN 1 ELSE 0 END AS c FROM t")
+            .unwrap();
+        assert_eq!(flatten(&flagged, 0), vec![Some(1.0); 6]);
+        // And through a mutation's own filter, over the tombstones the
+        // first DELETE left behind.
+        assert_eq!(
+            table.mutate("DELETE FROM t WHERE y - x > 20").unwrap(),
+            split.num_rows() as u64
+        );
     }
 
     #[test]
@@ -2794,6 +3094,337 @@ mod mutation_tests {
         table.query(window).unwrap();
     }
 
+    /// One output column flattened across batches, nulls preserved.
+    fn f64s(output: &query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let column = f64_column(batch, index);
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn regr_r2_answers_and_is_undefined_where_the_fit_is() {
+        // A perfect line: R² is exactly 1 — the clamp exists so the
+        // corrected two-pass cannot report 1 + ε on a perfect fit.
+        let build = |rows: &[(i64, f64, f64)]| {
+            let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+            for &(ts, x, y) in rows {
+                table
+                    .append(&[
+                        RowValue::I64(ts),
+                        RowValue::Key("A"),
+                        RowValue::F64(x),
+                        RowValue::F64(y),
+                    ])
+                    .unwrap();
+            }
+            table
+        };
+        // BOTH frame shapes, because they take different code paths:
+        // an unbounded frame recomputes per frame, a trailing one rides
+        // the incremental moment sweep, and each carries its own
+        // undefined-fit guard.
+        let r2 = |t: &Table, frame: &str| {
+            let sql = format!("SELECT regr_r2(y, x) OVER (ORDER BY ts {frame}) AS r FROM t");
+            f64s(&t.query(&sql).unwrap(), 0)
+        };
+        let recompute = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+        let incremental = "ROWS BETWEEN 5 PRECEDING AND CURRENT ROW";
+        let mut table = build(&[(1, 1.0, 3.0), (2, 2.0, 5.0), (3, 3.0, 7.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(
+                r2(&table, frame),
+                [None, Some(1.0), Some(1.0)],
+                "a two-point fit is already perfect; one point is undefined ({frame})"
+            );
+        }
+        // A flat y — no variance to explain — leaves R² undefined
+        // rather than reporting a fabricated 1.0. This is the case a
+        // naive Sxy²/(Sxx·Syy) returns NaN for, and NaN is a *value*
+        // here, so it would otherwise reach the user as one.
+        table = build(&[(1, 1.0, 4.0), (2, 2.0, 4.0), (3, 3.0, 4.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(r2(&table, frame), [None, None, None], "flat y ({frame})");
+        }
+        // And a flat x — the fit itself undefined — is NULL too, the
+        // same rule regr_slope follows.
+        table = build(&[(1, 2.0, 1.0), (2, 2.0, 5.0), (3, 2.0, 9.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(r2(&table, frame), [None, None, None], "flat x ({frame})");
+        }
+    }
+
+    #[test]
+    fn dispersion_windows_answer_through_sql_and_agree_with_hand_computation() {
+        // M5.0's SQL surface: `var_pop`/`stddev_pop` over a ROWS frame,
+        // through the ordinary window path — registered natives, so
+        // they need no special casing anywhere above the registry.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+        for (i, x) in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0].iter().enumerate() {
+            table
+                .append(&[
+                    RowValue::I64(i as i64),
+                    RowValue::Key("A"),
+                    RowValue::F64(*x),
+                    RowValue::F64(0.0),
+                ])
+                .unwrap();
+        }
+        // The textbook set: mean 5, population variance 4, stddev 2.
+        let whole = "OVER (ORDER BY ts ROWS BETWEEN 7 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT var_pop(x) {whole} AS v, stddev_pop(x) {whole} AS s FROM t"
+            ))
+            .unwrap();
+        let variance = f64s(&output, 0);
+        let stddev = f64s(&output, 1);
+        assert_eq!(variance.last().unwrap(), &Some(4.0));
+        assert_eq!(stddev.last().unwrap(), &Some(2.0));
+        // A single-row frame has zero spread, never NULL — population
+        // variance of one point is 0, as `covar_pop` is for one pair.
+        let single = "OVER (ORDER BY ts ROWS BETWEEN 0 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!("SELECT var_pop(x) {single} AS v FROM t"))
+            .unwrap();
+        assert!(f64s(&output, 0).iter().all(|v| *v == Some(0.0)));
+        // stddev is exactly the root of var over every trailing frame.
+        let trailing = "OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT var_pop(x) {trailing} AS v, stddev_pop(x) {trailing} AS s FROM t"
+            ))
+            .unwrap();
+        for (v, s) in f64s(&output, 0).iter().zip(f64s(&output, 1)) {
+            match (v, s) {
+                (Some(v), Some(s)) => assert!((v.sqrt() - s).abs() < 1e-15, "{v} {s}"),
+                other => panic!("both defined on this frame: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lag_and_lead_read_neighbouring_rows_and_keep_the_column_type() {
+        // M5.1. LAG/LEAD are positional, not aggregates: they copy a
+        // neighbour's value, so the output column carries the SOURCE
+        // column's type. That is not a nicety — a nanosecond timestamp
+        // is past 2^53, where f64 stops being exact, and lagging a
+        // timestamp is the most natural thing a user will write.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        // Nanosecond-scale stamps, one apart: distinguishable in i64,
+        // indistinguishable after a round trip through f64.
+        let base = 1_700_000_000_000_000_001i64;
+        for i in 0..6i64 {
+            table
+                .append(&[RowValue::I64(base + i), RowValue::F64(i as f64)])
+                .unwrap();
+        }
+        let output = table
+            .query("SELECT lag(ts, 1) OVER (ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        assert_eq!(
+            output.schema.fields()[0].column_type(),
+            ColumnType::I64,
+            "a lagged BIGINT stays BIGINT"
+        );
+        let previous: Vec<Option<i64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[0] else {
+                    panic!("expected i64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(previous[0], None, "no row before the first");
+        // Every stamp exact, one nanosecond apart — the whole point.
+        for (i, got) in previous.iter().enumerate().skip(1) {
+            assert_eq!(*got, Some(base + i as i64 - 1), "row {i}");
+        }
+        // LEAD looks the other way and runs off the far end.
+        let output = table
+            .query("SELECT lead(x, 2) OVER (ORDER BY ts) AS ahead FROM t")
+            .unwrap();
+        assert_eq!(output.schema.fields()[0].column_type(), ColumnType::F64);
+        let ahead = f64s(&output, 0);
+        assert_eq!(ahead[0], Some(2.0));
+        assert_eq!(ahead[3], Some(5.0));
+        assert_eq!(ahead[4], None, "past the end");
+        assert_eq!(ahead[5], None);
+        // The default offset is 1, as in standard SQL.
+        let output = table
+            .query("SELECT lag(x) OVER (ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        assert_eq!(f64s(&output, 0)[1], Some(0.0));
+    }
+
+    #[test]
+    fn range_frames_share_one_window_across_tied_timestamps() {
+        // The peer rule, which is what separates RANGE from ROWS:
+        // standard SQL ends a RANGE frame at the current row's LAST
+        // PEER, so every row sharing an ordering value reports the
+        // identical window — including peers that sit *after* it.
+        //
+        // The expected values below are DuckDB 1.5.5's, taken directly
+        // (2026-07-30) rather than derived here: the differential
+        // corpus has no tied timestamps, so this property has no
+        // coverage there and needed its own reference.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
+        for (ts, x) in [
+            (10i64, 1.0f64),
+            (20, 2.0),
+            (20, 3.0),
+            (20, 4.0),
+            (25, 5.0),
+            (40, 6.0),
+        ] {
+            table
+                .append(&[RowValue::I64(ts), RowValue::F64(x)])
+                .unwrap();
+        }
+        let frame = "OVER (ORDER BY ts RANGE BETWEEN 10 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!(
+                "SELECT sum(x) {frame} AS s, count(x) {frame} AS n FROM t"
+            ))
+            .unwrap();
+        // The three ts=20 rows all see rows with ts in [10, 20] — all
+        // four of them — so each reports 1+2+3+4 = 10, not a running
+        // total. A row-count reading would give 3, 6, 10 instead.
+        assert_eq!(
+            f64s(&output, 0),
+            [
+                Some(1.0),
+                Some(10.0),
+                Some(10.0),
+                Some(10.0),
+                Some(14.0),
+                Some(6.0)
+            ]
+        );
+        // COUNT exports as i64 (B5), so read it as one.
+        let counts: Vec<Option<i64>> = output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[1] else {
+                    panic!("count exports i64")
+                };
+                (0..column.len())
+                    .map(|row| {
+                        column
+                            .is_valid(row)
+                            .then(|| column.values().as_slice()[row])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [Some(1), Some(4), Some(4), Some(4), Some(4), Some(1)]
+        );
+        // A zero span is the peer group itself: the tied rows see only
+        // each other, and an untied row sees only itself.
+        let peers = "OVER (ORDER BY ts RANGE BETWEEN 0 PRECEDING AND CURRENT ROW)";
+        let output = table
+            .query(&format!("SELECT sum(x) {peers} AS s FROM t"))
+            .unwrap();
+        assert_eq!(
+            f64s(&output, 0),
+            [
+                Some(1.0),
+                Some(9.0),
+                Some(9.0),
+                Some(9.0),
+                Some(5.0),
+                Some(6.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn lag_and_lead_refuse_what_they_cannot_mean() {
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+        for i in 0..6i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        // A frame clause is meaningless on a one-row lookup, and
+        // standard SQL gives these functions none: refused, not ignored.
+        let framed = "SELECT lag(x, 1) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+                      AND CURRENT ROW) FROM t";
+        assert!(matches!(
+            table.query(framed),
+            Err(EngineError::Query(QueryError::Unsupported(_)))
+        ));
+        // Symbols are unordered labels whose codes are per-segment, so a
+        // lagged code would name nothing (the #58 reasoning).
+        assert!(matches!(
+            table.query("SELECT lag(sym, 1) OVER (ORDER BY ts) FROM t"),
+            Err(EngineError::Query(QueryError::TypeError(_)))
+        ));
+        // Offset 0 is the row itself; the third (default) argument is
+        // standard but unbuilt — refused by name, never silently dropped.
+        for sql in [
+            "SELECT lag(x, 0) OVER (ORDER BY ts) FROM t",
+            "SELECT lag(x, 1, 0.0) OVER (ORDER BY ts) FROM t",
+            "SELECT lag(x, -1) OVER (ORDER BY ts) FROM t",
+        ] {
+            assert!(
+                matches!(
+                    table.query(sql),
+                    Err(EngineError::Query(QueryError::Unsupported(_)))
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn lag_partitions_by_symbol_and_never_crosses_a_partition() {
+        // The cross-sectional shape: each symbol's own previous row,
+        // never the interleaved neighbour's.
+        let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 2).unwrap();
+        for i in 0..8i64 {
+            table.append(&linear_row(i)).unwrap();
+        }
+        let output = table
+            .query("SELECT lag(x, 1) OVER (PARTITION BY sym ORDER BY ts) AS prev FROM t")
+            .unwrap();
+        let previous = f64s(&output, 0);
+        // linear_row alternates A (even ts) and B (odd ts), x = ts.
+        assert_eq!(previous[0], None, "first A has no predecessor");
+        assert_eq!(previous[1], None, "first B has no predecessor");
+        assert_eq!(previous[2], Some(0.0), "A: 2 follows 0");
+        assert_eq!(previous[3], Some(1.0), "B: 3 follows 1");
+        assert_eq!(previous[4], Some(2.0));
+        assert_eq!(previous[5], Some(3.0));
+    }
+
     #[test]
     fn update_validates_before_mutating() {
         let mut table = small_table();
@@ -2819,6 +3450,27 @@ mod mutation_tests {
             flatten(&output, 0).iter().filter(|v| v.is_none()).count(),
             0
         );
+    }
+
+    #[test]
+    fn a_mutation_matching_nothing_affects_zero_rows() {
+        // Found by the repo-wide code review. Storage refuses a
+        // supersession with no victims — that shape is an append, not
+        // a correction — but an UPDATE whose WHERE selects nothing is
+        // ordinary SQL and must report 0, not an error. DELETE already
+        // did; UPDATE surfaced the storage refusal to the user.
+        let mut table = small_table();
+        assert_eq!(
+            table.mutate("UPDATE t SET x = 0 WHERE ts = 9999").unwrap(),
+            0
+        );
+        assert_eq!(table.mutate("DELETE FROM t WHERE ts = 9999").unwrap(), 0);
+        // And the table is untouched, including by the UPDATE: no
+        // half-applied correction, no spare knowledge event.
+        assert_eq!(table.query("SELECT ts FROM t").unwrap().num_rows(), 10);
+        // The matching case still works, so the short-circuit is not
+        // swallowing real work.
+        assert_eq!(table.mutate("UPDATE t SET x = 0 WHERE ts = 1").unwrap(), 1);
     }
 
     #[test]
@@ -2932,8 +3584,22 @@ mod window_truth {
     /// `high_precision` fills it; `stats_from` leaves it NaN.
     #[derive(Clone, Copy, Default)]
     pub(crate) struct Stats {
+        /// `y`'s population variance — what `var_pop(y)` must match,
+        /// and the square of what `stddev_pop(y)` must match (M5.0).
+        pub(crate) var_y: f64,
+        /// `x`'s population variance. The corpora put their 1e6–1e12
+        /// offsets on `x` alone, so this is the *adversarial* column
+        /// for a one-column statistic — checking dispersion only on
+        /// `y` would never exercise the cancellation the corrected
+        /// two-pass exists to prevent.
+        pub(crate) var_x: f64,
         pub(crate) covar: f64,
         pub(crate) corr: f64,
+        /// The coefficient of determination — `covar² / (var_x·var_y)`,
+        /// computed from the same compensated moments rather than by
+        /// squaring `corr`, so it is a reference in its own right and
+        /// not a second reading of one.
+        pub(crate) r2: f64,
         pub(crate) eigen_max: f64,
         pub(crate) slope: f64,
         pub(crate) intercept: f64,
@@ -2950,8 +3616,15 @@ mod window_truth {
         let half_trace = (var_y + var_x) / 2.0;
         let radius = ((var_y - var_x) / 2.0).hypot(covar);
         Stats {
+            var_y,
+            var_x,
             covar,
             corr,
+            r2: if var_y > 0.0 && var_x > 0.0 {
+                covar * covar / (var_x * var_y)
+            } else {
+                f64::NAN
+            },
             eigen_max: half_trace + radius,
             slope: if var_x > 0.0 { covar / var_x } else { f64::NAN },
             intercept: f64::NAN,
@@ -3122,9 +3795,31 @@ mod window_numerics_guard {
                     truth.covar.abs() > 1e-3
                         && truth.corr.abs() > 1e-3
                         && truth.eigen_max.abs() > 1e-3
-                        && truth.slope.abs() > 1e-3,
+                        && truth.slope.abs() > 1e-3
+                        && truth.var_y.abs() > 1e-3
+                        && truth.var_x.abs() > 1e-3,
                     "{name} row {i}: corpus left a statistic near zero"
                 );
+                // M5.0's dispersion pair takes one column, so it runs
+                // once per column — and `x` is the one that matters:
+                // it carries the corpus offset, so an uncorrected
+                // two-pass shows up here and nowhere else.
+                for (column, var) in [(&window[..1], truth.var_y), (&window[1..], truth.var_x)] {
+                    for (kind, expected) in [
+                        (SpreadKind::VarPop, var),
+                        (SpreadKind::StddevPop, var.sqrt()),
+                    ] {
+                        let got = SpreadStatistic { kind }
+                            .evaluate(column)
+                            .unwrap()
+                            .expect("defined on these corpora");
+                        assert!(
+                            relative(got, expected) < BOUND,
+                            "{name} row {i} {kind:?}: {got} vs {expected} (relative {:.2e})",
+                            relative(got, expected)
+                        );
+                    }
+                }
                 for (kind, expected) in [
                     (PairKind::CovarPop, truth.covar),
                     (PairKind::Corr, truth.corr),
@@ -3143,6 +3838,7 @@ mod window_numerics_guard {
                 for (output, expected) in [
                     (RegressionOutput::Slope, truth.slope),
                     (RegressionOutput::Intercept, truth.intercept),
+                    (RegressionOutput::R2, truth.r2),
                 ] {
                     let got = RollingRegression { output }
                         .evaluate(&window)
@@ -3190,6 +3886,12 @@ mod window_numerics_guard {
                 }),
             ),
             (
+                "regr_r2",
+                Box::new(RollingRegression {
+                    output: RegressionOutput::R2,
+                }),
+            ),
+            (
                 "covar_pop",
                 Box::new(PairStatistic {
                     kind: PairKind::CovarPop,
@@ -3208,6 +3910,45 @@ mod window_numerics_guard {
                 }),
             ),
         ];
+        // The arity-1 statistics run the same comparison over `y`
+        // alone, which carries the NaN and −Inf rows.
+        let spreads: Vec<(&str, Box<dyn WindowAggregate>)> = vec![
+            (
+                "var_pop",
+                Box::new(SpreadStatistic {
+                    kind: SpreadKind::VarPop,
+                }),
+            ),
+            (
+                "stddev_pop",
+                Box::new(SpreadStatistic {
+                    kind: SpreadKind::StddevPop,
+                }),
+            ),
+        ];
+        for preceding in [1usize, 3, 7] {
+            for (name, aggregate) in &spreads {
+                let one: [&[f64]; 1] = [&y];
+                let incremental = aggregate.evaluate_frames(&one, Some(preceding)).unwrap();
+                let reference =
+                    query_lite::recompute_frames(aggregate.as_ref(), &one, Some(preceding))
+                        .unwrap();
+                assert_eq!(incremental.len(), reference.len());
+                for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
+                    match (got, want) {
+                        (None, None) => {}
+                        (Some(a), Some(b)) if a.is_nan() && b.is_nan() => {}
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => assert!(
+                            ((a - b) / b).abs() < 1e-9,
+                            "{name} w={} row {i}: {a} vs {b}",
+                            preceding + 1
+                        ),
+                        (got, want) => panic!("{name} row {i}: {got:?} vs {want:?}"),
+                    }
+                }
+            }
+        }
         for preceding in [1usize, 3, 7] {
             for (name, aggregate) in &aggregates {
                 let incremental = aggregate
@@ -3282,11 +4023,33 @@ mod window_numerics_guard {
                 (RegressionOutput::Intercept, "intercept", &|s: &Stats| {
                     s.intercept
                 }),
+                (RegressionOutput::R2, "r2", &|s: &Stats| s.r2),
             ] {
                 let results = RollingRegression { output }
                     .evaluate_frames(&columns, Some(w - 1))
                     .unwrap();
                 check(label, results, pick);
+            }
+            // M5.0's dispersion pair sweeps each column on its own —
+            // `x` included, which is where the corpus offset lives.
+            for (kind, on_y, on_x) in [
+                (
+                    SpreadKind::VarPop,
+                    &(|s: &Stats| s.var_y) as &dyn Fn(&Stats) -> f64,
+                    &(|s: &Stats| s.var_x) as &dyn Fn(&Stats) -> f64,
+                ),
+                (
+                    SpreadKind::StddevPop,
+                    &|s: &Stats| s.var_y.sqrt(),
+                    &|s: &Stats| s.var_x.sqrt(),
+                ),
+            ] {
+                for (slice, pick) in [(&columns[..1], on_y), (&columns[1..], on_x)] {
+                    let results = SpreadStatistic { kind }
+                        .evaluate_frames(slice, Some(w - 1))
+                        .unwrap();
+                    check(&format!("{kind:?}"), results, pick);
+                }
             }
         }
     }

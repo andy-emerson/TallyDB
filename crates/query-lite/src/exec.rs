@@ -13,8 +13,10 @@
 //! ## One batch per segment
 //!
 //! A query runs over a storage snapshot — one [`SegmentView`] per
-//! segment of one table, in append order — and produces one output batch
-//! per view with any live rows, Arrow's own model for a chunked result.
+//! segment of one table, in append order — and a plain scan produces one
+//! output batch per view with any live rows, Arrow's own model for a
+//! chunked result. (How many batches is not a contract: the collapsing
+//! stages materialize a single one — see [`QueryOutput`].)
 //! That shape is what keeps passthrough zero-copy: each batch's
 //! passthrough columns share its segment's buffers (copy-on-write
 //! clones), and each batch's key columns keep their segment's own
@@ -35,12 +37,23 @@
 //! BY` across segments, each segment's dictionary codes are first
 //! remapped into a query-lifetime key space (the query-time remap
 //! decision #6 accepted).
+//!
+//! Two later shapes add copies of their own, and they are the largest
+//! here. A **join** materializes both sides up front; the as-of join
+//! additionally builds one ascending `(clock, row)` index per key over
+//! the whole dimension, which is what binds it to the size invariant
+//! rather than to the streaming co-walk its design describes (#92).
+//! **Bucket grouping** is the one shape that avoids a copy: over
+//! ordered data it streams, holding only the open bucket's
+//! accumulators and emitting each group as its bucket closes, and falls
+//! back to hashing — same answers, state proportional to the result —
+//! when the data is not ordered.
 
 use crate::plan::{
-    AggCall, AggFunction, AggItem, ArithOp, OrderBy, Plan, PlanItem, Projection, QueryError,
-    ScalarExpr, ScalarFunction, SEQUENCE_COLUMN,
+    AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
+    PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, WindowCall, SEQUENCE_COLUMN,
 };
-use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
+use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
@@ -81,6 +94,31 @@ pub trait WindowAggregate: Send + Sync {
         preceding: Option<usize>,
     ) -> Result<Vec<Option<f64>>, String> {
         recompute_frames(self, columns, preceding)
+    }
+
+    /// Evaluates every frame over one contiguous run where the frames
+    /// are given **explicitly** as half-open `(start, end)` row ranges —
+    /// the `RANGE` shape, where a frame's width follows the ordering
+    /// key's *values* rather than a row count.
+    ///
+    /// Two properties hold and an override may rely on both: `start`
+    /// and `end` are each non-decreasing across the run (the ordering
+    /// key is non-decreasing, checked before the window runs), and
+    /// every frame is non-empty. A frame is **not** necessarily
+    /// trailing — standard SQL ends a `RANGE` frame at the current
+    /// row's last peer, so `end` can exceed `position + 1`.
+    ///
+    /// The default recomputes each frame through [`Self::evaluate`],
+    /// which is correct for any aggregate. An aggregate whose
+    /// consecutive frames share work can override this with a
+    /// two-pointer sweep; because the executor only ever calls through
+    /// here, the override is a pure implementation swap.
+    fn evaluate_bounded_frames(
+        &self,
+        columns: &[&[f64]],
+        bounds: &[(usize, usize)],
+    ) -> Result<Vec<Option<f64>>, String> {
+        recompute_bounded_frames(self, columns, bounds)
     }
 
     /// The Arrow type of this window's output column. Computed in `f64`
@@ -210,11 +248,64 @@ pub fn execute(
                 .to_owned(),
         ));
     }
-    execute_single(schema, handles, plan, registry)
+    execute_single(schema, handles, ordering_key_of(handles), plan, registry)
 }
 
-/// Runs a star-schema join plan: `fact_views` joined against
-/// `dimension_views` on the plan's key columns, then the ordinary
+/// As [`execute`], but told which column the table is ordered on
+/// instead of inferring it from the snapshot.
+///
+/// The difference only shows on an **empty** table. Inferring the
+/// ordering key from `handles.first()` means there is nothing to infer
+/// from when a table has no segments, and a schema-level refusal that
+/// depends on whether rows happen to exist is a bad refusal: without
+/// this, `GROUP BY <a non-ordering BIGINT>` is accepted while the table
+/// is empty and refused as soon as a row lands. Embedders that know the
+/// answer — `engine::Table` does, from its store — should call this.
+pub fn execute_with_ordering_key(
+    schema: &Schema,
+    handles: &[SegmentHandle],
+    ordering_key: usize,
+    plan: &Plan,
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    if plan.join.is_some() {
+        return Err(QueryError::Unsupported(
+            "joins execute through the multi-table doorway (Database), not a single table"
+                .to_owned(),
+        ));
+    }
+    execute_single(schema, handles, Some(ordering_key), plan, registry)
+}
+
+/// As [`ordering_key_of`], over materialized views.
+fn ordering_key_of_views(views: &[&SegmentView]) -> Option<usize> {
+    views.first().map(|view| view.segment.ordering_key())
+}
+
+/// The ordering key a snapshot reveals — `None` when it has no
+/// segments to reveal it.
+fn ordering_key_of(handles: &[SegmentHandle]) -> Option<usize> {
+    handles.first().map(SegmentHandle::ordering_key)
+}
+
+/// One side of a join: a table's schema, a snapshot of its segments,
+/// and the index of its declared ordering-key column.
+///
+/// The ordering key travels separately because the schema cannot say
+/// it — and because an as-of join needs it even from a side with no
+/// segments to ask, so that a query naming the wrong column is refused
+/// the same way whether or not the table happens to be empty.
+pub struct JoinSide<'a> {
+    /// The table's stored schema.
+    pub schema: &'a Schema,
+    /// Its segments, in append order.
+    pub handles: &'a [SegmentHandle],
+    /// Index of the declared ordering-key column (`i64 NOT NULL`).
+    pub ordering_key: usize,
+}
+
+/// Runs a star-schema join plan: the fact side joined against the
+/// dimension side on the plan's key columns, then the ordinary
 /// single-table pipeline over the joined intermediate.
 ///
 /// The join is fact-driven: output stays one batch per fact segment;
@@ -231,27 +322,42 @@ pub fn execute(
 /// key must be unique among its live rows — a star-schema dimension is
 /// a lookup table, and a duplicate key is an error, not a silent row
 /// multiplication.
+///
+/// An **as-of** join ([`crate::AsOfMatch`], #65) changes exactly that
+/// last rule and nothing else: the dimension key is deliberately *not*
+/// unique — a quote table has many rows per symbol — and each fact row
+/// takes the most recent of its key's dimension rows on the two
+/// tables' declared ordering keys. Everything downstream (the gather,
+/// the live mask, INNER versus LEFT) is the equi-join's, unchanged.
 pub fn execute_join(
-    fact_schema: &Schema,
-    fact_handles: &[SegmentHandle],
-    dimension_schema: &Schema,
-    dimension_handles: &[SegmentHandle],
+    fact: JoinSide<'_>,
+    dimension: JoinSide<'_>,
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
+    let fact_schema = fact.schema;
+    let dimension_schema = dimension.schema;
     let Some(join) = &plan.join else {
-        return execute(fact_schema, fact_handles, plan, registry);
+        return execute_with_ordering_key(
+            fact_schema,
+            fact.handles,
+            fact.ordering_key,
+            plan,
+            registry,
+        );
     };
     // A join reads both sides whole (the gather touches every fact row
     // and any dimension row a key can reach), so both sides materialize
     // here; single-table pruning happens after the join, on the joined
     // intermediate, exactly as before.
-    let fact_views = fact_handles
+    let fact_views = fact
+        .handles
         .iter()
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
     let fact_views = &fact_views[..];
-    let dimension_views = dimension_handles
+    let dimension_views = dimension
+        .handles
         .iter()
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
@@ -271,25 +377,18 @@ pub fn execute_join(
             join.dimension_key
         )));
     }
-    // The dimension lookup: key value → (view, row), unique or bust.
-    let mut lookup: HashMap<String, (usize, usize)> = HashMap::new();
-    for (view_index, view) in dimension_views.iter().enumerate() {
-        let Column::Key(keys) = &view.segment.batch().columns()[dimension_key_index] else {
-            unreachable!("validated as a key column above")
-        };
-        for row in live_rows(view) {
-            let Some(value) = keys.value_at(row) else {
-                continue; // a null dimension key matches nothing
-            };
-            if lookup.insert(value.to_owned(), (view_index, row)).is_some() {
-                return Err(QueryError::TypeError(format!(
-                    "dimension key '{}' is not unique (value '{value}'): a star-schema \
-                     dimension is a lookup table",
-                    join.dimension_key
-                )));
-            }
+    let index = match join.as_of {
+        None => DimensionIndex::unique(dimension_views, dimension_key_index, &join.dimension_key)?,
+        Some(matching) => {
+            check_as_of_axis(join, &fact, &dimension)?;
+            DimensionIndex::history(
+                dimension_views,
+                dimension_key_index,
+                dimension.ordering_key,
+                matching,
+            )
         }
-    }
+    };
     // The joined schema: fact columns, then the dimension columns the
     // query actually reads (#81) minus its key (which duplicates the
     // fact key), all nullable (LEFT produces nulls; INNER's
@@ -330,21 +429,7 @@ pub fn execute_join(
         let Column::Key(keys) = &batch.columns()[fact_key_index] else {
             unreachable!("validated as a key column above")
         };
-        let dictionary = keys.dictionary();
-        // The once-per-distinct-value lookup.
-        let remap: Vec<Option<(usize, usize)>> = (0..dictionary.len() as u32)
-            .map(|code| lookup.get(dictionary.value(code)).copied())
-            .collect();
-        let codes = keys.codes().as_slice();
-        let picks: Vec<Option<(usize, usize)>> = (0..batch.num_rows())
-            .map(|row| {
-                if keys.is_valid(row) {
-                    remap[codes[row] as usize]
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let picks = index.picks(batch, keys, fact.ordering_key);
         let live = if join.left {
             view.live.clone()
         } else {
@@ -394,7 +479,195 @@ pub fn execute_join(
         .into_iter()
         .map(|view| SegmentHandle::resident(view.segment, view.live))
         .collect();
-    execute_single(&joined_schema, &joined_handles, plan, registry)
+    // The joined intermediate keeps the fact table's ordering key:
+    // joining widens rows, it never reorders them.
+    execute_single(
+        &joined_schema,
+        &joined_handles,
+        Some(fact.ordering_key),
+        plan,
+        registry,
+    )
+}
+
+/// One key's dimension rows for an as-of match: `(ordering-key value,
+/// view, row)`, ascending, with the tie order the match rule wants.
+type KeyHistory = Vec<(i64, usize, usize)>;
+
+/// The dimension side, indexed for whichever question the fact rows
+/// are going to ask it.
+enum DimensionIndex {
+    /// An equi-join: one row per key value, or the join is an error.
+    Unique(HashMap<String, (usize, usize)>),
+    /// An as-of join: every row per key value, in time order, and the
+    /// comparison that decides which of them a fact clock reaches.
+    History(HashMap<String, KeyHistory>, AsOfMatch),
+}
+
+impl DimensionIndex {
+    /// The star-schema lookup: key value → (view, row), unique or bust.
+    fn unique(
+        dimension_views: &[SegmentView],
+        key_index: usize,
+        key_name: &str,
+    ) -> Result<DimensionIndex, QueryError> {
+        let mut lookup: HashMap<String, (usize, usize)> = HashMap::new();
+        for (view_index, view) in dimension_views.iter().enumerate() {
+            let Column::Key(keys) = &view.segment.batch().columns()[key_index] else {
+                unreachable!("validated as a key column above")
+            };
+            for row in live_rows(view) {
+                let Some(value) = keys.value_at(row) else {
+                    continue; // a null dimension key matches nothing
+                };
+                if lookup.insert(value.to_owned(), (view_index, row)).is_some() {
+                    return Err(QueryError::TypeError(format!(
+                        "dimension key '{key_name}' is not unique (value '{value}'): a \
+                         star-schema dimension is a lookup table"
+                    )));
+                }
+            }
+        }
+        Ok(DimensionIndex::Unique(lookup))
+    }
+
+    /// The as-of index: per key value, that key's live rows as
+    /// `(clock, view, row)` in ascending clock order.
+    ///
+    /// Rows are collected in ingest order and then sorted by clock with
+    /// a *stable* sort, which costs a linear scan over the ordered data
+    /// TallyDB expects and does the right thing over data that arrived
+    /// out of order — this is where an as-of join stops depending on
+    /// the ordering key having actually been ordered. Stability is also
+    /// what settles ties: among dimension rows sharing a timestamp, the
+    /// last-ingested one is the match, the same "newest version wins"
+    /// rule corrections already follow.
+    fn history(
+        dimension_views: &[SegmentView],
+        key_index: usize,
+        time_index: usize,
+        matching: AsOfMatch,
+    ) -> DimensionIndex {
+        let mut history: HashMap<String, KeyHistory> = HashMap::new();
+        for (view_index, view) in dimension_views.iter().enumerate() {
+            let columns = view.segment.batch().columns();
+            let Column::Key(keys) = &columns[key_index] else {
+                unreachable!("validated as a key column above")
+            };
+            let clocks = ordering_clocks(&columns[time_index]);
+            for row in live_rows(view) {
+                let Some(value) = keys.value_at(row) else {
+                    continue; // a null dimension key matches nothing
+                };
+                history
+                    .entry(value.to_owned())
+                    .or_default()
+                    .push((clocks[row], view_index, row));
+            }
+        }
+
+        for rows in history.values_mut() {
+            rows.sort_by_key(|&(clock, _, _)| clock);
+        }
+        DimensionIndex::History(history, matching)
+    }
+
+    /// One fact segment's dimension picks: `(view, row)` per fact row,
+    /// `None` where the key matches nothing (equi-join) or nothing has
+    /// happened yet on the time axis (as-of).
+    ///
+    /// Both forms resolve the key once per *distinct dictionary value*
+    /// rather than once per row (decision #6's pattern); an as-of join
+    /// then pays one binary search per row over that key's history.
+    fn picks(
+        &self,
+        batch: &RecordBatch,
+        keys: &KeyColumn,
+        time_index: usize,
+    ) -> Vec<Option<(usize, usize)>> {
+        let dictionary = keys.dictionary();
+        let codes = keys.codes().as_slice();
+        match self {
+            DimensionIndex::Unique(lookup) => {
+                let remap: Vec<Option<(usize, usize)>> = (0..dictionary.len() as u32)
+                    .map(|code| lookup.get(dictionary.value(code)).copied())
+                    .collect();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        if keys.is_valid(row) {
+                            remap[codes[row] as usize]
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            DimensionIndex::History(history, matching) => {
+                let remap: Vec<Option<&KeyHistory>> = (0..dictionary.len() as u32)
+                    .map(|code| history.get(dictionary.value(code)))
+                    .collect();
+                let clocks = ordering_clocks(&batch.columns()[time_index]);
+                (0..batch.num_rows())
+                    .map(|row| {
+                        if !keys.is_valid(row) {
+                            return None;
+                        }
+                        let candidates = remap[codes[row] as usize]?;
+                        let clock = clocks[row];
+                        // How much of this key's history the fact row's
+                        // clock has reached; the match is the last of it.
+                        let reached = match matching {
+                            AsOfMatch::AtOrBefore => {
+                                candidates.partition_point(|&(at, _, _)| at <= clock)
+                            }
+                            AsOfMatch::StrictlyBefore => {
+                                candidates.partition_point(|&(at, _, _)| at < clock)
+                            }
+                        };
+                        reached
+                            .checked_sub(1)
+                            .map(|last| (candidates[last].1, candidates[last].2))
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// An ordering-key column's values. Storage validates the ordering key
+/// as `i64 NOT NULL` when a table is defined, so there is no other case
+/// and no null to consider.
+fn ordering_clocks(column: &Column) -> &[i64] {
+    let Column::Numeric(NumericData::I64(clocks)) = column else {
+        unreachable!("storage validates the ordering key as an i64 column")
+    };
+    clocks.values().as_slice()
+}
+
+/// Checks an explicit `ASOF ... ON ... AND q.ts <= t.ts` against the
+/// schemas. The time axis is *not* the query's to choose: it is the two
+/// tables' declared ordering keys, which is what makes the match a
+/// walk rather than a search. So an inequality naming anything else is
+/// refused here — the planner has no schemas and can only check its
+/// shape.
+fn check_as_of_axis(
+    join: &JoinPlan,
+    fact: &JoinSide<'_>,
+    dimension: &JoinSide<'_>,
+) -> Result<(), QueryError> {
+    let Some((named_fact, named_dimension)) = &join.as_of_named else {
+        return Ok(()); // implicit: the axis is the ordering keys by construction
+    };
+    let fact_axis = fact.schema.fields()[fact.ordering_key].name();
+    let dimension_axis = dimension.schema.fields()[dimension.ordering_key].name();
+    if named_fact != fact_axis || named_dimension != dimension_axis {
+        return Err(QueryError::Unsupported(format!(
+            "ASOF JOIN matches on the tables' declared ordering keys — '{fact_axis}' \
+             and '{dimension_axis}' — so its time comparison can only restate them; \
+             '{named_fact}' and '{named_dimension}' name something else"
+        )));
+    }
+    Ok(())
 }
 
 /// One dimension column, gathered per fact row (`None` pick = no match:
@@ -499,6 +772,7 @@ fn assemble_key(codes: Buffer<u32>, validity: Vec<bool>, mut dictionary: Diction
 fn execute_single(
     schema: &Schema,
     handles: &[SegmentHandle],
+    ordering_key: Option<usize>,
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
@@ -527,7 +801,12 @@ fn execute_single(
         let view = match &plan.predicate {
             None => view,
             Some(predicate) => {
-                let matched = evaluate_predicate(predicate, schema, &view)?;
+                let matched = evaluate_predicate(
+                    predicate,
+                    schema,
+                    &view,
+                    &ViewScalars::new(schema, &view, registry),
+                )?;
                 let live = match &view.live {
                     None => matched,
                     Some(live) => live.and(&matched),
@@ -556,9 +835,7 @@ fn execute_single(
             let output_name = match item {
                 PlanItem::Column { name, alias } => alias.as_deref().unwrap_or(name),
                 PlanItem::Computed { name, .. } => name,
-                PlanItem::WindowAgg {
-                    function, alias, ..
-                } => alias.as_deref().unwrap_or(function),
+                PlanItem::Window { call, alias } => alias.as_deref().unwrap_or(call.default_name()),
             };
             output_name == order_by.column
         }),
@@ -584,12 +861,12 @@ fn execute_single(
             items,
             having,
         } => match having {
-            None => project_aggregate(schema, &views, keys, items)?,
+            None => project_aggregate(schema, &views, ordering_key, keys, items)?,
             Some(having) => {
                 let mut extended = items.to_vec();
                 extended.extend(having.items.iter().cloned());
-                let output = project_aggregate(schema, &views, keys, &extended)?;
-                filter_having(output, &having.predicate, items.len())?
+                let output = project_aggregate(schema, &views, ordering_key, keys, &extended)?;
+                filter_having(output, &having.predicate, items.len(), registry)?
             }
         },
     };
@@ -695,27 +972,14 @@ fn project_items(
     for item in items {
         let (field, columns) = match item {
             PlanItem::Column { name, alias } => passthrough(schema, views, name, alias.as_deref())?,
-            PlanItem::Computed { expr, name } => {
-                computed_column(schema, views, expr, name, registry)?
+            PlanItem::Computed {
+                expr,
+                windows,
+                name,
+            } => computed_column(schema, views, expr, windows, name, registry)?,
+            PlanItem::Window { call, alias } => {
+                evaluate_window_call(schema, views, registry, call, alias.as_deref())?
             }
-            PlanItem::WindowAgg {
-                function,
-                args,
-                partition_by,
-                order_by,
-                preceding,
-                alias,
-            } => window_aggregate(
-                schema,
-                views,
-                registry,
-                function,
-                args,
-                partition_by.as_deref(),
-                order_by,
-                *preceding,
-                alias.as_deref(),
-            )?,
         };
         fields.push(field);
         for (out, column) in columns_per_view.iter_mut().zip(columns) {
@@ -739,6 +1003,7 @@ fn filter_having(
     output: QueryOutput,
     predicate: &Predicate,
     visible: usize,
+    registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
     let full_schema = output.schema.clone();
     let mut picks: Vec<(usize, usize)> = Vec::new();
@@ -750,7 +1015,12 @@ fn filter_having(
             0,
             false,
         )));
-        let matched = evaluate_predicate(predicate, &full_schema, &view)?;
+        let matched = evaluate_predicate(
+            predicate,
+            &full_schema,
+            &view,
+            &ViewScalars::new(&full_schema, &view, registry),
+        )?;
         for row in 0..batch.num_rows() {
             if matched.get(row) {
                 picks.push((batch_index, row));
@@ -773,9 +1043,19 @@ fn computed_column(
     schema: &Schema,
     views: &[&SegmentView],
     expr: &ScalarExpr,
+    window_calls: &[WindowCall],
     name: &str,
     registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // Hoisted windows compute first, and whole (#94): a partition can
+    // span segments, so a window cannot be folded into the per-view
+    // walk below — which is exactly why the call is hoisted rather than
+    // evaluated where it was written.
+    let mut window_columns: Vec<Vec<Column>> = Vec::with_capacity(window_calls.len());
+    for call in window_calls {
+        let (_, columns) = evaluate_window_call(schema, views, registry, call, None)?;
+        window_columns.push(columns);
+    }
     // A registered kernel must see the query's rows as ONE column:
     // storage segmentation is an internal detail, and a kernel with
     // window semantics (a rolling combinator) would otherwise reset at
@@ -787,11 +1067,12 @@ fn computed_column(
     // internal detail, so a one-segment table takes the same path (and
     // meets the same refusals) as a hundred-segment one.
     if uses_registered(expr) {
-        return computed_column_whole(schema, views, expr, name, registry);
+        return computed_column_whole(schema, views, expr, &window_columns, name, registry);
     }
     let mut columns = Vec::with_capacity(views.len());
-    for view in views {
-        let (values, validity) = evaluate_scalar(expr, schema, view, registry)?;
+    for (view_index, view) in views.iter().enumerate() {
+        let windows = window_results(&window_columns, view_index);
+        let (values, validity) = evaluate_scalar(expr, schema, view, registry, &windows)?;
         columns.push(Column::Numeric(NumericData::F64(assemble_f64_values(
             values, validity,
         ))));
@@ -803,14 +1084,36 @@ fn computed_column(
 fn uses_registered(expr: &ScalarExpr) -> bool {
     match expr {
         ScalarExpr::Registered { .. } => true,
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Window(_) => false,
         ScalarExpr::Negate(inner) => uses_registered(inner),
         ScalarExpr::Binary { left, right, .. } => uses_registered(left) || uses_registered(right),
         ScalarExpr::Call { args, .. } => args.iter().any(uses_registered),
         ScalarExpr::Case { whens, otherwise } => {
-            whens.iter().any(|(_, value)| uses_registered(value))
-                || otherwise.as_deref().is_some_and(uses_registered)
+            // The CONDITION counts too. Before #95 it could not hold a
+            // call at all; now it holds a full expression on both sides
+            // of a comparison, so a kernel can hide there — and if this
+            // missed it, the kernel would run once per segment and its
+            // answer would depend on how the rows happened to be split.
+            whens.iter().any(|(condition, value)| {
+                predicate_uses_registered(condition) || uses_registered(value)
+            }) || otherwise.as_deref().is_some_and(uses_registered)
         }
+    }
+}
+
+/// Whether a predicate's expression comparisons call a registered
+/// kernel anywhere. Only `CompareExpr` can: every other leaf compares a
+/// stored column to a literal.
+fn predicate_uses_registered(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::CompareExpr { left, right, .. } => {
+            uses_registered(left) || uses_registered(right)
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_uses_registered(left) || predicate_uses_registered(right)
+        }
+        Predicate::Not(inner) => predicate_uses_registered(inner),
+        _ => false,
     }
 }
 
@@ -823,7 +1126,9 @@ fn registered_columns(expr: &ScalarExpr, out: &mut Vec<String>) -> Result<(), Qu
             out.push(name.clone());
             Ok(())
         }
-        ScalarExpr::Literal(_) => Ok(()),
+        // A hoisted window is already a value by the time the gather
+        // runs, so it contributes no stored column to collect.
+        ScalarExpr::Literal(_) | ScalarExpr::Window(_) => Ok(()),
         ScalarExpr::Negate(inner) => registered_columns(inner, out),
         ScalarExpr::Binary { left, right, .. } => {
             registered_columns(left, out)?;
@@ -852,9 +1157,26 @@ fn computed_column_whole(
     schema: &Schema,
     views: &[&SegmentView],
     expr: &ScalarExpr,
+    window_columns: &[Vec<Column>],
     name: &str,
     registry: &Registry,
 ) -> Result<(Field, Vec<Column>), QueryError> {
+    // This path gathers every view into one synthetic segment, so the
+    // window results have to be gathered the same way to line up with
+    // it, row for row.
+    let whole: Vec<(Vec<f64>, Vec<bool>)> = window_columns
+        .iter()
+        .map(|per_view| {
+            let mut values = Vec::new();
+            let mut validity = Vec::new();
+            for column in per_view {
+                let (mut v, mut m) = column_as_f64(column);
+                values.append(&mut v);
+                validity.append(&mut m);
+            }
+            (values, validity)
+        })
+        .collect();
     let mut names = Vec::new();
     registered_columns(expr, &mut names)?;
     names.sort();
@@ -872,7 +1194,7 @@ fn computed_column_whole(
         let mut validity = Vec::with_capacity(total);
         for view in views {
             let column = ScalarExpr::Column(column_name.clone());
-            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry)?;
+            let (mut v, mut m) = evaluate_scalar(&column, schema, view, registry, &[])?;
             values.append(&mut v);
             validity.append(&mut m);
         }
@@ -884,7 +1206,7 @@ fn computed_column_whole(
     let batch = RecordBatch::new(Schema::new(fields), gathered);
     let synthetic = SegmentView::all_live(Arc::new(Segment::from_batch_unpruned(batch, 0, false)));
     let reduced = synthetic.segment.batch().schema().clone();
-    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry)?;
+    let (values, validity) = evaluate_scalar(expr, &reduced, &synthetic, registry, &whole)?;
     let mut columns = Vec::with_capacity(views.len());
     let mut offset = 0;
     for view in views {
@@ -898,6 +1220,120 @@ fn computed_column_whole(
     Ok((Field::new(name, ColumnType::F64, true), columns))
 }
 
+/// The scalar evaluator a predicate uses when it contains an
+/// expression comparison (#95): one view's rows, the registry for
+/// kernel calls, and any window results already computed for this item.
+pub struct ViewScalars<'a> {
+    schema: &'a Schema,
+    view: &'a SegmentView,
+    registry: &'a Registry,
+    windows: &'a [(Vec<f64>, Vec<bool>)],
+}
+
+impl<'a> ViewScalars<'a> {
+    /// An evaluator over one view. `windows` is empty everywhere a
+    /// window cannot appear — `WHERE` and the mutation filters, which
+    /// standard SQL runs before the window phase.
+    pub fn new(
+        schema: &'a Schema,
+        view: &'a SegmentView,
+        registry: &'a Registry,
+    ) -> ViewScalars<'a> {
+        ViewScalars {
+            schema,
+            view,
+            registry,
+            windows: &[],
+        }
+    }
+}
+
+impl ScalarEval for ViewScalars<'_> {
+    fn eval(&self, expr: &ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+        evaluate_scalar(expr, self.schema, self.view, self.registry, self.windows)
+    }
+}
+
+/// One view's slice of each hoisted window's result, as the scalar
+/// evaluator's `(values, validity)` pair.
+fn window_results(window_columns: &[Vec<Column>], view: usize) -> Vec<(Vec<f64>, Vec<bool>)> {
+    window_columns
+        .iter()
+        .map(|per_view| column_as_f64(&per_view[view]))
+        .collect()
+}
+
+/// A window result column as `f64` values plus validity. Window outputs
+/// are numeric by construction; `COUNT`'s `i64` widens exactly, because
+/// the scalar pipeline computes in `f64` throughout.
+fn column_as_f64(column: &Column) -> (Vec<f64>, Vec<bool>) {
+    match column {
+        Column::Numeric(NumericData::F64(numeric)) => (
+            numeric.values().as_slice().to_vec(),
+            (0..numeric.len())
+                .map(|row| numeric.is_valid(row))
+                .collect(),
+        ),
+        Column::Numeric(NumericData::I64(numeric)) => (
+            numeric
+                .values()
+                .as_slice()
+                .iter()
+                .map(|&v| v as f64)
+                .collect(),
+            (0..numeric.len())
+                .map(|row| numeric.is_valid(row))
+                .collect(),
+        ),
+        Column::Key(_) => unreachable!("window outputs are numeric"),
+    }
+}
+
+/// Dispatches one window call to the machinery that answers it.
+fn evaluate_window_call(
+    schema: &Schema,
+    views: &[&SegmentView],
+    registry: &Registry,
+    call: &WindowCall,
+    alias: Option<&str>,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    match call {
+        WindowCall::Agg {
+            function,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        } => window_aggregate(
+            schema,
+            views,
+            registry,
+            function,
+            args,
+            partition_by,
+            order_by.as_deref(),
+            *frame,
+            alias,
+        ),
+        WindowCall::Value {
+            lead,
+            column,
+            offset,
+            partition_by,
+            order_by,
+        } => window_value(
+            schema,
+            views,
+            *lead,
+            column,
+            *offset,
+            partition_by,
+            order_by,
+            alias,
+        ),
+    }
+}
+
 /// One view's worth of a scalar expression: `(values, validity)` over
 /// the live rows, in stored order.
 fn evaluate_scalar(
@@ -905,9 +1341,12 @@ fn evaluate_scalar(
     schema: &Schema,
     view: &SegmentView,
     registry: &Registry,
+    windows: &[(Vec<f64>, Vec<bool>)],
 ) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
     let rows = view.live_rows();
     match expr {
+        // Already computed, whole, before this walk started (#94).
+        ScalarExpr::Window(index) => Ok(windows[*index].clone()),
         ScalarExpr::Column(name) => {
             let (index, field) = resolve(schema, name)?;
             match &view.segment.batch().columns()[index] {
@@ -943,15 +1382,15 @@ fn evaluate_scalar(
         }
         ScalarExpr::Literal(value) => Ok((vec![*value; rows], vec![true; rows])),
         ScalarExpr::Negate(inner) => {
-            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry)?;
+            let (mut values, validity) = evaluate_scalar(inner, schema, view, registry, windows)?;
             for value in &mut values {
                 *value = -*value;
             }
             Ok((values, validity))
         }
         ScalarExpr::Binary { op, left, right } => {
-            let (lv, lval) = evaluate_scalar(left, schema, view, registry)?;
-            let (rv, rval) = evaluate_scalar(right, schema, view, registry)?;
+            let (lv, lval) = evaluate_scalar(left, schema, view, registry, windows)?;
+            let (rv, rval) = evaluate_scalar(right, schema, view, registry, windows)?;
             let values = lv
                 .iter()
                 .zip(&rv)
@@ -969,7 +1408,7 @@ fn evaluate_scalar(
         ScalarExpr::Call { function, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry, windows)?);
             }
             let mut values = Vec::with_capacity(rows);
             let mut validity = Vec::with_capacity(rows);
@@ -997,12 +1436,22 @@ fn evaluate_scalar(
             let mut conditions = Vec::with_capacity(whens.len());
             let mut arms = Vec::with_capacity(whens.len());
             for (predicate, arm) in whens {
-                conditions.push(evaluate_predicate(predicate, schema, view)?);
-                arms.push(evaluate_scalar(arm, schema, view, registry)?);
+                conditions.push(evaluate_predicate(
+                    predicate,
+                    schema,
+                    view,
+                    &ViewScalars {
+                        schema,
+                        view,
+                        registry,
+                        windows,
+                    },
+                )?);
+                arms.push(evaluate_scalar(arm, schema, view, registry, windows)?);
             }
             let fallback = otherwise
                 .as_ref()
-                .map(|expr| evaluate_scalar(expr, schema, view, registry))
+                .map(|expr| evaluate_scalar(expr, schema, view, registry, windows))
                 .transpose()?;
             let mut values = vec![0.0f64; rows];
             let mut validity = vec![false; rows];
@@ -1043,7 +1492,7 @@ fn evaluate_scalar(
             // kernel then runs once for the whole view.
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(evaluate_scalar(arg, schema, view, registry)?);
+                evaluated.push(evaluate_scalar(arg, schema, view, registry, windows)?);
             }
             let dense: Vec<(&[f64], &[bool])> = evaluated
                 .iter()
@@ -1213,18 +1662,75 @@ pub fn recompute_frames<A: WindowAggregate + ?Sized>(
     Ok(results)
 }
 
+/// Frame-by-frame recomputation over explicit `(start, end)` bounds —
+/// the [`WindowAggregate::evaluate_bounded_frames`] default, exposed so
+/// an incremental override can fall back to it.
+pub fn recompute_bounded_frames<A: WindowAggregate + ?Sized>(
+    aggregate: &A,
+    columns: &[&[f64]],
+    bounds: &[(usize, usize)],
+) -> Result<Vec<Option<f64>>, String> {
+    let mut results = Vec::with_capacity(bounds.len());
+    let mut frame: Vec<&[f64]> = Vec::with_capacity(columns.len());
+    for &(start, end) in bounds {
+        frame.clear();
+        frame.extend(columns.iter().map(|column| &column[start..end]));
+        results.push(aggregate.evaluate(&frame)?);
+    }
+    Ok(results)
+}
+
+/// The `(start, end)` row range of each `RANGE` frame over one run's
+/// ordering-key values, which arrive non-decreasing.
+///
+/// `start` is the first row whose key is `>= key[i] - span` (saturating,
+/// so a span wider than the data simply starts at the run's beginning),
+/// and `end` is one past the current row's **last peer** — every row
+/// sharing `key[i]`. That peer rule is standard SQL's, and it is why
+/// rows with equal ordering keys all see the identical frame.
+///
+/// Both pointers only advance, so the whole pass is O(rows).
+fn range_bounds(keys: &[i64], span: u64) -> Vec<(usize, usize)> {
+    let mut bounds = Vec::with_capacity(keys.len());
+    let (mut start, mut end) = (0usize, 0usize);
+    for (position, &key) in keys.iter().enumerate() {
+        // The span is unsigned and keys can be negative: saturate so a
+        // wide span cannot wrap into a bogus lower bound.
+        let floor = key.saturating_sub_unsigned(span);
+        while keys[start] < floor {
+            start += 1;
+        }
+        end = end.max(position + 1);
+        while end < keys.len() && keys[end] == key {
+            end += 1;
+        }
+        bounds.push((start, end));
+    }
+    bounds
+}
+
 /// Calls the aggregate's frame-sequence evaluation and holds it to the
 /// executor's contract: one result per row of the run.
 fn evaluate_run(
     aggregate: &dyn WindowAggregate,
     columns: &[&[f64]],
     rows: usize,
-    preceding: Option<usize>,
+    frame: Frame,
+    keys: &[i64],
 ) -> Result<Vec<Option<f64>>, QueryError> {
     debug_assert!(columns.iter().all(|column| column.len() == rows));
-    let results = aggregate
-        .evaluate_frames(columns, preceding)
-        .map_err(QueryError::Compute)?;
+    let results = match frame {
+        Frame::Rows(preceding) => aggregate.evaluate_frames(columns, preceding),
+        Frame::Range(span) => {
+            debug_assert_eq!(keys.len(), rows);
+            aggregate.evaluate_bounded_frames(columns, &range_bounds(keys, span))
+        }
+        // The whole partition, so every row's frame is the same one —
+        // and a cross-sectional statistic is one value repeated across
+        // the instant it describes.
+        Frame::Partition => aggregate.evaluate_bounded_frames(columns, &vec![(0, rows); rows]),
+    }
+    .map_err(QueryError::Compute)?;
     if results.len() != rows {
         return Err(QueryError::Compute(format!(
             "window aggregate returned {} results for {rows} frames",
@@ -1269,29 +1775,52 @@ fn check_order(
     order_index: usize,
     order_by: &str,
 ) -> Result<(), QueryError> {
+    match ordering_problem(views, order_index) {
+        None => Ok(()),
+        Some(Disorder::WrongColumn) => Err(QueryError::Unsupported(format!(
+            "ORDER BY '{order_by}' — windows order by the declared ordering key only"
+        ))),
+        Some(Disorder::WithinSegment) => Err(QueryError::Unordered(format!(
+            "ingest was not sorted on '{order_by}' (compaction restores order)"
+        ))),
+        Some(Disorder::AcrossSegments) => Err(QueryError::Unordered(format!(
+            "ingest was not sorted on '{order_by}' across segments"
+        ))),
+    }
+}
+
+/// Why a snapshot is not in ordering-key order.
+enum Disorder {
+    /// The column asked for is not the declared ordering key.
+    WrongColumn,
+    /// Some segment's rows are not non-decreasing.
+    WithinSegment,
+    /// Segments are individually ordered but overlap each other.
+    AcrossSegments,
+}
+
+/// Whether the snapshot's live rows are non-decreasing on the ordering
+/// key, within every segment and across them — the fact a streaming
+/// aggregation stands on, and the same one `check_order` refuses
+/// without.
+fn ordering_problem(views: &[&SegmentView], order_index: usize) -> Option<Disorder> {
     let mut previous_last: Option<i64> = None;
     for view in views {
         if order_index != view.segment.ordering_key() {
-            return Err(QueryError::Unsupported(format!(
-                "ORDER BY '{order_by}' — windows order by the declared ordering key only"
-            )));
+            return Some(Disorder::WrongColumn);
         }
         if !view.segment.is_ordered() {
-            return Err(QueryError::Unordered(format!(
-                "ingest was not sorted on '{order_by}' (compaction restores order)"
-            )));
+            return Some(Disorder::WithinSegment);
         }
         let Some((first, last)) = live_ordering_bounds(view) else {
             continue;
         };
         if previous_last.is_some_and(|previous| first < previous) {
-            return Err(QueryError::Unordered(format!(
-                "ingest was not sorted on '{order_by}' across segments"
-            )));
+            return Some(Disorder::AcrossSegments);
         }
         previous_last = Some(last);
     }
-    Ok(())
+    None
 }
 
 /// One argument column's live values in one view: a shared slice where
@@ -1308,6 +1837,23 @@ impl ArgValues<'_> {
             ArgValues::Gathered(values) => values,
         }
     }
+}
+
+/// Per-view live ordering-key values — what a `RANGE` frame measures
+/// its span against. The ordering key is `i64` by construction and
+/// NOT NULL by DDL, so this cannot fail the way an argument column can.
+fn ordering_values(views: &[&SegmentView], index: usize) -> Vec<Vec<i64>> {
+    views
+        .iter()
+        .map(|view| {
+            let Column::Numeric(NumericData::I64(column)) = &view.segment.batch().columns()[index]
+            else {
+                return Vec::new(); // a non-i64 ordering key cannot occur
+            };
+            let values = column.values().as_slice();
+            live_rows(view).map(|row| values[row]).collect()
+        })
+        .collect()
 }
 
 /// Per-view live `f64` values for one argument column, validated
@@ -1341,6 +1887,306 @@ fn argument_values<'a>(
     Ok(result)
 }
 
+/// One column's live values, kept in the source column's own type so a
+/// positional lookup never rounds. `i64` is not widened: a nanosecond
+/// timestamp exceeds 2^53, where `f64` stops being exact — and reading
+/// a *neighbouring timestamp* is the single most common `LAG`.
+enum ValueSeq {
+    F64(Vec<Option<f64>>),
+    I64(Vec<Option<i64>>),
+}
+
+impl ValueSeq {
+    fn column_type(&self) -> ColumnType {
+        match self {
+            ValueSeq::F64(_) => ColumnType::F64,
+            ValueSeq::I64(_) => ColumnType::I64,
+        }
+    }
+}
+
+/// `LAG`/`LEAD`: read the value `offset` rows away within the partition
+/// (the whole ordered run when unpartitioned), NULL where that row does
+/// not exist. Not an aggregate — nothing is reduced, so nothing is
+/// computed in `f64` and the output column carries the source column's
+/// type (`BIGINT` stays `BIGINT`).
+///
+/// Standard SQL gives these no frame, and the planner refuses one.
+#[allow(clippy::too_many_arguments)]
+fn window_value(
+    schema: &Schema,
+    views: &[&SegmentView],
+    lead: bool,
+    column: &str,
+    offset: usize,
+    partition_by: &[GroupKey],
+    order_by: &str,
+    alias: Option<&str>,
+) -> Result<(Field, Vec<Column>), QueryError> {
+    let (index, field) = resolve(schema, column)?;
+    if field.column_type() == ColumnType::Key {
+        return Err(QueryError::TypeError(format!(
+            "LAG/LEAD on symbol column '{column}': symbols are labels whose \
+             codes are per-segment, so a lagged code would name nothing — \
+             lag a number, or group by the symbol"
+        )));
+    }
+    let (order_index, _) = resolve(schema, order_by)?;
+    check_order(views, order_index, order_by)?;
+    // Per view, the live values in order — typed, nulls preserved.
+    let mut per_view: Vec<ValueSeq> = Vec::with_capacity(views.len());
+    for view in views {
+        per_view.push(match &view.segment.batch().columns()[index] {
+            Column::Numeric(NumericData::F64(source)) => ValueSeq::F64(
+                live_rows(view)
+                    .map(|row| {
+                        source
+                            .is_valid(row)
+                            .then(|| source.values().as_slice()[row])
+                    })
+                    .collect(),
+            ),
+            Column::Numeric(NumericData::I64(source)) => ValueSeq::I64(
+                live_rows(view)
+                    .map(|row| {
+                        source
+                            .is_valid(row)
+                            .then(|| source.values().as_slice()[row])
+                    })
+                    .collect(),
+            ),
+            Column::Key(_) => unreachable!("refused above"),
+        });
+    }
+    let output_type = per_view
+        .first()
+        .map_or(field.column_type(), ValueSeq::column_type);
+    // The row order the lookup walks: for each partition, the ordered
+    // (view, live position) pairs — the same origin bookkeeping the
+    // partitioned aggregate path builds.
+    let runs = value_runs(schema, views, partition_by)?;
+    let mut results: Vec<ValueSeq> = views
+        .iter()
+        .map(|view| match output_type {
+            ColumnType::I64 => ValueSeq::I64(vec![None; view.live_rows()]),
+            _ => ValueSeq::F64(vec![None; view.live_rows()]),
+        })
+        .collect();
+    for run in &runs {
+        for (position, &(view_index, live_position)) in run.iter().enumerate() {
+            // LAG looks back, LEAD looks forward; out of range is NULL.
+            let source = if lead {
+                position.checked_add(offset).filter(|at| *at < run.len())
+            } else {
+                position.checked_sub(offset)
+            };
+            let Some(source) = source else { continue };
+            let (from_view, from_position) = run[source];
+            match (&mut results[view_index], &per_view[from_view]) {
+                (ValueSeq::F64(out), ValueSeq::F64(src)) => {
+                    out[live_position] = src[from_position];
+                }
+                (ValueSeq::I64(out), ValueSeq::I64(src)) => {
+                    out[live_position] = src[from_position];
+                }
+                _ => {
+                    return Err(QueryError::TypeError(format!(
+                        "column '{column}' has different types across segments"
+                    )))
+                }
+            }
+        }
+    }
+    let name = alias.unwrap_or(if lead { "lead" } else { "lag" });
+    let columns = results
+        .into_iter()
+        .map(|result| match result {
+            ValueSeq::F64(values) => assemble_f64(values),
+            ValueSeq::I64(values) => assemble_i64(values),
+        })
+        .collect();
+    Ok((Field::new(name, output_type, true), columns))
+}
+
+/// The ordered `(view, live position)` runs a positional window walks:
+/// one run for the whole snapshot when unpartitioned, else one per
+/// distinct partition key.
+fn value_runs(
+    schema: &Schema,
+    views: &[&SegmentView],
+    partition_by: &[GroupKey],
+) -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
+    if partition_by.is_empty() {
+        let mut run = Vec::new();
+        for (view_index, view) in views.iter().enumerate() {
+            for live_position in 0..view.live_rows() {
+                run.push((view_index, live_position));
+            }
+        }
+        return Ok(vec![run]);
+    }
+    let mut space = PartitionSpace::new(schema, ordering_key_of_views(views), partition_by)?;
+    let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
+    for (view_index, view) in views.iter().enumerate() {
+        let remaps = space.remaps(view)?;
+        for (live_position, row) in live_rows(view).enumerate() {
+            let slot = space.slot(view, &remaps, row);
+            if runs.len() <= slot {
+                runs.resize_with(slot + 1, Vec::new);
+            }
+            runs[slot].push((view_index, live_position));
+        }
+    }
+    Ok(runs)
+}
+
+/// The partition space a window's `PARTITION BY` terms define: how to
+/// read each term, and which slot a row's combination of them lands in.
+///
+/// Several terms intersect — `PARTITION BY sym, ts / 60` is one
+/// partition per symbol per bar — so a slot is keyed by the whole
+/// tuple, exactly as `GROUP BY` keys a group.
+struct PartitionSpace {
+    terms: Vec<GroupTerm>,
+    /// Symbol value → unified code, keyed by VALUE because dictionary
+    /// codes are per-segment interning ranks (decision #6). One space
+    /// per term, so two symbol columns cannot collide.
+    unified: Vec<HashMap<String, usize>>,
+    slots: HashMap<Vec<GroupCode>, usize>,
+}
+
+/// One view's dictionary remap per term (`None` for a bucket).
+type PartitionRemaps<'a> = Vec<Option<(&'a KeyColumn, Vec<usize>)>>;
+
+impl PartitionSpace {
+    fn new(
+        schema: &Schema,
+        ordering_key: Option<usize>,
+        partition_by: &[GroupKey],
+    ) -> Result<PartitionSpace, QueryError> {
+        let terms = partition_by
+            .iter()
+            .map(|key| resolve_partition_key(schema, ordering_key, key))
+            .collect::<Result<Vec<GroupTerm>, QueryError>>()?;
+        Ok(PartitionSpace {
+            unified: vec![HashMap::new(); terms.len()],
+            slots: HashMap::new(),
+            terms,
+        })
+    }
+
+    fn remaps<'a>(&mut self, view: &'a SegmentView) -> Result<PartitionRemaps<'a>, QueryError> {
+        let columns = view.segment.batch().columns();
+        self.terms
+            .iter()
+            .zip(&mut self.unified)
+            .map(|(term, unified)| partition_remap(term, columns, view, unified))
+            .collect()
+    }
+
+    fn slot(&mut self, view: &SegmentView, remaps: &PartitionRemaps<'_>, row: usize) -> usize {
+        let columns = view.segment.batch().columns();
+        let key: Vec<GroupCode> = self
+            .terms
+            .iter()
+            .zip(remaps)
+            .map(|(term, remap)| term.code(columns, remap.as_ref(), row))
+            .collect();
+        let next = self.slots.len();
+        *self.slots.entry(key).or_insert(next)
+    }
+}
+
+/// Resolves a `PARTITION BY` term, with the type rules that decide
+/// which direction a window runs in.
+///
+/// A symbol column partitions the time-series way (one run per symbol);
+/// the ordering key, or a bucket of it, partitions the **cross-
+/// sectional** way (one run per instant, every symbol in it). Any other
+/// `BIGINT` is admitted too — correct, and gathered rather than
+/// streamed, because nothing clusters the data on it. A `DOUBLE` is
+/// refused: float equality is not partition identity, the same rule
+/// grouping follows.
+fn resolve_partition_key(
+    schema: &Schema,
+    ordering_key: Option<usize>,
+    key: &GroupKey,
+) -> Result<GroupTerm, QueryError> {
+    let (index, field) = resolve(schema, key.column())?;
+    match (key, field.column_type()) {
+        (GroupKey::Column(_), ColumnType::Key) => Ok(GroupTerm::Label { index }),
+        (GroupKey::Column(_), ColumnType::I64) => Ok(GroupTerm::Bucket {
+            index,
+            divide: 1,
+            multiply: None,
+        }),
+        (GroupKey::Column(name), ColumnType::F64) => Err(QueryError::TypeError(format!(
+            "PARTITION BY '{name}': a DOUBLE cannot key a partition — equality \
+             on floats is not partition identity"
+        ))),
+        (
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply,
+            },
+            _,
+        ) => {
+            let is_ordering_key = ordering_key.is_none_or(|ordering| ordering == index);
+            if field.column_type() != ColumnType::I64 || !is_ordering_key {
+                return Err(QueryError::TypeError(format!(
+                    "PARTITION BY '{column} / {divide}': a bucket divides the \
+                     declared ordering key — '{column}' is not it"
+                )));
+            }
+            Ok(GroupTerm::Bucket {
+                index,
+                divide: *divide,
+                multiply: *multiply,
+            })
+        }
+    }
+}
+
+/// The per-view dictionary remap a label term needs (`None` for a
+/// bucket, which reads its value straight from the column). Also where
+/// a null partition key is refused: a window over "the rows with no
+/// key" is not a question this engine answers.
+///
+/// `unified` is the query-lifetime key space keyed by the symbol's
+/// **value**, never by its code. Codes are per-segment interning ranks
+/// (decision #6), so the same symbol wears different codes in different
+/// segments; keying on the code would silently split one partition in
+/// two, or merge two into one.
+fn partition_remap<'a>(
+    term: &GroupTerm,
+    columns: &'a [Column],
+    view: &SegmentView,
+    unified: &mut HashMap<String, usize>,
+) -> Result<Option<(&'a KeyColumn, Vec<usize>)>, QueryError> {
+    let &GroupTerm::Label { index } = term else {
+        return Ok(None);
+    };
+    let Column::Key(keys) = &columns[index] else {
+        unreachable!("validated as a key column above")
+    };
+    if keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row)) {
+        return Err(QueryError::Unsupported(
+            "PARTITION BY on a column with nulls (unsupported as a partition key)".to_owned(),
+        ));
+    }
+    let dictionary = keys.dictionary();
+    let remap: Vec<usize> = (0..dictionary.len() as u32)
+        .map(|code| {
+            let next = unified.len();
+            *unified
+                .entry(dictionary.value(code).to_owned())
+                .or_insert(next)
+        })
+        .collect();
+    Ok(Some((keys, remap)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn window_aggregate(
     schema: &Schema,
@@ -1348,9 +2194,9 @@ fn window_aggregate(
     registry: &Registry,
     function: &str,
     arg_names: &[String],
-    partition_by: Option<&str>,
-    order_by: &str,
-    preceding: Option<usize>,
+    partition_by: &[GroupKey],
+    order_by: Option<&str>,
+    frame: Frame,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
     // The embedder's registry wins (explicit beats implicit); the
@@ -1373,8 +2219,17 @@ fn window_aggregate(
             arg_names.len()
         )));
     }
-    let (order_index, _) = resolve(schema, order_by)?;
-    check_order(views, order_index, order_by)?;
+    // An unordered window (the cross-sectional shape) has no ordering
+    // column to check or to measure a span against; its frame is the
+    // whole partition, which needs neither.
+    let order_index = match order_by {
+        Some(order_by) => {
+            let (index, _) = resolve(schema, order_by)?;
+            check_order(views, index, order_by)?;
+            Some(index)
+        }
+        None => None,
+    };
     // args[a][v]: argument `a`'s live values in view `v`.
     let mut args: Vec<Vec<ArgValues<'_>>> = Vec::with_capacity(arg_names.len());
     for name in arg_names {
@@ -1386,17 +2241,26 @@ fn window_aggregate(
         .iter()
         .map(|view| vec![None; view.live_rows()])
         .collect();
-    match partition_by {
-        None => unpartitioned(aggregate.as_ref(), &args, preceding, &mut results)?,
-        Some(partition_column) => partitioned(
+    let keys = match order_index {
+        Some(order_index) => ordering_values(views, order_index),
+        None => views
+            .iter()
+            .map(|view| vec![0i64; view.live_rows()])
+            .collect(),
+    };
+    if partition_by.is_empty() {
+        unpartitioned(aggregate.as_ref(), &args, &keys, frame, &mut results)?;
+    } else {
+        partitioned(
             schema,
             views,
             aggregate.as_ref(),
             &args,
-            partition_column,
-            preceding,
+            &keys,
+            partition_by,
+            frame,
             &mut results,
-        )?,
+        )?;
     }
     let name = alias.unwrap_or(function);
     let output_type = aggregate.output_type();
@@ -1420,7 +2284,8 @@ fn window_aggregate(
 fn unpartitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
-    preceding: Option<usize>,
+    keys: &[Vec<i64>],
+    frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
     let gathered: Vec<Vec<f64>>;
@@ -1439,7 +2304,16 @@ fn unpartitioned(
         gathered.iter().map(Vec::as_slice).collect()
     };
     let rows: usize = results.iter().map(Vec::len).sum();
-    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, preceding)?.into_iter();
+    // The run's ordering values, contiguous — windows span view
+    // boundaries, the stored buffers don't.
+    let run_keys: Vec<i64> = match keys {
+        [single] => single.clone(),
+        many => many
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect(),
+    };
+    let mut outputs = evaluate_run(aggregate, &arg_slices, rows, frame, &run_keys)?.into_iter();
     for result in results.iter_mut() {
         for slot in result.iter_mut() {
             *slot = outputs.next().expect("length checked by evaluate_run");
@@ -1454,66 +2328,44 @@ fn unpartitioned(
 /// first; each partition's rows are then gathered into contiguous
 /// scratch (they are scattered even within one segment) and results
 /// scattered back to their view and live position.
+#[allow(clippy::too_many_arguments)]
 fn partitioned(
     schema: &Schema,
     views: &[&SegmentView],
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
-    partition_column: &str,
-    preceding: Option<usize>,
+    ordering: &[Vec<i64>],
+    partition_by: &[GroupKey],
+    frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
-    let (index, _) = resolve(schema, partition_column)?;
-    // The query-lifetime key space: value → unified code, built once per
-    // distinct value per segment (cheap under low cardinality).
-    let mut unified: HashMap<String, usize> = HashMap::new();
+    let mut space = PartitionSpace::new(schema, ordering_key_of_views(views), partition_by)?;
     // Per partition: scratch per argument, plus where each row came from
     // (view index, live position within the view).
     let mut scratch: Vec<Vec<Vec<f64>>> = Vec::new();
     let mut origins: Vec<Vec<(usize, usize)>> = Vec::new();
+    // Each partition's ordering values, in the same order as its rows —
+    // what a RANGE frame measures its span against.
+    let mut partition_keys: Vec<Vec<i64>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
-        let Column::Key(keys) = &view.segment.batch().columns()[index] else {
-            return Err(QueryError::TypeError(format!(
-                "PARTITION BY '{partition_column}' must be a key column"
-            )));
-        };
-        let any_live_null =
-            keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row));
-        if any_live_null {
-            return Err(QueryError::Unsupported(format!(
-                "PARTITION BY '{partition_column}' has nulls (unsupported as a partition key)"
-            )));
-        }
-        let dictionary = keys.dictionary();
-        let remap: Vec<usize> = (0..dictionary.len() as u32)
-            .map(|code| {
-                let next = unified.len();
-                *unified
-                    .entry(dictionary.value(code).to_owned())
-                    .or_insert(next)
-            })
-            .collect();
-        // One slot per unified code — allocated eagerly, because a code
-        // can enter the unified space from a dictionary entry whose live
-        // rows come later or never (a tombstoned row's key, a value seen
-        // only in another segment). Codeless partitions stay empty and
-        // cost nothing below.
-        while scratch.len() < unified.len() {
-            scratch.push(vec![Vec::new(); args.len()]);
-            origins.push(Vec::new());
-        }
-        let codes = keys.codes().as_slice();
+        let remaps = space.remaps(view)?;
         for (live_position, row) in live_rows(view).enumerate() {
-            let partition = remap[codes[row] as usize];
+            let partition = space.slot(view, &remaps, row);
+            if scratch.len() <= partition {
+                scratch.resize_with(partition + 1, || vec![Vec::new(); args.len()]);
+                origins.resize_with(partition + 1, Vec::new);
+                partition_keys.resize_with(partition + 1, Vec::new);
+            }
             for (argument, per_view) in args.iter().enumerate() {
                 scratch[partition][argument].push(per_view[view_index].as_slice()[live_position]);
             }
             origins[partition].push((view_index, live_position));
+            partition_keys[partition].push(ordering[view_index][live_position]);
         }
     }
-    for (values, rows) in scratch.iter().zip(&origins) {
+    for ((values, rows), run_keys) in scratch.iter().zip(&origins).zip(&partition_keys) {
         let columns: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
-        let outputs = evaluate_run(aggregate, &columns, rows.len(), preceding)?;
+        let outputs = evaluate_run(aggregate, &columns, rows.len(), frame, run_keys)?;
         for (output, &(view_index, live_position)) in outputs.into_iter().zip(rows) {
             results[view_index][live_position] = output;
         }
@@ -1561,6 +2413,15 @@ impl WindowAggregate for BuiltinWindow {
                 .copied()
                 .max_by(|left, right| cmp_f64(*left, *right))
                 .expect("window is non-empty"),
+            // Windows arrive oldest-first — checked, not assumed:
+            // `check_order` runs for every ordered window, and an
+            // UNordered one cannot reach here at all, because the
+            // planner refuses `first`/`last` without an ORDER BY. So
+            // the frame's ends *are* its earliest and latest ordering
+            // keys, and no clock is needed here as it is in the group
+            // form.
+            AggFunction::First => window[0],
+            AggFunction::Last => window[window.len() - 1],
         }))
     }
 }
@@ -1572,14 +2433,87 @@ fn builtin_window(function: &str) -> Option<Arc<dyn WindowAggregate>> {
         "avg" => AggFunction::Avg,
         "min" => AggFunction::Min,
         "max" => AggFunction::Max,
+        "first" => AggFunction::First,
+        "last" => AggFunction::Last,
         _ => return None,
     };
     Some(Arc::new(BuiltinWindow(function)))
 }
 
-/// A group key's per-row code: a unified dictionary code, or the null
-/// group.
-type GroupCode = Option<usize>;
+/// A group key's per-row code.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GroupCode {
+    /// A symbol column's unified dictionary code; `None` = the null
+    /// group (SQL groups nulls together).
+    Label(Option<usize>),
+    /// A bucket of the ordering key: the integer the arithmetic
+    /// produced. Never null — the ordering key is `NOT NULL`.
+    Bucket(i64),
+}
+
+/// One resolved `GROUP BY` term: where to read it and how to read it.
+enum GroupTerm {
+    /// A symbol column, grouped by value through the unified key space.
+    Label {
+        /// Column index in the stored schema.
+        index: usize,
+    },
+    /// The ordering key, grouped by a monotone integer bucket of its
+    /// value (F1 = d). A bare `GROUP BY ts` is this with width 1.
+    Bucket {
+        /// Column index in the stored schema.
+        index: usize,
+        /// Bucket width, in the key's own units.
+        divide: i64,
+        /// Multiplier back to the bucket's start value, if written.
+        multiply: Option<i64>,
+    },
+}
+
+impl GroupTerm {
+    /// This term's value for one row.
+    fn code(
+        &self,
+        columns: &[Column],
+        remap: Option<&(&KeyColumn, Vec<usize>)>,
+        row: usize,
+    ) -> GroupCode {
+        match self {
+            GroupTerm::Label { .. } => {
+                let (column, remap) = remap.expect("label terms carry a remap");
+                GroupCode::Label(
+                    column
+                        .is_valid(row)
+                        .then(|| remap[column.codes().as_slice()[row] as usize]),
+                )
+            }
+            GroupTerm::Bucket {
+                index,
+                divide,
+                multiply,
+            } => {
+                let value = ordering_clocks(&columns[*index])[row];
+                // Truncating division, which is what SQL's `/` on
+                // integers means. Negative keys therefore bucket toward
+                // zero rather than toward minus infinity — monotone
+                // either way, which is all the streaming needs.
+                let bucket = value / divide;
+                GroupCode::Bucket(match multiply {
+                    None => bucket,
+                    Some(multiply) => bucket * multiply,
+                })
+            }
+        }
+    }
+
+    /// The Arrow type this term's output column takes.
+    fn column_type(&self) -> ColumnType {
+        match self {
+            GroupTerm::Label { .. } => ColumnType::Key,
+            GroupTerm::Bucket { .. } => ColumnType::I64,
+        }
+    }
+}
 
 /// One aggregate accumulator. The variant is chosen from the call and
 /// its argument column's type; every variant tracks whether it has seen
@@ -1589,11 +2523,43 @@ type GroupCode = Option<usize>;
 enum Accumulator {
     CountStar(i64),
     CountColumn(i64),
-    SumF64 { sum: f64, seen: bool },
-    SumI64 { sum: i64, seen: bool },
-    Avg { sum: f64, count: i64 },
-    MinMaxF64 { value: f64, seen: bool, max: bool },
-    MinMaxI64 { value: i64, seen: bool, max: bool },
+    SumF64 {
+        sum: f64,
+        seen: bool,
+    },
+    SumI64 {
+        sum: i64,
+        seen: bool,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    MinMaxF64 {
+        value: f64,
+        seen: bool,
+        max: bool,
+    },
+    MinMaxI64 {
+        value: i64,
+        seen: bool,
+        max: bool,
+    },
+    /// `FIRST`/`LAST`: the value carried by the row with the smallest
+    /// (or largest) ordering key in the group, so `clock` travels
+    /// beside the value.
+    FirstLastF64 {
+        clock: i64,
+        value: f64,
+        seen: bool,
+        last: bool,
+    },
+    FirstLastI64 {
+        clock: i64,
+        value: i64,
+        seen: bool,
+        last: bool,
+    },
 }
 
 impl Accumulator {
@@ -1634,10 +2600,28 @@ impl Accumulator {
                     max: call.function == AggFunction::Max,
                 }
             }
+            (AggFunction::First | AggFunction::Last, Some(ColumnType::F64)) => {
+                Accumulator::FirstLastF64 {
+                    clock: 0,
+                    value: 0.0,
+                    seen: false,
+                    last: call.function == AggFunction::Last,
+                }
+            }
+            (AggFunction::First | AggFunction::Last, Some(ColumnType::I64)) => {
+                Accumulator::FirstLastI64 {
+                    clock: 0,
+                    value: 0,
+                    seen: false,
+                    last: call.function == AggFunction::Last,
+                }
+            }
             (AggFunction::Sum, _) => return Err(type_error("SUM")),
             (AggFunction::Avg, _) => return Err(type_error("AVG")),
             (AggFunction::Min, _) => return Err(type_error("MIN")),
             (AggFunction::Max, _) => return Err(type_error("MAX")),
+            (AggFunction::First, _) => return Err(type_error("FIRST")),
+            (AggFunction::Last, _) => return Err(type_error("LAST")),
         })
     }
 
@@ -1650,10 +2634,12 @@ impl Accumulator {
             Accumulator::CountStar(_)
             | Accumulator::CountColumn(_)
             | Accumulator::SumI64 { .. }
-            | Accumulator::MinMaxI64 { .. } => ColumnType::I64,
+            | Accumulator::MinMaxI64 { .. }
+            | Accumulator::FirstLastI64 { .. } => ColumnType::I64,
             Accumulator::SumF64 { .. }
             | Accumulator::Avg { .. }
-            | Accumulator::MinMaxF64 { .. } => ColumnType::F64,
+            | Accumulator::MinMaxF64 { .. }
+            | Accumulator::FirstLastF64 { .. } => ColumnType::F64,
         }
     }
 
@@ -1663,7 +2649,8 @@ impl Accumulator {
         match self {
             Accumulator::CountStar(count) | Accumulator::CountColumn(count) => Some(*count),
             Accumulator::SumI64 { sum, seen } => seen.then_some(*sum),
-            Accumulator::MinMaxI64 { value, seen, .. } => seen.then_some(*value),
+            Accumulator::MinMaxI64 { value, seen, .. }
+            | Accumulator::FirstLastI64 { value, seen, .. } => seen.then_some(*value),
             _ => None,
         }
     }
@@ -1674,14 +2661,17 @@ impl Accumulator {
         match self {
             Accumulator::SumF64 { sum, seen } => seen.then_some(*sum),
             Accumulator::Avg { sum, count } => (*count > 0).then(|| sum / *count as f64),
-            Accumulator::MinMaxF64 { value, seen, .. } => seen.then_some(*value),
+            Accumulator::MinMaxF64 { value, seen, .. }
+            | Accumulator::FirstLastF64 { value, seen, .. } => seen.then_some(*value),
             _ => None,
         }
     }
 
     /// Folds in one row's cell (`None` = the cell is null, or the call
-    /// is `COUNT(*)` and there is no cell).
-    fn update(&mut self, cell: Option<CellNumber>) -> Result<(), QueryError> {
+    /// is `COUNT(*)` and there is no cell), at ordering-key value
+    /// `clock` — which only the positional variants (`FIRST`/`LAST`)
+    /// read, every other aggregate being order-independent.
+    fn update(&mut self, cell: Option<CellNumber>, clock: i64) -> Result<(), QueryError> {
         match (self, cell) {
             (Accumulator::CountStar(count), _) => *count += 1,
             (Accumulator::CountColumn(_), None) => {}
@@ -1721,10 +2711,52 @@ impl Accumulator {
                 }
                 *seen = true;
             }
+            (
+                Accumulator::FirstLastF64 {
+                    clock: at,
+                    value,
+                    seen,
+                    last,
+                },
+                Some(cell),
+            ) => {
+                if first_last_replaces(*seen, *last, clock, *at) {
+                    *at = clock;
+                    *value = cell.as_f64();
+                }
+                *seen = true;
+            }
+            (
+                Accumulator::FirstLastI64 {
+                    clock: at,
+                    value,
+                    seen,
+                    last,
+                },
+                Some(CellNumber::I64(candidate)),
+            ) => {
+                if first_last_replaces(*seen, *last, clock, *at) {
+                    *at = clock;
+                    *value = candidate;
+                }
+                *seen = true;
+            }
             _ => unreachable!("accumulator variant chosen from the argument type"),
         }
         Ok(())
     }
+}
+
+/// Whether a `FIRST`/`LAST` accumulator holding a value at `held`
+/// should take one arriving at `clock`.
+///
+/// Ties are what this exists to pin down. A group can hold several rows
+/// on one ordering-key value, and then "the last" has to mean
+/// something: it means the last of them in **storage order**, the same
+/// rule the as-of join and corrections follow. `LAST` therefore takes
+/// an equal clock and `FIRST` keeps the one it has.
+fn first_last_replaces(seen: bool, last: bool, clock: i64, held: i64) -> bool {
+    !seen || if last { clock >= held } else { clock < held }
 }
 
 /// One numeric cell, typed.
@@ -1743,6 +2775,116 @@ impl CellNumber {
     }
 }
 
+/// One aggregate call's finished output, one cell per closed group.
+///
+/// Groups are reduced to cells the moment they close rather than at the
+/// end, which is what lets the streaming path below hold accumulators
+/// for only the bucket it is inside. Both paths end here, so the output
+/// assembly does not care which one ran.
+enum AggCells {
+    I64(Vec<Option<i64>>),
+    F64(Vec<Option<f64>>),
+}
+
+impl AggCells {
+    fn for_type(column_type: ColumnType) -> AggCells {
+        match column_type {
+            ColumnType::I64 => AggCells::I64(Vec::new()),
+            _ => AggCells::F64(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, accumulator: &Accumulator) {
+        match self {
+            AggCells::I64(cells) => cells.push(accumulator.i64_value()),
+            AggCells::F64(cells) => cells.push(accumulator.f64_value()),
+        }
+    }
+}
+
+/// Closed groups: their keys, and their aggregates already reduced to
+/// values.
+struct GroupSink {
+    keys: Vec<Vec<GroupCode>>,
+    cells: Vec<AggCells>,
+}
+
+impl GroupSink {
+    fn new(template: &[Accumulator]) -> GroupSink {
+        GroupSink {
+            keys: Vec::new(),
+            cells: template
+                .iter()
+                .map(|accumulator| AggCells::for_type(accumulator.column_type()))
+                .collect(),
+        }
+    }
+
+    /// Finishes one group: its key, and one cell per call.
+    fn close(&mut self, key: Vec<GroupCode>, accumulators: &[Accumulator]) {
+        self.keys.push(key);
+        for (cells, accumulator) in self.cells.iter_mut().zip(accumulators) {
+            cells.push(accumulator);
+        }
+    }
+}
+
+/// Resolves one `GROUP BY` term against the schema and the snapshot's
+/// ordering key — the step the planner cannot do, because it has
+/// neither.
+fn resolve_group_key(
+    schema: &Schema,
+    key: &GroupKey,
+    ordering_key: Option<usize>,
+) -> Result<GroupTerm, QueryError> {
+    let (index, field) = resolve(schema, key.column())?;
+    // A bucket divides the time axis. On any other column the same
+    // arithmetic is just arithmetic: it proves nothing about the order
+    // groups come out in, which is the whole reason this form is
+    // admitted where general expressions are not.
+    let is_ordering_key = ordering_key.is_none_or(|ordering| ordering == index);
+    match key {
+        GroupKey::Column(name) => match field.column_type() {
+            ColumnType::Key => Ok(GroupTerm::Label { index }),
+            // The ordering key groups by value — `GROUP BY ts` is the
+            // finest bucket there is, one per distinct timestamp.
+            ColumnType::I64 if is_ordering_key => Ok(GroupTerm::Bucket {
+                index,
+                divide: 1,
+                multiply: None,
+            }),
+            ColumnType::I64 => Err(QueryError::TypeError(format!(
+                "GROUP BY '{name}': grouping is what symbol columns are for, \
+                 and the one number that groups is the ordering key (whole or \
+                 bucketed: {name} / <width>)"
+            ))),
+            ColumnType::F64 => Err(QueryError::TypeError(format!(
+                "GROUP BY '{name}': a DOUBLE cannot key a group — equality on \
+                 floats is not group identity. Group by a symbol column or a \
+                 bucket of the ordering key"
+            ))),
+        },
+        GroupKey::Bucket {
+            column,
+            divide,
+            multiply,
+        } => {
+            if field.column_type() != ColumnType::I64 || !is_ordering_key {
+                return Err(QueryError::TypeError(format!(
+                    "GROUP BY '{column} / {divide}': a bucket divides the \
+                     declared ordering key, which is what makes the buckets \
+                     come out in order — '{column}' is not it"
+                )));
+            }
+            Ok(GroupTerm::Bucket {
+                index,
+                divide: *divide,
+                multiply: *multiply,
+            })
+        }
+    }
+}
+
 /// The aggregate projection: group live rows by key columns in the
 /// query-lifetime unified key space (decision #6 — codes remap per
 /// segment), fold the accumulators, and emit one batch with one row per
@@ -1752,22 +2894,18 @@ impl CellNumber {
 fn project_aggregate(
     schema: &Schema,
     views: &[&SegmentView],
-    keys: &[String],
+    ordering_key: Option<usize>,
+    keys: &[GroupKey],
     items: &[AggItem],
 ) -> Result<QueryOutput, QueryError> {
-    // Resolve keys (must be key columns) and calls (typed accumulators).
-    let key_indices: Vec<usize> = keys
+    // Which column ingest is ordered on — the axis a bucket is allowed
+    // to divide. The schema cannot say it, so it is threaded in;
+    // `None` means nobody could tell us AND the snapshot has no segment
+    // to ask, which leaves the bucket checks below unable to refuse.
+    let terms: Vec<GroupTerm> = keys
         .iter()
-        .map(|key| {
-            let (index, field) = resolve(schema, key)?;
-            if field.column_type() != ColumnType::Key {
-                return Err(QueryError::TypeError(format!(
-                    "GROUP BY '{key}' must be a key column — grouping is what keys are for"
-                )));
-            }
-            Ok(index)
-        })
-        .collect::<Result<Vec<usize>, QueryError>>()?;
+        .map(|key| resolve_group_key(schema, key, ordering_key))
+        .collect::<Result<Vec<GroupTerm>, QueryError>>()?;
     let calls: Vec<(&AggCall, Option<usize>, Option<ColumnType>)> = items
         .iter()
         .filter_map(|item| match item {
@@ -1792,21 +2930,52 @@ fn project_aggregate(
     // The unified key space, one per key column.
     let mut unified: Vec<HashMap<String, usize>> = vec![HashMap::new(); keys.len()];
     let mut unified_values: Vec<Vec<String>> = vec![Vec::new(); keys.len()];
-    // Groups in first-seen order.
+    // Whether the grouping can stream. A bucket of the ordering key is
+    // monotone in it, so over data that is actually ordered the bucket
+    // values arrive non-decreasing: once a bucket is left it can never
+    // come back, and every group inside it can be closed and reduced to
+    // its cells there and then. What stays live is the groups of the
+    // ONE open bucket — the symbols trading in this minute — instead of
+    // every group the query will produce.
+    //
+    // This is the dividend F1 = (d) was chosen for, and it is a
+    // property of the data, checked from segment metadata before a byte
+    // is read. Unordered data (an UPDATE reappended before compaction)
+    // silently takes the hash path below and gets the same answer more
+    // expensively — correct always, fast when the data behaves, and
+    // `compact()` restores it, exactly as for tombstones.
+    let bucketed = terms
+        .iter()
+        .any(|term| matches!(term, GroupTerm::Bucket { .. }));
+    let streaming =
+        bucketed && ordering_key.is_some_and(|index| ordering_problem(views, index).is_none());
+    let mut sink = GroupSink::new(&template);
+    // Open groups: the lookup, their keys in first-seen order, and
+    // their accumulators. On the streaming path these are cleared at
+    // every bucket boundary; on the hash path they grow to the whole
+    // result.
     let mut groups: HashMap<Vec<GroupCode>, usize> = HashMap::new();
-    let mut group_keys: Vec<Vec<GroupCode>> = Vec::new();
+    let mut open_keys: Vec<Vec<GroupCode>> = Vec::new();
     let mut accumulators: Vec<Vec<Accumulator>> = Vec::new();
+    // The bucket the open groups belong to (the bucket terms' codes).
+    let mut open_bucket: Option<Vec<GroupCode>> = None;
     if keys.is_empty() {
         groups.insert(Vec::new(), 0);
-        group_keys.push(Vec::new());
+        open_keys.push(Vec::new());
         accumulators.push(template.clone());
     }
     for view in views {
         let batch = view.segment.batch();
         // This view's key columns, with per-segment codes remapped into
         // the unified space (decision #6's query-time remap).
-        let mut remaps: Vec<(&KeyColumn, Vec<usize>)> = Vec::with_capacity(key_indices.len());
-        for (position, &index) in key_indices.iter().enumerate() {
+        let mut remaps: Vec<Option<(&KeyColumn, Vec<usize>)>> = Vec::with_capacity(terms.len());
+        for (position, term) in terms.iter().enumerate() {
+            let &GroupTerm::Label { index } = term else {
+                // A bucket reads its value straight from the ordering
+                // key; there is no dictionary to unify.
+                remaps.push(None);
+                continue;
+            };
             let Column::Key(column) = &batch.columns()[index] else {
                 unreachable!("validated as a key column above")
             };
@@ -1824,21 +2993,38 @@ fn project_aggregate(
                     }
                 })
                 .collect();
-            remaps.push((column, remap));
+            remaps.push(Some((column, remap)));
         }
+        // `FIRST`/`LAST` are positional on the time axis, so they need
+        // the ordering key's value beside each cell. Fetched once per
+        // view; the column exists and is `NOT NULL` by construction.
+        let clocks = ordering_key.map(|index| ordering_clocks(&batch.columns()[index]));
         for row in live_rows(view) {
-            let group_key: Vec<GroupCode> = remaps
+            let group_key: Vec<GroupCode> = terms
                 .iter()
-                .map(|(column, remap)| {
-                    column
-                        .is_valid(row)
-                        .then(|| remap[column.codes().as_slice()[row] as usize])
-                })
+                .zip(&remaps)
+                .map(|(term, remap)| term.code(batch.columns(), remap.as_ref(), row))
                 .collect();
+            if streaming {
+                // Leaving a bucket closes everything inside it.
+                let bucket: Vec<GroupCode> = group_key
+                    .iter()
+                    .zip(&terms)
+                    .filter(|(_, term)| matches!(term, GroupTerm::Bucket { .. }))
+                    .map(|(code, _)| code.clone())
+                    .collect();
+                if open_bucket.as_ref() != Some(&bucket) {
+                    for (key, group) in open_keys.drain(..).zip(accumulators.drain(..)) {
+                        sink.close(key, &group);
+                    }
+                    groups.clear();
+                    open_bucket = Some(bucket);
+                }
+            }
             let group = *groups.entry(group_key.clone()).or_insert_with(|| {
-                group_keys.push(group_key.clone());
+                open_keys.push(group_key.clone());
                 accumulators.push(template.clone());
-                group_keys.len() - 1
+                open_keys.len() - 1
             });
             for ((_, argument_index, _), accumulator) in
                 calls.iter().zip(accumulators[group].iter_mut())
@@ -1859,50 +3045,67 @@ fn project_aggregate(
                         }
                     },
                 };
-                accumulator.update(cell)?;
+                accumulator.update(cell, clocks.map_or(0, |clocks| clocks[row]))?;
             }
         }
     }
+    // Whatever is still open belongs to the last bucket (or, on the
+    // hash path, is the whole result).
+    for (key, group) in open_keys.drain(..).zip(accumulators.drain(..)) {
+        sink.close(key, &group);
+    }
     // Assemble the single output batch, SELECT-list order.
+    let group_keys = &sink.keys;
     let group_count = group_keys.len();
     let mut fields = Vec::with_capacity(items.len());
     let mut columns = Vec::with_capacity(items.len());
     let mut next_call = 0usize;
     for item in items {
         match item {
-            AggItem::Key { name, alias } => {
-                let position = keys.iter().position(|key| key == name).expect("validated");
+            AggItem::Key { key, alias } => {
+                let position = keys.iter().position(|term| term == key).expect("validated");
+                let default_name = key.output_name();
+                let name = alias.as_deref().unwrap_or(&default_name);
+                if terms[position].column_type() == ColumnType::I64 {
+                    // A bucket: its integer value, one per group.
+                    let values: Buffer<i64> = group_keys
+                        .iter()
+                        .map(|group_key| match group_key[position] {
+                            GroupCode::Bucket(value) => value,
+                            GroupCode::Label(_) => unreachable!("bucket term, bucket code"),
+                        })
+                        .collect();
+                    fields.push(Field::new(name, ColumnType::I64, false));
+                    columns.push(Column::Numeric(NumericData::I64(
+                        NumericColumn::new_non_null(values),
+                    )));
+                    continue;
+                }
                 let mut dictionary = Dictionary::new();
                 let mut codes: Buffer<u32> = Buffer::with_capacity(group_count);
                 let mut validity: Vec<bool> = Vec::with_capacity(group_count);
-                for group_key in &group_keys {
+                for group_key in group_keys {
                     match group_key[position] {
-                        Some(code) => {
+                        GroupCode::Label(Some(code)) => {
                             codes.push(dictionary.intern(&unified_values[position][code]));
                             validity.push(true);
                         }
-                        None => {
+                        GroupCode::Label(None) => {
                             codes.push(0);
                             validity.push(false);
                         }
+                        GroupCode::Bucket(_) => unreachable!("label term, label code"),
                     }
                 }
+                // Through `assemble_key`, not a second copy of it: its
+                // empty-dictionary placeholder is what keeps every code
+                // in range when EVERY group's key is null, which a
+                // WHERE can leave behind even though ingest refuses an
+                // all-null key column. The inline copy this replaces
+                // had drifted from it and panicked on that input.
                 let nullable = validity.iter().any(|&valid| !valid);
-                let column = if nullable {
-                    KeyColumn::new_nullable(
-                        codes,
-                        Bitmap::from_bools(validity.iter().copied()),
-                        dictionary,
-                    )
-                } else {
-                    KeyColumn::new_non_null(codes, dictionary)
-                };
-                fields.push(Field::new(
-                    alias.as_deref().unwrap_or(name),
-                    ColumnType::Key,
-                    nullable,
-                ));
-                columns.push(Column::Key(column));
+                fields.push(Field::new(name, ColumnType::Key, nullable));
+                columns.push(Column::Key(assemble_key(codes, validity, dictionary)));
             }
             AggItem::Call(call) => {
                 let default_name = match call.function {
@@ -1911,17 +3114,13 @@ fn project_aggregate(
                     AggFunction::Avg => "avg",
                     AggFunction::Min => "min",
                     AggFunction::Max => "max",
+                    AggFunction::First => "first",
+                    AggFunction::Last => "last",
                 };
                 let name = call.alias.as_deref().unwrap_or(default_name);
                 // Output type from the plan (the template accumulator), so
                 // it is the same whether or not any group matched (B4).
-                let output_type = template[next_call].column_type();
-                let (field, column) = assemble_aggregate(
-                    name,
-                    output_type,
-                    accumulators.iter().map(|group| &group[next_call]),
-                    group_count,
-                );
+                let (field, column) = assemble_aggregate(name, &sink.cells[next_call]);
                 fields.push(field);
                 columns.push(column);
                 next_call += 1;
@@ -1941,18 +3140,9 @@ fn project_aggregate(
 /// column's `output_type` comes from the plan (a template accumulator),
 /// not from the accumulator instances here — so zero groups still yields
 /// the right Arrow type (B4).
-fn assemble_aggregate<'a>(
-    name: &str,
-    output_type: ColumnType,
-    accumulators: impl Iterator<Item = &'a Accumulator>,
-    groups: usize,
-) -> (Field, Column) {
-    match output_type {
-        ColumnType::I64 => {
-            let mut cells: Vec<Option<i64>> = Vec::with_capacity(groups);
-            for accumulator in accumulators {
-                cells.push(accumulator.i64_value());
-            }
+fn assemble_aggregate(name: &str, cells: &AggCells) -> (Field, Column) {
+    match cells {
+        AggCells::I64(cells) => {
             let nullable = cells.iter().any(Option::is_none);
             let values: Buffer<i64> = cells.iter().map(|value| value.unwrap_or(0)).collect();
             let column = if nullable {
@@ -1968,12 +3158,7 @@ fn assemble_aggregate<'a>(
                 Column::Numeric(NumericData::I64(column)),
             )
         }
-        // Aggregates are numeric; a Key output can't arise.
-        _ => {
-            let mut cells: Vec<Option<f64>> = Vec::with_capacity(groups);
-            for accumulator in accumulators {
-                cells.push(accumulator.f64_value());
-            }
+        AggCells::F64(cells) => {
             let nullable = cells.iter().any(Option::is_none);
             let values: Buffer<f64> = cells.iter().map(|value| value.unwrap_or(0.0)).collect();
             let column = if nullable {
@@ -2287,6 +3472,15 @@ fn assemble_f64(results: Vec<Option<f64>>) -> Column {
     let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
     let values: Buffer<f64> = results.into_iter().map(|v| v.unwrap_or(0.0)).collect();
     assemble_numeric_f64(values, validity)
+}
+
+/// Materializes an `i64` output column from `i64` results — the
+/// positional-window path (`LAG`/`LEAD` over a `BIGINT` column), where
+/// values are *copied*, never computed, so nothing rounds.
+fn assemble_i64(results: Vec<Option<i64>>) -> Column {
+    let validity: Vec<bool> = results.iter().map(Option::is_some).collect();
+    let values: Buffer<i64> = results.into_iter().map(|v| v.unwrap_or(0)).collect();
+    assemble_numeric_i64(values, validity)
 }
 
 /// Materializes an `i64` output column from integral `f64` results — the
@@ -2941,9 +4135,12 @@ mod tests {
                 "SELECT mean(x, x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
                 "takes 1 arguments",
             ),
+            // A DOUBLE cannot key a partition, for the reason it cannot
+            // key a group. (A BIGINT can — see the cross-sectional
+            // tests; that is the one type rule M5.3 relaxed here.)
             (
                 "SELECT mean(x) OVER (PARTITION BY x ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-                "must be a key column",
+                "not partition identity",
             ),
         ];
         for (sql, needle) in cases {
@@ -3655,12 +4852,648 @@ mod query1_tests {
         }
     }
 
+    /// The i64 column of an output batch, as `Option<i64>` per row.
+    fn i64s(output: &QueryOutput, index: usize) -> Vec<Option<i64>> {
+        output
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
+                    panic!("expected i64 column")
+                };
+                (0..column.len())
+                    .map(|row| column.is_valid(row).then(|| column.values()[row]))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     #[test]
-    fn grouping_by_numeric_is_refused_by_design() {
+    fn a_bucket_groups_the_ordering_key_by_width_and_names_itself() {
+        // Ten seconds of a two-symbol tape, bucketed into 5s bars.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (4, "A", 3.0),
+            (5, "A", 4.0),
+            (7, "B", 20.0),
+            (9, "A", 5.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            // The bucket INDEX: ts / 5 is 0 for ts 0-4, 1 for ts 5-9.
+            let output = run(
+                &views,
+                "SELECT ts / 5 AS bar, count(*) AS n, sum(x) AS total \
+                 FROM t GROUP BY ts / 5",
+            )
+            .unwrap();
+            assert_eq!(output.schema.fields()[0].name(), "bar");
+            assert_eq!(i64s(&output, 0), [Some(0), Some(1)]);
+            assert_eq!(i64s(&output, 1), [Some(4), Some(3)]);
+            assert_eq!(flatten(&output, 2), [Some(16.0), Some(29.0)]);
+            // The bucket START: (ts / 5) * 5 relabels the same groups
+            // with the value the bar opens at, which is what a chart
+            // axis wants. The aggregates must not move.
+            let started = run(
+                &views,
+                "SELECT (ts / 5) * 5 AS bar, sum(x) AS total FROM t GROUP BY (ts / 5) * 5",
+            )
+            .unwrap();
+            assert_eq!(i64s(&started, 0), [Some(0), Some(5)]);
+            assert_eq!(flatten(&started, 1), flatten(&output, 2));
+            // Unaliased, a bucket names itself after the arithmetic.
+            let unnamed = run(&views, "SELECT ts / 5, count(*) FROM t GROUP BY ts / 5").unwrap();
+            assert_eq!(unnamed.schema.fields()[0].name(), "ts / 5");
+            // A bare ordering key is the finest bucket: one per stamp.
+            let finest = run(&views, "SELECT ts, count(*) FROM t GROUP BY ts").unwrap();
+            assert_eq!(finest.num_rows(), 7);
+            // `//` is DuckDB's spelling for the truncating division `/`
+            // already means here; both write the same bucket.
+            let duck = run(
+                &views,
+                "SELECT ts // 5 AS bar, sum(x) AS total FROM t GROUP BY ts // 5",
+            )
+            .unwrap();
+            assert_eq!(i64s(&duck, 0), i64s(&output, 0));
+            assert_eq!(flatten(&duck, 1), flatten(&output, 2));
+        }
+    }
+
+    #[test]
+    fn a_bucket_composes_with_a_symbol_key_for_the_ohlc_shape() {
+        // The canonical bar query: per symbol, per bucket, the open and
+        // close — which is what FIRST/LAST are for, and why they need
+        // the ordering key rather than row order.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (4, "A", 3.0),
+            (5, "A", 4.0),
+            (7, "B", 20.0),
+            (9, "A", 5.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(
+                &views,
+                "SELECT sym, ts / 5 AS bar, first(x) AS open, max(x) AS high, \
+                 min(x) AS low, last(x) AS close \
+                 FROM t GROUP BY sym, ts / 5",
+            )
+            .unwrap();
+            // Groups in first-seen order: (A,0), (B,0), (A,1), (B,1).
+            assert_eq!(i64s(&output, 1), [Some(0), Some(0), Some(1), Some(1)]);
+            assert_eq!(
+                flatten(&output, 2),
+                [Some(1.0), Some(10.0), Some(4.0), Some(20.0)],
+                "open"
+            );
+            assert_eq!(
+                flatten(&output, 5),
+                [Some(3.0), Some(10.0), Some(5.0), Some(20.0)],
+                "close"
+            );
+            assert_eq!(
+                flatten(&output, 3),
+                [Some(3.0), Some(10.0), Some(5.0), Some(20.0)],
+                "high"
+            );
+            assert_eq!(
+                flatten(&output, 4),
+                [Some(1.0), Some(10.0), Some(4.0), Some(20.0)],
+                "low"
+            );
+        }
+    }
+
+    #[test]
+    fn first_and_last_read_the_time_axis_not_the_row_order() {
+        // Rows arriving out of order, and two rows sharing a stamp.
+        // FIRST/LAST must answer by ordering key, so the late row
+        // cannot become the "last" just by arriving last; and the tie
+        // resolves to the last of the tied rows in storage order, the
+        // rule the as-of join follows.
+        let views = segment(&[
+            (5, "A", 50.0),
+            (1, "A", 10.0), // late: earliest stamp, arrives second
+            (9, "A", 90.0),
+            (9, "A", 91.0), // ties with the row before it
+            (3, "A", 30.0), // late again
+        ]);
+        let output = run(
+            &views,
+            "SELECT sym, first(x) AS open, last(x) AS close FROM t GROUP BY sym",
+        )
+        .unwrap();
+        assert_eq!(flatten(&output, 1), [Some(10.0)], "earliest stamp wins");
+        assert_eq!(flatten(&output, 2), [Some(91.0)], "the later of the tie");
+    }
+
+    #[test]
+    fn a_cross_sectional_window_runs_across_the_instant_not_down_the_symbol() {
+        // Three symbols printing at two timestamps. PARTITION BY sym is
+        // the time-series direction; PARTITION BY ts is its transpose,
+        // and the two must give different answers over the same rows —
+        // which is the whole point of admitting the second.
+        let rows: &[(i64, &str, f64)] = &[
+            (10, "A", 1.0),
+            (10, "B", 2.0),
+            (10, "C", 7.0),
+            (20, "A", 4.0),
+            (20, "B", 6.0),
+            (20, "C", 10.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            // The cross-section's total at each instant: 10 then 20,
+            // repeated across every row of the instant it describes.
+            let output = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&output, 1),
+                [
+                    Some(10.0),
+                    Some(10.0),
+                    Some(10.0),
+                    Some(20.0),
+                    Some(20.0),
+                    Some(20.0)
+                ]
+            );
+            // The portfolio weight: each row's share of its own
+            // instant. This is what cross-sectional partitioning is
+            // FOR, and it needs a scalar expression over a window
+            // result (#94) as much as it needs the partition.
+            let weights = run(
+                &views,
+                "SELECT ts, x / sum(x) OVER (PARTITION BY ts) AS w FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&weights, 1),
+                [
+                    Some(0.1),
+                    Some(0.2),
+                    Some(0.7),
+                    Some(0.2),
+                    Some(0.3),
+                    Some(0.5)
+                ]
+            );
+            // Weights sum to 1 within each instant — the property that
+            // makes them weights, checked rather than assumed.
+            for instant in [0..3, 3..6] {
+                let total: f64 = flatten(&weights, 1)[instant]
+                    .iter()
+                    .map(|value| value.expect("no nulls"))
+                    .sum();
+                assert!((total - 1.0).abs() < 1e-12, "{total}");
+            }
+            // Cross-sectional demeaning, the other half of a z-score.
+            let demeaned = run(
+                &views,
+                "SELECT ts, x - avg(x) OVER (PARTITION BY ts) AS d FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&demeaned, 1),
+                [
+                    Some(1.0 - 10.0 / 3.0),
+                    Some(2.0 - 10.0 / 3.0),
+                    Some(7.0 - 10.0 / 3.0),
+                    Some(4.0 - 20.0 / 3.0),
+                    Some(6.0 - 20.0 / 3.0),
+                    Some(10.0 - 20.0 / 3.0)
+                ]
+            );
+            // A bucket partitions coarser: one cross-section per bar,
+            // so both instants fall in the same partition.
+            let bucketed = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts / 100) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&bucketed, 1), [Some(30.0); 6]);
+            // And the time-series direction over the same rows is a
+            // different answer, as it must be.
+            let down = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&down, 1),
+                [
+                    Some(5.0),
+                    Some(8.0),
+                    Some(17.0),
+                    Some(5.0),
+                    Some(8.0),
+                    Some(17.0)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_expression_composes_over_window_results() {
+        // #94: windows compute first, whole, and the SELECT list's
+        // arithmetic then runs over their results — standard SQL's own
+        // evaluation order. Without this a window can only BE a
+        // projection, never feed one.
+        let views = segment(&[(1, "A", 2.0), (2, "A", 5.0), (3, "A", 9.0)]);
+        // The difference idiom: subtract the previous row.
+        let diff = run(
+            &views,
+            "SELECT ts, x - lag(x) OVER (ORDER BY ts) AS d FROM t",
+        )
+        .unwrap();
+        assert_eq!(flatten(&diff, 1), [None, Some(3.0), Some(4.0)]);
+        // Two windows in one expression, each computed independently.
+        let span = run(
+            &views,
+            "SELECT ts, lead(x) OVER (ORDER BY ts) - lag(x) OVER (ORDER BY ts) AS s FROM t",
+        )
+        .unwrap();
+        assert_eq!(flatten(&span, 1), [None, Some(7.0), None]);
+        // A window inside a scalar function call, not just arithmetic.
+        let deviation = run(
+            &views,
+            "SELECT ts, abs(x - avg(x) OVER (ORDER BY ts \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) AS a FROM t",
+        )
+        .unwrap();
+        // Frames [2], [2,5], [5,9] → means 2, 3.5, 7.
+        assert_eq!(flatten(&deviation, 1), [Some(0.0), Some(1.5), Some(2.0)]);
+        // A window's NULL propagates through the arithmetic as a NULL,
+        // rather than becoming a number.
+        assert_eq!(flatten(&diff, 1)[0], None);
+    }
+
+    #[test]
+    fn a_predicate_may_compare_expressions() {
+        // #95: `WHERE x > y` is basic SQL and was refused until now,
+        // because the predicate type was the *prunable* one.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        // Arithmetic on the left, which the old grammar refused
+        // outright because only a bare column could go there.
+        let output = run(&views, "SELECT x FROM t WHERE x * 2 > 5").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(5.0)]);
+        // Expressions on both sides: x + 1 > 2x - 2 reduces to x < 3.
+        let output = run(&views, "SELECT x FROM t WHERE x + 1 > x * 2 - 2").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0)]);
+        // And a scalar call as an operand.
+        let output = run(&views, "SELECT x FROM t WHERE abs(x - 3) > 1").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(5.0)]);
+        // An i64 column in an expression comparison meets #40's refusal
+        // — the scalar pipeline computes in f64 and will not silently
+        // narrow a BIGINT. Recorded because it is the edge of what #95
+        // delivers, not a bug in it.
+        let error = run(&views, "SELECT x FROM t WHERE x > ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integer expression arithmetic"), "{error}");
+        // The prunable shape is untouched — a negative literal still
+        // reaches `Compare`, minus sign intact, rather than falling
+        // through to the general path with the sign stripped.
+        let all = run(&views, "SELECT x FROM t WHERE x > -1").unwrap();
+        assert_eq!(all.num_rows(), 3);
+        let none = run(&views, "SELECT x FROM t WHERE x < -1").unwrap();
+        assert_eq!(none.num_rows(), 0);
+    }
+
+    #[test]
+    fn an_unprunable_conjunct_does_not_disable_pruning_for_its_siblings() {
+        // The correctness-adjacent claim of #95: an expression
+        // comparison cannot be zone-pruned, but that must cost only
+        // ITSELF. A query mixing it with a prunable conjunct still
+        // skips the segments the prunable half rules out — otherwise
+        // adding `AND x > y` would quietly turn a pruned scan into a
+        // full one.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "A", 2.0), (50, "A", 3.0), (51, "A", 4.0)],
+            2,
+        );
+        let schema = schema();
+        let predicate = |sql: &str| {
+            crate::plan::plan(sql)
+                .unwrap()
+                .predicate
+                .expect("has a WHERE")
+        };
+        let early = &views[0]; // ts 1..2
+        assert!(
+            !can_match(&predicate("SELECT x FROM t WHERE ts > 40"), &schema, early),
+            "the prunable conjunct alone prunes this segment"
+        );
+        assert!(
+            can_match(
+                &predicate("SELECT x FROM t WHERE x * 2 > 5"),
+                &schema,
+                early
+            ),
+            "an expression comparison prunes nothing, by construction"
+        );
+        assert!(
+            !can_match(
+                &predicate("SELECT x FROM t WHERE ts > 40 AND x * 2 > 5"),
+                &schema,
+                early
+            ),
+            "mixing the two must still prune on the half that can"
+        );
+    }
+
+    #[test]
+    fn a_backwards_comparison_is_the_same_predicate_as_the_forwards_one() {
+        // Found by the repo-wide code review. `40 < ts` is `ts > 40`
+        // with the operands swapped, but before this it fell through
+        // to the general expression comparison of #95: same answer
+        // where both work, yet no pruning, and on an i64 column no
+        // answer at all — `40 < ts` met #40's refusal while `ts > 40`
+        // answered. Which side the user puts the column on must not
+        // change what the engine can do.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "A", 2.0), (50, "A", 3.0), (51, "A", 4.0)],
+            2,
+        );
+        let schema = schema();
+        let predicate = |sql: &str| {
+            crate::plan::plan(sql)
+                .unwrap()
+                .predicate
+                .expect("has a WHERE")
+        };
+        // Same lowered predicate, not merely the same answer.
+        assert_eq!(
+            format!("{:?}", predicate("SELECT x FROM t WHERE 40 < ts")),
+            format!("{:?}", predicate("SELECT x FROM t WHERE ts > 40")),
+        );
+        // So the backwards form prunes the segment the forwards one does.
+        let early = &views[0]; // ts 1..2
+        assert!(
+            !can_match(&predicate("SELECT x FROM t WHERE 40 < ts"), &schema, early),
+            "the backwards form must prune what the forwards one prunes"
+        );
+        // And it answers on an i64 column rather than meeting #40.
+        let output = run(&views, "SELECT x FROM t WHERE 40 < ts").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(4.0)]);
+        // Every operator, including the ones that are their own mirror,
+        // and a negative literal (unary minus over a value).
+        for (backwards, forwards) in [
+            ("40 <= ts", "ts >= 40"),
+            ("40 > ts", "ts < 40"),
+            ("40 >= ts", "ts <= 40"),
+            ("50 = ts", "ts = 50"),
+            ("50 <> ts", "ts <> 50"),
+            ("-1 < x", "x > -1"),
+        ] {
+            let backwards = run(&views, &format!("SELECT x FROM t WHERE {backwards}")).unwrap();
+            let forwards = run(&views, &format!("SELECT x FROM t WHERE {forwards}")).unwrap();
+            assert_eq!(flatten(&backwards, 0), flatten(&forwards, 0));
+        }
+        // Literal-on-both-sides and expression operands are untouched:
+        // the mirror only fires when the other side is a bare column.
+        let output = run(&views, "SELECT x FROM t WHERE 40 < x * 20").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(4.0)]);
+    }
+
+    #[test]
+    fn a_window_in_a_row_predicate_is_refused_by_name() {
+        // Standard SQL runs WHERE before the window phase, so there is
+        // no window result to test against — a refusal, not a gap.
+        let error = crate::plan::plan("SELECT ts FROM t WHERE sum(x) OVER () > 1")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before the"), "{error}");
+        // In a CASE condition, where the window HAS been computed by
+        // the time the projection runs, the same call is fine.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        let flagged = run(
+            &views,
+            "SELECT CASE WHEN x > avg(x) OVER () THEN 1 ELSE 0 END AS above FROM t",
+        )
+        .unwrap();
+        // Mean is 3, so only the last row is above it.
+        assert_eq!(flatten(&flagged, 0), [Some(0.0), Some(0.0), Some(1.0)]);
+    }
+
+    #[test]
+    fn a_group_whose_every_key_is_null_assembles() {
+        // Found by the repo-wide code review. Ingest refuses an
+        // all-null key column, so this is only reachable once a WHERE
+        // leaves nothing but null-key rows — and then an empty
+        // dictionary met a code of 0. `assemble_key` has carried the
+        // placeholder for exactly this since the join path needed it;
+        // the group path had grown a second copy that lost it.
+        let views = segment(&[(1, "A", 1.0), (2, "B", 5.0)]);
+        let output = run(
+            &views,
+            "SELECT sym, count(*) AS n FROM t WHERE x > 2 GROUP BY sym",
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 1, "one surviving group");
+    }
+
+    #[test]
+    fn first_and_last_refuse_a_window_with_no_order() {
+        // They are positional on the time axis — the group-level
+        // counterpart of LAG/LEAD — so an unordered window leaves them
+        // nothing to be first OF. Answering from storage order would
+        // quietly mean something other than their names.
+        for sql in [
+            "SELECT first(x) OVER (PARTITION BY sym) FROM t",
+            "SELECT last(x) OVER () FROM t",
+        ] {
+            let error = crate::plan::plan(sql).unwrap_err().to_string();
+            assert!(error.contains("needs an ORDER BY"), "{sql}: {error}");
+        }
+        // Ordered, they answer.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        assert!(run(
+            &views,
+            "SELECT first(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_schema_refusal_does_not_depend_on_whether_rows_exist() {
+        // Found by the repo-wide code review. Which column is the
+        // ordering key cannot be read off the schema, and an empty
+        // snapshot has no segment to ask — so inferring it from the
+        // first handle meant `GROUP BY <a non-ordering BIGINT>` was
+        // ACCEPTED while a table was empty and REFUSED once a row
+        // landed. No wrong answers, but a refusal that moves with the
+        // data is not a refusal a user can rely on.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("venue", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let registry = Registry::new();
+        let run = |views: &[SegmentHandle], sql: &str| {
+            execute_with_ordering_key(
+                &schema,
+                views,
+                0,
+                &crate::plan::plan(sql).unwrap(),
+                &registry,
+            )
+        };
+        let mut store = storage_lite::Store::with_segment_rows(schema.clone(), 0, 8).unwrap();
+        let populated: Vec<SegmentHandle> = {
+            store
+                .append(&[
+                    storage_lite::RowValue::I64(1),
+                    storage_lite::RowValue::I64(7),
+                    storage_lite::RowValue::F64(1.0),
+                ])
+                .unwrap();
+            store.snapshot().unwrap()
+        };
+        for (label, views) in [("empty", &[][..]), ("populated", &populated[..])] {
+            assert!(
+                run(views, "SELECT venue, count(*) FROM t GROUP BY venue").is_err(),
+                "a non-ordering BIGINT never groups ({label})"
+            );
+            assert!(
+                run(views, "SELECT ts / 5, count(*) FROM t GROUP BY ts / 5").is_ok(),
+                "a bucket of the ordering key always does ({label})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_by_may_name_a_bucket_by_its_select_alias() {
+        let views = segment(&[(0, "A", 1.0), (61, "A", 2.0), (130, "A", 4.0)]);
+        let aliased = run(
+            &views,
+            "SELECT ts / 60 AS bar, sum(x) AS s FROM t GROUP BY bar",
+        )
+        .unwrap();
+        let spelled = run(
+            &views,
+            "SELECT ts / 60 AS bar, sum(x) AS s FROM t GROUP BY ts / 60",
+        )
+        .unwrap();
+        assert_eq!(i64s(&aliased, 0), [Some(0), Some(1), Some(2)]);
+        assert_eq!(flatten(&aliased, 1), flatten(&spelled, 1));
+    }
+
+    #[test]
+    fn an_unordered_window_takes_its_whole_partition_and_refuses_a_frame() {
+        let views = segment(&[(10, "A", 1.0), (10, "B", 2.0), (20, "A", 4.0)]);
+        // No PARTITION BY and no ORDER BY: one partition, every row —
+        // the grand total beside each row.
+        let all = run(&views, "SELECT ts, sum(x) OVER () AS s FROM t").unwrap();
+        assert_eq!(flatten(&all, 1), [Some(7.0), Some(7.0), Some(7.0)]);
+        // A frame with nothing to be relative to is a contradiction,
+        // refused rather than silently ignored. (Refused by the
+        // planner, so it never reaches the executor.)
+        let error = crate::plan::plan(
+            "SELECT sum(x) OVER (PARTITION BY ts ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM t",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("needs an ORDER BY"), "{error}");
+        // A positional lookup with no order has nowhere to look.
+        let error = crate::plan::plan("SELECT lag(x) OVER (PARTITION BY ts) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs an ORDER BY"), "{error}");
+    }
+
+    #[test]
+    fn several_partition_terms_intersect() {
+        // `PARTITION BY sym, ts / 60` — per symbol, per bar. The two
+        // directions at once, which is what a bar chart per instrument
+        // needs and what a single-term PARTITION BY cannot say.
+        let rows: &[(i64, &str, f64)] = &[
+            (0, "A", 1.0),
+            (1, "B", 10.0),
+            (2, "A", 2.0),
+            (61, "A", 4.0),
+            (62, "B", 20.0),
+            (63, "A", 8.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            let output = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym, ts / 60) AS s FROM t",
+            )
+            .unwrap();
+            // (A,bar0)=1+2=3, (B,bar0)=10, (A,bar1)=4+8=12, (B,bar1)=20.
+            assert_eq!(
+                flatten(&output, 1),
+                [
+                    Some(3.0),
+                    Some(10.0),
+                    Some(3.0),
+                    Some(12.0),
+                    Some(20.0),
+                    Some(12.0)
+                ]
+            );
+            // Each term alone is coarser than both together, which is
+            // what "intersect" has to mean.
+            let by_symbol = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&by_symbol, 1)[0], Some(15.0), "A's whole column");
+            let by_bar = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts / 60) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&by_bar, 1)[0], Some(13.0), "bar 0, both symbols");
+        }
+    }
+
+    #[test]
+    fn a_partition_may_be_any_integer_but_never_a_double() {
+        let views = segment(&[(10, "A", 1.0), (10, "B", 2.0), (20, "A", 4.0)]);
+        // A DOUBLE never keys a partition — same rule as grouping.
+        let error = run(&views, "SELECT sum(x) OVER (PARTITION BY x) FROM t")
+            .unwrap_err()
+            .to_string();
+        let _ = &views;
+        assert!(error.contains("not partition identity"), "{error}");
+        // A bucket of anything but the ordering key is refused too: the
+        // arithmetic proves nothing about order on another column.
+        let error = run(&views, "SELECT sum(x) OVER (PARTITION BY x / 2) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared ordering key"), "{error}");
+    }
+
+    #[test]
+    fn only_symbols_and_the_time_axis_can_key_a_group() {
         let views = segment(&[(1, "A", 1.0)]);
+        // A DOUBLE never keys a group: equality on floats is not group
+        // identity, which is the same reason F1 rejected general
+        // GROUP BY expressions.
         let error = run(&views, "SELECT x, count(*) FROM t GROUP BY x")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("keys"), "{error}");
+        assert!(error.contains("not group identity"), "{error}");
+        // The ordering key does, whole or bucketed — that is F1 = d,
+        // and it is what makes bucketed aggregation expressible at all.
+        assert!(run(&views, "SELECT ts, count(*) FROM t GROUP BY ts").is_ok());
+        assert!(run(
+            &views,
+            "SELECT ts / 60 AS bucket, count(*) FROM t GROUP BY ts / 60"
+        )
+        .is_ok());
     }
 }

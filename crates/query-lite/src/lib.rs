@@ -36,15 +36,16 @@
 //! reason to exclude something otherwise in scope. Concretely in scope
 //! (and built): `SELECT` / `WHERE` / `GROUP BY` (`HAVING` included) /
 //! `ORDER BY` (`NULLS FIRST`/`LAST` included) / `LIMIT`, `DISTINCT`,
-//! scalar expressions and `CASE` in projection, equi-joins, window
-//! functions, `CREATE TABLE` / `INSERT` (lowered here, executed by the
+//! scalar expressions and `CASE` in projection, equi-joins and as-of
+//! joins, window functions, `CREATE TABLE` / `INSERT` (lowered here,
+//! executed by the
 //! embedder), and `UPDATE` / `DELETE` (implemented as tombstone +
 //! reinsert against `storage-lite`, not a separate mutation path — see
 //! that crate's docs). Concretely out of scope for now: general
 //! subqueries/CTEs, string-*producing* functions (`SUBSTRING`, `CONCAT`,
 //! `CAST AS VARCHAR`, `GROUP_CONCAT` — a produced string is a value that is
 //! neither numeric nor key), and a cost-based join planner beyond
-//! star-schema equi-joins.
+//! star-schema equi-joins and the as-of family.
 //!
 //! ## Strings: predicates in, production out
 //! numeric-or-key holds across the whole pipeline (results and intermediates,
@@ -75,16 +76,18 @@ pub mod plan;
 pub mod predicate;
 
 pub use exec::{
-    contiguous, execute, execute_join, recompute_frames, ColumnFunction, QueryOutput, Registry,
-    WindowAggregate,
+    contiguous, execute, execute_join, execute_with_ordering_key, recompute_frames, ColumnFunction,
+    JoinSide, QueryOutput, Registry, ViewScalars, WindowAggregate,
 };
 pub use plan::{
-    parse_statement, plan, AggCall, AggFunction, AggItem, Assignment, ColumnSpec, CreateTablePlan,
-    DeletePlan, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem, Projection, QueryError,
-    SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
+    parse_statement, plan, AggCall, AggFunction, AggItem, AsOfMatch, Assignment, ColumnSpec,
+    CreateTablePlan, DeletePlan, Frame, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem,
+    Projection, QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
 };
-pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
+pub use predicate::{
+    can_match, evaluate as evaluate_predicate, CmpOp, NoScalars, Number, Predicate, ScalarEval,
+};
 
 // TODO: DataFusion as a secondary differential oracle beside DuckDB
-// TODO: window ORDER BY beyond the ordering key; RANGE frames;
-//       DISTINCT aggregates — as the inclusion principle admits them
+// TODO: window ORDER BY beyond the ordering key; DISTINCT aggregates
+//       — as the inclusion principle admits them

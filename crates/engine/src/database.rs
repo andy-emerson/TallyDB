@@ -624,4 +624,206 @@ mod join_tests {
             .to_string();
         assert!(error.contains("multi-table"), "{error}");
     }
+
+    /// Trades against a quote history: the as-of fixture.
+    ///
+    /// The quote table's time column is `qts`, not `ts`, because a
+    /// dimension attribute sharing a fact column's name is refused
+    /// (see `an_asof_join_still_refuses_a_clashing_attribute_name`).
+    ///
+    /// Deliberate shapes, each of which some plausible wrong
+    /// implementation gets wrong: a trade before its symbol's first
+    /// quote (nothing to match), two quotes on the same timestamp (the
+    /// tie), a trade exactly on a quote (at-or-before versus strictly
+    /// before), a symbol with no quotes at all, and quotes for a symbol
+    /// that never trades. Segments hold two rows apiece, so both sides
+    /// span several with per-segment dictionaries.
+    fn asof_database() -> Database {
+        let mut db = Database::new();
+        db.add_table(
+            Table::with_segment_rows("trades", fact_schema(), "ts", 2).expect("fact schema"),
+        )
+        .unwrap();
+        let quote_schema = Schema::new(vec![
+            Field::new("qts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("bid", ColumnType::F64, false),
+        ]);
+        db.add_table(
+            Table::with_segment_rows("quotes", quote_schema, "qts", 2).expect("quote schema"),
+        )
+        .unwrap();
+        for (qts, sym, bid) in [
+            (10, "A", 1.0),
+            (20, "A", 2.0),
+            (20, "A", 3.0), // same timestamp: the later row is the match
+            (30, "B", 9.0),
+            (40, "A", 4.0),
+            (40, "Z", 0.0), // a symbol that never trades
+        ] {
+            db.append(
+                "quotes",
+                &[RowValue::I64(qts), RowValue::Key(sym), RowValue::F64(bid)],
+            )
+            .unwrap();
+        }
+        for (ts, sym) in [
+            (5, "A"),  // before A's first quote
+            (10, "A"), // exactly on one
+            (20, "A"), // exactly on the tied pair
+            (25, "A"),
+            (30, "C"), // a symbol with no quotes at all
+            (35, "B"),
+            (50, "A"),
+        ] {
+            db.append(
+                "trades",
+                &[
+                    RowValue::I64(ts),
+                    RowValue::Key(sym),
+                    RowValue::F64(ts as f64),
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn an_asof_join_takes_each_symbols_latest_quote_at_or_before_the_trade() {
+        let db = asof_database();
+        let bids = |sql: &str| f64s(&db.query(sql).unwrap(), 1);
+        // LEFT keeps the unmatched trades, with a null bid: the trade
+        // before A's first quote, and the symbol with no quotes.
+        assert_eq!(
+            bids(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym ORDER BY ts"
+            ),
+            [
+                None,
+                Some(1.0),
+                Some(3.0),
+                Some(3.0),
+                None,
+                Some(9.0),
+                Some(4.0)
+            ]
+        );
+        // INNER drops exactly those two.
+        assert_eq!(
+            bids(
+                "SELECT ts, bid FROM trades ASOF INNER JOIN quotes \
+                 ON trades.sym = quotes.sym ORDER BY ts"
+            ),
+            [Some(1.0), Some(3.0), Some(3.0), Some(9.0), Some(4.0)]
+        );
+        // The explicit inequality only chooses whether a quote landing
+        // exactly on the trade counts. Strictly before: the ts=10 trade
+        // loses A's first quote, and ts=20 falls back past the tie.
+        assert_eq!(
+            bids(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym AND quotes.qts < trades.ts ORDER BY ts"
+            ),
+            [None, None, Some(1.0), Some(3.0), None, Some(9.0), Some(4.0)]
+        );
+        // …and written the other way round it says the same thing.
+        assert_eq!(
+            bids(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym AND trades.ts >= quotes.qts ORDER BY ts"
+            ),
+            bids(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym ORDER BY ts"
+            ),
+        );
+    }
+
+    #[test]
+    fn an_asof_join_does_not_multiply_rows_the_way_an_equi_join_would() {
+        // The rule an as-of join relaxes is the dimension's unique key
+        // — a quote table has many rows per symbol, which a plain join
+        // refuses outright. What it must NOT relax is the row count:
+        // one output row per fact row, still.
+        let db = asof_database();
+        let plain = db
+            .query("SELECT ts FROM trades JOIN quotes ON trades.sym = quotes.sym")
+            .unwrap_err()
+            .to_string();
+        assert!(plain.contains("not unique"), "{plain}");
+        let output = db
+            .query(
+                "SELECT ts FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym",
+            )
+            .unwrap();
+        assert_eq!(output.num_rows(), 7, "one row per trade, as ingested");
+    }
+
+    #[test]
+    fn an_asof_joins_time_axis_is_the_declared_ordering_key() {
+        // The inequality is validated, not obeyed: it may only restate
+        // the two tables' declared ordering keys. Naming anything else
+        // is a refusal, because obeying it would mean a search where
+        // the design promises a walk.
+        let db = asof_database();
+        let error = db
+            .query(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym AND quotes.bid <= trades.ts",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared ordering keys"), "{error}");
+        // Backwards is the whole point: asking for the quote *after*
+        // each trade is a different question, refused rather than
+        // quietly answered in reverse.
+        let error = db
+            .query(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym AND trades.ts <= quotes.qts",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("looks backwards"), "{error}");
+    }
+
+    #[test]
+    fn an_asof_join_still_refuses_a_clashing_attribute_name() {
+        // A quote table whose time column is also called `ts` — the
+        // natural schema — collides with the fact's, and the join
+        // refuses it exactly as a plain join does. Recorded here
+        // because it is the shape a desk reaches for first, and the
+        // refusal is the current answer, not an oversight.
+        let mut db = Database::new();
+        db.add_table(Table::new("trades", fact_schema(), "ts").unwrap())
+            .unwrap();
+        let clashing = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("bid", ColumnType::F64, false),
+        ]);
+        db.add_table(Table::new("quotes", clashing, "ts").unwrap())
+            .unwrap();
+        db.append(
+            "trades",
+            &[RowValue::I64(1), RowValue::Key("A"), RowValue::F64(1.0)],
+        )
+        .unwrap();
+        db.append(
+            "quotes",
+            &[RowValue::I64(1), RowValue::Key("A"), RowValue::F64(2.0)],
+        )
+        .unwrap();
+        let error = db
+            .query(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exists in both tables"), "{error}");
+    }
 }

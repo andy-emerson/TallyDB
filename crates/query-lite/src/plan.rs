@@ -7,7 +7,9 @@
 //! SELECT [DISTINCT] <columns | scalar expressions | CASE | window calls
 //!                    | GROUP BY keys + aggregates>
 //! FROM fact [[LEFT] JOIN dim ON fact.key = dim.key]
-//! [WHERE predicate] [GROUP BY keys [HAVING predicate]]
+//!           [ASOF LEFT|INNER JOIN dim ON fact.key = dim.key
+//!                                    AND fact.ts >= dim.ts]
+//! [WHERE predicate] [GROUP BY keys | buckets [HAVING predicate]]
 //! [ORDER BY column [DESC] [NULLS FIRST|LAST]] [LIMIT n] [OFFSET n];
 //! CREATE TABLE t (col BIGINT|DOUBLE|SYMBOL [NOT NULL|ORDERING KEY], ...);
 //! INSERT INTO t [(columns)] VALUES (literals), ...;
@@ -15,14 +17,23 @@
 //! DELETE FROM table [WHERE predicate];
 //! ```
 //!
-//! (the predicate fragment is documented in [`crate::predicate`];
-//! window calls are `fn(args) OVER ([PARTITION BY key] ORDER BY
-//! ordering_key ROWS BETWEEN n PRECEDING AND CURRENT ROW)`; aggregates
-//! are `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over plain columns). Everything
-//! else — extra joins, subqueries, CTEs, other frame shapes — is
-//! rejected with a message naming what was rejected. The rejection is
-//! scope honesty, not a parser limit: what the inclusion principle
-//! admits arrives through this same lowering.
+//! The predicate fragment is documented in [`crate::predicate`]. A
+//! `GROUP BY` key is a symbol column or a monotone bucket of the
+//! ordering key (`ts / 60`, `(ts / 60) * 60`, bare `ts`), optionally
+//! named by its `SELECT` alias; aggregates are `COUNT` / `SUM` / `AVG`
+//! / `MIN` / `MAX` / `FIRST` / `LAST`. A window call is
+//! `fn(args) OVER ([PARTITION BY term, ...] [ORDER BY ordering_key]
+//! [ROWS|RANGE BETWEEN n|UNBOUNDED PRECEDING AND CURRENT ROW])`: the
+//! frame may be omitted for the whole partition, `LAG`/`LEAD` take no
+//! frame at all, an unordered partition ranks peers within one instant,
+//! and a scalar expression may be written over a window result (#94).
+//!
+//! Everything else — extra joins, subqueries, CTEs, frame shapes
+//! outside the two above — is rejected with a message naming what was
+//! rejected. The rejection is scope honesty, not a parser limit: what
+//! the inclusion principle admits arrives through this same lowering.
+//! The per-item documentation below is the authority on any detail;
+//! this block is the shape.
 
 use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;
@@ -91,26 +102,128 @@ pub enum PlanItem {
     Computed {
         /// The expression.
         expr: ScalarExpr,
+        /// The window calls hoisted out of `expr`, in the order
+        /// [`ScalarExpr::Window`] indexes them.
+        windows: Vec<WindowCall>,
         /// The output column name: the alias, or the expression's SQL
         /// text when unaliased.
         name: String,
     },
-    /// A window aggregate over a trailing frame.
-    WindowAgg {
+    /// A window call, whole: `sum(x) OVER (...)` as a SELECT item.
+    Window {
+        /// What to compute.
+        call: WindowCall,
+        /// Output name, if aliased.
+        alias: Option<String>,
+    },
+}
+
+/// One window call — an aggregate over a frame, or a positional
+/// lookup. Shared by the whole-item form ([`PlanItem::Window`]) and by
+/// calls hoisted out of a scalar expression, so composing a window into
+/// arithmetic reuses the call rather than restating it.
+#[derive(Clone, PartialEq, Debug)]
+pub enum WindowCall {
+    /// An aggregate over the frame: `sum(x) OVER (...)`.
+    Agg {
         /// Function name, lower-cased (resolved against the registry).
         function: String,
         /// Argument column names, in call order.
         args: Vec<String>,
-        /// PARTITION BY column (a key column), if present.
-        partition_by: Option<String>,
-        /// ORDER BY column — must be the data's ordering key.
-        order_by: String,
-        /// Frame start: this many rows preceding (`None` = UNBOUNDED
-        /// PRECEDING), through the current row.
-        preceding: Option<usize>,
-        /// Output name, if aliased.
-        alias: Option<String>,
+        /// PARTITION BY terms, in order (empty = one partition over
+        /// the whole snapshot). Each is a symbol column (the
+        /// time-series direction, one partition per symbol) or the
+        /// ordering key / a bucket of it (the cross-sectional
+        /// direction, one partition per instant); several together give
+        /// the intersection — `PARTITION BY sym, ts / 60` is one
+        /// partition per symbol per bar.
+        partition_by: Vec<GroupKey>,
+        /// ORDER BY column — must be the data's ordering key. `None`
+        /// for a cross-sectional window, which has no order *within*
+        /// an instant and therefore takes the whole partition as its
+        /// frame.
+        order_by: Option<String>,
+        /// What rows the frame covers (see [`Frame`]).
+        frame: Frame,
     },
+    /// `LAG(x, k)` / `LEAD(x, k)` — a positional lookup, **not** an
+    /// aggregate: it reads another *row* rather than reducing a frame,
+    /// which is why standard SQL gives it no frame clause and why it
+    /// carries the source column's type instead of computing in `f64`.
+    Value {
+        /// `true` for `LEAD` (look forward), `false` for `LAG`.
+        lead: bool,
+        /// The column read.
+        column: String,
+        /// How many rows away, `>= 1`.
+        offset: usize,
+        /// PARTITION BY terms (see [`WindowCall::Agg`]).
+        partition_by: Vec<GroupKey>,
+        /// ORDER BY column — must be the data's ordering key. Required
+        /// here: a positional lookup with no order has no meaning.
+        order_by: String,
+    },
+}
+
+impl WindowCall {
+    /// The output name this call takes when the query writes no alias.
+    pub fn default_name(&self) -> &str {
+        match self {
+            WindowCall::Agg { function, .. } => function,
+            WindowCall::Value { lead: true, .. } => "lead",
+            WindowCall::Value { lead: false, .. } => "lag",
+        }
+    }
+
+    /// Every stored column this call reads.
+    pub fn columns(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        match self {
+            WindowCall::Agg {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                names.extend(args.iter().cloned());
+                names.extend(order_by.iter().cloned());
+                names.extend(partition_by.iter().map(|key| key.column().to_owned()));
+            }
+            WindowCall::Value {
+                column,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                names.push(column.clone());
+                names.push(order_by.clone());
+                names.extend(partition_by.iter().map(|key| key.column().to_owned()));
+            }
+        }
+        names
+    }
+}
+
+/// A window's frame — what rows one output row sees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Frame {
+    /// `ROWS BETWEEN n PRECEDING AND CURRENT ROW`, `None` = UNBOUNDED:
+    /// a **row count**, uniform across the column.
+    Rows(Option<usize>),
+    /// `RANGE BETWEEN v PRECEDING AND CURRENT ROW`: every row whose
+    /// ordering key is within `v` of the current row's — a **value**
+    /// span, so the row count varies from row to row.
+    ///
+    /// The bound is in the ordering key's own units (there is no
+    /// `INTERVAL` type — a five-minute span over nanosecond stamps is
+    /// `300000000000`), and it is unsigned because a frame extends
+    /// backward from the current row.
+    Range(u64),
+    /// The **whole partition** — what standard SQL gives a window with
+    /// no `ORDER BY`, and what a cross-sectional statistic wants: every
+    /// row of the instant sees every other row of it, so there is no
+    /// "before" and no frame arithmetic to do.
+    Partition,
 }
 
 /// A scalar arithmetic operator.
@@ -175,6 +288,17 @@ impl ScalarFunction {
 pub enum ScalarExpr {
     /// A stored `f64` column's value.
     Column(String),
+    /// One of this item's window calls, by position in its `windows`
+    /// list — the placeholder a window call leaves behind when it is
+    /// hoisted out of a scalar expression (#94).
+    ///
+    /// Hoisting is how standard SQL's evaluation order is honoured
+    /// rather than reimplemented: windows compute over the whole
+    /// partition first, and the SELECT list's arithmetic then runs over
+    /// their results, one row at a time. A window cannot be evaluated
+    /// row-by-row from inside a scalar, because its partition spans
+    /// segments the scalar walks one at a time.
+    Window(usize),
     /// A numeric literal.
     Literal(f64),
     /// Unary minus.
@@ -229,6 +353,10 @@ pub enum AggFunction {
     Min,
     /// `MAX(col)`.
     Max,
+    /// `FIRST(col)` — the value at the group's earliest ordering key.
+    First,
+    /// `LAST(col)` — the value at the group's latest ordering key.
+    Last,
 }
 
 impl AggFunction {
@@ -239,6 +367,14 @@ impl AggFunction {
             "avg" => Some(AggFunction::Avg),
             "min" => Some(AggFunction::Min),
             "max" => Some(AggFunction::Max),
+            // The de-facto TSDB names (ruled (a) 2026-07-29). There is
+            // no ISO spelling, but every time-series engine that has
+            // this concept calls it this, and it is well defined here
+            // for the reason it is ill defined in general SQL: the
+            // ordering key is declared, so "first" is not a question
+            // about physical row order.
+            "first" => Some(AggFunction::First),
+            "last" => Some(AggFunction::Last),
             _ => None,
         }
     }
@@ -261,13 +397,73 @@ pub enum AggItem {
     /// A GROUP BY key, passed through (must appear in the GROUP BY
     /// list).
     Key {
-        /// The key column.
-        name: String,
+        /// What the group is keyed on.
+        key: GroupKey,
         /// Output name, if aliased.
         alias: Option<String>,
     },
     /// An aggregate call.
     Call(AggCall),
+}
+
+/// One `GROUP BY` term.
+///
+/// The planner has no schema, so it cannot tell a symbol column from
+/// the ordering key — both are bare identifiers. It records the
+/// *shape* and the executor, which knows the column types and which
+/// column ingest is ordered on, decides what the shape means.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GroupKey {
+    /// A bare column: a symbol column (grouped by value) or the
+    /// declared ordering key (grouped by its integer value).
+    Column(String),
+    /// A time bucket — monotone integer arithmetic on the ordering key
+    /// (F1 = d, ruled 2026-07-29): `ts / 60` is the bucket index and
+    /// `(ts / 60) * 60` the bucket's start. Because the arithmetic is
+    /// monotone on a column the data is already clustered by, the
+    /// buckets come out in order and grouping streams.
+    ///
+    /// The executor refuses this on any column but the ordering key:
+    /// on anything else the arithmetic proves nothing about order.
+    Bucket {
+        /// The column the arithmetic reads (must be the ordering key).
+        column: String,
+        /// The divisor — the bucket width, in the key's own units.
+        /// Positive; `1` for a bare `ts` read as a bucket.
+        divide: i64,
+        /// The multiplier that turns a bucket index back into the
+        /// bucket's start value, when the query wrote one.
+        multiply: Option<i64>,
+    },
+}
+
+impl GroupKey {
+    /// The column this term reads.
+    pub fn column(&self) -> &str {
+        match self {
+            GroupKey::Column(name) | GroupKey::Bucket { column: name, .. } => name,
+        }
+    }
+
+    /// The output name when the query writes no alias: the column's own
+    /// name, or the bucket arithmetic in canonical form (`ts / 60`,
+    /// `(ts / 60) * 60`) — whatever spacing the query used. Alias a
+    /// bucket to name it anything else.
+    pub fn output_name(&self) -> String {
+        match self {
+            GroupKey::Column(name) => name.clone(),
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply: None,
+            } => format!("{column} / {divide}"),
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply: Some(multiply),
+            } => format!("({column} / {divide}) * {multiply}"),
+        }
+    }
 }
 
 /// What the SELECT list computes.
@@ -277,8 +473,8 @@ pub enum Projection {
     Items(Vec<PlanItem>),
     /// `GROUP BY` keys and aggregate calls, one output row per group.
     Aggregate {
-        /// The GROUP BY key columns (empty = one global group).
-        keys: Vec<String>,
+        /// The GROUP BY terms (empty = one global group).
+        keys: Vec<GroupKey>,
         /// The SELECT list.
         items: Vec<AggItem>,
         /// The `HAVING` filter, if present.
@@ -325,6 +521,32 @@ pub struct JoinPlan {
     /// `true` for LEFT (unmatched fact rows keep null dimension cells);
     /// `false` for INNER (unmatched fact rows drop).
     pub left: bool,
+    /// `Some` when the query wrote `ASOF LEFT JOIN` / `ASOF INNER
+    /// JOIN` (#65): match each fact row to the dimension's most recent
+    /// row at-or-before it on the two tables' declared ordering keys,
+    /// within the `ON` equality's partition.
+    pub as_of: Option<AsOfMatch>,
+    /// The two columns an explicit `ASOF` inequality named, if the
+    /// query wrote one: `(fact side, dimension side)`. The planner has
+    /// no schemas, so it only checks their *shape*; the executor —
+    /// which knows the declared ordering keys — is what checks they
+    /// name the time axis, and refuses with a teaching error if not.
+    pub as_of_named: Option<(String, String)>,
+}
+
+/// One side of a join's `ON` comparison: its table qualifier, if the
+/// query wrote one, and its column name.
+type OnSide = (Option<String>, String);
+
+/// How an as-of join compares the two ordering keys (#65: the operator
+/// is what the user's explicit inequality selects, `>=` by default).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AsOfMatch {
+    /// The dimension row's key is **at or before** the fact's — the
+    /// default, and what `q.ts <= t.ts` spells.
+    AtOrBefore,
+    /// Strictly before, which `q.ts < t.ts` spells.
+    StrictlyBefore,
 }
 
 /// The SELECT plan.
@@ -387,16 +609,12 @@ impl Plan {
                         PlanItem::Column { name, .. } => {
                             names.insert(name.clone());
                         }
-                        PlanItem::Computed { expr, .. } => scalar_columns(expr, &mut names),
-                        PlanItem::WindowAgg {
-                            args,
-                            partition_by,
-                            order_by,
-                            ..
-                        } => {
-                            names.extend(args.iter().cloned());
-                            names.extend(partition_by.iter().cloned());
-                            names.insert(order_by.clone());
+                        PlanItem::Computed { expr, windows, .. } => {
+                            scalar_columns(expr, &mut names);
+                            names.extend(windows.iter().flat_map(WindowCall::columns));
+                        }
+                        PlanItem::Window { call, .. } => {
+                            names.extend(call.columns());
                         }
                     }
                 }
@@ -406,11 +624,11 @@ impl Plan {
                 items,
                 having,
             } => {
-                names.extend(keys.iter().cloned());
+                names.extend(keys.iter().map(|key| key.column().to_owned()));
                 let agg_item =
                     |item: &AggItem, names: &mut std::collections::HashSet<String>| match item {
-                        AggItem::Key { name, .. } => {
-                            names.insert(name.clone());
+                        AggItem::Key { key, .. } => {
+                            names.insert(key.column().to_owned());
                         }
                         AggItem::Call(call) => names.extend(call.argument.iter().cloned()),
                     };
@@ -432,6 +650,10 @@ impl Plan {
 /// Every column name a predicate tests.
 fn predicate_columns(predicate: &Predicate, names: &mut std::collections::HashSet<String>) {
     match predicate {
+        Predicate::CompareExpr { left, right, .. } => {
+            scalar_columns(left, names);
+            scalar_columns(right, names);
+        }
         Predicate::Compare { column, .. }
         | Predicate::KeyEquals { column, .. }
         | Predicate::KeyLike { column, .. }
@@ -454,7 +676,9 @@ fn scalar_columns(expr: &ScalarExpr, names: &mut std::collections::HashSet<Strin
         ScalarExpr::Column(name) => {
             names.insert(name.clone());
         }
-        ScalarExpr::Literal(_) => {}
+        // A hoisted window's own columns are collected from the
+        // item's `windows` list, not from here.
+        ScalarExpr::Literal(_) | ScalarExpr::Window(_) => {}
         ScalarExpr::Negate(inner) => scalar_columns(inner, names),
         ScalarExpr::Binary { left, right, .. } => {
             scalar_columns(left, names);
@@ -903,23 +1127,19 @@ fn is_create_table(sql: &str) -> bool {
 }
 
 /// Splits the knowledge-time clause out of the SQL text before parsing:
-/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
-/// keyword followed by `JOIN` and is left alone) and the SQL:2011
-/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
-/// as known at ingest sequence n". Returns the SQL with the clause
-/// spliced out (`None` when the text held no clause — untouched input is
-/// never rewritten) and the cut it named. The two-word near-miss
-/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
-/// alias named OF), so it gets a teaching error instead of a puzzle.
-fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
-    // Shallow tokenization, recording each token's byte span: quoted runs
-    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
-    // string literal can look like a clause; comments are skipped whole so
-    // nothing inside one does either; hugging punctuation splits off so
-    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
-    // ORIGINAL text (below), never reassembled from tokens — reassembly
-    // would collapse the newline that terminates a `--` comment and
-    // silently comment out the rest of the statement.
+/// Shallow tokenization with byte spans, shared by every pre-parse
+/// lift. Quoted runs (`'…'` with `''` escapes, `"…"`) stay single
+/// tokens so nothing inside a string literal can look like a clause;
+/// comments are skipped whole so nothing inside one does either;
+/// hugging punctuation splits off so `ASOF 5,` scans.
+///
+/// **Spans are the point.** A lift splices its clause out of the
+/// ORIGINAL text using these spans, never reassembling the statement
+/// from tokens — reassembly collapses the newline that terminates a
+/// `--` comment and silently comments out the rest of the statement.
+/// That was a real bug (found at the M4 close), and it is why every
+/// new lift must come through here.
+fn tokenize_with_spans(sql: &str) -> (Vec<&str>, Vec<(usize, usize)>, Vec<String>) {
     let mut tokens: Vec<&str> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut chars = sql.char_indices().peekable();
@@ -983,6 +1203,84 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
+    (tokens, spans, lower)
+}
+
+/// Lifts the `ASOF` token that *precedes a join* (#65's hybrid: the
+/// grammar is ClickHouse's, the authority is our schema). The token is
+/// spliced out by byte span and the remainder parses as an ordinary
+/// join, which is why no fork of sqlparser is needed — verified
+/// 2026-07-29: sqlparser 0.62 parses only Snowflake's `MATCH_CONDITION`
+/// form and DuckDB accepts only its own `ON` form, and the two accepted
+/// sets are disjoint, so neither spelling could be borrowed.
+///
+/// Runs **before** [`extract_as_of`], because `ASOF LEFT JOIN` would
+/// otherwise look like the time-travel clause with `LEFT` as its cut.
+///
+/// Bare `ASOF JOIN` is refused: bare as-of semantics are a genuine
+/// vendor divergence, so the user says which they mean. (Standing
+/// revisit flagged by the Human 2026-07-30 — see #65.)
+fn extract_asof_join(sql: &str) -> Result<(Option<String>, bool), QueryError> {
+    let (_, spans, lower) = tokenize_with_spans(sql);
+    let mut found: Option<(usize, usize)> = None;
+    for index in 0..lower.len() {
+        if lower[index] != "asof" {
+            continue;
+        }
+        match lower.get(index + 1).map(String::as_str) {
+            Some("join") => {
+                return Err(QueryError::Unsupported(
+                    "bare ASOF JOIN — write ASOF LEFT JOIN (keep unmatched fact rows, \
+                     null-padded) or ASOF INNER JOIN (drop them). Vendors disagree on \
+                     what a bare as-of join means, so this engine makes you say it"
+                        .to_owned(),
+                ));
+            }
+            Some("left") | Some("inner") => {
+                // `ASOF LEFT JOIN` / `ASOF INNER JOIN` — and only those:
+                // `ASOF LEFT` with no JOIN is not a join at all, and
+                // falls through to the time-travel lift's own error.
+                if lower.get(index + 2).map(String::as_str) != Some("join") {
+                    continue;
+                }
+                if found.is_some() {
+                    return Err(QueryError::Unsupported(
+                        "one ASOF join per query".to_owned(),
+                    ));
+                }
+                found = Some(spans[index]);
+            }
+            _ => continue,
+        }
+    }
+    let Some((start, end)) = found else {
+        return Ok((None, false));
+    };
+    let mut rewritten = String::with_capacity(sql.len());
+    rewritten.push_str(&sql[..start]);
+    rewritten.push_str(&sql[end..]);
+    Ok((Some(rewritten), true))
+}
+
+/// `ASOF <n>` (the engine's one-word spelling — `ASOF JOIN` is the same
+/// keyword followed by `JOIN` and is left alone) and the SQL:2011
+/// `FOR SYSTEM_TIME AS OF <n>`, both accepted, both meaning "the table
+/// as known at ingest sequence n". Returns the SQL with the clause
+/// spliced out (`None` when the text held no clause — untouched input is
+/// never rewritten) and the cut it named. The two-word near-miss
+/// `AS OF <n>` collides with SQL's alias grammar (`AS OF` parses as an
+/// alias named OF), so it gets a teaching error instead of a puzzle.
+fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError> {
+    // Shallow tokenization, recording each token's byte span: quoted runs
+    // ('…' with '' escapes, "…") stay single tokens so nothing inside a
+    // string literal can look like a clause; comments are skipped whole so
+    // nothing inside one does either; hugging punctuation splits off so
+    // `ASOF 5,` scans. Spans matter: the clause is spliced out of the
+    // ORIGINAL text (below), never reassembled from tokens — reassembly
+    // would collapse the newline that terminates a `--` comment and
+    // silently comment out the rest of the statement.
+    let (tokens, spans, lower) = tokenize_with_spans(sql);
+
     let parse_cut = |token: &str| -> Result<u64, QueryError> {
         token.parse::<u64>().map_err(|_| {
             QueryError::Unsupported(format!(
@@ -1055,6 +1353,16 @@ fn extract_as_of(sql: &str) -> Result<(Option<String>, Option<u64>), QueryError>
 }
 
 pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
+    // The as-of JOIN lift runs first: `ASOF LEFT JOIN` would otherwise
+    // read as the time-travel clause with `LEFT` as its cut.
+    let joined;
+    let (sql, asof_join) = match extract_asof_join(sql)? {
+        (Some(rewritten), flag) => {
+            joined = rewritten;
+            (joined.as_str(), flag)
+        }
+        (None, flag) => (sql, flag),
+    };
     let stripped;
     let (sql, as_of) = match extract_as_of(sql)? {
         (Some(cleaned), cut) => {
@@ -1085,7 +1393,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, QueryError> {
     }
     match statement {
         ast::Statement::Query(query) => {
-            let mut plan = lower_query(query)?;
+            let mut plan = lower_query(query, asof_join)?;
             if as_of.is_some() {
                 if plan.join.is_some() {
                     return Err(QueryError::Unsupported(
@@ -1144,7 +1452,7 @@ fn lower_update(update: &ast::Update) -> Result<UpdatePlan, QueryError> {
     if assignments.is_empty() {
         return Err(QueryError::Unsupported("UPDATE without SET".to_owned()));
     }
-    let predicate = update.selection.as_ref().map(lower_predicate).transpose()?;
+    let predicate = lower_row_predicate(update.selection.as_ref())?;
     Ok(UpdatePlan {
         table,
         assignments,
@@ -1217,14 +1525,14 @@ fn lower_delete(delete: &ast::Delete) -> Result<DeletePlan, QueryError> {
             "DELETE target must be a plain table".to_owned(),
         ));
     };
-    let predicate = delete.selection.as_ref().map(lower_predicate).transpose()?;
+    let predicate = lower_row_predicate(delete.selection.as_ref())?;
     Ok(DeletePlan {
         table: object_name(name)?,
         predicate,
     })
 }
 
-fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {
+fn lower_query(query: &ast::Query, asof_join: bool) -> Result<Plan, QueryError> {
     if query.with.is_some() {
         return Err(QueryError::Unsupported("WITH / CTEs".to_owned()));
     }
@@ -1235,7 +1543,7 @@ fn lower_query(query: &ast::Query) -> Result<Plan, QueryError> {
             "set operations / VALUES".to_owned(),
         ));
     };
-    let mut plan = lower_select(select)?;
+    let mut plan = lower_select(select, asof_join)?;
     plan.order_by = order_by;
     plan.limit = limit;
     plan.offset = offset;
@@ -1309,7 +1617,7 @@ fn lower_limit(
     Ok((limit, offset))
 }
 
-fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
+fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryError> {
     let distinct = match &select.distinct {
         None | Some(ast::Distinct::All) => false,
         Some(ast::Distinct::Distinct) => true,
@@ -1335,7 +1643,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
     // front after validating their qualifier, so the rest of the
     // lowering — and the executor's joined schema — see plain names.
     let (join, projection_exprs, selection_expr) =
-        match lower_join(&table, fact_alias.as_deref(), joins)? {
+        match lower_join(&table, fact_alias.as_deref(), joins, asof_join)? {
             Some((plan, dimension_alias)) => {
                 let mut known: Vec<&str> = vec![&table, &plan.dimension];
                 if let Some(alias) = &fact_alias {
@@ -1359,8 +1667,8 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
             None => (None, select.projection.clone(), select.selection.clone()),
         };
     let select_projection = &projection_exprs;
-    let predicate = selection_expr.as_ref().map(lower_predicate).transpose()?;
-    let keys = lower_group_by(&select.group_by)?;
+    let predicate = lower_row_predicate(selection_expr.as_ref())?;
+    let keys = resolve_group_aliases(lower_group_by(&select.group_by)?, select_projection);
     // An aggregate projection is signaled by GROUP BY or by any plain
     // (no OVER) call to a standard aggregate in the SELECT list.
     let aggregate_shaped = !keys.is_empty()
@@ -1388,7 +1696,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
                 let rewritten = extract_having_calls(expr, &mut hidden)?;
                 Ok::<Having, QueryError>(Having {
                     items: hidden,
-                    predicate: crate::predicate::lower_predicate(&rewritten)?,
+                    predicate: lower_row_predicate(Some(&rewritten))?.expect("Some in"),
                 })
             })
             .transpose()?;
@@ -1397,7 +1705,7 @@ fn lower_select(select: &ast::Select) -> Result<Plan, QueryError> {
             // ones; a visible column occupying a `__having` name would
             // shadow the filter's target and filter on the wrong value.
             let output_name = |item: &AggItem| match item {
-                AggItem::Key { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+                AggItem::Key { key, alias } => alias.clone().unwrap_or_else(|| key.output_name()),
                 AggItem::Call(call) => call.alias.clone().unwrap_or_default(),
             };
             if let Some(taken) = items
@@ -1543,6 +1851,7 @@ fn lower_join(
     fact: &str,
     fact_alias: Option<&str>,
     joins: &[ast::Join],
+    asof_join: bool,
 ) -> Result<Option<(JoinPlan, Option<String>)>, QueryError> {
     match joins {
         [] => Ok(None),
@@ -1573,19 +1882,31 @@ fn lower_join(
             };
             let dimension = object_name(name)?;
             let dimension_alias = alias.as_ref().map(|alias| ident(&alias.name));
-            // ON: an equality of two (possibly qualified) columns, one
-            // per side, in either order.
+            // ON: the equality of two (possibly qualified) columns —
+            // and, for an as-of join only, an optional second conjunct
+            // naming the time axis explicitly.
+            let (equality, inequality) = match on {
+                ast::Expr::BinaryOp {
+                    left,
+                    op: ast::BinaryOperator::And,
+                    right,
+                } if asof_join => (left.as_ref(), Some(right.as_ref())),
+                other => (other, None),
+            };
             let ast::Expr::BinaryOp {
                 left: on_left,
                 op: ast::BinaryOperator::Eq,
                 right: on_right,
-            } = on
+            } = equality
             else {
-                return Err(QueryError::Unsupported(
-                    "JOIN ON must be a single equality".to_owned(),
-                ));
+                return Err(QueryError::Unsupported(if asof_join {
+                    "ASOF JOIN ON must start with the partition equality                      (fact.key = dim.key), optionally AND an inequality on the                      ordering keys"
+                        .to_owned()
+                } else {
+                    "JOIN ON must be a single equality".to_owned()
+                }));
             };
-            let side = |expr: &ast::Expr| -> Result<(Option<String>, String), QueryError> {
+            let side = |expr: &ast::Expr| -> Result<OnSide, QueryError> {
                 match expr {
                     ast::Expr::Identifier(column) => Ok((None, ident(column))),
                     ast::Expr::CompoundIdentifier(parts) => match parts.as_slice() {
@@ -1599,12 +1920,24 @@ fn lower_join(
                     ))),
                 }
             };
-            let (left_side, right_side) = (side(on_left)?, side(on_right)?);
             let is_fact = |qualifier: &Option<String>| {
                 qualifier
                     .as_ref()
                     .map(|name| name == fact || fact_alias.is_some_and(|alias| name == alias))
             };
+            // The time axis: implicit (at-or-before) unless the query
+            // spells an inequality, which is VALIDATED rather than
+            // obeyed — it must name the two tables' ordering keys, and
+            // all it selects is >= versus >.
+            let (as_of, as_of_named) = match (asof_join, inequality) {
+                (false, _) => (None, None),
+                (true, None) => (Some(AsOfMatch::AtOrBefore), None),
+                (true, Some(expr)) => {
+                    let (matching, named) = lower_asof_inequality(expr, &side, &is_fact)?;
+                    (Some(matching), Some(named))
+                }
+            };
+            let (left_side, right_side) = (side(on_left)?, side(on_right)?);
             // Assign sides: qualified names decide; two unqualified
             // names are ambiguous only if they can't be told apart —
             // require at least one qualifier.
@@ -1627,6 +1960,8 @@ fn lower_join(
                     fact_key,
                     dimension_key,
                     left,
+                    as_of,
+                    as_of_named,
                 },
                 dimension_alias,
             )))
@@ -1637,7 +1972,144 @@ fn lower_join(
     }
 }
 
-fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError> {
+/// Validates an as-of join's explicit time-axis inequality. The
+/// engine already knows the axis — it is the two tables' declared
+/// ordering keys — so this neither chooses columns nor reorders
+/// anything: it checks that what the user wrote agrees with the
+/// schema, and reads off which comparison they meant.
+///
+/// Written dimension-first (`q.ts <= t.ts`) or fact-first
+/// (`t.ts >= q.ts`); both say the same thing. Which side is the fact is
+/// read from the qualifiers, never from the operator — otherwise
+/// `t.ts <= q.ts`, which asks for the quote *after* each trade, would
+/// be silently answered with the one before it.
+///
+/// Returns the comparison and the two column names it used, fact side
+/// first, for the executor to check against the declared ordering keys.
+fn lower_asof_inequality(
+    expr: &ast::Expr,
+    side: &dyn Fn(&ast::Expr) -> Result<OnSide, QueryError>,
+    is_fact: &dyn Fn(&Option<String>) -> Option<bool>,
+) -> Result<(AsOfMatch, (String, String)), QueryError> {
+    let ast::Expr::BinaryOp { left, op, right } = expr else {
+        return Err(QueryError::Unsupported(
+            "ASOF JOIN's second ON conjunct must compare the two ordering keys".to_owned(),
+        ));
+    };
+    let (left_side, right_side) = (side(left)?, side(right)?);
+    let fact_on_left = match (is_fact(&left_side.0), is_fact(&right_side.0)) {
+        (Some(true), Some(false)) | (Some(true), None) | (None, Some(false)) => true,
+        (Some(false), Some(true)) | (None, Some(true)) | (Some(false), None) => false,
+        _ => {
+            return Err(QueryError::Unsupported(
+                "qualify at least one side of ASOF JOIN's time comparison, so it \
+                 says which table each ordering key belongs to (fact.ts >= dim.ts)"
+                    .to_owned(),
+            ))
+        }
+    };
+    // The operator says two things: which way the comparison points,
+    // and whether an exactly-equal timestamp counts. Only the second is
+    // ours to obey.
+    let (left_is_later, matching) = match op {
+        ast::BinaryOperator::GtEq => (true, AsOfMatch::AtOrBefore),
+        ast::BinaryOperator::Gt => (true, AsOfMatch::StrictlyBefore),
+        ast::BinaryOperator::LtEq => (false, AsOfMatch::AtOrBefore),
+        ast::BinaryOperator::Lt => (false, AsOfMatch::StrictlyBefore),
+        other => {
+            return Err(QueryError::Unsupported(format!(
+                "ASOF JOIN's time comparison is '{other}' — it must be one of \
+                 <=, <, >=, > (which one only selects whether an exactly-equal \
+                 timestamp matches)"
+            )))
+        }
+    };
+    // An as-of join looks *backwards*: the fact's clock is the later
+    // one. Written the other way round, the query is asking for the
+    // dimension row that comes after — a different question, and one
+    // worth refusing rather than quietly answering the reverse of.
+    if left_is_later != fact_on_left {
+        return Err(QueryError::Unsupported(format!(
+            "ASOF JOIN's time comparison puts the {} row at or after the {} one \
+             — an as-of join looks backwards, so write it the other way round \
+             (fact.ts >= dim.ts)",
+            if fact_on_left { "dimension" } else { "fact" },
+            if fact_on_left { "fact" } else { "dimension" },
+        )));
+    }
+    let named = if fact_on_left {
+        (left_side.1, right_side.1)
+    } else {
+        (right_side.1, left_side.1)
+    };
+    Ok((matching, named))
+}
+
+/// A predicate in row position — `WHERE`, `HAVING`'s row half, an
+/// `UPDATE`/`DELETE` filter — where a window call is not merely
+/// unsupported but meaningless: standard SQL evaluates these before the
+/// window phase, so there is no window result yet to compare against.
+/// Refused by name rather than silently mis-scoped.
+fn lower_row_predicate(expr: Option<&ast::Expr>) -> Result<Option<Predicate>, QueryError> {
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    let mut windows = Vec::new();
+    let predicate = lower_predicate(expr, &mut windows)?;
+    if !windows.is_empty() {
+        return Err(QueryError::Unsupported(
+            "a window call in WHERE — standard SQL runs WHERE before the \
+             window phase, so there is no window result to test yet"
+                .to_owned(),
+        ));
+    }
+    // A registered kernel sees the query's rows as ONE column, which a
+    // predicate cannot give it: WHERE is evaluated per segment, to
+    // build each view's live mask, so a kernel with running semantics
+    // would restart at every boundary and the answer would depend on
+    // how the rows happened to be split. Before expression comparisons
+    // (#95) a call could not appear here at all; this keeps that.
+    if predicate_calls_a_kernel(&predicate) {
+        return Err(QueryError::Unsupported(
+            "a registered function in a row filter — it must see the query's \
+             rows as one column, and a filter is evaluated per segment; \
+             compute it in the SELECT list and filter on that"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(predicate))
+}
+
+/// Whether any expression comparison in `predicate` calls a registered
+/// kernel. Only [`Predicate::CompareExpr`] can hold one; every other
+/// leaf compares a stored column to a literal.
+fn predicate_calls_a_kernel(predicate: &Predicate) -> bool {
+    fn in_expr(expr: &ScalarExpr) -> bool {
+        match expr {
+            ScalarExpr::Registered { .. } => true,
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Window(_) => false,
+            ScalarExpr::Negate(inner) => in_expr(inner),
+            ScalarExpr::Binary { left, right, .. } => in_expr(left) || in_expr(right),
+            ScalarExpr::Call { args, .. } => args.iter().any(in_expr),
+            ScalarExpr::Case { whens, otherwise } => {
+                whens
+                    .iter()
+                    .any(|(condition, value)| predicate_calls_a_kernel(condition) || in_expr(value))
+                    || otherwise.as_deref().is_some_and(in_expr)
+            }
+        }
+    }
+    match predicate {
+        Predicate::CompareExpr { left, right, .. } => in_expr(left) || in_expr(right),
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_calls_a_kernel(left) || predicate_calls_a_kernel(right)
+        }
+        Predicate::Not(inner) => predicate_calls_a_kernel(inner),
+        _ => false,
+    }
+}
+
+fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<GroupKey>, QueryError> {
     let ast::GroupByExpr::Expressions(exprs, modifiers) = group_by else {
         return Err(QueryError::Unsupported("GROUP BY ALL".to_owned()));
     };
@@ -1646,18 +2118,155 @@ fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<String>, QueryError
             "GROUP BY ROLLUP / CUBE / GROUPING SETS".to_owned(),
         ));
     }
-    exprs
-        .iter()
-        .map(|expr| match expr {
-            ast::Expr::Identifier(column) => Ok(ident(column)),
-            other => Err(QueryError::Unsupported(format!(
-                "GROUP BY '{other}' (plain key columns only)"
-            ))),
+    exprs.iter().map(lower_group_key).collect()
+}
+
+/// Lets `GROUP BY` name a bucket by the alias the SELECT list gave it:
+/// `SELECT ts / 60 AS bar … GROUP BY bar` rather than repeating the
+/// arithmetic. PostgreSQL and DuckDB both accept the output name here,
+/// so this follows convention rather than coining.
+///
+/// Deliberately narrow: only an alias whose expression is a **bucket**
+/// is substituted. Aliases of plain columns are left alone, because
+/// there the alias and the column mean the same thing anyway and
+/// substituting could only introduce a way to disagree. If a stored
+/// column shares a bucket alias's name the alias wins — which is what
+/// PostgreSQL does, and the query said the name after writing it.
+fn resolve_group_aliases(keys: Vec<GroupKey>, projection: &[ast::SelectItem]) -> Vec<GroupKey> {
+    let aliased = |name: &str| -> Option<GroupKey> {
+        projection.iter().find_map(|item| {
+            let ast::SelectItem::ExprWithAlias { expr, alias } = item else {
+                return None;
+            };
+            if ident(alias) != name {
+                return None;
+            }
+            match lower_group_key(expr) {
+                Ok(key @ GroupKey::Bucket { .. }) => Some(key),
+                _ => None,
+            }
+        })
+    };
+    keys.into_iter()
+        .map(|key| match &key {
+            GroupKey::Column(name) => aliased(name).unwrap_or(key),
+            GroupKey::Bucket { .. } => key,
         })
         .collect()
 }
 
-fn lower_agg_item(item: &ast::SelectItem, keys: &[String]) -> Result<AggItem, QueryError> {
+/// Lowers one `GROUP BY` term: a bare column, or the monotone integer
+/// arithmetic on the ordering key that F1 = d admits (`ts / 60`,
+/// `(ts / 60) * 60`) and nothing else.
+///
+/// "Nothing else" is the point, not a shortcut. A general expression
+/// would have to be evaluated per row into a hash table, which is the
+/// cost this whole shape exists to avoid; and a general expression over
+/// floats would make group identity float equality. So the admitted
+/// forms are recognised **structurally** — a column, integer literals,
+/// `/` then optionally `*` — and everything else keeps the teaching
+/// error.
+fn lower_group_key(expr: &ast::Expr) -> Result<GroupKey, QueryError> {
+    // `(ts / 60) * 60` — the bucket's start value. The parenthesised
+    // left side arrives as `Nested`; a query that omits the parens gets
+    // the same tree by precedence, so both spellings land here.
+    if let ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::Multiply,
+        right,
+    } = expr
+    {
+        let inner = match left.as_ref() {
+            ast::Expr::Nested(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let GroupKey::Bucket {
+            column,
+            divide,
+            multiply: None,
+        } = lower_group_key(inner)?
+        {
+            return Ok(GroupKey::Bucket {
+                column,
+                divide,
+                multiply: Some(bucket_literal(right)?),
+            });
+        }
+        return Err(QueryError::Unsupported(format!(
+            "GROUP BY '{expr}' — the only arithmetic GROUP BY admits is a \
+             bucket of the ordering key: ts / <width>, or (ts / <width>) * \
+             <width> for the bucket's start"
+        )));
+    }
+    match expr {
+        ast::Expr::Identifier(column) => Ok(GroupKey::Column(ident(column))),
+        ast::Expr::Nested(inner) => lower_group_key(inner),
+        // `/` and `//` both mean truncating integer division here, and
+        // that is not a fudge: a bucket divides an integer by an
+        // integer, and a DOUBLE cannot key a group, so there is exactly
+        // one meaning available in this position. Accepting both
+        // spellings means the ISO/PostgreSQL habit (`/` truncates) and
+        // the DuckDB habit (`/` is float, `//` truncates) each write
+        // what they mean and get it.
+        //
+        // It does constrain #40: when exact integer expression
+        // arithmetic reaches projection, `ts / 60` there must truncate
+        // too, or the same text would mean two things in two clauses.
+        // ISO says truncate, so that is where #40 should land anyway.
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Divide | ast::BinaryOperator::DuckIntegerDivide,
+            right,
+        } => match left.as_ref() {
+            ast::Expr::Identifier(column) => Ok(GroupKey::Bucket {
+                column: ident(column),
+                divide: bucket_literal(right)?,
+                multiply: None,
+            }),
+            other => Err(QueryError::Unsupported(format!(
+                "GROUP BY '{other} / …' — a bucket divides the ordering key \
+                 itself, not an expression"
+            ))),
+        },
+        other => Err(QueryError::Unsupported(format!(
+            "GROUP BY '{other}' (a column, or a bucket of the ordering key: \
+             ts / <width>)"
+        ))),
+    }
+}
+
+/// A bucket width or multiplier: a **positive** integer literal.
+///
+/// Positive because that is what makes the arithmetic monotone, which
+/// is the entire licence for streaming the grouping; zero would divide
+/// by zero and a negative would reverse the order the buckets come out
+/// in. In the key's own units — there is no `INTERVAL` type, so a
+/// minute over nanosecond stamps is `60000000000`.
+fn bucket_literal(expr: &ast::Expr) -> Result<i64, QueryError> {
+    let ast::Expr::Value(value) = expr else {
+        return Err(QueryError::Unsupported(format!(
+            "bucket width '{expr}' must be an integer literal"
+        )));
+    };
+    let ast::Value::Number(number, _) = &value.value else {
+        return Err(QueryError::Unsupported(format!(
+            "bucket width '{expr}' must be an integer literal"
+        )));
+    };
+    match number.parse::<i64>() {
+        Ok(width) if width > 0 => Ok(width),
+        Ok(_) => Err(QueryError::Unsupported(format!(
+            "bucket width '{number}' must be positive — a bucket's width is \
+             what makes the arithmetic monotone"
+        ))),
+        Err(_) => Err(QueryError::Unsupported(format!(
+            "bucket width '{number}' must be an integer (in the ordering \
+             key's own units — no INTERVAL type)"
+        ))),
+    }
+}
+
+fn lower_agg_item(item: &ast::SelectItem, keys: &[GroupKey]) -> Result<AggItem, QueryError> {
     let (expr, alias) = match item {
         ast::SelectItem::UnnamedExpr(expr) => (expr, None),
         ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident(alias))),
@@ -1668,14 +2277,17 @@ fn lower_agg_item(item: &ast::SelectItem, keys: &[String]) -> Result<AggItem, Qu
         }
     };
     match expr {
-        ast::Expr::Identifier(name) => {
-            let name = ident(name);
-            if !keys.contains(&name) {
+        // A bare column or a bucket: either way it must be one of the
+        // GROUP BY terms, matched as a whole — `SELECT ts / 60 … GROUP
+        // BY ts / 300` names two different buckets, not one.
+        ast::Expr::Identifier(_) | ast::Expr::BinaryOp { .. } | ast::Expr::Nested(_) => {
+            let key = lower_group_key(expr)?;
+            if !keys.contains(&key) {
                 return Err(QueryError::Unsupported(format!(
-                    "column '{name}' must appear in GROUP BY or an aggregate"
+                    "'{expr}' must appear in GROUP BY or an aggregate"
                 )));
             }
-            Ok(AggItem::Key { name, alias })
+            Ok(AggItem::Key { key, alias })
         }
         ast::Expr::Function(function) if function.over.is_none() => {
             let name = object_name(&function.name)?.to_lowercase();
@@ -1780,13 +2392,16 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
             name: ident(name),
             alias,
         }),
-        ast::Expr::Function(function) if function.over.is_some() => {
-            lower_window_call(function, alias)
-        }
+        ast::Expr::Function(function) if function.over.is_some() => Ok(PlanItem::Window {
+            call: lower_window_call(function)?,
+            alias,
+        }),
         other => {
-            let scalar = lower_scalar_expr(other)?;
+            let mut windows = Vec::new();
+            let scalar = lower_scalar_expr(other, &mut windows)?;
             Ok(PlanItem::Computed {
                 expr: scalar,
+                windows,
                 name: alias.unwrap_or_else(|| other.to_string()),
             })
         }
@@ -1796,9 +2411,12 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
 /// Lowers a scalar expression for the computed-projection slot (#49):
 /// arithmetic, the built-in scalar functions, and `CASE` with WHERE
 /// grammar conditions. Anything else is refused loudly.
-fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
+pub(crate) fn lower_scalar_expr(
+    expr: &ast::Expr,
+    windows: &mut Vec<WindowCall>,
+) -> Result<ScalarExpr, QueryError> {
     match expr {
-        ast::Expr::Nested(inner) => lower_scalar_expr(inner),
+        ast::Expr::Nested(inner) => lower_scalar_expr(inner, windows),
         ast::Expr::Identifier(name) => Ok(ScalarExpr::Column(ident(name))),
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(text, _) => {
@@ -1815,11 +2433,13 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Minus,
             expr,
-        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(expr)?))),
+        } => Ok(ScalarExpr::Negate(Box::new(lower_scalar_expr(
+            expr, windows,
+        )?))),
         ast::Expr::UnaryOp {
             op: ast::UnaryOperator::Plus,
             expr,
-        } => lower_scalar_expr(expr),
+        } => lower_scalar_expr(expr, windows),
         ast::Expr::BinaryOp { left, op, right } => {
             let op = match op {
                 ast::BinaryOperator::Plus => ArithOp::Add,
@@ -1835,16 +2455,20 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             };
             Ok(ScalarExpr::Binary {
                 op,
-                left: Box::new(lower_scalar_expr(left)?),
-                right: Box::new(lower_scalar_expr(right)?),
+                left: Box::new(lower_scalar_expr(left, windows)?),
+                right: Box::new(lower_scalar_expr(right, windows)?),
             })
         }
         ast::Expr::Function(function) => {
             let name = object_name(&function.name)?.to_lowercase();
+            // A window call inside arithmetic: hoist it, leaving a
+            // placeholder. Standard SQL computes windows first and runs
+            // the SELECT list's expressions over their results, so this
+            // honours the existing order rather than inventing one.
             if function.over.is_some() {
-                return Err(QueryError::Unsupported(
-                    "a window call inside a scalar expression".to_owned(),
-                ));
+                let call = lower_window_call(function)?;
+                windows.push(call);
+                return Ok(ScalarExpr::Window(windows.len() - 1));
             }
             let ast::FunctionArguments::List(list) = &function.args else {
                 return Err(QueryError::Unsupported(format!(
@@ -1858,7 +2482,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
                         "argument '{arg}' in {name}"
                     )));
                 };
-                args.push(lower_scalar_expr(expr)?);
+                args.push(lower_scalar_expr(expr, windows)?);
             }
             let Some((scalar, arity)) = ScalarFunction::from_name(&name) else {
                 if AggFunction::from_name(&name).is_some() {
@@ -1897,7 +2521,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             };
             Ok(ScalarExpr::Call {
                 function,
-                args: vec![lower_scalar_expr(expr)?],
+                args: vec![lower_scalar_expr(expr, windows)?],
             })
         }
         ast::Expr::Case {
@@ -1914,13 +2538,13 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
             let mut whens = Vec::with_capacity(conditions.len());
             for case_when in conditions {
                 whens.push((
-                    crate::predicate::lower_predicate(&case_when.condition)?,
-                    lower_scalar_expr(&case_when.result)?,
+                    crate::predicate::lower_predicate(&case_when.condition, windows)?,
+                    lower_scalar_expr(&case_when.result, windows)?,
                 ));
             }
             let otherwise = else_result
                 .as_ref()
-                .map(|expr| lower_scalar_expr(expr).map(Box::new))
+                .map(|expr| lower_scalar_expr(expr, windows).map(Box::new))
                 .transpose()?;
             Ok(ScalarExpr::Case { whens, otherwise })
         }
@@ -1930,10 +2554,7 @@ fn lower_scalar_expr(expr: &ast::Expr) -> Result<ScalarExpr, QueryError> {
     }
 }
 
-fn lower_window_call(
-    function: &ast::Function,
-    alias: Option<String>,
-) -> Result<PlanItem, QueryError> {
+fn lower_window_call(function: &ast::Function) -> Result<WindowCall, QueryError> {
     let name = object_name(&function.name)?.to_lowercase();
     let Some(over) = &function.over else {
         return Err(QueryError::Unsupported(format!(
@@ -1943,54 +2564,194 @@ fn lower_window_call(
     let ast::WindowType::WindowSpec(spec) = over else {
         return Err(QueryError::Unsupported("named WINDOW clauses".to_owned()));
     };
-    let args = lower_args(&function.args)?;
-    let partition_by = match spec.partition_by.as_slice() {
+    // The partition term takes the same shapes GROUP BY does: a column,
+    // or a bucket of the ordering key. Which direction the window runs
+    // in is decided by which column it names — down one symbol through
+    // time, or across every symbol at one instant.
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|expr| {
+            lower_group_key(expr).map_err(|_| {
+                QueryError::Unsupported(format!(
+                    "PARTITION BY '{expr}' — a column, or a bucket of the ordering \
+                     key (ts / <width>) for a cross-sectional window"
+                ))
+            })
+        })
+        .collect::<Result<Vec<GroupKey>, QueryError>>()?;
+    // ORDER BY is optional, and its absence is meaningful rather than
+    // sloppy: standard SQL gives an unordered window the whole
+    // partition as its frame, which is exactly a cross-sectional
+    // statistic — every row of the instant against every other.
+    let order_column = match spec.order_by.as_slice() {
         [] => None,
-        [ast::Expr::Identifier(column)] => Some(ident(column)),
+        [order] => {
+            let ast::Expr::Identifier(column) = &order.expr else {
+                return Err(QueryError::Unsupported(
+                    "ORDER BY must be a plain column".to_owned(),
+                ));
+            };
+            if order.options.asc == Some(false) {
+                return Err(QueryError::Unsupported("ORDER BY ... DESC".to_owned()));
+            }
+            Some(ident(column))
+        }
         _ => {
             return Err(QueryError::Unsupported(
-                "PARTITION BY must be a single column".to_owned(),
+                "ORDER BY must be a single column".to_owned(),
             ))
         }
     };
-    let [order] = spec.order_by.as_slice() else {
-        return Err(QueryError::Unsupported(
-            "ORDER BY must be a single column".to_owned(),
-        ));
-    };
-    let ast::Expr::Identifier(order_column) = &order.expr else {
-        return Err(QueryError::Unsupported(
-            "ORDER BY must be a plain column".to_owned(),
-        ));
-    };
-    if order.options.asc == Some(false) {
-        return Err(QueryError::Unsupported("ORDER BY ... DESC".to_owned()));
+    if let Some(lead) = positional_window(&name) {
+        // A positional lookup needs somewhere to look: without an
+        // order, "the previous row" names nothing.
+        let Some(order_column) = order_column else {
+            return Err(QueryError::Unsupported(format!(
+                "{name} needs an ORDER BY — it reads the previous or next row, \
+                 and an unordered window has neither"
+            )));
+        };
+        // A frame clause on `LAG`/`LEAD` is meaningless — the function
+        // reads one specific row, not a range of them — and standard
+        // SQL accordingly gives them none. Refuse a frame rather than
+        // silently ignoring what the user wrote.
+        if spec.window_frame.is_some() {
+            return Err(QueryError::Unsupported(format!(
+                "{name} reads one row, so it takes no frame — drop the \
+                 ROWS/RANGE clause"
+            )));
+        }
+        let (column, offset) = lower_offset_args(&name, &function.args)?;
+        return Ok(WindowCall::Value {
+            lead,
+            column,
+            offset,
+            partition_by,
+            order_by: order_column,
+        });
     }
-    let preceding = lower_frame(spec.window_frame.as_ref())?;
-    Ok(PlanItem::WindowAgg {
+    let args = lower_args(&function.args)?;
+    // `FIRST`/`LAST` are positional on the time axis exactly as
+    // `LAG`/`LEAD` are, so an unordered window leaves them with nothing
+    // to be first OF: the frame's ends would be storage order, which is
+    // not what their names promise. Refuse rather than answer by
+    // accident — the same rule the positional lookups follow above.
+    if order_column.is_none() && matches!(name.as_str(), "first" | "last") {
+        return Err(QueryError::Unsupported(format!(
+            "{name} needs an ORDER BY — it reads the frame's earliest or latest \
+             row on the time axis, and an unordered window has no such axis"
+        )));
+    }
+    // With no order there is nothing for a frame to be relative to, so
+    // standard SQL's answer — the whole partition — is the only one
+    // available, and a frame clause beside it is a contradiction rather
+    // than an extra.
+    let frame = match &order_column {
+        Some(_) => lower_frame(spec.window_frame.as_ref())?,
+        None if spec.window_frame.is_some() => {
+            return Err(QueryError::Unsupported(
+                "a frame needs an ORDER BY to be relative to — an unordered                  window already covers its whole partition"
+                    .to_owned(),
+            ))
+        }
+        None => Frame::Partition,
+    };
+    Ok(WindowCall::Agg {
         function: name,
         args,
         partition_by,
-        order_by: ident(order_column),
-        preceding,
-        alias,
+        order_by: order_column,
+        frame,
     })
 }
 
-/// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW`;
-/// `None` is the unbounded start.
-fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryError> {
+/// Whether `name` is a positional window function, and which way it
+/// looks. These are the only window calls whose arguments are not all
+/// columns, so they are recognized before the columns-only rule runs.
+fn positional_window(name: &str) -> Option<bool> {
+    match name {
+        "lag" => Some(false),
+        "lead" => Some(true),
+        _ => None,
+    }
+}
+
+/// `LAG`/`LEAD`'s arguments: the column, and an optional positive
+/// offset defaulting to 1 (SQL's own default). A third `default`
+/// argument is standard but unbuilt — refused by name rather than
+/// silently dropped, because dropping it would change answers.
+fn lower_offset_args(
+    name: &str,
+    args: &ast::FunctionArguments,
+) -> Result<(String, usize), QueryError> {
+    let ast::FunctionArguments::List(list) = args else {
+        return Err(QueryError::Unsupported(format!(
+            "{name} without an argument list"
+        )));
+    };
+    let mut column: Option<String> = None;
+    let mut offset: Option<usize> = None;
+    for (position, argument) in list.args.iter().enumerate() {
+        let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) = argument else {
+            return Err(QueryError::Unsupported(format!(
+                "{name}'s arguments must be a column and an optional offset"
+            )));
+        };
+        match (position, expr) {
+            (0, ast::Expr::Identifier(name)) => column = Some(ident(name)),
+            (1, ast::Expr::Value(value)) => {
+                let ast::Value::Number(number, _) = &value.value else {
+                    return Err(QueryError::Unsupported(format!(
+                        "{name}'s offset must be a literal positive integer"
+                    )));
+                };
+                let parsed = number.parse::<usize>().map_err(|_| {
+                    QueryError::Unsupported(format!(
+                        "{name}'s offset must be a literal positive integer, got '{number}'"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(QueryError::Unsupported(format!(
+                        "{name}'s offset must be at least 1 (offset 0 is the row itself)"
+                    )));
+                }
+                offset = Some(parsed);
+            }
+            (2, _) => {
+                return Err(QueryError::Unsupported(format!(
+                    "{name}'s third (default) argument"
+                )))
+            }
+            _ => {
+                return Err(QueryError::Unsupported(format!(
+                    "{name}'s arguments must be a column and an optional offset"
+                )))
+            }
+        }
+    }
+    let Some(column) = column else {
+        return Err(QueryError::Unsupported(format!("{name} needs a column")));
+    };
+    Ok((column, offset.unwrap_or(1)))
+}
+
+/// Accepts `ROWS BETWEEN <n | UNBOUNDED> PRECEDING AND CURRENT ROW` and
+/// `RANGE BETWEEN <v> PRECEDING AND CURRENT ROW`. `GROUPS` is refused —
+/// it needs peer-group semantics nothing here has.
+fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Frame, QueryError> {
     let Some(frame) = frame else {
         return Err(QueryError::Unsupported(
             "window without a frame (write ROWS BETWEEN n PRECEDING AND CURRENT ROW)".to_owned(),
         ));
     };
-    if frame.units != ast::WindowFrameUnits::Rows {
+    if frame.units == ast::WindowFrameUnits::Groups {
         return Err(QueryError::Unsupported(
-            "RANGE / GROUPS frames (ROWS only)".to_owned(),
+            "GROUPS frames (ROWS or RANGE)".to_owned(),
         ));
     }
-    let preceding = match &frame.start_bound {
+    let range = frame.units == ast::WindowFrameUnits::Range;
+    let bound = match &frame.start_bound {
         ast::WindowFrameBound::Preceding(None) => None, // UNBOUNDED
         ast::WindowFrameBound::Preceding(Some(preceding)) => {
             let ast::Expr::Value(value) = preceding.as_ref() else {
@@ -2003,11 +2764,7 @@ fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryE
                     "frame bound must be a literal number".to_owned(),
                 ));
             };
-            Some(
-                number
-                    .parse::<usize>()
-                    .map_err(|_| QueryError::Unsupported(format!("frame bound '{number}'")))?,
-            )
+            Some(number.clone())
         }
         _ => {
             return Err(QueryError::Unsupported(
@@ -2015,11 +2772,31 @@ fn lower_frame(frame: Option<&ast::WindowFrame>) -> Result<Option<usize>, QueryE
             ))
         }
     };
-    match &frame.end_bound {
-        Some(ast::WindowFrameBound::CurrentRow) => Ok(preceding),
-        _ => Err(QueryError::Unsupported(
+    if !matches!(frame.end_bound, Some(ast::WindowFrameBound::CurrentRow)) {
+        return Err(QueryError::Unsupported(
             "frame must end at CURRENT ROW".to_owned(),
-        )),
+        ));
+    }
+    if range {
+        // UNBOUNDED PRECEDING under RANGE is the whole run either way —
+        // the row count and the value span agree — so it lowers to the
+        // ROWS form and keeps that path's incremental sweep.
+        let Some(number) = bound else {
+            return Ok(Frame::Rows(None));
+        };
+        let span = number.parse::<u64>().map_err(|_| {
+            QueryError::Unsupported(format!(
+                "RANGE bound '{number}' must be a non-negative integer in the \
+                 ordering key's own units (there is no INTERVAL type)"
+            ))
+        })?;
+        return Ok(Frame::Range(span));
+    }
+    match bound {
+        None => Ok(Frame::Rows(None)),
+        Some(number) => Ok(Frame::Rows(Some(number.parse::<usize>().map_err(
+            |_| QueryError::Unsupported(format!("frame bound '{number}'")),
+        )?))),
     }
 }
 
@@ -2082,12 +2859,14 @@ mod tests {
                     name: "sym".into(),
                     alias: None
                 },
-                PlanItem::WindowAgg {
-                    function: "regr_slope".into(),
-                    args: vec!["y".into(), "x".into()],
-                    partition_by: Some("sym".into()),
-                    order_by: "ts".into(),
-                    preceding: Some(19),
+                PlanItem::Window {
+                    call: WindowCall::Agg {
+                        function: "regr_slope".into(),
+                        args: vec!["y".into(), "x".into()],
+                        partition_by: vec![GroupKey::Column("sym".into())],
+                        order_by: Some("ts".into()),
+                        frame: Frame::Rows(Some(19)),
+                    },
                     alias: Some("beta".into()),
                 },
             ])
@@ -2102,12 +2881,14 @@ mod tests {
         .expect("plans");
         assert_eq!(
             plan.projection,
-            Projection::Items(vec![PlanItem::WindowAgg {
-                function: "mean".into(),
-                args: vec!["x".into()],
-                partition_by: None,
-                order_by: "ts".into(),
-                preceding: Some(2),
+            Projection::Items(vec![PlanItem::Window {
+                call: WindowCall::Agg {
+                    function: "mean".into(),
+                    args: vec!["x".into()],
+                    partition_by: Vec::new(),
+                    order_by: Some("ts".into()),
+                    frame: Frame::Rows(Some(2)),
+                },
                 alias: None,
             }])
         );
@@ -2176,6 +2957,165 @@ mod tests {
     }
 
     #[test]
+    fn an_asof_join_lifts_its_keyword_and_reads_the_time_axis() {
+        // #65's hybrid: the ASOF token is spliced out by byte span and
+        // the remainder parses as an ordinary join, so no fork of
+        // sqlparser is needed.
+        let lifted = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym").unwrap();
+        let join = lifted.join.expect("joined");
+        assert_eq!(join.as_of, Some(AsOfMatch::AtOrBefore), "implicit axis");
+        assert!(join.left, "ASOF LEFT JOIN keeps unmatched fact rows");
+        assert_eq!(join.fact_key, "sym");
+        assert_eq!(join.dimension_key, "sym");
+        let inner = plan("SELECT t.x FROM t ASOF INNER JOIN q ON t.sym = q.sym").unwrap();
+        assert!(!inner.join.expect("joined").left, "INNER drops them");
+        // An explicit inequality is permitted and only selects the
+        // comparison; either side order says the same thing.
+        for (sql, expected) in [
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts <= t.ts",
+                AsOfMatch::AtOrBefore,
+            ),
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND t.ts >= q.ts",
+                AsOfMatch::AtOrBefore,
+            ),
+            (
+                "SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts < t.ts",
+                AsOfMatch::StrictlyBefore,
+            ),
+        ] {
+            let join = plan(sql).unwrap().join.expect("joined");
+            assert_eq!(join.as_of, Some(expected), "{sql}");
+            // The columns travel fact-side first whichever way round
+            // the query wrote them; only the executor, which has the
+            // schemas, can say whether they name the ordering keys.
+            assert_eq!(
+                join.as_of_named,
+                Some(("ts".to_owned(), "ts".to_owned())),
+                "{sql}"
+            );
+        }
+        // Written backwards, the inequality asks for the quote *after*
+        // each trade — a different question, refused rather than
+        // silently answered in reverse. The operator alone cannot tell:
+        // both of these are `<=`, and only the qualifiers separate them.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND t.ts <= q.ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("looks backwards"), "{error}");
+        // Unqualified on both sides, nothing says which table is which.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND ts <= ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("qualify at least one side"), "{error}");
+        // An equality is not an ordering.
+        let error = plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts = t.ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be one of"), "{error}");
+        // A plain join is untouched — no as-of anything.
+        let plain = plan("SELECT t.x FROM t LEFT JOIN q ON t.sym = q.sym").unwrap();
+        let plain = plain.join.expect("joined");
+        assert_eq!(plain.as_of, None);
+        assert_eq!(plain.as_of_named, None);
+    }
+
+    #[test]
+    fn the_asof_join_lift_survives_comments_and_string_literals() {
+        // The M4-close lesson: a pre-parse lift that reassembles from
+        // tokens collapses the newline ending a `--` comment and
+        // silently comments out the rest of the statement. This one
+        // splices by byte span, so the comment stays a comment.
+        let commented_join = plan(
+            "SELECT t.x FROM t ASOF LEFT JOIN q -- pick the prior quote\n             ON t.sym = q.sym WHERE t.x > 1",
+        )
+        .expect("plans");
+        assert!(commented_join.join.is_some(), "the join survived");
+        assert!(commented_join.predicate.is_some(), "and so did the WHERE");
+        // ASOF inside a comment or a string is inert.
+        let inert = plan("SELECT x FROM t WHERE sym = 'ASOF LEFT JOIN'").unwrap();
+        assert!(inert.join.is_none() && inert.as_of.is_none());
+        let commented = plan("SELECT x FROM t /* ASOF LEFT JOIN q */ WHERE x > 1").unwrap();
+        assert!(commented.join.is_none());
+        // One token, two clauses, told apart by what follows it — the
+        // lift separates them correctly. Combining them is then refused
+        // for an unrelated and pre-existing reason (M4.4: a knowledge
+        // cut binds to one table's sequence space, and the join
+        // lowering does not carry it), which is the error the user
+        // should see rather than a parse puzzle.
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym ASOF 7").unwrap_err()
+        );
+        assert!(error.contains("AS OF with JOIN"), "{error}");
+    }
+
+    #[test]
+    fn bare_asof_join_is_refused_by_name() {
+        // Vendors genuinely diverge on bare as-of semantics, so the
+        // user says which they mean (#65; standing revisit flagged
+        // 2026-07-30).
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF JOIN q ON t.sym = q.sym").unwrap_err()
+        );
+        assert!(error.contains("bare ASOF JOIN"), "{error}");
+        assert!(error.contains("ASOF LEFT JOIN"), "{error}");
+        assert!(error.contains("ASOF INNER JOIN"), "{error}");
+        // And a comparison that is not an inequality is named, not
+        // quietly ignored.
+        let error = format!(
+            "{}",
+            plan("SELECT t.x FROM t ASOF LEFT JOIN q ON t.sym = q.sym AND q.ts <> t.ts")
+                .unwrap_err()
+        );
+        assert!(error.contains("time comparison"), "{error}");
+    }
+
+    #[test]
+    fn a_range_frame_parses_into_its_own_frame_kind() {
+        // RANGE lowers to a value span rather than a row count. The
+        // executor refuses it for now (its frames are not trailing —
+        // standard SQL ends a RANGE frame at the current row's last
+        // peer), but the planner must carry the distinction so that
+        // refusal is not silently reinterpreted as ROWS.
+        let ranged = plan(
+            "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 300 PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .unwrap();
+        let Projection::Items(items) = &ranged.projection else {
+            panic!("items")
+        };
+        let PlanItem::Window {
+            call: WindowCall::Agg { frame, .. },
+            ..
+        } = &items[0]
+        else {
+            panic!("window")
+        };
+        assert_eq!(*frame, Frame::Range(300));
+        // UNBOUNDED PRECEDING means the whole run either way, so it
+        // lowers to the ROWS form and keeps that path's sweep.
+        let unbounded = plan(
+            "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t",
+        )
+        .unwrap();
+        let Projection::Items(items) = &unbounded.projection else {
+            panic!("items")
+        };
+        let PlanItem::Window {
+            call: WindowCall::Agg { frame, .. },
+            ..
+        } = &items[0]
+        else {
+            panic!("window")
+        };
+        assert_eq!(*frame, Frame::Rows(None));
+    }
+
+    #[test]
     fn rejections_name_the_construct() {
         for (sql, needle) in [
             ("SELECT * FROM t", "wildcard"),
@@ -2196,9 +3136,11 @@ mod tests {
                 "SELECT DISTINCT count(x) FROM t",
                 "DISTINCT over window or aggregate projections",
             ),
+            // `x + 1` is arithmetic, but not the one monotone shape
+            // GROUP BY admits (a bucket of the ordering key).
             (
                 "SELECT x, sum(y) FROM t GROUP BY x, x + 1",
-                "plain key columns",
+                "a bucket of the ordering key",
             ),
             ("SELECT x FROM t GROUP BY x LIMIT x", "LIMIT"),
             // (an unknown plain call like nope_agg(x) now lowers to a
@@ -2206,8 +3148,8 @@ mod tests {
             // execution, where the registry lives — tested in engine)
             ("SELECT y FROM t GROUP BY x", "must appear in GROUP BY"),
             (
-                "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
-                "ROWS only",
+                "SELECT sum(x) OVER (ORDER BY ts GROUPS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
+                "GROUPS frames",
             ),
             ("SELECT sum(x) OVER (ORDER BY ts) FROM t", "without a frame"),
             ("INSERT INTO t VALUES (1)", "entry points"), // supported, elsewhere
