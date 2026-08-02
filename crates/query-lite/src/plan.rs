@@ -101,10 +101,16 @@ pub enum PlanItem {
         function: String,
         /// Argument column names, in call order.
         args: Vec<String>,
-        /// PARTITION BY column (a key column), if present.
-        partition_by: Option<String>,
-        /// ORDER BY column — must be the data's ordering key.
-        order_by: String,
+        /// PARTITION BY term, if present: a symbol column (the
+        /// time-series direction, one partition per symbol) or the
+        /// ordering key / a bucket of it (the cross-sectional
+        /// direction, one partition per instant).
+        partition_by: Option<GroupKey>,
+        /// ORDER BY column — must be the data's ordering key. `None`
+        /// for a cross-sectional window, which has no order *within*
+        /// an instant and therefore takes the whole partition as its
+        /// frame.
+        order_by: Option<String>,
         /// What rows the frame covers (see [`Frame`]).
         frame: Frame,
         /// Output name, if aliased.
@@ -121,9 +127,10 @@ pub enum PlanItem {
         column: String,
         /// How many rows away, `>= 1`.
         offset: usize,
-        /// PARTITION BY column (a key column), if present.
-        partition_by: Option<String>,
-        /// ORDER BY column — must be the data's ordering key.
+        /// PARTITION BY term, if present (see [`PlanItem::WindowAgg`]).
+        partition_by: Option<GroupKey>,
+        /// ORDER BY column — must be the data's ordering key. Required
+        /// here: a positional lookup with no order has no meaning.
         order_by: String,
         /// Output name, if aliased.
         alias: Option<String>,
@@ -145,6 +152,11 @@ pub enum Frame {
     /// `300000000000`), and it is unsigned because a frame extends
     /// backward from the current row.
     Range(u64),
+    /// The **whole partition** — what standard SQL gives a window with
+    /// no `ORDER BY`, and what a cross-sectional statistic wants: every
+    /// row of the instant sees every other row of it, so there is no
+    /// "before" and no frame arithmetic to do.
+    Partition,
 }
 
 /// A scalar arithmetic operator.
@@ -534,8 +546,8 @@ impl Plan {
                             ..
                         } => {
                             names.extend(args.iter().cloned());
-                            names.extend(partition_by.iter().cloned());
-                            names.insert(order_by.clone());
+                            names.extend(partition_by.iter().map(|key| key.column().to_owned()));
+                            names.extend(order_by.iter().cloned());
                         }
                         PlanItem::WindowValue {
                             column,
@@ -546,7 +558,7 @@ impl Plan {
                             names.insert(column.clone());
                             names.insert(order_by.clone());
                             if let Some(partition) = partition_by {
-                                names.insert(partition.clone());
+                                names.insert(partition.column().to_owned());
                             }
                         }
                     }
@@ -2384,29 +2396,56 @@ fn lower_window_call(
     let ast::WindowType::WindowSpec(spec) = over else {
         return Err(QueryError::Unsupported("named WINDOW clauses".to_owned()));
     };
+    // The partition term takes the same shapes GROUP BY does: a column,
+    // or a bucket of the ordering key. Which direction the window runs
+    // in is decided by which column it names — down one symbol through
+    // time, or across every symbol at one instant.
     let partition_by = match spec.partition_by.as_slice() {
         [] => None,
-        [ast::Expr::Identifier(column)] => Some(ident(column)),
+        [expr] => Some(lower_group_key(expr).map_err(|_| {
+            QueryError::Unsupported(format!(
+                "PARTITION BY '{expr}' — a column, or a bucket of the ordering \
+                 key (ts / <width>) for a cross-sectional window"
+            ))
+        })?),
         _ => {
             return Err(QueryError::Unsupported(
                 "PARTITION BY must be a single column".to_owned(),
             ))
         }
     };
-    let [order] = spec.order_by.as_slice() else {
-        return Err(QueryError::Unsupported(
-            "ORDER BY must be a single column".to_owned(),
-        ));
+    // ORDER BY is optional, and its absence is meaningful rather than
+    // sloppy: standard SQL gives an unordered window the whole
+    // partition as its frame, which is exactly a cross-sectional
+    // statistic — every row of the instant against every other.
+    let order_column = match spec.order_by.as_slice() {
+        [] => None,
+        [order] => {
+            let ast::Expr::Identifier(column) = &order.expr else {
+                return Err(QueryError::Unsupported(
+                    "ORDER BY must be a plain column".to_owned(),
+                ));
+            };
+            if order.options.asc == Some(false) {
+                return Err(QueryError::Unsupported("ORDER BY ... DESC".to_owned()));
+            }
+            Some(ident(column))
+        }
+        _ => {
+            return Err(QueryError::Unsupported(
+                "ORDER BY must be a single column".to_owned(),
+            ))
+        }
     };
-    let ast::Expr::Identifier(order_column) = &order.expr else {
-        return Err(QueryError::Unsupported(
-            "ORDER BY must be a plain column".to_owned(),
-        ));
-    };
-    if order.options.asc == Some(false) {
-        return Err(QueryError::Unsupported("ORDER BY ... DESC".to_owned()));
-    }
     if let Some(lead) = positional_window(&name) {
+        // A positional lookup needs somewhere to look: without an
+        // order, "the previous row" names nothing.
+        let Some(order_column) = order_column else {
+            return Err(QueryError::Unsupported(format!(
+                "{name} needs an ORDER BY — it reads the previous or next row, \
+                 and an unordered window has neither"
+            )));
+        };
         // A frame clause on `LAG`/`LEAD` is meaningless — the function
         // reads one specific row, not a range of them — and standard
         // SQL accordingly gives them none. Refuse a frame rather than
@@ -2423,17 +2462,30 @@ fn lower_window_call(
             column,
             offset,
             partition_by,
-            order_by: ident(order_column),
+            order_by: order_column,
             alias,
         });
     }
     let args = lower_args(&function.args)?;
-    let frame = lower_frame(spec.window_frame.as_ref())?;
+    // With no order there is nothing for a frame to be relative to, so
+    // standard SQL's answer — the whole partition — is the only one
+    // available, and a frame clause beside it is a contradiction rather
+    // than an extra.
+    let frame = match &order_column {
+        Some(_) => lower_frame(spec.window_frame.as_ref())?,
+        None if spec.window_frame.is_some() => {
+            return Err(QueryError::Unsupported(
+                "a frame needs an ORDER BY to be relative to — an unordered                  window already covers its whole partition"
+                    .to_owned(),
+            ))
+        }
+        None => Frame::Partition,
+    };
     Ok(PlanItem::WindowAgg {
         function: name,
         args,
         partition_by,
-        order_by: ident(order_column),
+        order_by: order_column,
         frame,
         alias,
     })
@@ -2635,8 +2687,8 @@ mod tests {
                 PlanItem::WindowAgg {
                     function: "regr_slope".into(),
                     args: vec!["y".into(), "x".into()],
-                    partition_by: Some("sym".into()),
-                    order_by: "ts".into(),
+                    partition_by: Some(GroupKey::Column("sym".into())),
+                    order_by: Some("ts".into()),
                     frame: Frame::Rows(Some(19)),
                     alias: Some("beta".into()),
                 },
@@ -2656,7 +2708,7 @@ mod tests {
                 function: "mean".into(),
                 args: vec!["x".into()],
                 partition_by: None,
-                order_by: "ts".into(),
+                order_by: Some("ts".into()),
                 frame: Frame::Rows(Some(2)),
                 alias: None,
             }])

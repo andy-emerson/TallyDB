@@ -924,8 +924,8 @@ fn project_items(
                 registry,
                 function,
                 args,
-                partition_by.as_deref(),
-                order_by,
+                partition_by.as_ref(),
+                order_by.as_deref(),
                 *frame,
                 alias.as_deref(),
             )?,
@@ -942,7 +942,7 @@ fn project_items(
                 *lead,
                 column,
                 *offset,
-                partition_by.as_deref(),
+                partition_by.as_ref(),
                 order_by,
                 alias.as_deref(),
             )?,
@@ -1506,6 +1506,10 @@ fn evaluate_run(
             debug_assert_eq!(keys.len(), rows);
             aggregate.evaluate_bounded_frames(columns, &range_bounds(keys, span))
         }
+        // The whole partition, so every row's frame is the same one —
+        // and a cross-sectional statistic is one value repeated across
+        // the instant it describes.
+        Frame::Partition => aggregate.evaluate_bounded_frames(columns, &vec![(0, rows); rows]),
     }
     .map_err(QueryError::Compute)?;
     if results.len() != rows {
@@ -1673,7 +1677,7 @@ fn window_value(
     lead: bool,
     column: &str,
     offset: usize,
-    partition_by: Option<&str>,
+    partition_by: Option<&GroupKey>,
     order_by: &str,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
@@ -1768,9 +1772,9 @@ fn window_value(
 fn value_runs(
     schema: &Schema,
     views: &[&SegmentView],
-    partition_by: Option<&str>,
+    partition_by: Option<&GroupKey>,
 ) -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
-    let Some(partition_column) = partition_by else {
+    let Some(key) = partition_by else {
         let mut run = Vec::new();
         for (view_index, view) in views.iter().enumerate() {
             for live_position in 0..view.live_rows() {
@@ -1779,40 +1783,115 @@ fn value_runs(
         }
         return Ok(vec![run]);
     };
-    let (index, _) = resolve(schema, partition_column)?;
+    let term = resolve_partition_key(schema, views, key)?;
     let mut unified: HashMap<String, usize> = HashMap::new();
+    let mut slots: HashMap<GroupCode, usize> = HashMap::new();
     let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
-        let Column::Key(keys) = &view.segment.batch().columns()[index] else {
-            return Err(QueryError::TypeError(format!(
-                "PARTITION BY '{partition_column}' must be a key column"
-            )));
-        };
-        let any_live_null =
-            keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row));
-        if any_live_null {
-            return Err(QueryError::Unsupported(format!(
-                "PARTITION BY '{partition_column}' has nulls (unsupported as a partition key)"
-            )));
-        }
-        let dictionary = keys.dictionary();
-        let remap: Vec<usize> = (0..dictionary.len() as u32)
-            .map(|code| {
-                let next = unified.len();
-                *unified
-                    .entry(dictionary.value(code).to_owned())
-                    .or_insert(next)
-            })
-            .collect();
-        while runs.len() < unified.len() {
-            runs.push(Vec::new());
-        }
-        let codes = keys.codes().as_slice();
+        let columns = view.segment.batch().columns();
+        let remap = partition_remap(&term, columns, view, &mut unified)?;
         for (live_position, row) in live_rows(view).enumerate() {
-            runs[remap[codes[row] as usize]].push((view_index, live_position));
+            let code = term.code(columns, remap.as_ref(), row);
+            let next = slots.len();
+            let slot = *slots.entry(code).or_insert(next);
+            if runs.len() <= slot {
+                runs.resize_with(slot + 1, Vec::new);
+            }
+            runs[slot].push((view_index, live_position));
         }
     }
     Ok(runs)
+}
+
+/// Resolves a `PARTITION BY` term, with the type rules that decide
+/// which direction a window runs in.
+///
+/// A symbol column partitions the time-series way (one run per symbol);
+/// the ordering key, or a bucket of it, partitions the **cross-
+/// sectional** way (one run per instant, every symbol in it). Any other
+/// `BIGINT` is admitted too — correct, and gathered rather than
+/// streamed, because nothing clusters the data on it. A `DOUBLE` is
+/// refused: float equality is not partition identity, the same rule
+/// grouping follows.
+fn resolve_partition_key(
+    schema: &Schema,
+    views: &[&SegmentView],
+    key: &GroupKey,
+) -> Result<GroupTerm, QueryError> {
+    let ordering_key = views.first().map(|view| view.segment.ordering_key());
+    let (index, field) = resolve(schema, key.column())?;
+    match (key, field.column_type()) {
+        (GroupKey::Column(_), ColumnType::Key) => Ok(GroupTerm::Label { index }),
+        (GroupKey::Column(_), ColumnType::I64) => Ok(GroupTerm::Bucket {
+            index,
+            divide: 1,
+            multiply: None,
+        }),
+        (GroupKey::Column(name), ColumnType::F64) => Err(QueryError::TypeError(format!(
+            "PARTITION BY '{name}': a DOUBLE cannot key a partition — equality \
+             on floats is not partition identity"
+        ))),
+        (
+            GroupKey::Bucket {
+                column,
+                divide,
+                multiply,
+            },
+            _,
+        ) => {
+            let is_ordering_key = ordering_key.is_none_or(|ordering| ordering == index);
+            if field.column_type() != ColumnType::I64 || !is_ordering_key {
+                return Err(QueryError::TypeError(format!(
+                    "PARTITION BY '{column} / {divide}': a bucket divides the \
+                     declared ordering key — '{column}' is not it"
+                )));
+            }
+            Ok(GroupTerm::Bucket {
+                index,
+                divide: *divide,
+                multiply: *multiply,
+            })
+        }
+    }
+}
+
+/// The per-view dictionary remap a label term needs (`None` for a
+/// bucket, which reads its value straight from the column). Also where
+/// a null partition key is refused: a window over "the rows with no
+/// key" is not a question this engine answers.
+///
+/// `unified` is the query-lifetime key space keyed by the symbol's
+/// **value**, never by its code. Codes are per-segment interning ranks
+/// (decision #6), so the same symbol wears different codes in different
+/// segments; keying on the code would silently split one partition in
+/// two, or merge two into one.
+fn partition_remap<'a>(
+    term: &GroupTerm,
+    columns: &'a [Column],
+    view: &SegmentView,
+    unified: &mut HashMap<String, usize>,
+) -> Result<Option<(&'a KeyColumn, Vec<usize>)>, QueryError> {
+    let &GroupTerm::Label { index } = term else {
+        return Ok(None);
+    };
+    let Column::Key(keys) = &columns[index] else {
+        unreachable!("validated as a key column above")
+    };
+    if keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row)) {
+        return Err(QueryError::Unsupported(
+            "PARTITION BY on a column with nulls (unsupported as a partition key)".to_owned(),
+        ));
+    }
+    let dictionary = keys.dictionary();
+    let remap: Vec<usize> = (0..dictionary.len() as u32)
+        .map(|code| {
+            let next = unified.len();
+            *unified
+                .entry(dictionary.value(code).to_owned())
+                .or_insert(next)
+        })
+        .collect();
+    Ok(Some((keys, remap)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1822,8 +1901,8 @@ fn window_aggregate(
     registry: &Registry,
     function: &str,
     arg_names: &[String],
-    partition_by: Option<&str>,
-    order_by: &str,
+    partition_by: Option<&GroupKey>,
+    order_by: Option<&str>,
     frame: Frame,
     alias: Option<&str>,
 ) -> Result<(Field, Vec<Column>), QueryError> {
@@ -1847,8 +1926,17 @@ fn window_aggregate(
             arg_names.len()
         )));
     }
-    let (order_index, _) = resolve(schema, order_by)?;
-    check_order(views, order_index, order_by)?;
+    // An unordered window (the cross-sectional shape) has no ordering
+    // column to check or to measure a span against; its frame is the
+    // whole partition, which needs neither.
+    let order_index = match order_by {
+        Some(order_by) => {
+            let (index, _) = resolve(schema, order_by)?;
+            check_order(views, index, order_by)?;
+            Some(index)
+        }
+        None => None,
+    };
     // args[a][v]: argument `a`'s live values in view `v`.
     let mut args: Vec<Vec<ArgValues<'_>>> = Vec::with_capacity(arg_names.len());
     for name in arg_names {
@@ -1860,7 +1948,13 @@ fn window_aggregate(
         .iter()
         .map(|view| vec![None; view.live_rows()])
         .collect();
-    let keys = ordering_values(views, order_index);
+    let keys = match order_index {
+        Some(order_index) => ordering_values(views, order_index),
+        None => views
+            .iter()
+            .map(|view| vec![0i64; view.live_rows()])
+            .collect(),
+    };
     match partition_by {
         None => unpartitioned(aggregate.as_ref(), &args, &keys, frame, &mut results)?,
         Some(partition_column) => partitioned(
@@ -1947,14 +2041,15 @@ fn partitioned(
     aggregate: &dyn WindowAggregate,
     args: &[Vec<ArgValues<'_>>],
     ordering: &[Vec<i64>],
-    partition_column: &str,
+    partition_by: &GroupKey,
     frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
-    let (index, _) = resolve(schema, partition_column)?;
-    // The query-lifetime key space: value → unified code, built once per
-    // distinct value per segment (cheap under low cardinality).
+    let term = resolve_partition_key(schema, views, partition_by)?;
+    // The query-lifetime symbol space (value → unified code), and the
+    // partition slot per distinct key value, in first-seen order.
     let mut unified: HashMap<String, usize> = HashMap::new();
+    let mut slots: HashMap<GroupCode, usize> = HashMap::new();
     // Per partition: scratch per argument, plus where each row came from
     // (view index, live position within the view).
     let mut scratch: Vec<Vec<Vec<f64>>> = Vec::new();
@@ -1963,40 +2058,18 @@ fn partitioned(
     // what a RANGE frame measures its span against.
     let mut partition_keys: Vec<Vec<i64>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
-        let Column::Key(keys) = &view.segment.batch().columns()[index] else {
-            return Err(QueryError::TypeError(format!(
-                "PARTITION BY '{partition_column}' must be a key column"
-            )));
-        };
-        let any_live_null =
-            keys.validity().is_some() && live_rows(view).any(|row| !keys.is_valid(row));
-        if any_live_null {
-            return Err(QueryError::Unsupported(format!(
-                "PARTITION BY '{partition_column}' has nulls (unsupported as a partition key)"
-            )));
-        }
-        let dictionary = keys.dictionary();
-        let remap: Vec<usize> = (0..dictionary.len() as u32)
-            .map(|code| {
-                let next = unified.len();
-                *unified
-                    .entry(dictionary.value(code).to_owned())
-                    .or_insert(next)
-            })
-            .collect();
-        // One slot per unified code — allocated eagerly, because a code
-        // can enter the unified space from a dictionary entry whose live
-        // rows come later or never (a tombstoned row's key, a value seen
-        // only in another segment). Codeless partitions stay empty and
-        // cost nothing below.
-        while scratch.len() < unified.len() {
-            scratch.push(vec![Vec::new(); args.len()]);
-            origins.push(Vec::new());
-            partition_keys.push(Vec::new());
-        }
-        let codes = keys.codes().as_slice();
+        let columns = view.segment.batch().columns();
+        let remap = partition_remap(&term, columns, view, &mut unified)?;
         for (live_position, row) in live_rows(view).enumerate() {
-            let partition = remap[codes[row] as usize];
+            let next = slots.len();
+            let partition = *slots
+                .entry(term.code(columns, remap.as_ref(), row))
+                .or_insert(next);
+            if scratch.len() <= partition {
+                scratch.resize_with(partition + 1, || vec![Vec::new(); args.len()]);
+                origins.resize_with(partition + 1, Vec::new);
+                partition_keys.resize_with(partition + 1, Vec::new);
+            }
             for (argument, per_view) in args.iter().enumerate() {
                 scratch[partition][argument].push(per_view[view_index].as_slice()[live_position]);
             }
@@ -3695,9 +3768,12 @@ mod tests {
                 "SELECT mean(x, x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
                 "takes 1 arguments",
             ),
+            // A DOUBLE cannot key a partition, for the reason it cannot
+            // key a group. (A BIGINT can — see the cross-sectional
+            // tests; that is the one type rule M5.3 relaxed here.)
             (
                 "SELECT mean(x) OVER (PARTITION BY x ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-                "must be a key column",
+                "not partition identity",
             ),
         ];
         for (sql, needle) in cases {
@@ -4547,6 +4623,122 @@ mod query1_tests {
         .unwrap();
         assert_eq!(flatten(&output, 1), [Some(10.0)], "earliest stamp wins");
         assert_eq!(flatten(&output, 2), [Some(91.0)], "the later of the tie");
+    }
+
+    #[test]
+    fn a_cross_sectional_window_runs_across_the_instant_not_down_the_symbol() {
+        // Three symbols printing at two timestamps. PARTITION BY sym is
+        // the time-series direction; PARTITION BY ts is its transpose,
+        // and the two must give different answers over the same rows —
+        // which is the whole point of admitting the second.
+        let rows: &[(i64, &str, f64)] = &[
+            (10, "A", 1.0),
+            (10, "B", 2.0),
+            (10, "C", 7.0),
+            (20, "A", 4.0),
+            (20, "B", 6.0),
+            (20, "C", 10.0),
+        ];
+        for segment_rows in [2, 100] {
+            let views = segmented(rows, segment_rows);
+            // The cross-section's total at each instant: 10 then 20,
+            // repeated across every row of the instant it describes.
+            let output = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&output, 1),
+                [
+                    Some(10.0),
+                    Some(10.0),
+                    Some(10.0),
+                    Some(20.0),
+                    Some(20.0),
+                    Some(20.0)
+                ]
+            );
+            // NOT YET: the portfolio weight, `x / sum(x) OVER
+            // (PARTITION BY ts)`. The cross-section is computable and
+            // sits beside every row, but dividing by it needs a scalar
+            // expression over a window result, which the projection
+            // does not compose (#94). Recorded as the refusal it is, so
+            // that building the composition flips a test rather than
+            // discovering an assumption.
+            let error =
+                crate::plan::plan("SELECT ts, x / sum(x) OVER (PARTITION BY ts) AS w FROM t")
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("window call inside a scalar"), "{error}");
+            // A bucket partitions coarser: one cross-section per bar,
+            // so both instants fall in the same partition.
+            let bucketed = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY ts / 100) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(flatten(&bucketed, 1), [Some(30.0); 6]);
+            // And the time-series direction over the same rows is a
+            // different answer, as it must be.
+            let down = run(
+                &views,
+                "SELECT ts, sum(x) OVER (PARTITION BY sym) AS s FROM t",
+            )
+            .unwrap();
+            assert_eq!(
+                flatten(&down, 1),
+                [
+                    Some(5.0),
+                    Some(8.0),
+                    Some(17.0),
+                    Some(5.0),
+                    Some(8.0),
+                    Some(17.0)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn an_unordered_window_takes_its_whole_partition_and_refuses_a_frame() {
+        let views = segment(&[(10, "A", 1.0), (10, "B", 2.0), (20, "A", 4.0)]);
+        // No PARTITION BY and no ORDER BY: one partition, every row —
+        // the grand total beside each row.
+        let all = run(&views, "SELECT ts, sum(x) OVER () AS s FROM t").unwrap();
+        assert_eq!(flatten(&all, 1), [Some(7.0), Some(7.0), Some(7.0)]);
+        // A frame with nothing to be relative to is a contradiction,
+        // refused rather than silently ignored. (Refused by the
+        // planner, so it never reaches the executor.)
+        let error = crate::plan::plan(
+            "SELECT sum(x) OVER (PARTITION BY ts ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM t",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("needs an ORDER BY"), "{error}");
+        // A positional lookup with no order has nowhere to look.
+        let error = crate::plan::plan("SELECT lag(x) OVER (PARTITION BY ts) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs an ORDER BY"), "{error}");
+    }
+
+    #[test]
+    fn a_partition_may_be_any_integer_but_never_a_double() {
+        let views = segment(&[(10, "A", 1.0), (10, "B", 2.0), (20, "A", 4.0)]);
+        // A DOUBLE never keys a partition — same rule as grouping.
+        let error = run(&views, "SELECT sum(x) OVER (PARTITION BY x) FROM t")
+            .unwrap_err()
+            .to_string();
+        let _ = &views;
+        assert!(error.contains("not partition identity"), "{error}");
+        // A bucket of anything but the ordering key is refused too: the
+        // arithmetic proves nothing about order on another column.
+        let error = run(&views, "SELECT sum(x) OVER (PARTITION BY x / 2) FROM t")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared ordering key"), "{error}");
     }
 
     #[test]

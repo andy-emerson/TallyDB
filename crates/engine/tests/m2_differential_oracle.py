@@ -357,6 +357,21 @@ WINDOW_QUERIES = [
     # A span wider than the whole corpus: every frame starts at row 1.
     "SELECT ts, sum(x) OVER (ORDER BY ts RANGE BETWEEN 100000000 PRECEDING "
     "AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+    # M5.3: cross-sectional windows over the raw time axis — PARTITION
+    # BY the instant rather than the symbol, so each row sees its own
+    # instant across every symbol. Standard SQL gives an ORDER BY-less
+    # window its whole partition, and DuckDB agrees, so these run the
+    # same text on both sides.
+    #
+    # The corpus has one row per distinct ts, so `PARTITION BY ts` is a
+    # partition per row — a real edge (every partition a singleton), not
+    # an interesting cross-section. The bucketed forms, which do put
+    # several rows in a partition, need DuckDB's `//` and so live in
+    # CROSS_SECTIONAL_FAMILIES below.
+    "SELECT ts, sum(x) OVER (PARTITION BY ts) AS w FROM corpus ORDER BY ts",
+    # The whole snapshot as one partition — `OVER ()`, the grand total
+    # beside every row.
+    "SELECT ts, sum(x) OVER () AS w FROM corpus ORDER BY ts",
 ]
 
 
@@ -504,6 +519,49 @@ BUCKET_FAMILIES = [
         "GROUP BY ts / 60000000000 HAVING count(*) > 20",
         "SELECT ts // 60000000000 AS bar, avg(x) AS a FROM corpus WHERE x > 100 "
         "GROUP BY ts // 60000000000 HAVING count(*) > 20",
+    ),
+]
+
+# The cross-sectional families whose partition is a BUCKET of the time
+# axis. Paired SQL for the same reason BUCKET_FAMILIES is paired:
+# TallyDB's `/` between integers truncates, DuckDB's returns a DOUBLE.
+# That difference is not cosmetic here — a float bucket of a nanosecond
+# stamp keeps its fractional part, so DuckDB would partition per ROW
+# rather than per bar, and the two engines would be answering different
+# questions. The oracle side says `//`.
+CROSS_SECTIONAL_FAMILIES = [
+    (
+        "SELECT ts, avg(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, avg(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, count(x) OVER (PARTITION BY ts / 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, count(x) OVER (PARTITION BY ts // 60000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, max(x) OVER (PARTITION BY ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, max(x) OVER (PARTITION BY ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    (
+        "SELECT ts, var_pop(x) OVER (PARTITION BY ts / 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+        "SELECT ts, var_pop(x) OVER (PARTITION BY ts // 300000000000) AS w FROM corpus "
+        "ORDER BY ts",
+    ),
+    # A bucket partition is not restricted to the cross-sectional
+    # reading: ordered inside the bucket, it is a frame that resets at
+    # each bar boundary.
+    (
+        "SELECT ts, sum(x) OVER (PARTITION BY ts / 60000000000 ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
+        "SELECT ts, sum(x) OVER (PARTITION BY ts // 60000000000 ORDER BY ts "
+        "ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
     ),
 ]
 
@@ -677,6 +735,11 @@ def main() -> None:
             f"FAIL the quote history has only {ties} tied (sym, qts) "
             "timestamps — the as-of families cannot cover the tie rule"
         )
+    for sql, definition in CROSS_SECTIONAL_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(definition).to_arrow_table()
+        compare_tables(sql, engine, oracle, window=True)
+        passed += 1
     for sql, definition in BUCKET_FAMILIES:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(definition).to_arrow_table()
