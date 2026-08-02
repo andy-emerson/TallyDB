@@ -148,6 +148,39 @@ impl MaterializedView {
         })
     }
 
+    /// As [`MaterializedView::open`], **read-only** (F4): the
+    /// cross-process shape — a console or binding watching a directory
+    /// another process maintains. The union read needs no writes, so a
+    /// read-only view still answers exactly; what it cannot do is
+    /// persist repair, and [`MaterializedView::refresh`] refuses
+    /// loudly, like every mutation on a read-only table.
+    pub fn open_read_only(
+        name: &str,
+        dir: impl AsRef<Path>,
+        source: &Table,
+    ) -> Result<MaterializedView, EngineError> {
+        let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
+            .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
+        let (stamp, source_name, sql) = decode_definition(&record)?;
+        if source_name != source.name() {
+            return Err(definition_error(format!(
+                "view '{name}' is over '{source_name}', not '{}'",
+                source.name()
+            )));
+        }
+        validated_definition(&sql, source)?;
+        let table = Table::open_read_only(name, dir.as_ref())?;
+        Ok(MaterializedView {
+            table,
+            sql,
+            source: source_name,
+            stamp,
+            // Read-only: the stamp is never advanced, so nothing is
+            // ever written back.
+            dir: None,
+        })
+    }
+
     /// The view's name.
     pub fn name(&self) -> &str {
         self.table.name()
@@ -212,59 +245,124 @@ impl MaterializedView {
         if now == self.stamp {
             return Ok(0);
         }
-        let plan = lower_plan(&self.sql).map_err(EngineError::Query)?;
-        let (bucket, bucket_name) = eligible_shape(&plan, source)?;
-        let (divide, view_scale) = bucket_arithmetic(&bucket);
-        let mut buckets = std::collections::BTreeSet::new();
-        source.touched_ordering_keys(self.stamp, |value| {
-            buckets.insert(value / divide);
-        })?;
-        if buckets.is_empty() {
+        let definition = Definition::of(&self.sql, source)?;
+        let Some(runs) = definition.touched_runs(source, self.stamp)? else {
             // Coordinates were spent (a DELETE that matched nothing,
             // say) but no row changed: nothing to fold, and the stamp
             // still advances past them.
             self.advance_stamp(now)?;
             return Ok(0);
-        }
-        let folded = buckets.len() as u64;
-        let runs = contiguous_runs(&buckets);
+        };
+        let folded = runs
+            .iter()
+            .map(|&(first, last)| last - first + 1)
+            .sum::<i64>() as u64;
         // The re-fold: the definition, restricted to the touched
         // buckets, over the source's latest state.
-        let mut restricted = plan.clone();
-        let source_ranges = ranges_predicate(
-            source.ordering_key(),
-            runs.iter()
-                .map(|&(first, last)| (bucket_low(first, divide), bucket_high(last, divide))),
-        );
-        restricted.predicate = Some(match restricted.predicate {
-            Some(own) => Predicate::And(Box::new(source_ranges), Box::new(own)),
-            None => source_ranges,
-        });
-        let replacement = source.execute_plan(&restricted)?;
+        let replacement = source.execute_plan(&definition.restricted_to(&runs, source))?;
         // The write half: those buckets' materialized rows out, the
-        // re-folded ones in. The view-side ordering key stores the
-        // bucket index scaled by the definition's multiplier (or the
-        // raw key for a bare-`ts` bucket), so a run of indices maps to
-        // one scaled range.
-        let victims = ranges_predicate(
-            &bucket_name,
-            runs.iter().map(|&(first, last)| {
-                (
-                    first.saturating_mul(view_scale),
-                    last.saturating_mul(view_scale),
-                )
-            }),
-        );
+        // re-folded ones in.
+        let victims = definition.view_ranges(&runs);
         self.table.replace_matching(Some(&victims), &replacement)?;
         self.advance_stamp(now)?;
         Ok(folded)
     }
 
+    /// Answers `user_plan` (a query naming this view) **exactly**: the
+    /// materialization's clean buckets unioned with a live fold of
+    /// everything the stamp does not cover — dirty buckets and the
+    /// unfolded tail alike, one mechanism (the read-side half of the
+    /// 2026-08-02 ruling on #83). Repair never changes an answer; a
+    /// refresh only shrinks the live part of this union. Read-only:
+    /// nothing is persisted, which is what lets an F4 read-only
+    /// process serve exact view answers over a directory another
+    /// process writes.
+    ///
+    /// `AS OF` on a view recomputes: `view AS OF s` is *defined* as
+    /// the definition over `base AS OF s`, so the materialization —
+    /// which reflects only the latest state — is bypassed entirely.
+    /// The materialization accelerates current reads; it is never the
+    /// authority.
+    pub(crate) fn query_union(
+        &self,
+        source: &Table,
+        user_plan: &Plan,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        let definition = Definition::of(&self.sql, source)?;
+        if let Some(cut) = user_plan.as_of {
+            let mut past = definition.plan.clone();
+            past.as_of = Some(cut);
+            let folded = source.execute_plan(&past)?;
+            let mut current = user_plan.clone();
+            current.as_of = None;
+            return self.over_scratch(std::iter::empty(), folded, &current);
+        }
+        let Some(runs) = definition.touched_runs(source, self.stamp)? else {
+            return self.table.execute_plan(user_plan);
+        };
+        // The live half: the definition over exactly the uncovered
+        // buckets. The clean half: every materialized row outside them.
+        let fresh = source.execute_plan(&definition.restricted_to(&runs, source))?;
+        let mut clean = select_everything(&self.table)?;
+        clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
+        let clean = self.table.execute_plan(&clean)?;
+        self.over_scratch(clean.batches.into_iter(), fresh, user_plan)
+    }
+
+    /// Runs `user_plan` over an ad-hoc union of view-shaped batches, as
+    /// scratch segments. Orderedness is inspected per batch, never
+    /// assumed: a stale view's union can interleave bucket ranges, and
+    /// the executor's own ordering checks then govern — the same
+    /// stance every disordered table gets (correct, less optimized,
+    /// `refresh` + `compact` restore the fast path).
+    fn over_scratch(
+        &self,
+        clean: impl Iterator<Item = arrow_lite::RecordBatch>,
+        fresh: query_lite::QueryOutput,
+        user_plan: &Plan,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        use storage_lite::{Segment, SegmentHandle};
+        let ordering_key = self
+            .table
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == self.table.ordering_key())
+            .expect("the view table validated its ordering key at construction");
+        let handles: Vec<SegmentHandle> = clean
+            .chain(fresh.batches)
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| {
+                let ordered = is_non_decreasing(&batch, ordering_key);
+                SegmentHandle::resident(
+                    std::sync::Arc::new(Segment::from_batch_unpruned(batch, ordering_key, ordered)),
+                    None,
+                )
+            })
+            .collect();
+        query_lite::execute_with_ordering_key(
+            self.table.schema(),
+            &handles,
+            ordering_key,
+            user_plan,
+            &self.table.current_registry(),
+        )
+        .map_err(EngineError::Query)
+    }
+
     /// Moves the stamp forward and, for a persistent view, makes it
     /// durable — strictly after the materialization it describes.
+    /// "Durable" is the strong sense: the view table is **flushed**
+    /// first, because a read-only reader (F4) sees only the durable
+    /// prefix — a stamp ahead of the flushed materialization would
+    /// make it treat never-written buckets as clean and silently drop
+    /// them from the union. One small segment per refresh is the cost;
+    /// `compact` on the view table restores contiguity, like any
+    /// table's.
     fn advance_stamp(&mut self, now: u64) -> Result<(), EngineError> {
         self.stamp = now;
         if let Some(dir) = self.dir.clone() {
+            self.table.flush()?;
             self.write_definition(&dir)?;
         }
         Ok(())
@@ -284,6 +382,122 @@ impl MaterializedView {
             .and_then(|()| std::fs::rename(&staging, &path))
             .map_err(|error| definition_error(format!("writing {DEFINITION_FILE}: {error}")))
     }
+}
+
+/// A lowered, validated view definition plus its bucket arithmetic —
+/// what both halves of the machinery share: the refresh restricts and
+/// folds with it, the union read restricts and tops up with it.
+struct Definition {
+    plan: Plan,
+    bucket_name: String,
+    divide: i64,
+    view_scale: i64,
+}
+
+impl Definition {
+    fn of(sql: &str, source: &Table) -> Result<Definition, EngineError> {
+        let plan = lower_plan(sql).map_err(EngineError::Query)?;
+        let (bucket, bucket_name) = eligible_shape(&plan, source)?;
+        let (divide, view_scale) = bucket_arithmetic(&bucket);
+        Ok(Definition {
+            plan,
+            bucket_name,
+            divide,
+            view_scale,
+        })
+    }
+
+    /// The touched buckets since `stamp`, as maximal runs of
+    /// consecutive indices — `None` when no row changed.
+    fn touched_runs(
+        &self,
+        source: &Table,
+        stamp: u64,
+    ) -> Result<Option<Vec<(i64, i64)>>, EngineError> {
+        let mut buckets = std::collections::BTreeSet::new();
+        let divide = self.divide;
+        source.touched_ordering_keys(stamp, |value| {
+            buckets.insert(value / divide);
+        })?;
+        if buckets.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(contiguous_runs(&buckets)))
+    }
+
+    /// The definition, restricted to the runs' buckets: its own plan
+    /// with the prunable source-side range predicate ANDed in, so zone
+    /// maps skip every untouched segment.
+    fn restricted_to(&self, runs: &[(i64, i64)], source: &Table) -> Plan {
+        let mut restricted = self.plan.clone();
+        let ranges = ranges_predicate(
+            source.ordering_key(),
+            runs.iter().map(|&(first, last)| {
+                (
+                    bucket_low(first, self.divide),
+                    bucket_high(last, self.divide),
+                )
+            }),
+        );
+        restricted.predicate = Some(match restricted.predicate.take() {
+            Some(own) => Predicate::And(Box::new(ranges), Box::new(own)),
+            None => ranges,
+        });
+        restricted
+    }
+
+    /// The same runs on the view side: the view's ordering key stores
+    /// the bucket index scaled by the definition's multiplier (or the
+    /// raw key for a bare-`ts` bucket), so a run of indices maps to
+    /// one scaled range.
+    fn view_ranges(&self, runs: &[(i64, i64)]) -> Predicate {
+        ranges_predicate(
+            &self.bucket_name,
+            runs.iter().map(|&(first, last)| {
+                (
+                    first.saturating_mul(self.view_scale),
+                    last.saturating_mul(self.view_scale),
+                )
+            }),
+        )
+    }
+}
+
+/// A plan projecting every column of `table`, built structurally — an
+/// unaliased bucket's column name (`ts / 4`) cannot round-trip through
+/// SQL text, where it would parse as arithmetic.
+fn select_everything(table: &Table) -> Result<Plan, EngineError> {
+    Ok(Plan {
+        table: table.name().to_owned(),
+        join: None,
+        projection: query_lite::Projection::Items(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| query_lite::PlanItem::Column {
+                    name: field.name().to_owned(),
+                    alias: None,
+                })
+                .collect(),
+        ),
+        distinct: false,
+        predicate: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    })
+}
+
+/// Whether `batch`'s column `index` is non-decreasing — the honest
+/// per-batch orderedness of a scratch segment.
+fn is_non_decreasing(batch: &arrow_lite::RecordBatch, index: usize) -> bool {
+    use arrow_lite::{Column, NumericData};
+    let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
+        return false;
+    };
+    column.values().as_slice().windows(2).all(|w| w[0] <= w[1])
 }
 
 /// Lowers and validates a view definition against its source, returning
@@ -750,9 +964,10 @@ mod tests {
         db.create_materialized_view("ohlc", OHLC).unwrap();
         assert_eq!(db.view_names(), ["ohlc"]);
         assert_eq!(db.view("ohlc").unwrap().source(), "trades");
-        // Querying the view answers from the materialization — empty
-        // until the first refresh, honestly reflecting stamp 0.
-        assert_eq!(db.query("SELECT o FROM ohlc").unwrap().num_rows(), 0);
+        // Querying the view answers exactly even before any refresh:
+        // the union read's live half covers everything the stamp does
+        // not, which at stamp 0 is the whole answer.
+        assert_eq!(db.query("SELECT o FROM ohlc").unwrap().num_rows(), 6);
         // One namespace: neither a table nor a second view may take
         // the name, in either direction.
         let error = db.create_table("ohlc", m1_schema(), "ts").unwrap_err();
@@ -1109,5 +1324,159 @@ mod tests {
         }
         assert_eq!(db.refresh_view("ohlc").unwrap(), 1);
         assert_matches_recompute(&db, "ohlc");
+    }
+
+    #[test]
+    fn a_view_read_is_exact_at_every_knowledge_coordinate() {
+        // The subsuming property of the union read: whatever
+        // interleaving of appends, corrections, deletes, and refreshes
+        // has happened, querying the view equals recomputing its
+        // definition — at EVERY coordinate, not just after a refresh.
+        // The interleaving is pseudo-random but deterministic (a fixed
+        // LCG), so a failure replays.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        let mut lcg: u64 = 0xB16B_00B5;
+        let mut roll = |sides: u64| {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) % sides
+        };
+        let mut next_ts: i64 = 0;
+        let mut live: Vec<i64> = Vec::new();
+        for step in 0..140 {
+            match roll(10) {
+                0..=5 => {
+                    // Append — mostly forward, occasionally late.
+                    let ts = if roll(8) == 0 && next_ts > 4 {
+                        next_ts - 3
+                    } else {
+                        next_ts += 1;
+                        next_ts
+                    };
+                    live.push(ts);
+                    db.append("trades", &linear_row(ts)).unwrap();
+                }
+                6..=7 if !live.is_empty() => {
+                    let ts = live[roll(live.len() as u64) as usize];
+                    db.mutate(&format!("UPDATE trades SET x = {step}.5 WHERE ts = {ts}"))
+                        .unwrap();
+                }
+                8 if !live.is_empty() => {
+                    let index = roll(live.len() as u64) as usize;
+                    let ts = live.swap_remove(index);
+                    live.retain(|&other| other != ts);
+                    db.mutate(&format!("DELETE FROM trades WHERE ts = {ts}"))
+                        .unwrap();
+                }
+                _ => {
+                    db.refresh_view("ohlc").unwrap();
+                }
+            }
+            assert_matches_recompute(&db, "ohlc");
+        }
+        // And one compaction-then-more-churn coda over the same
+        // property.
+        db.compact("trades").unwrap();
+        for step in 0..20 {
+            if !live.is_empty() && roll(2) == 0 {
+                let ts = live[roll(live.len() as u64) as usize];
+                db.mutate(&format!("UPDATE trades SET y = {step}.25 WHERE ts = {ts}"))
+                    .unwrap();
+            } else {
+                next_ts += 1;
+                live.push(next_ts);
+                db.append("trades", &linear_row(next_ts)).unwrap();
+            }
+            assert_matches_recompute(&db, "ohlc");
+        }
+    }
+
+    #[test]
+    fn as_of_on_a_view_recomputes_from_the_source() {
+        // D2.3 = (i), ruled 2026-08-02: 'view AS OF s' IS the
+        // definition over 'base AS OF s'. The materialization reflects
+        // only latest knowledge, so it is bypassed — including for
+        // cuts the view has never folded, and after corrections whose
+        // pre-image no current state holds.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..8 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        let before = db.table("trades").unwrap().next_sequence() - 1;
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        db.refresh_view("ohlc").map(|_| ()).unwrap_err(); // no view yet
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        db.refresh_view("ohlc").unwrap();
+        // As of 'before', the correction is unknown: the view answers
+        // the ORIGINAL x=3 world, though its materialization holds the
+        // corrected one.
+        let past_view = db
+            .query(&format!(
+                "SELECT sym, bar, o, h, l, c FROM ohlc ASOF {before}"
+            ))
+            .unwrap();
+        let past_base = db
+            .table("trades")
+            .unwrap()
+            .query(&format!(
+                "SELECT sym, ts / 4 AS bar, first(x) AS o, max(x) AS h, min(x) AS l, \
+                 last(x) AS c FROM trades ASOF {before} GROUP BY sym, ts / 4"
+            ))
+            .unwrap();
+        assert_eq!(sorted_rows(&past_view), sorted_rows(&past_base));
+        // The corrected world differs from the past one — the cut is
+        // real, not vacuous.
+        let current = db.query("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap();
+        assert_ne!(sorted_rows(&current), sorted_rows(&past_view));
+    }
+
+    #[test]
+    fn a_read_only_view_answers_exactly_and_refuses_repair() {
+        // F4: the union read needs no writes, so a read-only process
+        // serves exact view answers over a directory another process
+        // maintains — however stale the materialization it finds.
+        let dir = std::env::temp_dir().join(format!("tallydb-view-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("ohlc");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut writer = Table::persistent("trades", m1_schema(), "ts", &source_dir).unwrap();
+        for i in 0..12 {
+            writer.append(&linear_row(i)).unwrap();
+        }
+        {
+            let mut view = MaterializedView::persistent("ohlc", OHLC, &writer, &view_dir).unwrap();
+            view.refresh(&writer).unwrap();
+        }
+        // The writer keeps going — a correction and new rows the
+        // reader's materialization has never seen — and flushes.
+        writer
+            .mutate("UPDATE trades SET x = 300.0 WHERE ts = 2")
+            .unwrap();
+        for i in 12..14 {
+            writer.append(&linear_row(i)).unwrap();
+        }
+        writer.flush().unwrap();
+        // The read-only pair: a stale materialization plus the durable
+        // source. The union read converges them without writing a byte.
+        let ro_source = Table::open_read_only("trades", &source_dir).unwrap();
+        let mut db = Database::new();
+        db.add_table(ro_source).unwrap();
+        let ro_view =
+            MaterializedView::open_read_only("ohlc", &view_dir, db.table("trades").unwrap())
+                .unwrap();
+        db.add_view(ro_view).unwrap();
+        assert_matches_recompute(&db, "ohlc");
+        // Repair is the writer's job: a read-only refresh refuses
+        // loudly, like every mutation on a read-only table.
+        assert!(db.refresh_view("ohlc").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

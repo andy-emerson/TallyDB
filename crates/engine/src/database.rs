@@ -185,11 +185,13 @@ impl Database {
     /// Runs one SQL query against the table(s) it names — including
     /// star-schema joins, which resolve their dimension table here.
     ///
-    /// A query naming a maintained view answers from its
-    /// materialization — the view **as of its stamp**. (The union read
-    /// that tops the answer up over the unfolded tail is #83's cycle 3;
-    /// until it lands, the stamp says exactly how current the answer
-    /// is.)
+    /// A query naming a maintained view answers **exactly**, however
+    /// stale the materialization: clean materialized buckets unioned
+    /// with a live fold of everything the view's stamp does not cover
+    /// (see [`MaterializedView::query_union`]). `AS OF` on a view
+    /// recomputes the definition over the source as of that cut — the
+    /// materialization accelerates current reads, it is never the
+    /// authority.
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
         if let Some(join) = &plan.join {
@@ -203,7 +205,11 @@ impl Database {
         }
         let Some(table) = self.tables.get(&plan.table) else {
             if let Some(view) = self.views.get(&plan.table) {
-                return view.table().execute_plan(&plan);
+                let source = self
+                    .tables
+                    .get(view.source())
+                    .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
+                return view.query_union(source, &plan);
             }
             return Err(EngineError::UnknownTable(plan.table.clone()));
         };

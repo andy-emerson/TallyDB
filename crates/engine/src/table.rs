@@ -378,7 +378,7 @@ impl Table {
     }
 
     /// The registry as of now — a cheap `Arc` clone under a brief lock.
-    fn current_registry(&self) -> Arc<Registry> {
+    pub(crate) fn current_registry(&self) -> Arc<Registry> {
         Arc::clone(&self.registry.lock().expect("registry lock poisoned"))
     }
 
