@@ -295,6 +295,20 @@ WINDOW_QUERIES = [
     "SELECT ts, regr_intercept(y, x) OVER (ORDER BY ts "
     "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
     "WHERE y > -100000 ORDER BY ts",
+    # M5.4: regr_r2 — ISO's own name, two-variable, so it reaches SQL
+    # by the #77.1 rule without coining anything. DuckDB implements it
+    # too, so it is born cross-checked like the rest of the regr family.
+    # Both the incremental sweep (trailing frames) and the recompute
+    # path (unbounded) must match the same oracle.
+    "SELECT ts, regr_r2(y, x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, regr_r2(y, x) OVER (ORDER BY ts "
+    "ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
+    "SELECT ts, regr_r2(y, x) OVER (PARTITION BY sym ORDER BY ts "
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w FROM corpus "
+    "WHERE y > -100000 ORDER BY ts",
     # M2.6: the pair statistics DuckDB also implements.
     "SELECT ts, covar_pop(y, x) OVER (PARTITION BY sym ORDER BY ts "
     "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS w FROM corpus "

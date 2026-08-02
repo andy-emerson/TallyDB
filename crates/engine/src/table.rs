@@ -333,6 +333,12 @@ impl Table {
             }),
         );
         registry.register(
+            "regr_r2",
+            Arc::new(RollingRegression {
+                output: RegressionOutput::R2,
+            }),
+        );
+        registry.register(
             "covar_pop",
             Arc::new(PairStatistic {
                 kind: PairKind::CovarPop,
@@ -1274,6 +1280,9 @@ impl TableSnapshot {
 pub(crate) enum RegressionOutput {
     Slope,
     Intercept,
+    /// `regr_r2(y, x)` — the coefficient of determination, ISO's own
+    /// name for the fit's explained fraction of `y`'s variance.
+    R2,
 }
 
 /// Rolling least-squares of `y` on `x`, solved in closed form.
@@ -1326,7 +1335,8 @@ impl WindowAggregate for RollingRegression {
         // Second pass about the means. `sum_dx` and `sum_dy` are zero in
         // exact arithmetic and merely small in floating point; carrying
         // them is what makes this the corrected form.
-        let (mut sum_dx, mut sum_dy, mut sxy, mut sxx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut sum_dx, mut sum_dy, mut sxy, mut sxx, mut syy) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for (&xi, &yi) in x.iter().zip(y) {
             let dx = xi - mean_x;
             let dy = yi - mean_y;
@@ -1334,9 +1344,11 @@ impl WindowAggregate for RollingRegression {
             sum_dy += dy;
             sxy += dx * dy;
             sxx += dx * dx;
+            syy += dy * dy;
         }
         let sxx = sxx - sum_dx * sum_dx / count;
         let sxy = sxy - sum_dx * sum_dy / count;
+        let syy = syy - sum_dy * sum_dy / count;
         // Zero variance in x — or negative, which rounding can produce
         // from the correction — leaves the regression undefined: SQL
         // NULL, exactly `regr_slope`'s definition. NaN is tested for
@@ -1345,6 +1357,16 @@ impl WindowAggregate for RollingRegression {
         if sxx <= 0.0 || sxx.is_nan() {
             return Ok(None);
         }
+        // R² is the squared correlation, which needs `y`'s spread too;
+        // a flat `y` leaves it undefined (0/0), so it is NULL rather
+        // than a fabricated 1.0. Clamped to [0, 1] because the
+        // correction can push a perfect fit a rounding step past 1.
+        if matches!(self.output, RegressionOutput::R2) {
+            if syy <= 0.0 || syy.is_nan() {
+                return Ok(None);
+            }
+            return Ok(Some((sxy * sxy / (sxx * syy)).clamp(0.0, 1.0)));
+        }
         let slope = sxy / sxx;
         // The fit is `a + slope·(x − x̄)` with `a` correcting for the
         // leftover offset; the reported intercept is its value at x = 0.
@@ -1352,6 +1374,7 @@ impl WindowAggregate for RollingRegression {
         Ok(Some(match self.output {
             RegressionOutput::Slope => slope,
             RegressionOutput::Intercept => centered_intercept - slope * mean_x,
+            RegressionOutput::R2 => unreachable!("handled above"),
         }))
     }
 
@@ -1391,14 +1414,24 @@ impl RollingRegression {
         if moments.rows() < 2 {
             return None;
         }
-        let (_, var_x, covar) = moments.population();
+        let (var_y, var_x, covar) = moments.population();
         if var_x <= 0.0 || var_x.is_nan() {
             return None;
+        }
+        // R² rides the same incremental moments: it is the squared
+        // correlation, so it needs y's spread as well, and is undefined
+        // where y is flat.
+        if matches!(self.output, RegressionOutput::R2) {
+            if var_y <= 0.0 || var_y.is_nan() {
+                return None;
+            }
+            return Some((covar * covar / (var_x * var_y)).clamp(0.0, 1.0));
         }
         let slope = covar / var_x;
         Some(match self.output {
             RegressionOutput::Slope => slope,
             RegressionOutput::Intercept => moments.mean_y() - slope * moments.mean_x(),
+            RegressionOutput::R2 => unreachable!("handled above"),
         })
     }
 }
@@ -2941,6 +2974,58 @@ mod mutation_tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn regr_r2_answers_and_is_undefined_where_the_fit_is() {
+        // A perfect line: R² is exactly 1 — the clamp exists so the
+        // corrected two-pass cannot report 1 + ε on a perfect fit.
+        let build = |rows: &[(i64, f64, f64)]| {
+            let mut table = Table::with_segment_rows("t", m1_schema(), "ts", 3).unwrap();
+            for &(ts, x, y) in rows {
+                table
+                    .append(&[
+                        RowValue::I64(ts),
+                        RowValue::Key("A"),
+                        RowValue::F64(x),
+                        RowValue::F64(y),
+                    ])
+                    .unwrap();
+            }
+            table
+        };
+        // BOTH frame shapes, because they take different code paths:
+        // an unbounded frame recomputes per frame, a trailing one rides
+        // the incremental moment sweep, and each carries its own
+        // undefined-fit guard.
+        let r2 = |t: &Table, frame: &str| {
+            let sql = format!("SELECT regr_r2(y, x) OVER (ORDER BY ts {frame}) AS r FROM t");
+            f64s(&t.query(&sql).unwrap(), 0)
+        };
+        let recompute = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+        let incremental = "ROWS BETWEEN 5 PRECEDING AND CURRENT ROW";
+        let mut table = build(&[(1, 1.0, 3.0), (2, 2.0, 5.0), (3, 3.0, 7.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(
+                r2(&table, frame),
+                [None, Some(1.0), Some(1.0)],
+                "a two-point fit is already perfect; one point is undefined ({frame})"
+            );
+        }
+        // A flat y — no variance to explain — leaves R² undefined
+        // rather than reporting a fabricated 1.0. This is the case a
+        // naive Sxy²/(Sxx·Syy) returns NaN for, and NaN is a *value*
+        // here, so it would otherwise reach the user as one.
+        table = build(&[(1, 1.0, 4.0), (2, 2.0, 4.0), (3, 3.0, 4.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(r2(&table, frame), [None, None, None], "flat y ({frame})");
+        }
+        // And a flat x — the fit itself undefined — is NULL too, the
+        // same rule regr_slope follows.
+        table = build(&[(1, 2.0, 1.0), (2, 2.0, 5.0), (3, 2.0, 9.0)]);
+        for frame in [recompute, incremental] {
+            assert_eq!(r2(&table, frame), [None, None, None], "flat x ({frame})");
+        }
     }
 
     #[test]
