@@ -76,6 +76,9 @@ pub struct MaterializedView {
     /// Where the definition record persists; `None` for in-memory
     /// views, whose stamp lives only as long as they do.
     dir: Option<std::path::PathBuf>,
+    /// Opened via [`MaterializedView::open_read_only`]: refresh
+    /// refuses, the union read serves.
+    read_only: bool,
 }
 
 impl MaterializedView {
@@ -91,6 +94,7 @@ impl MaterializedView {
             source: source.name().to_owned(),
             stamp: 0,
             dir: None,
+            read_only: false,
         })
     }
 
@@ -111,6 +115,7 @@ impl MaterializedView {
             source: source.name().to_owned(),
             stamp: 0,
             dir: Some(dir.as_ref().to_path_buf()),
+            read_only: false,
         };
         view.write_definition(dir.as_ref())?;
         Ok(view)
@@ -128,16 +133,7 @@ impl MaterializedView {
         source: &Table,
         options: StoreOptions,
     ) -> Result<MaterializedView, EngineError> {
-        let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
-            .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-        let (stamp, source_name, sql) = decode_definition(&record)?;
-        if source_name != source.name() {
-            return Err(definition_error(format!(
-                "view '{name}' is over '{source_name}', not '{}'",
-                source.name()
-            )));
-        }
-        validated_definition(&sql, source)?;
+        let (stamp, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
         let table = Table::open(name, dir.as_ref(), options)?;
         Ok(MaterializedView {
             table,
@@ -145,6 +141,7 @@ impl MaterializedView {
             source: source_name,
             stamp,
             dir: Some(dir.as_ref().to_path_buf()),
+            read_only: false,
         })
     }
 
@@ -159,16 +156,7 @@ impl MaterializedView {
         dir: impl AsRef<Path>,
         source: &Table,
     ) -> Result<MaterializedView, EngineError> {
-        let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
-            .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-        let (stamp, source_name, sql) = decode_definition(&record)?;
-        if source_name != source.name() {
-            return Err(definition_error(format!(
-                "view '{name}' is over '{source_name}', not '{}'",
-                source.name()
-            )));
-        }
-        validated_definition(&sql, source)?;
+        let (stamp, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
         let table = Table::open_read_only(name, dir.as_ref())?;
         Ok(MaterializedView {
             table,
@@ -178,7 +166,18 @@ impl MaterializedView {
             // Read-only: the stamp is never advanced, so nothing is
             // ever written back.
             dir: None,
+            read_only: true,
         })
+    }
+
+    /// The source-table name a persisted view's definition record
+    /// names — what a directory scanner (the console) reads to open
+    /// the source before the view, without opening the view first.
+    pub fn stored_source(dir: impl AsRef<Path>) -> Result<String, EngineError> {
+        let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
+            .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
+        let (_, source, _) = decode_definition(&record)?;
+        Ok(source)
     }
 
     /// The view's name.
@@ -203,11 +202,20 @@ impl MaterializedView {
         self.stamp
     }
 
-    /// The materialization, read-only. What it answers is the view **as
-    /// of the stamp**; the always-exact answer is the union read
-    /// (cycle 3), which tops this up over the unfolded tail.
-    pub fn table(&self) -> &Table {
-        &self.table
+    /// The view's output schema — the shape its rows answer with.
+    pub fn schema(&self) -> &Schema {
+        self.table.schema()
+    }
+
+    /// Compacts the materialization: each refresh flushes one small
+    /// segment (the durability the stamp asserts), and compaction
+    /// merges them back into sorted, contiguous ones — the same
+    /// maintenance any table wants, reachable for views through
+    /// [`Database::compact`].
+    ///
+    /// [`Database::compact`]: crate::Database::compact
+    pub fn compact(&mut self) -> Result<(), EngineError> {
+        self.table.compact()
     }
 
     /// Folds everything the stamp does not cover — new appends and
@@ -234,18 +242,51 @@ impl MaterializedView {
     /// needs no durability of its own.
     ///
     /// Returns the number of buckets re-folded.
-    pub fn refresh(&mut self, source: &Table) -> Result<u64, EngineError> {
+    ///
+    /// Takes the source mutably because the first thing a refresh does
+    /// is **flush it**: the stamp asserts durability ("the view
+    /// reflects everything below this coordinate"), so everything it
+    /// covers must survive any crash the source's own WAL contract
+    /// admits — a stamp covering buffered rows would leave ghost
+    /// buckets when a crash rewinds the source (found by the repo-wide
+    /// code review; the ghost test replays it). At the intended
+    /// cadence — refresh at the freeze boundary — the buffer is empty
+    /// and the flush is free; a mid-buffer refresh pays one early
+    /// freeze, the price of durably stamping what it folds.
+    pub fn refresh(&mut self, source: &mut Table) -> Result<u64, EngineError> {
         if source.name() != self.source {
             return Err(EngineError::WrongTable {
                 expected: self.source.clone(),
                 got: source.name().to_owned(),
             });
         }
+        if self.read_only {
+            return Err(EngineError::Query(QueryError::Unsupported(
+                "refresh on a read-only view — repair is the maintaining \
+                 process's job; this handle serves exact answers via the \
+                 union read and never writes"
+                    .to_owned(),
+            )));
+        }
+        source.flush()?;
         let now = source.next_sequence();
+        let definition = Definition::of(&self.sql, source)?;
+        if now < self.stamp {
+            // The source's watermark sits BELOW the stamp: with the
+            // flush-then-stamp discipline this cannot come from a
+            // crash — only from a foreign or tampered pairing (a
+            // source directory swapped under the view, a stamp file
+            // hand-edited). Nothing the stamp claims can be trusted,
+            // so this is the rebuild floor: every materialized row
+            // out, one full fold in.
+            let replacement = source.execute_plan(&definition.plan)?;
+            self.table.replace_matching(None, &replacement)?;
+            self.advance_stamp(now)?;
+            return Ok(u64::MAX);
+        }
         if now == self.stamp {
             return Ok(0);
         }
-        let definition = Definition::of(&self.sql, source)?;
         let Some(runs) = definition.touched_runs(source, self.stamp)? else {
             // Coordinates were spent (a DELETE that matched nothing,
             // say) but no row changed: nothing to fold, and the stamp
@@ -288,6 +329,19 @@ impl MaterializedView {
         source: &Table,
         user_plan: &Plan,
     ) -> Result<query_lite::QueryOutput, EngineError> {
+        if user_plan.referenced_columns().contains(SEQUENCE_COLUMN) {
+            // Found by the repo-wide code review: the union's scratch
+            // segments would fabricate sequences, and the fresh path
+            // would serve the view table's own — two different wrong
+            // answers depending on staleness. The view's knowledge
+            // axis is the SOURCE's; ask the source.
+            return Err(EngineError::Query(QueryError::Unsupported(
+                "'_seq' on a maintained view — a view row has no single \
+                 ingest coordinate (it summarizes many); query the base \
+                 table's '_seq', or the view with ASOF"
+                    .to_owned(),
+            )));
+        }
         let definition = Definition::of(&self.sql, source)?;
         if let Some(cut) = user_plan.as_of {
             let mut past = definition.plan.clone();
@@ -382,6 +436,29 @@ impl MaterializedView {
             .and_then(|()| std::fs::rename(&staging, &path))
             .map_err(|error| definition_error(format!("writing {DEFINITION_FILE}: {error}")))
     }
+}
+
+/// Reads and validates a persisted definition record against the
+/// already-open source — the shared head of both `open` flavors:
+/// the record's stamp, source name, and SQL, with the wrong-source
+/// pairing and any schema drift refused loudly here rather than
+/// answered wrongly later.
+fn read_definition(
+    dir: &Path,
+    name: &str,
+    source: &Table,
+) -> Result<(u64, String, String), EngineError> {
+    let record = std::fs::read(dir.join(DEFINITION_FILE))
+        .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
+    let (stamp, source_name, sql) = decode_definition(&record)?;
+    if source_name != source.name() {
+        return Err(definition_error(format!(
+            "view '{name}' is over '{source_name}', not '{}'",
+            source.name()
+        )));
+    }
+    validated_definition(&sql, source)?;
+    Ok((stamp, source_name, sql))
 }
 
 /// A lowered, validated view definition plus its bucket arithmetic —
@@ -595,6 +672,24 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), Eng
     if bucket_terms.next().is_some() {
         return refuse("two buckets of the ordering key in one GROUP BY");
     }
+    if let GroupKey::Bucket {
+        divide,
+        multiply: Some(multiply),
+        ..
+    } = bucket
+    {
+        if multiply != divide {
+            // Found by the repo-wide code review: the executor
+            // multiplies unchecked, the view's range inverse
+            // saturates, and a mismatched multiplier is where the two
+            // could disagree at i64's edge. A bucket start multiplies
+            // back by its own width; anything else is refused.
+            return refuse(
+                "a bucket whose multiplier differs from its width in a view \
+                 definition — a bucket start is (ts / w) * w, same w",
+            );
+        }
+    }
     for key in keys {
         if let GroupKey::Column(column) = key {
             if column != source.ordering_key()
@@ -805,15 +900,15 @@ mod tests {
         // pays for the backlog.
         assert_eq!(view.stamp(), 0);
         assert_eq!(
-            view.table().query("SELECT o FROM ohlc").unwrap().num_rows(),
+            view.table.query("SELECT o FROM ohlc").unwrap().num_rows(),
             0
         );
         // The table's shape came from the executor: the bucket alias
         // is the ordering key, the aggregates are columns.
-        let schema = view.table().schema();
+        let schema = view.table.schema();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name()).collect();
         assert_eq!(names, ["sym", "bar", "o", "h", "l", "c"]);
-        assert_eq!(view.table().ordering_key(), "bar");
+        assert_eq!(view.table.ordering_key(), "bar");
         // The bucket start spelling and a bare-ts bucket are accepted
         // too, and an unaliased bucket keeps its arithmetic name.
         MaterializedView::new(
@@ -968,6 +1063,10 @@ mod tests {
         // the union read's live half covers everything the stamp does
         // not, which at stamp 0 is the whole answer.
         assert_eq!(db.query("SELECT o FROM ohlc").unwrap().num_rows(), 6);
+        // The all-views doorway folds it (and is otherwise exercised
+        // nowhere else — one real call keeps it honest).
+        db.refresh_views().unwrap();
+        assert!(db.view("ohlc").unwrap().stamp() > 0);
         // One namespace: neither a table nor a second view may take
         // the name, in either direction.
         let error = db.create_table("ohlc", m1_schema(), "ts").unwrap_err();
@@ -1055,7 +1154,7 @@ mod tests {
         let columns = db
             .view(view)
             .unwrap()
-            .table()
+            .table
             .schema()
             .fields()
             .iter()
@@ -1233,7 +1332,7 @@ mod tests {
         }
         {
             let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
-            view.refresh(&source).unwrap();
+            view.refresh(&mut source).unwrap();
             let stamp = view.stamp();
             // Mutate the source; crash before any refresh.
             source
@@ -1245,11 +1344,11 @@ mod tests {
         // refresh converges the view.
         let mut view =
             MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
-        assert_eq!(view.refresh(&source).unwrap(), 1);
+        assert_eq!(view.refresh(&mut source).unwrap(), 1);
         let recomputed = source.query(OHLC).unwrap();
         let view_columns = "sym, bar, o, h, l, c";
         let materialized = view
-            .table()
+            .table
             .query(&format!("SELECT {view_columns} FROM ohlc"))
             .unwrap();
         assert_eq!(sorted_rows(&materialized), sorted_rows(&recomputed));
@@ -1262,9 +1361,9 @@ mod tests {
         let mut view =
             MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
         assert_eq!(view.stamp(), 0);
-        view.refresh(&source).unwrap();
+        view.refresh(&mut source).unwrap();
         let materialized = view
-            .table()
+            .table
             .query(&format!("SELECT {view_columns} FROM ohlc"))
             .unwrap();
         assert_eq!(sorted_rows(&materialized), sorted_rows(&recomputed));
@@ -1453,7 +1552,7 @@ mod tests {
         }
         {
             let mut view = MaterializedView::persistent("ohlc", OHLC, &writer, &view_dir).unwrap();
-            view.refresh(&writer).unwrap();
+            view.refresh(&mut writer).unwrap();
         }
         // The writer keeps going — a correction and new rows the
         // reader's materialization has never seen — and flushes.
@@ -1478,5 +1577,166 @@ mod tests {
         // loudly, like every mutation on a read-only table.
         assert!(db.refresh_view("ohlc").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crash_that_rewinds_the_source_leaves_no_ghost_buckets() {
+        // Found by the repo-wide code review. Under WalSync::Off the
+        // durability boundary is the flush: a crash loses acknowledged
+        // but unflushed appends, rewinding the source's watermark. If
+        // a refresh had folded those rows and durably stamped past
+        // them, the view would hold buckets whose source rows never
+        // durably existed — and the old stamp logic silently ADOPTED
+        // the rewound watermark, so no refresh would ever remove the
+        // ghosts. The rule now: a persistent view's stamp never
+        // exceeds the source's flushed watermark, so what the stamp
+        // covers survives any crash the source's own contract admits.
+        let dir = std::env::temp_dir().join(format!("tallydb-view-ghost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("ohlc");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let off = storage_lite::StoreOptions {
+            wal_sync: storage_lite::WalSync::Off,
+            ..Default::default()
+        };
+        {
+            let mut source =
+                Table::persistent_with("trades", m1_schema(), "ts", &source_dir, off).unwrap();
+            for i in 0..8 {
+                source.append(&linear_row(i)).unwrap();
+            }
+            source.flush().unwrap();
+            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
+            view.refresh(&mut source).unwrap();
+            // Refresh flushes the source, so anything IT saw is
+            // durable; the losable tail is what arrives after the
+            // last refresh.
+            for i in 8..16 {
+                source.append(&linear_row(i)).unwrap();
+            }
+            // The critical refresh: it sees the buffered tail, so its
+            // stamp covers it — which is exactly why it must make the
+            // tail durable first.
+            view.refresh(&mut source).unwrap();
+            let recomputed = source.query(OHLC).unwrap();
+            let via_union = view
+                .query_union(
+                    &source,
+                    &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
+                )
+                .unwrap();
+            assert_eq!(sorted_rows(&via_union), sorted_rows(&recomputed));
+            // Crash: both handles drop; the source's unflushed tail is
+            // gone (WalSync::Off), while the view's materialization
+            // and stamp are durable — and cover only the flushed 8.
+        }
+        let mut source =
+            Table::persistent_with("trades", m1_schema(), "ts", &source_dir, off).unwrap();
+        assert_eq!(
+            source.query("SELECT ts FROM trades").unwrap().num_rows(),
+            16,
+            "everything a refresh stamped must survive the crash — a \
+             loss here means refresh stamped unflushed rows"
+        );
+        let mut view =
+            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
+        view.refresh(&mut source).unwrap();
+        let recomputed = source.query(OHLC).unwrap();
+        let materialized = view
+            .query_union(
+                &source,
+                &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            sorted_rows(&materialized),
+            sorted_rows(&recomputed),
+            "ghost buckets survived the crash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stamp_ahead_of_the_source_triggers_the_rebuild_floor() {
+        // With the flush-then-stamp discipline a crash can never leave
+        // the stamp ahead of the source; only a foreign pairing can —
+        // a source directory swapped under the view, a hand-edited
+        // record. Nothing such a stamp claims is trustworthy, so the
+        // refresh answers with the rebuild floor: every materialized
+        // row out, one full fold in.
+        let dir = std::env::temp_dir().join(format!("tallydb-view-belt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let view_dir = dir.join("ohlc");
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut source = Table::new("trades", m1_schema(), "ts").unwrap();
+        for i in 0..8 {
+            source.append(&linear_row(i)).unwrap();
+        }
+        {
+            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
+            view.refresh(&mut source).unwrap();
+        }
+        // The tamper: a stamp far past anything the source has spent.
+        std::fs::write(
+            view_dir.join(DEFINITION_FILE),
+            encode_definition(1_000_000, "trades", OHLC),
+        )
+        .unwrap();
+        let mut view =
+            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
+        assert_eq!(view.refresh(&mut source).unwrap(), u64::MAX);
+        let recomputed = source.query(OHLC).unwrap();
+        let materialized = view
+            .query_union(
+                &source,
+                &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(sorted_rows(&materialized), sorted_rows(&recomputed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seq_on_a_view_is_refused_and_mismatched_multipliers_too() {
+        // Two review findings, both refusals. '_seq' through the union
+        // path would fabricate coordinates on scratch segments and
+        // serve real ones when fresh — two wrong answers selected by
+        // staleness — so it is refused with the pointer to the base.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..8 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        let error = db
+            .query("SELECT bar, _seq FROM ohlc")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'_seq' on a maintained view"), "{error}");
+        let error = db
+            .query("SELECT bar FROM ohlc WHERE _seq >= 3")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'_seq' on a maintained view"), "{error}");
+        // A bucket start multiplies back by its own width; the executor
+        // multiplies unchecked and the view's range inverse saturates,
+        // so a mismatched multiplier is refused before the two could
+        // disagree at i64's edge.
+        let error = db
+            .create_materialized_view(
+                "bad",
+                "SELECT (ts / 4) * 5 AS bar, sum(x) AS s FROM trades GROUP BY (ts / 4) * 5",
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("multiplier differs from its width"),
+            "{error}"
+        );
     }
 }

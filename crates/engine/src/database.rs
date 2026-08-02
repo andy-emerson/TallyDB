@@ -122,7 +122,7 @@ impl Database {
             .ok_or_else(|| EngineError::UnknownTable(name.to_owned()))?;
         let source = self
             .tables
-            .get(view.source())
+            .get_mut(view.source())
             .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
         view.refresh(source)
     }
@@ -346,8 +346,13 @@ impl Database {
         self.script_log_sink = Some(sink);
     }
 
-    /// Compacts the named table (see [`Table::compact`]).
+    /// Compacts the named table or maintained view (see
+    /// [`Table::compact`]; a view compacts its materialization, which
+    /// accumulates one small segment per refresh).
     pub fn compact(&mut self, table: &str) -> Result<(), EngineError> {
+        if let Some(view) = self.views.get_mut(table) {
+            return view.compact();
+        }
         self.tables
             .get_mut(table)
             .ok_or_else(|| EngineError::UnknownTable(table.to_owned()))?

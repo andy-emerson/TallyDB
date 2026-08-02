@@ -53,7 +53,11 @@ pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
 /// record (schema, ordering key, and the table's current **generation**,
 /// see below) with its own magic, CRC, and versioning; the format lives
 /// in `format.rs` beside the segment's.
-const MANIFEST: &str = "table.tlym";
+/// The manifest's filename — public because it is the marker a
+/// directory scanner (the console, the oracle harness) tests to
+/// recognize a store directory, and two hand-rolled copies of the
+/// literal had already grown before this was exported.
+pub const MANIFEST: &str = "table.tlym";
 
 /// The write-ahead log's one name per table. Its header carries the
 /// generation, so a log stranded by a crashed compaction is recognized
@@ -905,7 +909,13 @@ impl KnowledgeSnapshot {
         // Kills after the stamp, still pending (uncompacted): the map
         // names the row id; its home segment names the value.
         for (&row_id, &kill) in &self.stamps {
-            if kill < since {
+            // kill == 0 is the v1 sentinel, "killed at an unknown
+            // coordinate". `as_of` reads it conservatively (never
+            // visible); this walk must be conservative in the OTHER
+            // direction — an unknown kill may postdate any stamp, so
+            // it always touches. (`kill >= since` covers it only while
+            // since is 0.)
+            if kill != 0 && kill < since {
                 continue;
             }
             let home = self.latest.iter().find(|handle| {
@@ -925,7 +935,9 @@ impl KnowledgeSnapshot {
             let kills = segment.superseded();
             for row in 0..segment.batch().num_rows() {
                 let kill = kills.map_or(0, |kills| kills[row]);
-                if kill >= since || segment.sequence_at(row) >= since {
+                // kill == 0: the v1 killed-at-unknown sentinel —
+                // always touched, as in the pending walk above.
+                if kill == 0 || kill >= since || segment.sequence_at(row) >= since {
                     touch(key_of(&segment, row));
                 }
             }

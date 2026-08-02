@@ -908,9 +908,7 @@ impl ViewContext {
     fn open_at(dir: &std::path::Path) -> Result<Database, crate::EngineError> {
         let source_dir = dir.join("trades");
         let view_dir = dir.join("bars");
-        let existing = std::fs::read_dir(&source_dir)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
+        let existing = source_dir.join(storage_lite::store::MANIFEST).is_file();
         let mut db = Database::new();
         if existing {
             let table = Table::open("trades", &source_dir, storage_lite::StoreOptions::default())?;
