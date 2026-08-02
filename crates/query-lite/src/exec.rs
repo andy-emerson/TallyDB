@@ -235,7 +235,44 @@ pub fn execute(
                 .to_owned(),
         ));
     }
-    execute_single(schema, handles, plan, registry)
+    execute_single(schema, handles, ordering_key_of(handles), plan, registry)
+}
+
+/// As [`execute`], but told which column the table is ordered on
+/// instead of inferring it from the snapshot.
+///
+/// The difference only shows on an **empty** table. Inferring the
+/// ordering key from `handles.first()` means there is nothing to infer
+/// from when a table has no segments, and a schema-level refusal that
+/// depends on whether rows happen to exist is a bad refusal: without
+/// this, `GROUP BY <a non-ordering BIGINT>` is accepted while the table
+/// is empty and refused as soon as a row lands. Embedders that know the
+/// answer — `engine::Table` does, from its store — should call this.
+pub fn execute_with_ordering_key(
+    schema: &Schema,
+    handles: &[SegmentHandle],
+    ordering_key: usize,
+    plan: &Plan,
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    if plan.join.is_some() {
+        return Err(QueryError::Unsupported(
+            "joins execute through the multi-table doorway (Database), not a single table"
+                .to_owned(),
+        ));
+    }
+    execute_single(schema, handles, Some(ordering_key), plan, registry)
+}
+
+/// As [`ordering_key_of`], over materialized views.
+fn ordering_key_of_views(views: &[&SegmentView]) -> Option<usize> {
+    views.first().map(|view| view.segment.ordering_key())
+}
+
+/// The ordering key a snapshot reveals — `None` when it has no
+/// segments to reveal it.
+fn ordering_key_of(handles: &[SegmentHandle]) -> Option<usize> {
+    handles.first().map(SegmentHandle::ordering_key)
 }
 
 /// One side of a join: a table's schema, a snapshot of its segments,
@@ -288,7 +325,13 @@ pub fn execute_join(
     let fact_schema = fact.schema;
     let dimension_schema = dimension.schema;
     let Some(join) = &plan.join else {
-        return execute(fact_schema, fact.handles, plan, registry);
+        return execute_with_ordering_key(
+            fact_schema,
+            fact.handles,
+            fact.ordering_key,
+            plan,
+            registry,
+        );
     };
     // A join reads both sides whole (the gather touches every fact row
     // and any dimension row a key can reach), so both sides materialize
@@ -423,7 +466,15 @@ pub fn execute_join(
         .into_iter()
         .map(|view| SegmentHandle::resident(view.segment, view.live))
         .collect();
-    execute_single(&joined_schema, &joined_handles, plan, registry)
+    // The joined intermediate keeps the fact table's ordering key:
+    // joining widens rows, it never reorders them.
+    execute_single(
+        &joined_schema,
+        &joined_handles,
+        Some(fact.ordering_key),
+        plan,
+        registry,
+    )
 }
 
 /// One key's dimension rows for an as-of match: `(ordering-key value,
@@ -708,6 +759,7 @@ fn assemble_key(codes: Buffer<u32>, validity: Vec<bool>, mut dictionary: Diction
 fn execute_single(
     schema: &Schema,
     handles: &[SegmentHandle],
+    ordering_key: Option<usize>,
     plan: &Plan,
     registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
@@ -796,11 +848,11 @@ fn execute_single(
             items,
             having,
         } => match having {
-            None => project_aggregate(schema, &views, keys, items)?,
+            None => project_aggregate(schema, &views, ordering_key, keys, items)?,
             Some(having) => {
                 let mut extended = items.to_vec();
                 extended.extend(having.items.iter().cloned());
-                let output = project_aggregate(schema, &views, keys, &extended)?;
+                let output = project_aggregate(schema, &views, ordering_key, keys, &extended)?;
                 filter_having(output, &having.predicate, items.len(), registry)?
             }
         },
@@ -1024,9 +1076,31 @@ fn uses_registered(expr: &ScalarExpr) -> bool {
         ScalarExpr::Binary { left, right, .. } => uses_registered(left) || uses_registered(right),
         ScalarExpr::Call { args, .. } => args.iter().any(uses_registered),
         ScalarExpr::Case { whens, otherwise } => {
-            whens.iter().any(|(_, value)| uses_registered(value))
-                || otherwise.as_deref().is_some_and(uses_registered)
+            // The CONDITION counts too. Before #95 it could not hold a
+            // call at all; now it holds a full expression on both sides
+            // of a comparison, so a kernel can hide there — and if this
+            // missed it, the kernel would run once per segment and its
+            // answer would depend on how the rows happened to be split.
+            whens.iter().any(|(condition, value)| {
+                predicate_uses_registered(condition) || uses_registered(value)
+            }) || otherwise.as_deref().is_some_and(uses_registered)
         }
+    }
+}
+
+/// Whether a predicate's expression comparisons call a registered
+/// kernel anywhere. Only `CompareExpr` can: every other leaf compares a
+/// stored column to a literal.
+fn predicate_uses_registered(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::CompareExpr { left, right, .. } => {
+            uses_registered(left) || uses_registered(right)
+        }
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            predicate_uses_registered(left) || predicate_uses_registered(right)
+        }
+        Predicate::Not(inner) => predicate_uses_registered(inner),
+        _ => false,
     }
 }
 
@@ -1938,7 +2012,7 @@ fn value_runs(
         }
         return Ok(vec![run]);
     }
-    let mut space = PartitionSpace::new(schema, views, partition_by)?;
+    let mut space = PartitionSpace::new(schema, ordering_key_of_views(views), partition_by)?;
     let mut runs: Vec<Vec<(usize, usize)>> = Vec::new();
     for (view_index, view) in views.iter().enumerate() {
         let remaps = space.remaps(view)?;
@@ -1974,12 +2048,12 @@ type PartitionRemaps<'a> = Vec<Option<(&'a KeyColumn, Vec<usize>)>>;
 impl PartitionSpace {
     fn new(
         schema: &Schema,
-        views: &[&SegmentView],
+        ordering_key: Option<usize>,
         partition_by: &[GroupKey],
     ) -> Result<PartitionSpace, QueryError> {
         let terms = partition_by
             .iter()
-            .map(|key| resolve_partition_key(schema, views, key))
+            .map(|key| resolve_partition_key(schema, ordering_key, key))
             .collect::<Result<Vec<GroupTerm>, QueryError>>()?;
         Ok(PartitionSpace {
             unified: vec![HashMap::new(); terms.len()],
@@ -2022,10 +2096,9 @@ impl PartitionSpace {
 /// grouping follows.
 fn resolve_partition_key(
     schema: &Schema,
-    views: &[&SegmentView],
+    ordering_key: Option<usize>,
     key: &GroupKey,
 ) -> Result<GroupTerm, QueryError> {
-    let ordering_key = views.first().map(|view| view.segment.ordering_key());
     let (index, field) = resolve(schema, key.column())?;
     match (key, field.column_type()) {
         (GroupKey::Column(_), ColumnType::Key) => Ok(GroupTerm::Label { index }),
@@ -2253,7 +2326,7 @@ fn partitioned(
     frame: Frame,
     results: &mut [Vec<Option<f64>>],
 ) -> Result<(), QueryError> {
-    let mut space = PartitionSpace::new(schema, views, partition_by)?;
+    let mut space = PartitionSpace::new(schema, ordering_key_of_views(views), partition_by)?;
     // Per partition: scratch per argument, plus where each row came from
     // (view index, live position within the view).
     let mut scratch: Vec<Vec<Vec<f64>>> = Vec::new();
@@ -2327,9 +2400,13 @@ impl WindowAggregate for BuiltinWindow {
                 .copied()
                 .max_by(|left, right| cmp_f64(*left, *right))
                 .expect("window is non-empty"),
-            // Windows arrive oldest-first, so the frame's ends *are*
-            // its earliest and latest ordering keys — no clock needed
-            // here, unlike the group form.
+            // Windows arrive oldest-first — checked, not assumed:
+            // `check_order` runs for every ordered window, and an
+            // UNordered one cannot reach here at all, because the
+            // planner refuses `first`/`last` without an ORDER BY. So
+            // the frame's ends *are* its earliest and latest ordering
+            // keys, and no clock is needed here as it is in the group
+            // form.
             AggFunction::First => window[0],
             AggFunction::Last => window[window.len() - 1],
         }))
@@ -2804,15 +2881,14 @@ fn resolve_group_key(
 fn project_aggregate(
     schema: &Schema,
     views: &[&SegmentView],
+    ordering_key: Option<usize>,
     keys: &[GroupKey],
     items: &[AggItem],
 ) -> Result<QueryOutput, QueryError> {
     // Which column ingest is ordered on — the axis a bucket is allowed
-    // to divide. Read from the snapshot rather than the schema, which
-    // cannot say it. With no segments there are no rows and therefore
-    // no groups, so there is nothing a wrong column could answer
-    // wrongly and the check is vacuous.
-    let ordering_key = views.first().map(|view| view.segment.ordering_key());
+    // to divide. The schema cannot say it, so it is threaded in;
+    // `None` means nobody could tell us AND the snapshot has no segment
+    // to ask, which leaves the bucket checks below unable to refuse.
     let terms: Vec<GroupTerm> = keys
         .iter()
         .map(|key| resolve_group_key(schema, key, ordering_key))
@@ -3008,18 +3084,15 @@ fn project_aggregate(
                         GroupCode::Bucket(_) => unreachable!("label term, label code"),
                     }
                 }
+                // Through `assemble_key`, not a second copy of it: its
+                // empty-dictionary placeholder is what keeps every code
+                // in range when EVERY group's key is null, which a
+                // WHERE can leave behind even though ingest refuses an
+                // all-null key column. The inline copy this replaces
+                // had drifted from it and panicked on that input.
                 let nullable = validity.iter().any(|&valid| !valid);
-                let column = if nullable {
-                    KeyColumn::new_nullable(
-                        codes,
-                        Bitmap::from_bools(validity.iter().copied()),
-                        dictionary,
-                    )
-                } else {
-                    KeyColumn::new_non_null(codes, dictionary)
-                };
                 fields.push(Field::new(name, ColumnType::Key, nullable));
-                columns.push(Column::Key(column));
+                columns.push(Column::Key(assemble_key(codes, validity, dictionary)));
             }
             AggItem::Call(call) => {
                 let default_name = match call.function {
@@ -5142,6 +5215,92 @@ mod query1_tests {
         .unwrap();
         // Mean is 3, so only the last row is above it.
         assert_eq!(flatten(&flagged, 0), [Some(0.0), Some(0.0), Some(1.0)]);
+    }
+
+    #[test]
+    fn a_group_whose_every_key_is_null_assembles() {
+        // Found by the repo-wide code review. Ingest refuses an
+        // all-null key column, so this is only reachable once a WHERE
+        // leaves nothing but null-key rows — and then an empty
+        // dictionary met a code of 0. `assemble_key` has carried the
+        // placeholder for exactly this since the join path needed it;
+        // the group path had grown a second copy that lost it.
+        let views = segment(&[(1, "A", 1.0), (2, "B", 5.0)]);
+        let output = run(
+            &views,
+            "SELECT sym, count(*) AS n FROM t WHERE x > 2 GROUP BY sym",
+        )
+        .unwrap();
+        assert_eq!(output.num_rows(), 1, "one surviving group");
+    }
+
+    #[test]
+    fn first_and_last_refuse_a_window_with_no_order() {
+        // They are positional on the time axis — the group-level
+        // counterpart of LAG/LEAD — so an unordered window leaves them
+        // nothing to be first OF. Answering from storage order would
+        // quietly mean something other than their names.
+        for sql in [
+            "SELECT first(x) OVER (PARTITION BY sym) FROM t",
+            "SELECT last(x) OVER () FROM t",
+        ] {
+            let error = crate::plan::plan(sql).unwrap_err().to_string();
+            assert!(error.contains("needs an ORDER BY"), "{sql}: {error}");
+        }
+        // Ordered, they answer.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        assert!(run(
+            &views,
+            "SELECT first(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_schema_refusal_does_not_depend_on_whether_rows_exist() {
+        // Found by the repo-wide code review. Which column is the
+        // ordering key cannot be read off the schema, and an empty
+        // snapshot has no segment to ask — so inferring it from the
+        // first handle meant `GROUP BY <a non-ordering BIGINT>` was
+        // ACCEPTED while a table was empty and REFUSED once a row
+        // landed. No wrong answers, but a refusal that moves with the
+        // data is not a refusal a user can rely on.
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("venue", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let registry = Registry::new();
+        let run = |views: &[SegmentHandle], sql: &str| {
+            execute_with_ordering_key(
+                &schema,
+                views,
+                0,
+                &crate::plan::plan(sql).unwrap(),
+                &registry,
+            )
+        };
+        let mut store = storage_lite::Store::with_segment_rows(schema.clone(), 0, 8).unwrap();
+        let populated: Vec<SegmentHandle> = {
+            store
+                .append(&[
+                    storage_lite::RowValue::I64(1),
+                    storage_lite::RowValue::I64(7),
+                    storage_lite::RowValue::F64(1.0),
+                ])
+                .unwrap();
+            store.snapshot().unwrap()
+        };
+        for (label, views) in [("empty", &[][..]), ("populated", &populated[..])] {
+            assert!(
+                run(views, "SELECT venue, count(*) FROM t GROUP BY venue").is_err(),
+                "a non-ordering BIGINT never groups ({label})"
+            );
+            assert!(
+                run(views, "SELECT ts / 5, count(*) FROM t GROUP BY ts / 5").is_ok(),
+                "a bucket of the ordering key always does ({label})"
+            );
+        }
     }
 
     #[test]

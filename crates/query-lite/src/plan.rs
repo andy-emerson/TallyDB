@@ -367,13 +367,6 @@ impl AggFunction {
             _ => None,
         }
     }
-
-    /// Whether this aggregate reads the ordering key as well as its
-    /// argument — `FIRST`/`LAST` are positional on the time axis, the
-    /// group-level counterpart of `LAG`/`LEAD`.
-    pub fn is_positional(self) -> bool {
-        matches!(self, AggFunction::First | AggFunction::Last)
-    }
 }
 
 /// One plain (non-window) aggregate call in an aggregate projection.
@@ -2585,6 +2578,17 @@ fn lower_window_call(function: &ast::Function) -> Result<WindowCall, QueryError>
         });
     }
     let args = lower_args(&function.args)?;
+    // `FIRST`/`LAST` are positional on the time axis exactly as
+    // `LAG`/`LEAD` are, so an unordered window leaves them with nothing
+    // to be first OF: the frame's ends would be storage order, which is
+    // not what their names promise. Refuse rather than answer by
+    // accident — the same rule the positional lookups follow above.
+    if order_column.is_none() && matches!(name.as_str(), "first" | "last") {
+        return Err(QueryError::Unsupported(format!(
+            "{name} needs an ORDER BY — it reads the frame's earliest or latest \
+             row on the time axis, and an unordered window has no such axis"
+        )));
+    }
     // With no order there is nothing for a frame to be relative to, so
     // standard SQL's answer — the whole partition — is the only one
     // available, and a frame clause beside it is a contradiction rather

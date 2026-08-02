@@ -76,8 +76,8 @@ pub mod plan;
 pub mod predicate;
 
 pub use exec::{
-    contiguous, execute, execute_join, recompute_frames, ColumnFunction, JoinSide, QueryOutput,
-    Registry, ViewScalars, WindowAggregate,
+    contiguous, execute, execute_join, execute_with_ordering_key, recompute_frames, ColumnFunction,
+    JoinSide, QueryOutput, Registry, ViewScalars, WindowAggregate,
 };
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, AsOfMatch, Assignment, ColumnSpec,

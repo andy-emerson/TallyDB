@@ -30,9 +30,9 @@ use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schem
 #[cfg(feature = "lua")]
 use compute_lua::LogSink;
 use query_lite::{
-    evaluate_predicate, execute, parse_statement, plan, recompute_frames, ColumnFunction,
-    DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan,
-    ViewScalars, WindowAggregate,
+    evaluate_predicate, execute_with_ordering_key, parse_statement, plan, recompute_frames,
+    ColumnFunction, DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue,
+    Statement, UpdatePlan, ViewScalars, WindowAggregate,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -446,9 +446,10 @@ impl Table {
             Some(cut) => self.store.knowledge_snapshot()?.as_of(cut)?,
             None => self.store.snapshot()?,
         };
-        Ok(execute(
+        Ok(execute_with_ordering_key(
             self.store.schema(),
             &segments,
+            self.store.ordering_key(),
             plan,
             &self.current_registry(),
         )?)
@@ -528,6 +529,7 @@ impl Table {
         TableReader {
             name: self.name.clone(),
             schema: self.store.schema().clone(),
+            ordering_key: self.store.ordering_key(),
             store: self.store.reader(),
             registry: Arc::clone(&self.registry),
         }
@@ -1201,6 +1203,9 @@ pub fn type_name(column_type: ColumnType) -> &'static str {
 pub struct TableReader {
     name: String,
     schema: Schema,
+    /// The declared ordering key's column index — carried because the
+    /// schema cannot say it and a snapshot may have no segment to ask.
+    ordering_key: usize,
     store: StoreReader,
     registry: Arc<Mutex<Arc<Registry>>>,
 }
@@ -1214,6 +1219,7 @@ impl TableReader {
         Ok(TableSnapshot {
             name: self.name.clone(),
             schema: self.schema.clone(),
+            ordering_key: self.ordering_key,
             knowledge,
             registry: Arc::clone(&self.registry.lock().expect("registry lock poisoned")),
         })
@@ -1234,6 +1240,11 @@ impl TableReader {
 pub struct TableSnapshot {
     name: String,
     schema: Schema,
+    /// The declared ordering key's column index, carried so a query
+    /// over an empty snapshot refuses exactly what a populated one
+    /// would — the schema cannot say it and there may be no segment
+    /// to ask.
+    ordering_key: usize,
     /// The latest-knowledge views plus what an `AS OF` query needs —
     /// history and pending kill stamps — captured at the same instant.
     knowledge: storage_lite::KnowledgeSnapshot,
@@ -1260,7 +1271,13 @@ impl TableSnapshot {
             }
             None => self.knowledge.latest(),
         };
-        Ok(execute(&self.schema, segments, &plan, &self.registry)?)
+        Ok(execute_with_ordering_key(
+            &self.schema,
+            segments,
+            self.ordering_key,
+            &plan,
+            &self.registry,
+        )?)
     }
 
     /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
@@ -2730,6 +2747,61 @@ mod snapshot_concurrency {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TableReader>();
         assert_send_sync::<TableSnapshot>();
+    }
+
+    #[test]
+    fn a_kernel_in_a_case_condition_is_refused_not_silently_resegmented() {
+        // Found by the repo-wide code review. A registered kernel must
+        // see the query's rows as ONE column — segmentation is an
+        // internal detail, and a kernel with running semantics would
+        // otherwise reset at every segment boundary. CASE combined
+        // with a kernel is refused for exactly that reason.
+        //
+        // #95 opened a new door: a CASE *condition* can now hold a
+        // full expression, so a kernel can hide there — and the
+        // routing test was only looking at the arms. The kernel took
+        // the per-view path and its answer changed with the segment
+        // size. It now meets the same refusal the arms do, which is
+        // the point: whether a query is accepted must not turn on how
+        // the rows happen to be split.
+        struct RunningSum;
+        impl ColumnFunction for RunningSum {
+            fn arity(&self) -> usize {
+                1
+            }
+            fn evaluate(&self, args: &[(&[f64], &[bool])]) -> Result<Vec<Option<f64>>, String> {
+                let (x, valid) = args[0];
+                let mut total = 0.0;
+                Ok((0..x.len())
+                    .map(|i| {
+                        valid[i].then(|| {
+                            total += x[i];
+                            total
+                        })
+                    })
+                    .collect())
+            }
+        }
+        for segment_rows in [8usize, 3] {
+            let mut table = Table::with_segment_rows("t", m1_schema(), "ts", segment_rows).unwrap();
+            for i in 0..8i64 {
+                table.append(&linear_row(i)).unwrap();
+            }
+            table
+                .register_column_function("running", RunningSum)
+                .unwrap();
+            let error = table
+                .query("SELECT CASE WHEN running(x) > 6 THEN 1 ELSE 0 END AS c FROM t")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lift the function out"),
+                "refused the same way at {segment_rows} rows per segment: {error}"
+            );
+            // The kernel alone is fine, and segment-independent.
+            let plain = table.query("SELECT running(x) AS c FROM t").unwrap();
+            assert_eq!(flatten(&plain, 0).last().copied().flatten(), Some(28.0));
+        }
     }
 
     #[test]
