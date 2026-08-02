@@ -36,22 +36,52 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-07-30: step 1 BUILT — the residency design; step 2 is the check-in)
+## Snapshot (2026-07-30: M5.0–M5.4 BUILT; reviews then merge)
 
-**State:** `main` = `cfeba35` (PR #86: AGENTS.md v2.4.0 +
-CONTRIBUTING.md + vector logo). `claude/dev` rebased onto it and
-carries step 1, built and pushed: the residency ruling (option b,
-manifest-section metadata, advisory budget, unbounded interim
-default) in three code commits (`322974b` manifest tag 1 +
-authoritative layout; `177b75b` lazy fault-in + budget + handle API
-sweep; `cb2a6d6` refresh retention + the budget differential) plus
-the decision-record doc commit. Full gate green at the push: fmt,
-clippy both legs, 28 suites (all guards verified tripping),
-rustdoc both legs, all six oracles over the faulting path. New
-issues: #87 (residency deferrals: column granularity, hard budget,
-the default), #88 (streaming scans — unpruned full-table working
-set). Local toolchain **Rust 1.97.1** matching CI — keep it current
-so the gate sees what CI sees.
+**State:** `main` = `8103306`. `claude/dev` rebased onto it, 16
+commits, full gate green at every push. M5.0 through M5.4 are built —
+the whole ordered-axis dividend plus two gaps found on the way:
+
+| Commit | What |
+|---|---|
+| `…` M5.0/M5.1 | dispersion windows, prelude, `LAG`/`LEAD`, `RANGE` frames |
+| as-of join ×2 | grammar + executor (#65) |
+| bucketing | `GROUP BY ts / 60`, `FIRST`/`LAST` (F1 = d) |
+| cross-sectional | `PARTITION BY ts` and buckets of it |
+| #94 | scalar expressions over window results |
+| PARTITION ×N | several partition terms intersect |
+| streaming | bucketed grouping holds the open bucket (measured 1.65×) |
+| #95 | predicates compare expressions, not only column-vs-literal |
+| `regr_r2` | the one M5.4 reduction with a standard name |
+
+**Evidence:** 143 → **146 differential families** vs DuckDB, 29 test
+suites, six oracles. Every guard added was shown to trip; two
+sabotages this stretch passed *silently* because the pattern matched
+nothing, which is now a standing lesson — a sabotage that does not
+fail is not a verified guard, it is an unverified edit.
+
+**Issues opened:** #92 (as-of streaming co-walk — clause 2 of the join
+constraint is designed, not built), #93 (**open decision for the
+Human**: `quotes.ts` beside `trades.ts` is refused; rename today),
+#94 (built, closed), #95 (built, closed).
+
+**M5.4 is done on TallyDB's side, and its centre of gravity moved.**
+`regr_r2` is ISO-named and shipped. Residual, fitted value and
+multi-factor have no standard SQL name, so #77.1 puts them
+script-side — and the Human ruled (2026-07-30) that they go to
+**MatLua** (github.com/andy-emerson/MatLua), a Lua array + linalg
+crate over faer and arrow-rs. SQL keeps only standard names; #77 was
+**not** amended. A requirements letter for the MatLua team is drafted
+at `scratchpad/matlua-requirements.md` — send it as an issue there.
+
+**Standing ruling from the Human (2026-07-30), important:** decisions
+made ad-hoc while building internal tools are *revisitable*; only
+decisions that undermine **what TallyDB is** are non-negotiable. Do
+not defend a choice by citing that it was ruled — give the reason, or
+concede. (Applied: D2's NaN half is ours and revisitable; D2's NULL
+half is SQL's and therefore identity-level.)
+
+**Toolchain:** Rust 1.97.1, matching CI.
 
 ### The plan (amended by the Human 2026-07-30, after step 1 landed)
 
@@ -109,11 +139,16 @@ The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
      constrains #40) and the `GROUP BY`/`PARTITION BY` type asymmetry.
      Opened on the way: **#95** (`WHERE x > y` — comparisons between
      expressions, refused since `WHERE` landed).
-   - **M5.4** the matrix tier on faer — **SQL gets scalar reductions
-     only** (#77.2 = c): R², residual, fitted; vectors/matrices via
-     API and scripts. Per-frame recompute ships it correct; the
-     incremental up/downdating research is deferred (below).
-3. **Code pass** (repo-wide review + fixes).
+   - ~~**M5.4** the matrix tier~~ — DONE on TallyDB's side
+     (2026-07-30). `regr_r2(y, x)` shipped: ISO-named, two-variable,
+     so #77.1 admits it without coining anything; NULL where the fit
+     is undefined; both the recompute and incremental paths, each
+     guard shown to trip. Residual, fitted value and multi-factor
+     have **no** standard SQL name, so they went script-side per
+     #77.1 — and by the Human's ruling they go to **MatLua** rather
+     than being built here. Nothing further is TallyDB's until
+     MatLua answers the requirements letter.
+3. **Code pass** (repo-wide review + fixes) ← HERE.
 4. **Doc pass** (truth then clarity; README claims at evidence).
 5. **Merge** (the Human).
 
