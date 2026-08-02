@@ -90,7 +90,11 @@ whole org.
 
 TallyDB's SQL surface is designed to be standard SQL over its schema:
 `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`, equi-joins, window functions, and —
-yes — `UPDATE`/`DELETE`. Under the hood, both mutations are implemented as
+yes — `UPDATE`/`DELETE`. Grouping and windowing both run in either
+direction over the ordered axis: down one symbol through time
+(`PARTITION BY sym`), or across every symbol at one instant
+(`PARTITION BY ts`, or a bucket of it — `ts / 60` for minute bars).
+Under the hood, both mutations are implemented as
 tombstone-plus-reinsert against immutable, append-only storage (the same
 mechanism handles ordinary corrections), resolved at the next compaction
 rather than in place. They aren't the fast path, and the engine isn't

@@ -94,9 +94,21 @@ The order is now step 1 → merge → **M5.0–M5.4** → passes → merge.
      gating): both tables are timestamped, and a dimension attribute
      sharing a fact column's name is refused, so `quotes.ts` beside
      `trades.ts` must be renamed today.
-   - **M5.3** bucketing (F1 = d: monotone integer arithmetic on the
-     ordering key in `GROUP BY`, streaming O(1)) + `FIRST`/`LAST`
-     **ruled (a)** + cross-sectional partitioning.
+   - ~~**M5.3** bucketing + `FIRST`/`LAST` + cross-sectional~~ — DONE
+     (2026-07-30). Bucketed `GROUP BY` (`ts / 60`, `(ts / 60) * 60`,
+     bare `ts`; `//` accepted; nameable by SELECT alias);
+     `FIRST`/`LAST` positional on the time axis; cross-sectional
+     `PARTITION BY` including multi-term intersection; and **#94**,
+     scalar expressions over window results, without which the
+     cross-sectional weight could be computed but not used.
+     The streaming dividend is built and **measured** — accumulator
+     state is the open bucket, 1.65× less than hashing over 160k
+     groups — with unordered data falling back to hashing rather than
+     refusing (`compact()` restores it). Two new decisions recorded in
+     DESIGN.md's F1 build note: `/` truncates between integers (ISO;
+     constrains #40) and the `GROUP BY`/`PARTITION BY` type asymmetry.
+     Opened on the way: **#95** (`WHERE x > y` — comparisons between
+     expressions, refused since `WHERE` landed).
    - **M5.4** the matrix tier on faer — **SQL gets scalar reductions
      only** (#77.2 = c): R², residual, fitted; vectors/matrices via
      API and scripts. Per-frame recompute ships it correct; the

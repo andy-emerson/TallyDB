@@ -926,7 +926,10 @@ DuckDB differential family; the shell's help cites this table.
 | regex on keys | deferred by ruling (2026-07-29) | menu incl. the Lua-pattern house option on #57 |
 | `IS NULL` / `IS NOT NULL` | in, built | one predicate arm over the validity bitmap; the only *total* leaf (never UNKNOWN); `IS NOT NULL` prunes an all-null segment |
 | `GROUP BY` + `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` | in, built | exact-loud `SUM(i64)` |
-| `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, ruled (F1 = d), M5.3 | streams O(1); `FIRST`/`LAST` naming pending |
+| `GROUP BY` monotone ordering-key arithmetic (`ts / 60`) | in, built (M5.3) | bucket index, `(ts / 60) * 60` for the bucket start, bare `ts` for the finest bucket. `/` truncates (ISO); `//` accepted (DuckDB's spelling). May be named by its SELECT alias. Over ordered data the grouping **streams** — accumulator state is the open bucket, not the result (measured 1.65× less than the hash path over 160k groups); unordered data falls back to hashing with the same answers, and `compact()` restores the fast path |
+| `FIRST` / `LAST` aggregates | in, built (M5.3) | the de-facto TSDB names (ruled (a)); positional on the **time axis**, not row order, so a late-arriving row cannot become "last". Ties on the clock go to the last row in storage order; nulls skipped, which coincides with DuckDB's `arg_min`/`arg_max` |
+| cross-sectional `PARTITION BY` (the ordering key, or a bucket of it) | in, built (M5.3) | the transpose of `PARTITION BY sym` — one partition per instant, across every symbol. Unordered windows (`OVER (PARTITION BY ts)`) take the whole partition, per standard SQL; several terms intersect (`sym, ts / 60` = per symbol per bar); any `BIGINT` partitions, `DOUBLE` never |
+| scalar expressions over window results | in, built (#94) | `x / sum(x) OVER (PARTITION BY ts)`, `x - lag(x) OVER (ORDER BY ts)`, the rolling z-score. Window calls hoist out of the scalar and compute first — standard SQL's evaluation order |
 | `HAVING` | in, built | hidden-column lowering; WHERE grammar over the group row |
 | `DISTINCT` | in, built | by value; NaN=NaN, −0=0, NULLs equal; `DISTINCT ON` out |
 | scalar expressions (`+ − * / %`, `ABS ROUND FLOOR CEIL SQRT LN EXP POWER`) | in, built | f64, three-valued; IEEE division — NaN is a value; i64 refused loudly (#40) |
@@ -966,6 +969,82 @@ none is built unless its row in the stdlib table says so.
    float-equality group identity); refusal (concedes the workload's
    most common query). `FIRST`/`LAST` aggregates (OHLC's open/close)
    surface a naming sub-ruling when M5.3 builds this.
+
+   **Build note (M5.3, 2026-07-30).** Built, and the streaming dividend
+   with it — but the claim above needed narrowing to what the code
+   earns:
+
+   - **"O(1) state, no hash table" is now "the open bucket's state".**
+     Once a bucket is left it cannot come back, so its groups close and
+     reduce to cells there and then; what stays live is the groups
+     *inside one bucket* (the symbols trading in this minute), not
+     every group the query will produce. The result itself, and the
+     keys labelling it, are one per group either way — so the honest
+     claim is that the accumulator state stops scaling, not that
+     memory does. Measured on a 200,000-row fixture over 160,000
+     groups: **40.4 MB streaming vs 66.7 MB hashing, a ratio of 1.65**
+     (`bucket_grouping_memory`, 2026-07-30). Truly constant state
+     would need streaming *output* too, which is #88.
+   - **Unordered data falls back rather than refusing.** Whether the
+     grouping can stream is read from segment metadata before a byte
+     is touched, so dispatch stays structural — but a table whose
+     order an `UPDATE` disturbed takes the hash path and gets the same
+     answer more expensively, with `compact()` restoring the fast
+     path. Correct always, fast when the data behaves: the same
+     bargain tombstones make. Refusing was considered and rejected —
+     it would make a correction change which queries *run*, not just
+     how fast they run.
+   - **`/` between integers truncates**, which is ISO and PostgreSQL;
+     `//` is accepted as a synonym because DuckDB spells it that way.
+     In this position only one meaning is available (a `DOUBLE` cannot
+     key a group), so accepting both costs nothing. It does constrain
+     #40: when exact integer arithmetic reaches projection, `ts / 60`
+     must truncate there too, or one text means two things.
+   - **`GROUP BY` may name a bucket by its SELECT alias**, as
+     PostgreSQL and DuckDB both allow. Narrow by design: only aliases
+     of buckets substitute.
+   - **`FIRST`/`LAST` = the de-facto TSDB names** (the pending
+     sub-ruling, closed (a) 2026-07-29). Positional on the time axis,
+     not on row order — the group-level counterpart of `LAG`/`LEAD` —
+     so a late-arriving row cannot become "last" by arriving last.
+     Ties on the clock go to the last row in storage order, the rule
+     the as-of join follows; nulls are skipped, as every other
+     aggregate here skips them, which coincides exactly with DuckDB's
+     `arg_min`/`arg_max` and is how the differential checks them.
+
+   **Cross-sectional partitioning — a later ruling (2026-07-30), built
+   in the same milestone and recorded here because it completes the
+   same axis.** The transpose of `PARTITION BY sym`: partitioning on the ordering
+   key, or a monotone bucket of it, gives each row its own *instant*
+   across every symbol instead of its own symbol across time. An
+   unordered window (`OVER (PARTITION BY ts)`, no `ORDER BY`) takes its
+   whole partition, which is standard SQL and is exactly a
+   cross-section; a frame clause beside it is refused as the
+   contradiction it is. Several terms intersect — `PARTITION BY sym,
+   ts / 60` is one partition per symbol per bar.
+
+   `PARTITION BY` admits any `BIGINT`, not only symbols; `DOUBLE` is
+   refused because float equality is not partition identity (the same
+   reason F1 rejected general expressions), and bucket arithmetic stays
+   ordering-key-only, where monotonicity means something. Which column
+   is named decides the direction, and which path runs is decided by
+   declared structure plus segment metadata — never by cost.
+
+   *Note the asymmetry, deliberate and flagged:* `GROUP BY` stays
+   restricted to the ordering key (F1's ruling), while `PARTITION BY`
+   admits any `BIGINT`. Different clauses, different rulings; revisit
+   F1 if the difference ever bites.
+
+   **The idiom this exists for needed a second thing.** A
+   cross-section is only useful if a row can be compared *to* it, and
+   that meant scalar expressions over window results (#94, built the
+   same day): `x / sum(x) OVER (PARTITION BY ts)` is the weight, `x -
+   avg(x) OVER (...)` the demeaning. Window calls are hoisted out of
+   the scalar at lowering and computed first — standard SQL's own
+   evaluation order, and forced rather than chosen, since a partition
+   spans segments while a scalar walks one at a time. The same change
+   made `x - lag(x) OVER (ORDER BY ts)` and the rolling z-score
+   expressible.
 2. **The as-of join (#65) — the hybrid.** Grammar from ClickHouse,
    authority from the schema: the single `ASOF` token is lifted
    pre-parse (byte-span splice, comments skipped — the hardened
