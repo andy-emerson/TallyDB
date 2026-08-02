@@ -77,14 +77,16 @@ pub mod predicate;
 
 pub use exec::{
     contiguous, execute, execute_join, recompute_frames, ColumnFunction, JoinSide, QueryOutput,
-    Registry, WindowAggregate,
+    Registry, ViewScalars, WindowAggregate,
 };
 pub use plan::{
     parse_statement, plan, AggCall, AggFunction, AggItem, AsOfMatch, Assignment, ColumnSpec,
     CreateTablePlan, DeletePlan, Frame, InsertPlan, InsertValue, JoinPlan, OrderBy, Plan, PlanItem,
     Projection, QueryError, SetValue, Statement, UpdatePlan, SEQUENCE_COLUMN,
 };
-pub use predicate::{can_match, evaluate as evaluate_predicate, CmpOp, Number, Predicate};
+pub use predicate::{
+    can_match, evaluate as evaluate_predicate, CmpOp, NoScalars, Number, Predicate, ScalarEval,
+};
 
 // TODO: DataFusion as a secondary differential oracle beside DuckDB
 // TODO: window ORDER BY beyond the ordering key; DISTINCT aggregates

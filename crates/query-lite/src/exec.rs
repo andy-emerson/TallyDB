@@ -40,7 +40,7 @@ use crate::plan::{
     AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
     PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, WindowCall, SEQUENCE_COLUMN,
 };
-use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate};
+use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
@@ -736,7 +736,12 @@ fn execute_single(
         let view = match &plan.predicate {
             None => view,
             Some(predicate) => {
-                let matched = evaluate_predicate(predicate, schema, &view)?;
+                let matched = evaluate_predicate(
+                    predicate,
+                    schema,
+                    &view,
+                    &ViewScalars::new(schema, &view, registry),
+                )?;
                 let live = match &view.live {
                     None => matched,
                     Some(live) => live.and(&matched),
@@ -796,7 +801,7 @@ fn execute_single(
                 let mut extended = items.to_vec();
                 extended.extend(having.items.iter().cloned());
                 let output = project_aggregate(schema, &views, keys, &extended)?;
-                filter_having(output, &having.predicate, items.len())?
+                filter_having(output, &having.predicate, items.len(), registry)?
             }
         },
     };
@@ -933,6 +938,7 @@ fn filter_having(
     output: QueryOutput,
     predicate: &Predicate,
     visible: usize,
+    registry: &Registry,
 ) -> Result<QueryOutput, QueryError> {
     let full_schema = output.schema.clone();
     let mut picks: Vec<(usize, usize)> = Vec::new();
@@ -944,7 +950,12 @@ fn filter_having(
             0,
             false,
         )));
-        let matched = evaluate_predicate(predicate, &full_schema, &view)?;
+        let matched = evaluate_predicate(
+            predicate,
+            &full_schema,
+            &view,
+            &ViewScalars::new(&full_schema, &view, registry),
+        )?;
         for row in 0..batch.num_rows() {
             if matched.get(row) {
                 picks.push((batch_index, row));
@@ -1120,6 +1131,40 @@ fn computed_column_whole(
         offset += count;
     }
     Ok((Field::new(name, ColumnType::F64, true), columns))
+}
+
+/// The scalar evaluator a predicate uses when it contains an
+/// expression comparison (#95): one view's rows, the registry for
+/// kernel calls, and any window results already computed for this item.
+pub struct ViewScalars<'a> {
+    schema: &'a Schema,
+    view: &'a SegmentView,
+    registry: &'a Registry,
+    windows: &'a [(Vec<f64>, Vec<bool>)],
+}
+
+impl<'a> ViewScalars<'a> {
+    /// An evaluator over one view. `windows` is empty everywhere a
+    /// window cannot appear — `WHERE` and the mutation filters, which
+    /// standard SQL runs before the window phase.
+    pub fn new(
+        schema: &'a Schema,
+        view: &'a SegmentView,
+        registry: &'a Registry,
+    ) -> ViewScalars<'a> {
+        ViewScalars {
+            schema,
+            view,
+            registry,
+            windows: &[],
+        }
+    }
+}
+
+impl ScalarEval for ViewScalars<'_> {
+    fn eval(&self, expr: &ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+        evaluate_scalar(expr, self.schema, self.view, self.registry, self.windows)
+    }
 }
 
 /// One view's slice of each hoisted window's result, as the scalar
@@ -1304,7 +1349,17 @@ fn evaluate_scalar(
             let mut conditions = Vec::with_capacity(whens.len());
             let mut arms = Vec::with_capacity(whens.len());
             for (predicate, arm) in whens {
-                conditions.push(evaluate_predicate(predicate, schema, view)?);
+                conditions.push(evaluate_predicate(
+                    predicate,
+                    schema,
+                    view,
+                    &ViewScalars {
+                        schema,
+                        view,
+                        registry,
+                        windows,
+                    },
+                )?);
                 arms.push(evaluate_scalar(arm, schema, view, registry, windows)?);
             }
             let fallback = otherwise
@@ -4993,6 +5048,100 @@ mod query1_tests {
         // A window's NULL propagates through the arithmetic as a NULL,
         // rather than becoming a number.
         assert_eq!(flatten(&diff, 1)[0], None);
+    }
+
+    #[test]
+    fn a_predicate_may_compare_expressions() {
+        // #95: `WHERE x > y` is basic SQL and was refused until now,
+        // because the predicate type was the *prunable* one.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        // Arithmetic on the left, which the old grammar refused
+        // outright because only a bare column could go there.
+        let output = run(&views, "SELECT x FROM t WHERE x * 2 > 5").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(3.0), Some(5.0)]);
+        // Expressions on both sides: x + 1 > 2x - 2 reduces to x < 3.
+        let output = run(&views, "SELECT x FROM t WHERE x + 1 > x * 2 - 2").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0)]);
+        // And a scalar call as an operand.
+        let output = run(&views, "SELECT x FROM t WHERE abs(x - 3) > 1").unwrap();
+        assert_eq!(flatten(&output, 0), [Some(1.0), Some(5.0)]);
+        // An i64 column in an expression comparison meets #40's refusal
+        // — the scalar pipeline computes in f64 and will not silently
+        // narrow a BIGINT. Recorded because it is the edge of what #95
+        // delivers, not a bug in it.
+        let error = run(&views, "SELECT x FROM t WHERE x > ts")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integer expression arithmetic"), "{error}");
+        // The prunable shape is untouched — a negative literal still
+        // reaches `Compare`, minus sign intact, rather than falling
+        // through to the general path with the sign stripped.
+        let all = run(&views, "SELECT x FROM t WHERE x > -1").unwrap();
+        assert_eq!(all.num_rows(), 3);
+        let none = run(&views, "SELECT x FROM t WHERE x < -1").unwrap();
+        assert_eq!(none.num_rows(), 0);
+    }
+
+    #[test]
+    fn an_unprunable_conjunct_does_not_disable_pruning_for_its_siblings() {
+        // The correctness-adjacent claim of #95: an expression
+        // comparison cannot be zone-pruned, but that must cost only
+        // ITSELF. A query mixing it with a prunable conjunct still
+        // skips the segments the prunable half rules out — otherwise
+        // adding `AND x > y` would quietly turn a pruned scan into a
+        // full one.
+        let views = segmented(
+            &[(1, "A", 1.0), (2, "A", 2.0), (50, "A", 3.0), (51, "A", 4.0)],
+            2,
+        );
+        let schema = schema();
+        let predicate = |sql: &str| {
+            crate::plan::plan(sql)
+                .unwrap()
+                .predicate
+                .expect("has a WHERE")
+        };
+        let early = &views[0]; // ts 1..2
+        assert!(
+            !can_match(&predicate("SELECT x FROM t WHERE ts > 40"), &schema, early),
+            "the prunable conjunct alone prunes this segment"
+        );
+        assert!(
+            can_match(
+                &predicate("SELECT x FROM t WHERE x * 2 > 5"),
+                &schema,
+                early
+            ),
+            "an expression comparison prunes nothing, by construction"
+        );
+        assert!(
+            !can_match(
+                &predicate("SELECT x FROM t WHERE ts > 40 AND x * 2 > 5"),
+                &schema,
+                early
+            ),
+            "mixing the two must still prune on the half that can"
+        );
+    }
+
+    #[test]
+    fn a_window_in_a_row_predicate_is_refused_by_name() {
+        // Standard SQL runs WHERE before the window phase, so there is
+        // no window result to test against — a refusal, not a gap.
+        let error = crate::plan::plan("SELECT ts FROM t WHERE sum(x) OVER () > 1")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("before the"), "{error}");
+        // In a CASE condition, where the window HAS been computed by
+        // the time the projection runs, the same call is fine.
+        let views = segment(&[(1, "A", 1.0), (2, "A", 3.0), (3, "A", 5.0)]);
+        let flagged = run(
+            &views,
+            "SELECT CASE WHEN x > avg(x) OVER () THEN 1 ELSE 0 END AS above FROM t",
+        )
+        .unwrap();
+        // Mean is 3, so only the last row is above it.
+        assert_eq!(flatten(&flagged, 0), [Some(0.0), Some(0.0), Some(1.0)]);
     }
 
     #[test]

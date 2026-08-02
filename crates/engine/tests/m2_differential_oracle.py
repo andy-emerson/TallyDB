@@ -668,6 +668,37 @@ IEEE_DIVISION_FAMILIES = [
     "ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS w FROM corpus ORDER BY ts",
 ]
 
+# #95: comparisons between EXPRESSIONS, not just column-vs-literal.
+#
+# These carry their own list because they carry their own guard. The
+# corpus's `y` runs about 1.3x its `x`, so the obvious family — `WHERE
+# x > y` — selects ZERO rows and would agree with DuckDB about nothing
+# at all. Every predicate here is therefore checked to leave both
+# branches non-empty before its answers are compared, which is the same
+# discipline the as-of tie count follows: a coverage claim that
+# re-earns itself on every run rather than being asserted once.
+#
+# `y` is nullable, so these also exercise three-valued logic on both
+# operands — NULL either side is UNKNOWN and the row drops, in both
+# engines.
+EXPRESSION_PREDICATE_FAMILIES = [
+    "SELECT ts, x, y FROM corpus WHERE x * 1.3 > y ORDER BY ts",
+    "SELECT ts, x, y FROM corpus WHERE y - x > 40 ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE abs(x - y) > 30 ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE x + 30 > y ORDER BY ts",
+    # Mixed with a prunable conjunct: same answers, and the prunable
+    # half must still prune (checked in-engine by `can_match`, which is
+    # the only place that difference is observable).
+    "SELECT ts, x FROM corpus WHERE ts > 1700002000000000000 AND x * 1.3 > y ORDER BY ts",
+    "SELECT ts, x FROM corpus WHERE x * 1.3 > y AND sym IN ('K000', 'K003') ORDER BY ts",
+    # In a CASE condition — the shape that prompted this, since a CASE
+    # condition is evaluated per row and never prunes anything.
+    "SELECT ts, CASE WHEN x * 1.3 > y THEN 1 ELSE 0 END AS c FROM corpus ORDER BY ts",
+    # And over a window result, which only #94 made reachable.
+    "SELECT ts, CASE WHEN x > avg(x) OVER () THEN 1 ELSE 0 END AS c "
+    "FROM corpus ORDER BY ts",
+]
+
 EIGEN_PRECEDING = 19
 
 
@@ -838,6 +869,29 @@ def main() -> None:
             f"FAIL the quote history has only {ties} tied (sym, qts) "
             "timestamps — the as-of families cannot cover the tie rule"
         )
+    for sql in EXPRESSION_PREDICATE_FAMILIES:
+        engine = tallydb_query(lib, sql)
+        oracle = connection.execute(sql).to_arrow_table()
+        # Non-vacuity first: a predicate matching none of the corpus (or
+        # all of it) would agree trivially and prove nothing about the
+        # comparison it is meant to exercise.
+        if "CASE" in sql:
+            flags = engine["c"].to_pylist()
+            selected = sum(1 for value in flags if value)
+            total = len(flags)
+        else:
+            selected, total = engine.num_rows, inputs.num_rows
+        # Both outcomes must actually occur, and by enough rows that
+        # agreement means something. Not a demand for a BALANCED split
+        # — a deliberately narrow conjunction is a fine thing to test —
+        # only that neither branch is empty or near-empty.
+        if selected < 50 or total - selected < 50:
+            sys.exit(
+                f"FAIL {sql}\n  selects {selected}/{total} rows — one branch is "
+                "too near empty for agreement to mean anything"
+            )
+        compare_tables(sql, engine, oracle, window=False)
+        passed += 1
     for sql in IEEE_DIVISION_FAMILIES:
         engine = tallydb_query(lib, sql)
         oracle = connection.execute(sql).to_arrow_table()

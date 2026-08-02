@@ -646,6 +646,10 @@ impl Plan {
 /// Every column name a predicate tests.
 fn predicate_columns(predicate: &Predicate, names: &mut std::collections::HashSet<String>) {
     match predicate {
+        Predicate::CompareExpr { left, right, .. } => {
+            scalar_columns(left, names);
+            scalar_columns(right, names);
+        }
         Predicate::Compare { column, .. }
         | Predicate::KeyEquals { column, .. }
         | Predicate::KeyLike { column, .. }
@@ -1444,7 +1448,7 @@ fn lower_update(update: &ast::Update) -> Result<UpdatePlan, QueryError> {
     if assignments.is_empty() {
         return Err(QueryError::Unsupported("UPDATE without SET".to_owned()));
     }
-    let predicate = update.selection.as_ref().map(lower_predicate).transpose()?;
+    let predicate = lower_row_predicate(update.selection.as_ref())?;
     Ok(UpdatePlan {
         table,
         assignments,
@@ -1517,7 +1521,7 @@ fn lower_delete(delete: &ast::Delete) -> Result<DeletePlan, QueryError> {
             "DELETE target must be a plain table".to_owned(),
         ));
     };
-    let predicate = delete.selection.as_ref().map(lower_predicate).transpose()?;
+    let predicate = lower_row_predicate(delete.selection.as_ref())?;
     Ok(DeletePlan {
         table: object_name(name)?,
         predicate,
@@ -1659,7 +1663,7 @@ fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryErro
             None => (None, select.projection.clone(), select.selection.clone()),
         };
     let select_projection = &projection_exprs;
-    let predicate = selection_expr.as_ref().map(lower_predicate).transpose()?;
+    let predicate = lower_row_predicate(selection_expr.as_ref())?;
     let keys = resolve_group_aliases(lower_group_by(&select.group_by)?, select_projection);
     // An aggregate projection is signaled by GROUP BY or by any plain
     // (no OVER) call to a standard aggregate in the SELECT list.
@@ -1688,7 +1692,7 @@ fn lower_select(select: &ast::Select, asof_join: bool) -> Result<Plan, QueryErro
                 let rewritten = extract_having_calls(expr, &mut hidden)?;
                 Ok::<Having, QueryError>(Having {
                     items: hidden,
-                    predicate: crate::predicate::lower_predicate(&rewritten)?,
+                    predicate: lower_row_predicate(Some(&rewritten))?.expect("Some in"),
                 })
             })
             .transpose()?;
@@ -2037,6 +2041,27 @@ fn lower_asof_inequality(
     Ok((matching, named))
 }
 
+/// A predicate in row position — `WHERE`, `HAVING`'s row half, an
+/// `UPDATE`/`DELETE` filter — where a window call is not merely
+/// unsupported but meaningless: standard SQL evaluates these before the
+/// window phase, so there is no window result yet to compare against.
+/// Refused by name rather than silently mis-scoped.
+fn lower_row_predicate(expr: Option<&ast::Expr>) -> Result<Option<Predicate>, QueryError> {
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    let mut windows = Vec::new();
+    let predicate = lower_predicate(expr, &mut windows)?;
+    if !windows.is_empty() {
+        return Err(QueryError::Unsupported(
+            "a window call in WHERE — standard SQL runs WHERE before the \
+             window phase, so there is no window result to test yet"
+                .to_owned(),
+        ));
+    }
+    Ok(Some(predicate))
+}
+
 fn lower_group_by(group_by: &ast::GroupByExpr) -> Result<Vec<GroupKey>, QueryError> {
     let ast::GroupByExpr::Expressions(exprs, modifiers) = group_by else {
         return Err(QueryError::Unsupported("GROUP BY ALL".to_owned()));
@@ -2339,7 +2364,7 @@ fn lower_item(item: &ast::SelectItem) -> Result<PlanItem, QueryError> {
 /// Lowers a scalar expression for the computed-projection slot (#49):
 /// arithmetic, the built-in scalar functions, and `CASE` with WHERE
 /// grammar conditions. Anything else is refused loudly.
-fn lower_scalar_expr(
+pub(crate) fn lower_scalar_expr(
     expr: &ast::Expr,
     windows: &mut Vec<WindowCall>,
 ) -> Result<ScalarExpr, QueryError> {
@@ -2466,7 +2491,7 @@ fn lower_scalar_expr(
             let mut whens = Vec::with_capacity(conditions.len());
             for case_when in conditions {
                 whens.push((
-                    crate::predicate::lower_predicate(&case_when.condition)?,
+                    crate::predicate::lower_predicate(&case_when.condition, windows)?,
                     lower_scalar_expr(&case_when.result, windows)?,
                 ));
             }

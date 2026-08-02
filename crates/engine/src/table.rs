@@ -32,7 +32,7 @@ use compute_lua::LogSink;
 use query_lite::{
     evaluate_predicate, execute, parse_statement, plan, recompute_frames, ColumnFunction,
     DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue, Statement, UpdatePlan,
-    WindowAggregate,
+    ViewScalars, WindowAggregate,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -930,10 +930,20 @@ impl Table {
         predicate: Option<&query_lite::Predicate>,
     ) -> Result<Vec<u64>, EngineError> {
         let schema = self.store.schema();
+        // A mutation filter may compare expressions (#95), so it needs
+        // the same evaluator a SELECT's WHERE gets — kernels included.
+        let registry = self.current_registry();
         let mut ids = Vec::new();
         for view in views {
             let matches = predicate
-                .map(|predicate| evaluate_predicate(predicate, schema, view))
+                .map(|predicate| {
+                    evaluate_predicate(
+                        predicate,
+                        schema,
+                        view,
+                        &ViewScalars::new(schema, view, &registry),
+                    )
+                })
                 .transpose()?;
             let base = view.segment.base_row_id();
             for row in 0..view.segment.batch().num_rows() {
@@ -996,13 +1006,21 @@ impl Table {
         }
         // Build the corrected copies of every matched live row.
         let views = materialize(&self.store.snapshot()?)?;
+        let registry = self.current_registry();
         let mut matched_ids: Vec<u64> = Vec::new();
         let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
         for view in &views {
             let matches = update
                 .predicate
                 .as_ref()
-                .map(|predicate| evaluate_predicate(predicate, &schema, view))
+                .map(|predicate| {
+                    evaluate_predicate(
+                        predicate,
+                        &schema,
+                        view,
+                        &ViewScalars::new(&schema, view, &registry),
+                    )
+                })
                 .transpose()?;
             let batch = view.segment.batch();
             let base = view.segment.base_row_id();
