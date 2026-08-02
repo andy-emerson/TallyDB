@@ -1633,29 +1633,52 @@ fn check_order(
     order_index: usize,
     order_by: &str,
 ) -> Result<(), QueryError> {
+    match ordering_problem(views, order_index) {
+        None => Ok(()),
+        Some(Disorder::WrongColumn) => Err(QueryError::Unsupported(format!(
+            "ORDER BY '{order_by}' — windows order by the declared ordering key only"
+        ))),
+        Some(Disorder::WithinSegment) => Err(QueryError::Unordered(format!(
+            "ingest was not sorted on '{order_by}' (compaction restores order)"
+        ))),
+        Some(Disorder::AcrossSegments) => Err(QueryError::Unordered(format!(
+            "ingest was not sorted on '{order_by}' across segments"
+        ))),
+    }
+}
+
+/// Why a snapshot is not in ordering-key order.
+enum Disorder {
+    /// The column asked for is not the declared ordering key.
+    WrongColumn,
+    /// Some segment's rows are not non-decreasing.
+    WithinSegment,
+    /// Segments are individually ordered but overlap each other.
+    AcrossSegments,
+}
+
+/// Whether the snapshot's live rows are non-decreasing on the ordering
+/// key, within every segment and across them — the fact a streaming
+/// aggregation stands on, and the same one `check_order` refuses
+/// without.
+fn ordering_problem(views: &[&SegmentView], order_index: usize) -> Option<Disorder> {
     let mut previous_last: Option<i64> = None;
     for view in views {
         if order_index != view.segment.ordering_key() {
-            return Err(QueryError::Unsupported(format!(
-                "ORDER BY '{order_by}' — windows order by the declared ordering key only"
-            )));
+            return Some(Disorder::WrongColumn);
         }
         if !view.segment.is_ordered() {
-            return Err(QueryError::Unordered(format!(
-                "ingest was not sorted on '{order_by}' (compaction restores order)"
-            )));
+            return Some(Disorder::WithinSegment);
         }
         let Some((first, last)) = live_ordering_bounds(view) else {
             continue;
         };
         if previous_last.is_some_and(|previous| first < previous) {
-            return Err(QueryError::Unordered(format!(
-                "ingest was not sorted on '{order_by}' across segments"
-            )));
+            return Some(Disorder::AcrossSegments);
         }
         previous_last = Some(last);
     }
-    Ok(())
+    None
 }
 
 /// One argument column's live values in one view: a shared slice where
@@ -2607,6 +2630,60 @@ impl CellNumber {
     }
 }
 
+/// One aggregate call's finished output, one cell per closed group.
+///
+/// Groups are reduced to cells the moment they close rather than at the
+/// end, which is what lets the streaming path below hold accumulators
+/// for only the bucket it is inside. Both paths end here, so the output
+/// assembly does not care which one ran.
+enum AggCells {
+    I64(Vec<Option<i64>>),
+    F64(Vec<Option<f64>>),
+}
+
+impl AggCells {
+    fn for_type(column_type: ColumnType) -> AggCells {
+        match column_type {
+            ColumnType::I64 => AggCells::I64(Vec::new()),
+            _ => AggCells::F64(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, accumulator: &Accumulator) {
+        match self {
+            AggCells::I64(cells) => cells.push(accumulator.i64_value()),
+            AggCells::F64(cells) => cells.push(accumulator.f64_value()),
+        }
+    }
+}
+
+/// Closed groups: their keys, and their aggregates already reduced to
+/// values.
+struct GroupSink {
+    keys: Vec<Vec<GroupCode>>,
+    cells: Vec<AggCells>,
+}
+
+impl GroupSink {
+    fn new(template: &[Accumulator]) -> GroupSink {
+        GroupSink {
+            keys: Vec::new(),
+            cells: template
+                .iter()
+                .map(|accumulator| AggCells::for_type(accumulator.column_type()))
+                .collect(),
+        }
+    }
+
+    /// Finishes one group: its key, and one cell per call.
+    fn close(&mut self, key: Vec<GroupCode>, accumulators: &[Accumulator]) {
+        self.keys.push(key);
+        for (cells, accumulator) in self.cells.iter_mut().zip(accumulators) {
+            cells.push(accumulator);
+        }
+    }
+}
+
 /// Resolves one `GROUP BY` term against the schema and the snapshot's
 /// ordering key — the step the planner cannot do, because it has
 /// neither.
@@ -2709,13 +2786,38 @@ fn project_aggregate(
     // The unified key space, one per key column.
     let mut unified: Vec<HashMap<String, usize>> = vec![HashMap::new(); keys.len()];
     let mut unified_values: Vec<Vec<String>> = vec![Vec::new(); keys.len()];
-    // Groups in first-seen order.
+    // Whether the grouping can stream. A bucket of the ordering key is
+    // monotone in it, so over data that is actually ordered the bucket
+    // values arrive non-decreasing: once a bucket is left it can never
+    // come back, and every group inside it can be closed and reduced to
+    // its cells there and then. What stays live is the groups of the
+    // ONE open bucket — the symbols trading in this minute — instead of
+    // every group the query will produce.
+    //
+    // This is the dividend F1 = (d) was chosen for, and it is a
+    // property of the data, checked from segment metadata before a byte
+    // is read. Unordered data (an UPDATE reappended before compaction)
+    // silently takes the hash path below and gets the same answer more
+    // expensively — correct always, fast when the data behaves, and
+    // `compact()` restores it, exactly as for tombstones.
+    let bucketed = terms
+        .iter()
+        .any(|term| matches!(term, GroupTerm::Bucket { .. }));
+    let streaming =
+        bucketed && ordering_key.is_some_and(|index| ordering_problem(views, index).is_none());
+    let mut sink = GroupSink::new(&template);
+    // Open groups: the lookup, their keys in first-seen order, and
+    // their accumulators. On the streaming path these are cleared at
+    // every bucket boundary; on the hash path they grow to the whole
+    // result.
     let mut groups: HashMap<Vec<GroupCode>, usize> = HashMap::new();
-    let mut group_keys: Vec<Vec<GroupCode>> = Vec::new();
+    let mut open_keys: Vec<Vec<GroupCode>> = Vec::new();
     let mut accumulators: Vec<Vec<Accumulator>> = Vec::new();
+    // The bucket the open groups belong to (the bucket terms' codes).
+    let mut open_bucket: Option<Vec<GroupCode>> = None;
     if keys.is_empty() {
         groups.insert(Vec::new(), 0);
-        group_keys.push(Vec::new());
+        open_keys.push(Vec::new());
         accumulators.push(template.clone());
     }
     for view in views {
@@ -2759,10 +2861,26 @@ fn project_aggregate(
                 .zip(&remaps)
                 .map(|(term, remap)| term.code(batch.columns(), remap.as_ref(), row))
                 .collect();
+            if streaming {
+                // Leaving a bucket closes everything inside it.
+                let bucket: Vec<GroupCode> = group_key
+                    .iter()
+                    .zip(&terms)
+                    .filter(|(_, term)| matches!(term, GroupTerm::Bucket { .. }))
+                    .map(|(code, _)| code.clone())
+                    .collect();
+                if open_bucket.as_ref() != Some(&bucket) {
+                    for (key, group) in open_keys.drain(..).zip(accumulators.drain(..)) {
+                        sink.close(key, &group);
+                    }
+                    groups.clear();
+                    open_bucket = Some(bucket);
+                }
+            }
             let group = *groups.entry(group_key.clone()).or_insert_with(|| {
-                group_keys.push(group_key.clone());
+                open_keys.push(group_key.clone());
                 accumulators.push(template.clone());
-                group_keys.len() - 1
+                open_keys.len() - 1
             });
             for ((_, argument_index, _), accumulator) in
                 calls.iter().zip(accumulators[group].iter_mut())
@@ -2787,7 +2905,13 @@ fn project_aggregate(
             }
         }
     }
+    // Whatever is still open belongs to the last bucket (or, on the
+    // hash path, is the whole result).
+    for (key, group) in open_keys.drain(..).zip(accumulators.drain(..)) {
+        sink.close(key, &group);
+    }
     // Assemble the single output batch, SELECT-list order.
+    let group_keys = &sink.keys;
     let group_count = group_keys.len();
     let mut fields = Vec::with_capacity(items.len());
     let mut columns = Vec::with_capacity(items.len());
@@ -2816,7 +2940,7 @@ fn project_aggregate(
                 let mut dictionary = Dictionary::new();
                 let mut codes: Buffer<u32> = Buffer::with_capacity(group_count);
                 let mut validity: Vec<bool> = Vec::with_capacity(group_count);
-                for group_key in &group_keys {
+                for group_key in group_keys {
                     match group_key[position] {
                         GroupCode::Label(Some(code)) => {
                             codes.push(dictionary.intern(&unified_values[position][code]));
@@ -2855,13 +2979,7 @@ fn project_aggregate(
                 let name = call.alias.as_deref().unwrap_or(default_name);
                 // Output type from the plan (the template accumulator), so
                 // it is the same whether or not any group matched (B4).
-                let output_type = template[next_call].column_type();
-                let (field, column) = assemble_aggregate(
-                    name,
-                    output_type,
-                    accumulators.iter().map(|group| &group[next_call]),
-                    group_count,
-                );
+                let (field, column) = assemble_aggregate(name, &sink.cells[next_call]);
                 fields.push(field);
                 columns.push(column);
                 next_call += 1;
@@ -2881,18 +2999,9 @@ fn project_aggregate(
 /// column's `output_type` comes from the plan (a template accumulator),
 /// not from the accumulator instances here — so zero groups still yields
 /// the right Arrow type (B4).
-fn assemble_aggregate<'a>(
-    name: &str,
-    output_type: ColumnType,
-    accumulators: impl Iterator<Item = &'a Accumulator>,
-    groups: usize,
-) -> (Field, Column) {
-    match output_type {
-        ColumnType::I64 => {
-            let mut cells: Vec<Option<i64>> = Vec::with_capacity(groups);
-            for accumulator in accumulators {
-                cells.push(accumulator.i64_value());
-            }
+fn assemble_aggregate(name: &str, cells: &AggCells) -> (Field, Column) {
+    match cells {
+        AggCells::I64(cells) => {
             let nullable = cells.iter().any(Option::is_none);
             let values: Buffer<i64> = cells.iter().map(|value| value.unwrap_or(0)).collect();
             let column = if nullable {
@@ -2908,12 +3017,7 @@ fn assemble_aggregate<'a>(
                 Column::Numeric(NumericData::I64(column)),
             )
         }
-        // Aggregates are numeric; a Key output can't arise.
-        _ => {
-            let mut cells: Vec<Option<f64>> = Vec::with_capacity(groups);
-            for accumulator in accumulators {
-                cells.push(accumulator.f64_value());
-            }
+        AggCells::F64(cells) => {
             let nullable = cells.iter().any(Option::is_none);
             let values: Buffer<f64> = cells.iter().map(|value| value.unwrap_or(0.0)).collect();
             let column = if nullable {

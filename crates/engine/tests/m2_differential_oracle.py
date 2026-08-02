@@ -529,6 +529,29 @@ BUCKET_FAMILIES = [
         "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
         "SELECT ts, count(*) AS n FROM corpus GROUP BY ts",
     ),
+    # The SAME bucket query over the quote history, which is
+    # deliberately NOT compacted and carries late arrivals — so its
+    # segments are unordered and the grouping falls back from the
+    # streaming path to the hash path. Same answers, other branch.
+    (
+        "SELECT qts / 60000000000 AS bar, count(*) AS n, sum(q) AS s FROM quotes "
+        "GROUP BY qts / 60000000000",
+        "SELECT qts // 60000000000 AS bar, count(*) AS n, sum(q) AS s FROM quotes "
+        "GROUP BY qts // 60000000000",
+    ),
+    # FIRST/LAST over a history that CONTAINS TIED timestamps, so the
+    # tie rule is what is being checked, not just the extremes. The
+    # oracle keys arg_min/arg_max on the pair `(qts, seq)` — DuckDB
+    # compares tuples lexicographically — which spells TallyDB's rule
+    # exactly: latest stamp, and among equal stamps the later row in
+    # storage order. Keyed on `qts` alone, DuckDB's tie-breaking is
+    # unspecified and the comparison would be meaningless.
+    (
+        "SELECT sym, qts / 300000000000 AS bar, first(q) AS o, last(q) AS c FROM quotes "
+        "GROUP BY sym, qts / 300000000000",
+        "SELECT sym, qts // 300000000000 AS bar, arg_min(q, (qts, seq)) AS o, "
+        "arg_max(q, (qts, seq)) AS c FROM quotes GROUP BY sym, qts // 300000000000",
+    ),
     # Buckets compose with everything grouping already did: WHERE
     # before, HAVING after.
     (
