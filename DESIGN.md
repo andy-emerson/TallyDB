@@ -1279,7 +1279,7 @@ evicts cold, never pinned; refresh keeps decoded state); a forty-segment
 table under a four-segment budget answers six query shapes
 batch-identical to an unbounded open; the crash window between segment
 and manifest writes is pinned end-to-end by injected failure; all six
-differential oracles pass over the faulting path. Corruption moved with
+differential oracles then in the gate pass over the faulting path. Corruption moved with
 the design: a bad segment file is loud at first fault, not at open.
 
 ## Maintained views (#83, ruled by the Human 2026-08-02; tranche 1 built the same day)
@@ -1292,7 +1292,10 @@ principle behind all of it: **the field's three answers to "what does a
 maintained result do when its input is corrected" — retraction deltas,
 invalidation + repair, refuse/rebuild — compose here because the
 knowledge axis already gives base and view one shared version
-coordinate.**
+coordinate.** (Prose says "maintained view"; the API type is
+`MaterializedView`. The view's **stamp**, used throughout below, is
+the source-table ingest-sequence watermark below which the
+materialization is complete.)
 
 **The ruling set** (each with its rejected alternatives recorded on the
 issue): eligibility is **(c) the full reach, taken piecemeal** —
@@ -1339,21 +1342,30 @@ and has no single ingest coordinate). `ORDER BY` / `LIMIT` /
 table — they compose at read.
 
 **Evidence at the build** (2026-08-02, this container): the subsuming
-property — view equals recompute at *every* knowledge coordinate —
-holds over 160 seeded pseudo-random interleavings of append, update,
-delete, refresh, and compaction, plus the seventh oracle family
+property — view equals recompute at the current knowledge coordinate,
+whatever the history (past coordinates are exact by construction: they
+recompute) — holds at each of 160 states along one seeded
+pseudo-random interleaving of append, update, delete, and refresh,
+with one mid-run compaction; plus the seventh oracle family
 (`m5_view_oracle.py`, in CI): every statement mirrored into DuckDB and
-the view's answer diffed against from-scratch recompute after every
-step, across stale, fresh, corrected, compacted, and reopened states.
+the view's answer diffed against from-scratch recompute at eleven
+scripted checkpoints spanning stale, fresh, corrected, compacted, and
+reopened states.
 The scaling claim is measured: at 4× the table with a fixed 2,000-row
 batch, refresh cost is flat (0.78ms vs 0.85ms, ratio 1.09, guarded
 < 2.5 in `perf_sanity`) while full recompute scales 32ms → 122ms; the
-union read's staleness premium is bounded by the tail (1.0–1.7ms vs
-0.24–0.31ms fresh — the D3 honesty check, affirming the ruling).
+union read's staleness premium is dominated by the live fold of the
+tail (1.0–1.7ms vs 0.24–0.31ms fresh across the two table sizes — the
+staleness-premium check the read-semantics ruling asked for, affirming
+it).
 
 **Costs and seats, stated plainly**: each refresh flushes one small
 segment on the view (and possibly one early freeze on the source when
-called mid-buffer; at the freeze-boundary cadence the flush is free) —
+called mid-buffer; at the freeze-boundary cadence the flush is free);
+refresh also scans compacted correction *history* unconditionally —
+its kill coordinates live in the segments, not the metadata, and an
+additive manifest field removes the scan if it ever measures hot (the
+flat-refresh measurement above is a correction-free run) —
 `compact` on the view restores contiguity; the console opens existing
 views correctly (both scan sites route on the definition marker) but
 has no verbs to create or refresh them yet — the API-first ruling's

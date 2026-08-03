@@ -860,13 +860,15 @@ impl KnowledgeSnapshot {
 
     /// Calls `touch` with the ordering-key value of every row **born or
     /// killed** by an ingest-sequence coordinate at or after `since` —
-    /// `since` is a watermark (the first coordinate it does *not*
-    /// cover, [`Store::next_sequence`]'s convention), so the filter is
-    /// inclusive — the
-    /// derivation a maintained view's refresh (#83) runs to learn which
-    /// buckets its stamp no longer covers. The dirty list is derivable
-    /// state: this is the derivation, and it is why a view needs no
-    /// durable bookkeeping beyond the stamp itself.
+    /// the watermark below which the caller's derived state is
+    /// complete (the first coordinate it does *not* cover,
+    /// [`Store::next_sequence`]'s convention), so the filter is
+    /// inclusive. This is the derivation a maintained view's refresh
+    /// (#83) runs to learn which buckets need re-folding; the dirty
+    /// list is derivable state, which is why a view needs no durable
+    /// bookkeeping beyond its watermark. ("Stamp" in this function's
+    /// comments means a KILL's coordinate — the sense this module
+    /// already used — never the view-side watermark.)
     ///
     /// Cost is proportional to what changed, not to the table: a live
     /// segment whose every birth is at or below `since`
@@ -912,9 +914,9 @@ impl KnowledgeSnapshot {
             // kill == 0 is the v1 sentinel, "killed at an unknown
             // coordinate". `as_of` reads it conservatively (never
             // visible); this walk must be conservative in the OTHER
-            // direction — an unknown kill may postdate any stamp, so
-            // it always touches. (`kill >= since` covers it only while
-            // since is 0.)
+            // direction — an unknown kill may postdate any watermark,
+            // so it always touches. (`kill >= since` covers it only
+            // while since is 0.)
             if kill != 0 && kill < since {
                 continue;
             }

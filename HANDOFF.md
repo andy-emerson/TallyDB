@@ -59,11 +59,11 @@ views — is built, reviewed, and documented:
 **Evidence:** 471 tests default leg / 85 off-leg (re-run at this
 commit, not carried), 29 suites, **seven** oracle scripts (the gate
 list grew: m5_view_oracle.py joins the six). The subsuming property —
-`view == recompute at every knowledge coordinate` — holds over 160
-seeded interleavings in-crate and 11 DuckDB-diffed scripted states
-through the C ABI. Refresh cost measured flat at 4× the table (ratio
+view equals recompute, whatever the history — holds at each of 160
+states along one seeded interleaving in-crate and at 11 DuckDB-diffed
+scripted checkpoints through the C ABI. Refresh cost measured flat at 4× the table (ratio
 1.09; full recompute scales 32→122ms); union-read staleness premium
-bounded by the tail (1.0–1.7ms vs 0.24–0.31ms fresh). Three sabotages
+dominated by the tail's live fold (1.0–1.7ms vs 0.24–0.31ms fresh). Three sabotages
 initially passed SILENTLY (merged runs hid bucket-0 edges; an
 UPDATE's reinsert shadowed the history walk; a dropped flush was
 masked by the rebuild belt) — each test strengthened until its guard

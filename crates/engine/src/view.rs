@@ -9,9 +9,11 @@
 //! ingest-sequence watermark below which the materialization is
 //! complete. Everything at or above the stamp is the view's unfolded
 //! tail; a refresh folds it and advances the stamp, and a query never
-//! waits for one: the **union read** answers exactly at every
-//! knowledge coordinate — clean materialized buckets plus a live fold
-//! of whatever the stamp does not cover. Corrections need no
+//! waits for one: the **union read** answers exactly however stale the
+//! materialization — clean materialized buckets plus a live fold of
+//! whatever the stamp does not cover — and a past coordinate answers
+//! by recompute (`view AS OF s` is the definition over
+//! `base AS OF s`; the materialization is never the authority). Corrections need no
 //! bookkeeping of their own: the buckets they touch are **derivable**
 //! from the source's knowledge history, so the only durable view state
 //! is the stamp, written strictly after the materialization it
@@ -43,9 +45,10 @@
 //!   snapshot, or `view AS OF s = Q(base AS OF s)` stops being
 //!   well-defined (snapshot reducibility).
 //!
-//! `ORDER BY` / `LIMIT` / `DISTINCT` / `HAVING` are refused because a
-//! view is a table: order, limit, and filter at read, where they
-//! compose with everything else.
+//! `ORDER BY` / `LIMIT` / `OFFSET` / `DISTINCT` / `HAVING` are refused
+//! because a view is a table: order, limit, and filter at read, where
+//! they compose with everything else. Prose says "maintained view";
+//! the API type is [`MaterializedView`] — one concept, two registers.
 
 use crate::table::{EngineError, Table};
 use arrow_lite::{ColumnType, Field, Schema};
@@ -150,7 +153,8 @@ impl MaterializedView {
         })
     }
 
-    /// As [`MaterializedView::open`], **read-only** (F4): the
+    /// As [`MaterializedView::open`], **read-only** — the cross-process
+    /// reader shape (F4 in DESIGN's M5 roadmap): the
     /// cross-process shape — a console or binding watching a directory
     /// another process maintains. The union read needs no writes, so a
     /// read-only view still answers exactly; what it cannot do is
@@ -240,13 +244,18 @@ impl MaterializedView {
     ///    knowledge event where buckets are replaced (#73's rule) —
     ///    and advance the stamp to `now`.
     ///
-    /// Cost is proportional to what changed, never to the table. A
+    /// Cost is proportional to what changed, not to the live table —
+    /// plus a scan of compacted correction history, whose kill
+    /// coordinates live in the segments rather than the metadata (see
+    /// `touched_ordering_keys`; an additive manifest field removes the
+    /// scan if it ever measures hot). A
     /// crash anywhere leaves the stamp old (it persists only after the
     /// materialization is durable), and the next refresh re-derives
     /// and re-folds: the view self-heals, which is why the dirty list
     /// needs no durability of its own.
     ///
-    /// Returns the number of buckets re-folded.
+    /// Returns the number of buckets re-folded (`u64::MAX` for the
+    /// rebuild floor, which re-folds everything and counts nothing).
     ///
     /// Takes the source mutably because the first thing a refresh does
     /// is **flush it**: the stamp asserts durability ("the view
@@ -320,9 +329,9 @@ impl MaterializedView {
     /// unfolded tail alike, one mechanism (the read-side half of the
     /// 2026-08-02 ruling on #83). Repair never changes an answer; a
     /// refresh only shrinks the live part of this union. Read-only:
-    /// nothing is persisted, which is what lets an F4 read-only
-    /// process serve exact view answers over a directory another
-    /// process writes.
+    /// nothing is persisted, which is what lets a cross-process
+    /// read-only reader (F4) serve exact view answers over a directory
+    /// another process writes.
     ///
     /// `AS OF` on a view recomputes: `view AS OF s` is *defined* as
     /// the definition over `base AS OF s`, so the materialization —
@@ -409,15 +418,16 @@ impl MaterializedView {
         .map_err(EngineError::Query)
     }
 
-    /// Moves the stamp forward and, for a persistent view, makes it
-    /// durable — strictly after the materialization it describes.
-    /// "Durable" is the strong sense: the view table is **flushed**
-    /// first, because a read-only reader (F4) sees only the durable
-    /// prefix — a stamp ahead of the flushed materialization would
-    /// make it treat never-written buckets as clean and silently drop
-    /// them from the union. One small segment per refresh is the cost;
-    /// `compact` on the view table restores contiguity, like any
-    /// table's.
+    /// Moves the stamp forward and, for a persistent view, publishes
+    /// it atomically (write + rename) — strictly after the view table
+    /// is **flushed**, because a cross-process read-only reader sees
+    /// only the durable prefix, and a stamp ahead of the flushed
+    /// materialization would make it treat never-written buckets as
+    /// clean and silently drop them from the union. The record itself
+    /// is not fsynced and need not be: a stamp can only be lost
+    /// *backward*, and an old stamp merely re-folds. One small segment
+    /// per refresh is the cost; `compact` on the view table restores
+    /// contiguity, like any table's.
     fn advance_stamp(&mut self, now: u64) -> Result<(), EngineError> {
         self.stamp = now;
         if let Some(dir) = self.dir.clone() {

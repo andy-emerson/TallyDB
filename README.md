@@ -27,8 +27,8 @@
 > SQL-in-Lua driver scripts. M5 (desk adoption) landed the ordered-axis
 > dividends — as-of joins, time bucketing, `RANGE` frames, `LAG`/`LEAD`,
 > cross-sectional partitioning, `regr_r2` — and lazy residency, so a
-> table need not fit in memory. On the working branch: **maintained
-> views** (#83, first tranche) — bucketed aggregates kept fresh
+> table need not fit in memory — and, with it, the first tranche of
+> **maintained views** (#83): bucketed aggregates kept fresh
 > incrementally as data arrives, exact across corrections via the
 > knowledge axis, with refresh cost proportional to what changed
 > rather than to the table. The settled

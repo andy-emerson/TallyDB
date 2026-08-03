@@ -3,16 +3,17 @@
 
 Drives the `oracle-harness` view context in libengine: one persistent
 source table and one maintained bucketed view over it. Every statement
-this script sends to the engine is mirrored into DuckDB; after EVERY
-step — whether or not a refresh has run — the engine's answer to
+this script sends to the engine is mirrored into DuckDB; at eleven
+checkpoints — placed after the states that matter, refreshed or not —
+the engine's answer to
 `SELECT ... FROM bars` (the union read: materialized clean buckets plus
 a live fold of whatever the view's stamp does not cover) is diffed
 against DuckDB running the definition from scratch over the mirrored
 rows. Refreshes, a compaction (kills move to history — the derivation
 branch nothing else reaches end-to-end), and a full close-and-reopen of
 both directories are interleaved, so stale, fresh, corrected,
-compacted, and reopened states all meet the same check: the view is
-exact at every knowledge coordinate.
+compacted, and reopened states all meet the same check: the view
+equals recompute, whatever the history.
 
 Usage: m5_view_oracle.py [path/to/libengine.so]
 Exits nonzero on the first disagreement.

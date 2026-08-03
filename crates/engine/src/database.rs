@@ -1,7 +1,8 @@
 //! The multi-table handle: what an application embeds.
 //!
-//! A [`Database`] is a set of named [`Table`]s and a SQL doorway that
-//! routes each query to the table it names. It adds no storage or
+//! A [`Database`] is a set of named [`Table`]s — and maintained views
+//! (#83) — behind a SQL doorway that routes each query to what it
+//! names, a view's through the union read. It adds no storage or
 //! execution machinery of its own — each table still owns its store and
 //! its registered compute — but it is the shape applications program
 //! against (`add_table` / `append` / `query` / `mutate`), and it is
@@ -14,7 +15,8 @@ use query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use std::collections::HashMap;
 use storage_lite::RowValue;
 
-/// A set of named tables behind one SQL doorway.
+/// A set of named tables — and maintained views — behind one SQL
+/// doorway.
 ///
 /// ```
 /// use arrow_lite::{ColumnType, Field, Schema};
@@ -112,7 +114,8 @@ impl Database {
     /// Refreshes the named maintained view — folds everything its
     /// stamp does not cover and advances the stamp (see
     /// [`MaterializedView::refresh`]). Returns the number of buckets
-    /// re-folded. When to call it is the embedder's choice: TallyDB is
+    /// re-folded (`u64::MAX` for the rebuild floor). When to call it
+    /// is the embedder's choice: TallyDB is
     /// a library and owns no clock, so refresh cadence — after a batch,
     /// on a timer, before a read — belongs to the application.
     pub fn refresh_view(&mut self, name: &str) -> Result<u64, EngineError> {

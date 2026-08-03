@@ -112,7 +112,8 @@ fn view_refresh_scales_with_the_batch_not_the_table() {
         for i in rows..rows + batch {
             db.append("trades", &row(i)).unwrap();
         }
-        // The D3 honesty check first: a query against the STALE view
+        // The staleness-premium check first (the read-semantics
+        // ruling's honesty condition on #83): a query against the STALE view
         // (union read: materialized + live fold of the 2k tail) vs the
         // same query after refresh. The ruling's bet is that the tail-
         // bounded union costs little over the fresh read.
