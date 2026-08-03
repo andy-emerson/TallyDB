@@ -1000,6 +1000,37 @@ impl Table {
             .touched_ordering_keys(since, touch)?)
     }
 
+    /// As [`Table::touched_ordering_keys`], additionally yielding the
+    /// touched row's value in the named key column — the seam a
+    /// maintained join view's refresh needs (#83 tranche 3): a
+    /// reference-side correction's blast radius is a fact-key range
+    /// *per join-key value*, so the walk must say whose row changed
+    /// (see [`KnowledgeSnapshot::touched_rows`]).
+    ///
+    /// [`KnowledgeSnapshot::touched_rows`]:
+    ///     storage_lite::store::KnowledgeSnapshot::touched_rows
+    // Caller lands with the join-view refresh (#83 tranche 3 cycle 1);
+    // remove the allow when it does. Added 2026-08-03.
+    #[allow(dead_code)]
+    pub(crate) fn touched_rows(
+        &self,
+        since: u64,
+        key_column: &str,
+        touch: impl FnMut(i64, Option<&str>),
+    ) -> Result<(), EngineError> {
+        let index = self
+            .store
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == key_column)
+            .ok_or_else(|| EngineError::Query(QueryError::UnknownColumn(key_column.to_owned())))?;
+        Ok(self
+            .store
+            .knowledge_snapshot()?
+            .touched_rows(since, index, touch)?)
+    }
+
     /// Supersedes every live row matching `predicate` with the rows of
     /// `replacements` — the maintained-view refresh's write half: the
     /// old buckets out, the re-folded ones in. Where both sides are

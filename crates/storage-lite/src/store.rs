@@ -896,14 +896,64 @@ impl KnowledgeSnapshot {
         since: u64,
         mut touch: impl FnMut(i64),
     ) -> Result<(), StorageError> {
-        let key_of = |segment: &Segment, row: usize| -> i64 {
-            let Column::Numeric(NumericData::I64(column)) =
-                &segment.batch().columns()[segment.ordering_key()]
-            else {
-                unreachable!("the ordering key is validated as i64 at construction")
-            };
-            column.values().as_slice()[row]
-        };
+        self.touched_walk(since, |segment, row| {
+            touch(ordering_value(segment, row));
+        })
+    }
+
+    /// As [`KnowledgeSnapshot::touched_ordering_keys`], additionally
+    /// yielding the
+    /// touched row's value in `key_column` — the seam a maintained
+    /// **join** view's refresh needs (#83 tranche 3): a quote-side
+    /// correction's blast radius is a fact-key range *per symbol*, and
+    /// a symbol-blind endpoint is unsound, so the walk must say whose
+    /// row changed. `key_column` must be a key column; a null key
+    /// yields `None`, exactly as it matches nothing in the join.
+    pub fn touched_rows(
+        &self,
+        since: u64,
+        key_column: usize,
+        mut touch: impl FnMut(i64, Option<&str>),
+    ) -> Result<(), StorageError> {
+        // The snapshot carries no schema of its own; the column is
+        // validated against the first touched segment's (all segments
+        // share the store's), and a misuse is a loud error, not a
+        // panic.
+        let mut misuse: Option<StorageError> = None;
+        self.touched_walk(since, |segment, row| {
+            if misuse.is_some() {
+                return;
+            }
+            match segment.batch().columns().get(key_column) {
+                Some(Column::Key(keys)) => touch(ordering_value(segment, row), keys.value_at(row)),
+                _ => {
+                    misuse = Some(StorageError::TypeMismatch {
+                        column: segment
+                            .batch()
+                            .schema()
+                            .fields()
+                            .get(key_column)
+                            .map(|field| field.name().to_owned())
+                            .unwrap_or_else(|| format!("column {key_column}")),
+                        expected: arrow_lite::ColumnType::Key,
+                    })
+                }
+            }
+        })?;
+        match misuse {
+            None => Ok(()),
+            Some(error) => Err(error),
+        }
+    }
+
+    /// The shared walk behind both touched derivations: every row born
+    /// or killed at or after `since`, yielded as `(segment, row)`. One
+    /// body, so the two public forms cannot drift.
+    fn touched_walk(
+        &self,
+        since: u64,
+        mut touch: impl FnMut(&Segment, usize),
+    ) -> Result<(), StorageError> {
         // Births at or after the stamp, in live segments.
         for handle in &self.latest {
             if handle.sequence_end() <= since {
@@ -914,7 +964,7 @@ impl KnowledgeSnapshot {
             let segment = handle.view()?.segment;
             for row in 0..segment.batch().num_rows() {
                 if segment.sequence_at(row) >= since {
-                    touch(key_of(&segment, row));
+                    touch(&segment, row);
                 }
             }
         }
@@ -937,7 +987,7 @@ impl KnowledgeSnapshot {
             if let Some(handle) = home {
                 let segment = handle.view()?.segment;
                 let row = (row_id - segment.base_row_id()) as usize;
-                touch(key_of(&segment, row));
+                touch(&segment, row);
             }
         }
         // Kills (and births — a row both born and killed since the
@@ -950,12 +1000,23 @@ impl KnowledgeSnapshot {
                 // kill == 0: the v1 killed-at-unknown sentinel —
                 // always touched, as in the pending walk above.
                 if kill == 0 || kill >= since || segment.sequence_at(row) >= since {
-                    touch(key_of(&segment, row));
+                    touch(&segment, row);
                 }
             }
         }
         Ok(())
     }
+}
+
+/// A row's ordering-key value — validated `i64 NOT NULL` at
+/// construction, so there is no other case.
+fn ordering_value(segment: &Segment, row: usize) -> i64 {
+    let Column::Numeric(NumericData::I64(column)) =
+        &segment.batch().columns()[segment.ordering_key()]
+    else {
+        unreachable!("the ordering key is validated as i64 at construction")
+    };
+    column.values().as_slice()[row]
 }
 
 /// The [`KnowledgeSnapshot`] algorithm over locked state.
@@ -3087,5 +3148,61 @@ mod tests {
             views.last().unwrap().segment.sequence_info(),
             &SequenceInfo::Contiguous { base: 56 }
         );
+    }
+
+    #[test]
+    fn touched_rows_carry_the_join_key_through_births_kills_and_history() {
+        // The #83 tranche-3 seam: a maintained join view's refresh
+        // needs to know WHOSE row changed (a symbol-blind interval
+        // endpoint under-repairs), so the touched walk also yields the
+        // named key column's value — from a pending kill, from a kill
+        // compacted into history, and from a birth alike.
+        let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
+        append_n(&mut store, 0..6); // sequences 0..=5; A even, B odd
+                                    // Kill ts=1 (row id 1, symbol B): the kill consumes sequence 6.
+        store.tombstone(&[1]).unwrap();
+        let pairs = |store: &Store, since: u64| {
+            let mut touched: Vec<(i64, Option<String>)> = Vec::new();
+            store
+                .knowledge_snapshot()
+                .unwrap()
+                .touched_rows(since, 1, |ts, sym| {
+                    touched.push((ts, sym.map(str::to_owned)));
+                })
+                .unwrap();
+            touched
+        };
+        // Only the pending kill sits at or after 6 — and it names B.
+        assert_eq!(pairs(&store, 6), [(1, Some("B".to_owned()))]);
+        // Compaction moves the kill to history; the walk still sees it
+        // and still names B (the history branch reads the same row).
+        store.compact().unwrap();
+        assert_eq!(pairs(&store, 6), [(1, Some("B".to_owned()))]);
+        // A birth after the watermark reports its own symbol.
+        store
+            .append(&[RowValue::I64(9), RowValue::Key("C"), RowValue::F64(0.0)])
+            .unwrap(); // sequence 7
+        assert_eq!(pairs(&store, 7), [(9, Some("C".to_owned()))]);
+        // The two public walks share one body: same rows, same order.
+        let snapshot = store.knowledge_snapshot().unwrap();
+        let mut keys = Vec::new();
+        let mut with_syms = Vec::new();
+        snapshot
+            .touched_ordering_keys(0, |ts| keys.push(ts))
+            .unwrap();
+        snapshot
+            .touched_rows(0, 1, |ts, _| with_syms.push(ts))
+            .unwrap();
+        assert_eq!(keys, with_syms);
+        assert!(!keys.is_empty());
+        // Misuse is a loud error, never a panic: neither the i64
+        // ordering key nor the f64 payload is a key column.
+        for column in [0usize, 2] {
+            let error = snapshot.touched_rows(0, column, |_, _| {}).unwrap_err();
+            assert!(
+                matches!(error, StorageError::TypeMismatch { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

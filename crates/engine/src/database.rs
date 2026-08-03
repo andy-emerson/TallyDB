@@ -865,6 +865,43 @@ mod join_tests {
     }
 
     #[test]
+    fn asof_tie_winners_follow_knowledge_and_survive_compaction() {
+        // #83 tranche 3, F8: among quotes sharing a timestamp the match
+        // is the latest-KNOWN version — so correcting the LOSER of a
+        // tie makes its corrected form win (its rebirth is the newest
+        // knowledge), and compaction must never change the answer. The
+        // discriminating storage-vs-sequence case lives in query-lite
+        // (segments built with the orders disagreeing); this is the
+        // end-to-end belt over real ingest, correction, and compaction.
+        let mut db = asof_database();
+        let winner = |db: &Database| {
+            f64s(
+                &db.query(
+                    "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                     ON trades.sym = quotes.sym WHERE ts = 20",
+                )
+                .unwrap(),
+                1,
+            )
+        };
+        // The fixture's tie at qts = 20: bids 2.0 then 3.0 — the
+        // later-ingested 3.0 is the match.
+        assert_eq!(winner(&db), [Some(3.0)]);
+        // Correct the tie's LOSER: its rebirth is now the newest
+        // knowledge at that timestamp, so it takes the match.
+        db.mutate("UPDATE quotes SET bid = 7.0 WHERE bid = 2.0")
+            .unwrap();
+        assert_eq!(winner(&db), [Some(7.0)]);
+        db.compact("quotes").unwrap();
+        db.compact("trades").unwrap();
+        assert_eq!(
+            winner(&db),
+            [Some(7.0)],
+            "compaction changed an as-of tie winner"
+        );
+    }
+
+    #[test]
     fn an_asof_join_does_not_multiply_rows_the_way_an_equi_join_would() {
         // The rule an as-of join relaxes is the dimension's unique key
         // — a quote table has many rows per symbol, which a plain join
