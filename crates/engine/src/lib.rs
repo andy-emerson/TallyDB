@@ -81,6 +81,7 @@ pub mod database;
 mod driver;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
+mod partials;
 #[cfg(feature = "lua")]
 mod script;
 pub mod table;
