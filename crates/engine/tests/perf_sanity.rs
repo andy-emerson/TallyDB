@@ -189,8 +189,11 @@ fn running_correction_repairs_one_bucket_not_the_answer() {
         "one-row correction over {rows} rows: repair {repair:?} (1 bucket) \
          vs full recompute {recompute:?} — ratio {ratio:.3}"
     );
+    // Measured 0.011 on the recording run; the guard leaves ~10x
+    // headroom for noise while still catching a repair that regressed
+    // toward O(table).
     assert!(
-        ratio < 0.5,
+        ratio < 0.1,
         "one-bucket repair cost approached full recompute (ratio {ratio:.2})"
     );
 }
@@ -238,8 +241,12 @@ fn cumulative_range_read_prices_the_range_not_the_table() {
         "cumulative read of the last 10k of {rows} rows: ranged {ranged_read:?} \
          vs full recompute {full_read:?} — ratio {ratio:.3}"
     );
+    // Measured ~0.0002 on the recording run (the full read pays the
+    // executor's expanding-window sweep over every row); 0.05 leaves
+    // two orders of headroom while catching a ranged read that started
+    // paying for the table.
     assert!(
-        ratio < 0.5,
+        ratio < 0.05,
         "the ranged read cost approached the full recompute (ratio {ratio:.2})"
     );
 }

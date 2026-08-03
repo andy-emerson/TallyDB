@@ -329,8 +329,17 @@ impl Console {
                 plan.table
             ));
         }
+        // One namespace across tables AND views (the storage lock
+        // would refuse the view's directory anyway, but with a
+        // misleading "another process" message).
         if self.database.table(&plan.table).is_some() {
             return Err(format!("table '{}' already exists", plan.table));
+        }
+        if self.database.view(&plan.table).is_some() {
+            return Err(format!(
+                "'{}' already exists as a maintained view",
+                plan.table
+            ));
         }
         let (schema, ordering) = schema_from_create(plan).map_err(|e| e.to_string())?;
         let mut table = Table::persistent_with(

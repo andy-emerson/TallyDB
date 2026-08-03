@@ -89,6 +89,12 @@ pub struct MaterializedView {
     /// Where the definition record persists; `None` for in-memory
     /// views, whose stamp lives only as long as they do.
     dir: Option<std::path::PathBuf>,
+    /// The answer schema — the shape queries against this view
+    /// return. The materialization's own for a bucketed view; the
+    /// user definition's output for the partials shapes, whose
+    /// materialization stores internal columns (`__p{i}`, `__bucket`)
+    /// no query ever answers with.
+    answers: Schema,
     /// Opened via [`MaterializedView::open_read_only`]: refresh
     /// refuses, the union read serves.
     read_only: bool,
@@ -99,7 +105,7 @@ impl MaterializedView {
     /// definition is validated against the source's schema and refused
     /// by name outside tranche 1's shape (see the module doc).
     pub fn new(name: &str, sql: &str, source: &Table) -> Result<MaterializedView, EngineError> {
-        let (schema, bucket) = validated_definition(sql, source)?;
+        let (schema, bucket, answers) = validated_definition(sql, source)?;
         let table = Table::new(name, schema, &bucket)?;
         Ok(MaterializedView {
             table,
@@ -108,6 +114,7 @@ impl MaterializedView {
             stamp: 0,
             width: 0,
             dir: None,
+            answers,
             read_only: false,
         })
     }
@@ -121,7 +128,7 @@ impl MaterializedView {
         source: &Table,
         dir: impl AsRef<Path>,
     ) -> Result<MaterializedView, EngineError> {
-        let (schema, bucket) = validated_definition(sql, source)?;
+        let (schema, bucket, answers) = validated_definition(sql, source)?;
         let table = Table::persistent(name, schema, &bucket, dir.as_ref())?;
         let view = MaterializedView {
             table,
@@ -130,6 +137,7 @@ impl MaterializedView {
             stamp: 0,
             width: 0,
             dir: Some(dir.as_ref().to_path_buf()),
+            answers,
             read_only: false,
         };
         view.write_definition(dir.as_ref())?;
@@ -148,7 +156,8 @@ impl MaterializedView {
         source: &Table,
         options: StoreOptions,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, width, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql, answers) =
+            read_definition(dir.as_ref(), name, source)?;
         let table = Table::open(name, dir.as_ref(), options)?;
         Ok(MaterializedView {
             table,
@@ -157,6 +166,7 @@ impl MaterializedView {
             stamp,
             width,
             dir: Some(dir.as_ref().to_path_buf()),
+            answers,
             read_only: false,
         })
     }
@@ -173,7 +183,8 @@ impl MaterializedView {
         dir: impl AsRef<Path>,
         source: &Table,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, width, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql, answers) =
+            read_definition(dir.as_ref(), name, source)?;
         let table = Table::open_read_only(name, dir.as_ref())?;
         Ok(MaterializedView {
             table,
@@ -184,6 +195,7 @@ impl MaterializedView {
             // Read-only: the stamp is never advanced, so nothing is
             // ever written back.
             dir: None,
+            answers,
             read_only: true,
         })
     }
@@ -220,9 +232,12 @@ impl MaterializedView {
         self.stamp
     }
 
-    /// The view's output schema — the shape its rows answer with.
+    /// The view's answer schema — the shape queries against it return.
+    /// For a running or cumulative view this is the user definition's
+    /// output, NOT the hidden partials materialization (whose internal
+    /// columns no query ever answers with).
     pub fn schema(&self) -> &Schema {
-        self.table.schema()
+        &self.answers
     }
 
     /// Compacts the materialization: each refresh flushes one small
@@ -447,7 +462,12 @@ impl MaterializedView {
             let mut recompute = running.user.clone();
             recompute.as_of = user_plan.as_of;
             let answers = source.execute_plan(&recompute)?;
-            return run_over_output(&running.output, answers.batches, &current, source);
+            return run_over_output(
+                &running.output,
+                answers.batches,
+                &current,
+                &self.table.current_registry(),
+            );
         }
         let partials = self.partials_union(source, definition)?;
         let combined = self.over_scratch(
@@ -463,7 +483,7 @@ impl MaterializedView {
             &running.output,
             finalized.into_iter().collect(),
             &current,
-            source,
+            &self.table.current_registry(),
         )
     }
 
@@ -505,12 +525,12 @@ impl MaterializedView {
             let mut recompute = cumulative.user.clone();
             recompute.as_of = user_plan.as_of;
             let answers = source.execute_plan(&recompute)?;
-            return run_over_rows(
+            return run_over_scratch(
                 &cumulative.output,
                 cumulative.okey_index,
                 answers.batches,
                 &current,
-                source,
+                &self.table.current_registry(),
             );
         };
         let width = self.width as i64;
@@ -547,12 +567,12 @@ impl MaterializedView {
         });
         let assembled = source.execute_plan(&assembly)?;
         let adjusted = adjust_batches(cumulative, assembled.batches, &boundaries);
-        run_over_rows(
+        run_over_scratch(
             &cumulative.output,
             cumulative.okey_index,
             adjusted,
             &current,
-            source,
+            &self.table.current_registry(),
         )
     }
 
@@ -577,45 +597,30 @@ impl MaterializedView {
         }
     }
 
-    /// Runs `user_plan` over an ad-hoc union of view-shaped batches, as
-    /// scratch segments. Orderedness is inspected per batch, never
-    /// assumed: a stale view's union can interleave bucket ranges, and
-    /// the executor's own ordering checks then govern — the same
-    /// stance every disordered table gets (correct, less optimized,
-    /// `refresh` + `compact` restore the fast path).
+    /// Runs `user_plan` over an ad-hoc union of view-shaped batches —
+    /// [`run_over_scratch`] with this view's materialization schema
+    /// and ordering key (see there for the ordering and registry
+    /// stances).
     fn over_scratch(
         &self,
         clean: impl Iterator<Item = arrow_lite::RecordBatch>,
         fresh: query_lite::QueryOutput,
         user_plan: &Plan,
     ) -> Result<query_lite::QueryOutput, EngineError> {
-        use storage_lite::{Segment, SegmentHandle};
-        let ordering_key = self
+        let okey = self
             .table
             .schema()
             .fields()
             .iter()
             .position(|field| field.name() == self.table.ordering_key())
             .expect("the view table validated its ordering key at construction");
-        let handles: Vec<SegmentHandle> = clean
-            .chain(fresh.batches)
-            .filter(|batch| batch.num_rows() > 0)
-            .map(|batch| {
-                let ordered = is_non_decreasing(&batch, ordering_key);
-                SegmentHandle::resident(
-                    std::sync::Arc::new(Segment::from_batch_unpruned(batch, ordering_key, ordered)),
-                    None,
-                )
-            })
-            .collect();
-        query_lite::execute_with_ordering_key(
+        run_over_scratch(
             self.table.schema(),
-            &handles,
-            ordering_key,
+            okey,
+            clean.chain(fresh.batches).collect(),
             user_plan,
             &self.table.current_registry(),
         )
-        .map_err(EngineError::Query)
     }
 
     /// Moves the stamp forward and, for a persistent view, publishes
@@ -662,7 +667,7 @@ fn read_definition(
     dir: &Path,
     name: &str,
     source: &Table,
-) -> Result<(u64, u64, String, String), EngineError> {
+) -> Result<(u64, u64, String, String, Schema), EngineError> {
     let record = std::fs::read(dir.join(DEFINITION_FILE))
         .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
     let (stamp, width, source_name, sql) = decode_definition(&record)?;
@@ -672,8 +677,8 @@ fn read_definition(
             source.name()
         )));
     }
-    validated_definition(&sql, source)?;
-    Ok((stamp, width, source_name, sql))
+    let (_, _, answers) = validated_definition(&sql, source)?;
+    Ok((stamp, width, source_name, sql, answers))
 }
 
 /// A lowered, validated view definition plus its bucket arithmetic —
@@ -910,11 +915,38 @@ fn synthesize_running(user: Plan, source: &Table, width: i64) -> Result<Definiti
     let mut finalize: Vec<FinalStep> = Vec::new();
     let mut partial_index = 0usize;
     let mut combined_index = 0usize;
+    // The combine runs over the MATERIALIZATION as scratch, where a
+    // key column is stored under its selected output name — the user's
+    // alias when one was written. The combine's group keys and key
+    // items must therefore name the STORED column, not the source one
+    // (found by the repo-wide code review: source-named combine keys
+    // broke every partials-path read of an aliased-key view).
+    let stored_key_name = |key: &GroupKey| {
+        items
+            .iter()
+            .find_map(|item| match item {
+                AggItem::Key { key: k, alias } if k == key => {
+                    Some(alias.clone().unwrap_or_else(|| k.output_name()))
+                }
+                _ => None,
+            })
+            .expect("eligibility required every group key selected")
+    };
+    let mut combine_keys: Vec<GroupKey> = Vec::with_capacity(keys.len());
+    for key in keys {
+        combine_keys.push(GroupKey::Column(stored_key_name(key)));
+    }
     for item in items {
         match item {
-            AggItem::Key { .. } => {
+            AggItem::Key { key, alias } => {
                 internal_items.push(item.clone());
-                combine_items.push(item.clone());
+                let stored = alias.clone().unwrap_or_else(|| key.output_name());
+                combine_items.push(AggItem::Key {
+                    key: GroupKey::Column(stored.clone()),
+                    // Re-alias to the same output name: the combine's
+                    // output column keeps the user-facing name.
+                    alias: Some(stored),
+                });
                 finalize.push(FinalStep::Pass(combined_index));
                 combined_index += 1;
             }
@@ -970,7 +1002,7 @@ fn synthesize_running(user: Plan, source: &Table, width: i64) -> Result<Definiti
         table: user.table.clone(),
         join: None,
         projection: Proj::Aggregate {
-            keys: keys.clone(),
+            keys: combine_keys,
             items: combine_items,
             having: None,
         },
@@ -1338,8 +1370,20 @@ fn finalize_combined(
                 Column::Numeric(NumericData::I64(NumericColumn::new_non_null(values)))
             }
             FinalStep::AvgDivide { sum, count } => {
-                let Column::Numeric(NumericData::F64(sums)) = &batch.columns()[*sum] else {
-                    unreachable!("an AVG decomposition's sum partial is f64")
+                // The combined sum's type follows the argument column:
+                // f64 for an f64 argument, i64 for an i64 one (SUM over
+                // i64 stays exact i64). Both divide in f64 — AVG's
+                // output type either way.
+                let sum_at = |row: usize| -> Option<f64> {
+                    match &batch.columns()[*sum] {
+                        Column::Numeric(NumericData::F64(sums)) => {
+                            sums.is_valid(row).then(|| sums.values().as_slice()[row])
+                        }
+                        Column::Numeric(NumericData::I64(sums)) => sums
+                            .is_valid(row)
+                            .then(|| sums.values().as_slice()[row] as f64),
+                        Column::Key(_) => unreachable!("an AVG sum partial is numeric"),
+                    }
                 };
                 let Column::Numeric(NumericData::I64(counts)) = &batch.columns()[*count] else {
                     unreachable!("an AVG decomposition's count partial is i64")
@@ -1352,10 +1396,11 @@ fn finalize_combined(
                     } else {
                         0
                     };
-                    let defined = count > 0 && sums.is_valid(row);
+                    let sum = sum_at(row);
+                    let defined = count > 0 && sum.is_some();
                     validity.push(defined);
                     values.push(if defined {
-                        sums.values().as_slice()[row] / count as f64
+                        sum.expect("checked") / count as f64
                     } else {
                         0.0
                     });
@@ -1375,21 +1420,20 @@ fn finalize_combined(
 
 /// Runs `user_plan` over finished output rows as scratch, appending
 /// the `__row` axis where the rows arrived without one (the recompute
-/// paths, whose batches carry the bare user schema).
+/// paths, whose batches carry the bare user schema). Every batch here
+/// is ordered on `__row` by construction (it counts rows).
 fn run_over_output(
     output: &Schema,
     batches: Vec<arrow_lite::RecordBatch>,
     user_plan: &Plan,
-    source: &Table,
+    registry: &query_lite::Registry,
 ) -> Result<query_lite::QueryOutput, EngineError> {
     use arrow_lite::{Column, NumericColumn, NumericData, RecordBatch};
-    use storage_lite::{Segment, SegmentHandle};
-    let ordering_key = output.fields().len() - 1; // __row, by construction
-    let handles: Vec<SegmentHandle> = batches
+    let okey = output.fields().len() - 1; // __row, by construction
+    let batches = batches
         .into_iter()
-        .filter(|batch| batch.num_rows() > 0)
         .map(|batch| {
-            let batch = if batch.columns().len() == output.fields().len() {
+            if batch.columns().len() == output.fields().len() {
                 batch
             } else {
                 let rows = batch.num_rows() as i64;
@@ -1398,21 +1442,10 @@ fn run_over_output(
                     NumericColumn::new_non_null((0..rows).collect::<arrow_lite::Buffer<i64>>()),
                 )));
                 RecordBatch::new(output.clone(), columns)
-            };
-            SegmentHandle::resident(
-                std::sync::Arc::new(Segment::from_batch_unpruned(batch, ordering_key, true)),
-                None,
-            )
+            }
         })
         .collect();
-    query_lite::execute_with_ordering_key(
-        output,
-        &handles,
-        ordering_key,
-        user_plan,
-        &source.current_registry(),
-    )
-    .map_err(EngineError::Query)
+    run_over_scratch(output, okey, batches, user_plan, registry)
 }
 
 /// A conservative ordering-key **lower bound** from a query predicate:
@@ -1663,8 +1696,24 @@ fn folded(
                 let combined = match (own, other) {
                     (Some(a), Some(b)) => Some(match fold {
                         Fold::Add => a + b,
+                        // The engine's comparison relation places NaN
+                        // GREATER than every number (M5.0's total
+                        // order), and both reference computations — the
+                        // boundary's MAX aggregate and the assembled
+                        // MAX window — propagate it. Rust's `f64::max`
+                        // silently drops NaN, which would make the
+                        // answer depend on the query's WHERE clause;
+                        // `min` under the same relation correctly
+                        // prefers the number, which Rust's `min` also
+                        // does.
                         Fold::Min => a.min(b),
-                        Fold::Max => a.max(b),
+                        Fold::Max => {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else {
+                                a.max(b)
+                            }
+                        }
                     }),
                     (one, other) => one.or(other),
                 };
@@ -1704,16 +1753,25 @@ fn folded(
     }
 }
 
-/// Runs `user_plan` over finished cumulative rows as scratch. The
-/// scratch ordering key is the selected ordering-key column itself — a
-/// cumulative answer keeps the source's axis, so no `__row` is
-/// fabricated — and per-batch orderedness is inspected, never assumed.
-fn run_over_rows(
+/// The one scratch runner every view read funnels through: `user_plan`
+/// over ad-hoc batches as resident scratch segments, ordering key at
+/// `okey`. Per-batch orderedness is inspected, never assumed: a stale
+/// union can interleave ranges, and the executor's own ordering checks
+/// then govern — the same stance every disordered table gets.
+///
+/// The registry rule, uniform across shapes and staleness: a view read
+/// resolves registered functions from the VIEW's own registry, which
+/// is always empty — a view has no registration surface
+/// (`register_window` targets tables), so a custom kernel in a query
+/// against a view is refused identically whether the view is fresh,
+/// stale, or recomputing. Register on the base and query the base;
+/// a per-view registration surface is a held seat, not an accident.
+fn run_over_scratch(
     output: &Schema,
     okey: usize,
     batches: Vec<arrow_lite::RecordBatch>,
     user_plan: &Plan,
-    source: &Table,
+    registry: &query_lite::Registry,
 ) -> Result<query_lite::QueryOutput, EngineError> {
     use storage_lite::{Segment, SegmentHandle};
     let handles: Vec<SegmentHandle> = batches
@@ -1727,14 +1785,8 @@ fn run_over_rows(
             )
         })
         .collect();
-    query_lite::execute_with_ordering_key(
-        output,
-        &handles,
-        okey,
-        user_plan,
-        &source.current_registry(),
-    )
-    .map_err(EngineError::Query)
+    query_lite::execute_with_ordering_key(output, &handles, okey, user_plan, registry)
+        .map_err(EngineError::Query)
 }
 
 /// A plan projecting every column of `table`, built structurally — an
@@ -1775,10 +1827,17 @@ fn is_non_decreasing(batch: &arrow_lite::RecordBatch, index: usize) -> bool {
 }
 
 /// Lowers and validates a view definition against its source, returning
-/// the **materialization** table's schema and its ordering-key column
+/// the **materialization** table's schema, its ordering-key column
 /// name — the definition's own bucket for a bucketed view, the hidden
-/// bucket of the partials for a running one.
-fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), EngineError> {
+/// bucket of the partials for a running or cumulative one — and the
+/// **answer** schema, the shape queries against the view return (the
+/// materialization's own for a bucketed view; the user definition's
+/// for the partials shapes, whose materialization stores internal
+/// columns no query ever answers with).
+fn validated_definition(
+    sql: &str,
+    source: &Table,
+) -> Result<(Schema, String, Schema), EngineError> {
     let plan = lower_plan(sql).map_err(EngineError::Query)?;
     if plan.table != source.name() {
         return Err(EngineError::WrongTable {
@@ -1794,7 +1853,7 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
     // The bucket column is the view table's ordering key; the executor
     // may mark aggregate outputs nullable, but a bucket of a NOT NULL
     // ordering key is never null, and Table::new requires NOT NULL.
-    let fields = schema
+    let fields: Vec<Field> = schema
         .fields()
         .iter()
         .map(|field| {
@@ -1805,7 +1864,13 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
             }
         })
         .collect();
-    Ok((Schema::new(fields), bucket))
+    let materialization = Schema::new(fields);
+    let answers = match &definition.read {
+        ReadShape::Direct => materialization.clone(),
+        ReadShape::Running(running) => source.execute_plan_empty(&running.user)?.schema,
+        ReadShape::Cumulative(cumulative) => source.execute_plan_empty(&cumulative.user)?.schema,
+    };
+    Ok((materialization, bucket, answers))
 }
 
 /// What kind of maintainable definition a plan is.
@@ -1898,16 +1963,22 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
         // partials, so a correction's blast radius is one hidden
         // bucket, never the whole answer. The reserved names the
         // synthesis will add must be free.
-        for reserved in [crate::partials::HIDDEN_BUCKET] {
-            if source
-                .schema()
-                .fields()
+        reserved_names_free(plan, "running")?;
+        // Every group key must be a SELECT output: the combine
+        // reassembles groups from the materialization's stored
+        // columns, so a key the materialization does not store cannot
+        // be grouped on again (found by the repo-wide code review —
+        // the old code accepted the shape and every partials-path
+        // read then failed on the missing column).
+        for key in keys {
+            let selected = items
                 .iter()
-                .any(|f| f.name() == reserved)
-            {
+                .any(|item| matches!(item, query_lite::AggItem::Key { key: k, .. } if k == key));
+            if !selected {
                 return refuse(
-                    "a running view over a source with a '__bucket' column — \
-                     the name is reserved for the partials materialization",
+                    "a running view whose SELECT list omits a GROUP BY key — \
+                     the combine reads keys from the materialization, so \
+                     select every key (alias it to taste)",
                 );
             }
         }
@@ -1953,6 +2024,53 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
             ))
         })?;
     Ok(Shape::Bucketed(bucket.clone(), name))
+}
+
+/// Refuses a running or cumulative definition that touches the `__`
+/// name space — as columns it reads or as aliases it writes. The
+/// synthesis mints hidden columns there (`__bucket`, `__p{i}`,
+/// `__row`, `__w{i}_sum` / `__w{i}_count`), and a user name shadowing
+/// a minted one produces a view that creates and refreshes fine but
+/// can never be read (found by the repo-wide code review, which
+/// probed exactly that). One prefix rule covers every minted name,
+/// present and future; bucketed views mint nothing and keep the wider
+/// name space.
+fn reserved_names_free(plan: &Plan, shape: &str) -> Result<(), EngineError> {
+    let mut names: Vec<String> = plan.referenced_columns().into_iter().collect();
+    match &plan.projection {
+        Projection::Aggregate { items, .. } => {
+            for item in items {
+                match item {
+                    query_lite::AggItem::Key {
+                        alias: Some(alias), ..
+                    } => names.push(alias.clone()),
+                    query_lite::AggItem::Call(call) => names.extend(call.alias.clone()),
+                    query_lite::AggItem::Key { alias: None, .. } => {}
+                }
+            }
+        }
+        Projection::Items(items) => {
+            for item in items {
+                match item {
+                    query_lite::PlanItem::Column {
+                        alias: Some(alias), ..
+                    }
+                    | query_lite::PlanItem::Window {
+                        alias: Some(alias), ..
+                    } => names.push(alias.clone()),
+                    query_lite::PlanItem::Computed { name, .. } => names.push(name.clone()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    match names.iter().find(|name| name.starts_with("__")) {
+        None => Ok(()),
+        Some(name) => Err(EngineError::Query(QueryError::Unsupported(format!(
+            "'{name}' in a {shape} view definition — names beginning with \
+             '__' are reserved for the materialization's internal columns"
+        )))),
+    }
 }
 
 /// Classifies a row-per-row projection: a **cumulative** view when it
@@ -2089,19 +2207,7 @@ fn classify_cumulative(plan: &Plan, source: &Table) -> Result<Shape, EngineError
             }
         }
     }
-    for reserved in [crate::partials::HIDDEN_BUCKET] {
-        if source
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| f.name() == reserved)
-        {
-            return refuse(
-                "a cumulative view over a source with a '__bucket' column — \
-                 the name is reserved for the partials materialization",
-            );
-        }
-    }
+    reserved_names_free(plan, "cumulative")?;
     Ok(Shape::Cumulative)
 }
 
@@ -3391,7 +3497,10 @@ mod tests {
             db.append("trades", &linear_row(i)).unwrap();
         }
         db.create_materialized_view("cum", CUMULATIVE).unwrap();
-        // Unsized (width 0, nothing folded): answers by recompute.
+        // Unsized (width 0, nothing folded): BOTH A/B legs recompute
+        // here, so this check certifies routing and the recompute
+        // path's own predicate handling — not the partials machinery,
+        // which has no width to run under yet.
         assert_eq!(db.view("cum").unwrap().stamp(), 0);
         assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
         // First refresh sizes the hidden bucket and folds partials;
@@ -3634,6 +3743,11 @@ mod tests {
                 .unwrap();
         db.add_view(ro_view).unwrap();
         assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 8);
+        // And with the un-refreshed correction (ts = 9) strictly BELOW
+        // the floor: the read-only reader's boundary must fold the
+        // dirty bucket live — the read-only path has no repair to
+        // lean on, only the union.
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
         assert!(db.refresh_view("cum").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3658,7 +3772,8 @@ mod tests {
             0
         );
         // Rows arriving after the empty refresh serve by recompute
-        // until the next refresh chooses a width.
+        // until the next refresh chooses a width (both A/B legs share
+        // that path here — this checks routing, not partials).
         for i in 0..6 {
             db.append("trades", &linear_row(i)).unwrap();
         }
@@ -3792,5 +3907,269 @@ mod tests {
              sum(y) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS b FROM trades",
             "different PARTITION BY lists",
         );
+    }
+
+    #[test]
+    fn a_running_avg_over_an_i64_column_divides_not_panics() {
+        // The AVG sum partial follows its argument's type: SUM over an
+        // i64 column is exact i64, and finalize used to destructure it
+        // as f64 and panic on the first partials-path read (found by
+        // the repo-wide code review, reproduced there). The i64 sum
+        // divides in f64 like any average.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..10 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view(
+            "iavg",
+            "SELECT sym, avg(ts) AS a, min(ts) AS lo FROM trades GROUP BY sym",
+        )
+        .unwrap();
+        db.refresh_view("iavg").unwrap();
+        assert_running_matches(&db, "iavg", "sym, a, lo");
+    }
+
+    #[test]
+    fn a_cumulative_max_propagates_nan_across_the_boundary() {
+        // The engine's comparison relation places NaN GREATER than
+        // every number, and both reference computations — the boundary
+        // MAX aggregate and the assembled MAX window — propagate it.
+        // Rust's f64::max silently drops NaN, which made the answer
+        // depend on the query's WHERE clause (found by the repo-wide
+        // code review, reproduced there): a NaN below the floor
+        // reaches later rows only through the boundary fold.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..12 {
+            let x = if i == 3 { f64::NAN } else { i as f64 };
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(i),
+                    storage_lite::RowValue::Key("A"),
+                    storage_lite::RowValue::F64(x),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view(
+            "m",
+            "SELECT ts, sym, max(x) OVER (PARTITION BY sym ORDER BY ts \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hi FROM trades",
+        )
+        .unwrap();
+        db.refresh_view("m").unwrap();
+        assert_cumulative_matches(&db, "m", "ts, sym, hi", 8);
+        let ranged = db.query("SELECT hi FROM m WHERE ts >= 8").unwrap();
+        let values = crate::table::tests::flatten(&ranged, 0);
+        assert!(
+            values.iter().all(|v| v.unwrap().is_nan()),
+            "the boundary NaN must poison every later running max: {values:?}"
+        );
+    }
+
+    #[test]
+    fn a_running_view_with_aliased_keys_answers_from_partials() {
+        // The combine runs over the materialization, where a key
+        // column is stored under its selected output name — the
+        // user's alias. Source-named combine keys broke every
+        // partials-path read of an aliased-key view (found by the
+        // repo-wide code review, reproduced there: worked at width 0,
+        // failed after the first refresh).
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..10 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view(
+            "aliased",
+            "SELECT sym AS s, sum(x) AS total FROM trades GROUP BY sym",
+        )
+        .unwrap();
+        db.refresh_view("aliased").unwrap();
+        assert_running_matches(&db, "aliased", "s, total");
+        // And the shape the materialization cannot serve at all — a
+        // group key the SELECT list omits — is refused at create, not
+        // broken at first refresh.
+        let error = db
+            .create_materialized_view("keyless", "SELECT sum(x) AS s FROM trades GROUP BY sym")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("omits a GROUP BY key"), "{error}");
+    }
+
+    #[test]
+    fn reserved_names_are_refused_at_the_definition_door() {
+        // The synthesis mints hidden columns in the '__' name space; a
+        // user column or alias there produced a view that created and
+        // refreshed fine but could never be read (found by the
+        // repo-wide code review, which probed a source column named
+        // '__p0' selected as a running key). One prefix rule closes
+        // the whole family.
+        let schema = arrow_lite::Schema::new(vec![
+            arrow_lite::Field::new("ts", arrow_lite::ColumnType::I64, false),
+            arrow_lite::Field::new("__p0", arrow_lite::ColumnType::Key, false),
+            arrow_lite::Field::new("x", arrow_lite::ColumnType::F64, false),
+        ]);
+        let source = Table::new("t", schema, "ts").unwrap();
+        let refused = |sql: &str| {
+            let error = MaterializedView::new("v", sql, &source)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reserved"), "{sql}: {error}");
+        };
+        refused("SELECT __p0, sum(x) AS s FROM t GROUP BY __p0");
+        refused("SELECT ts, sum(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS __w0_sum FROM t");
+        refused("SELECT sum(x) AS __row FROM t");
+        // A bucketed view mints no hidden names and keeps the wider
+        // name space — the prefix rule is the partials shapes' alone.
+        MaterializedView::new("ok", "SELECT ts, sum(x) AS s FROM t GROUP BY ts", &source).unwrap();
+    }
+
+    #[test]
+    fn a_views_schema_names_its_answers_not_its_partials() {
+        // The public accessor answers with the shape queries return;
+        // for the partials shapes that is the user definition's
+        // output, never the internal materialization (whose '__p{i}' /
+        // '__bucket' columns no query answers with — found stranded by
+        // the repo-wide code review after the ReadShape refactor).
+        let source = source();
+        let running = MaterializedView::new(
+            "r",
+            "SELECT sym, avg(x) AS a FROM trades GROUP BY sym",
+            &source,
+        )
+        .unwrap();
+        let names: Vec<&str> = running.schema().fields().iter().map(|f| f.name()).collect();
+        assert_eq!(names, ["sym", "a"]);
+        let bucketed = MaterializedView::new("b", OHLC, &source).unwrap();
+        let names: Vec<&str> = bucketed
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(names, ["sym", "bar", "o", "h", "l", "c"]);
+    }
+
+    #[test]
+    fn okey_lower_bounds_extract_conservatively() {
+        // Every arm of the extraction, checked directly: a bound may
+        // sit BELOW the truth (extra assembly, filtered later), never
+        // above it (missing rows).
+        let cmp = |op, value| Predicate::Compare {
+            column: "ts".to_owned(),
+            op,
+            value,
+        };
+        let bound = |predicate: &Predicate| okey_lower_bound(predicate, "ts");
+        assert_eq!(bound(&cmp(CmpOp::Ge, Number::Int(5))), Some(5));
+        assert_eq!(bound(&cmp(CmpOp::Gt, Number::Int(5))), Some(5)); // weakened, safe
+        assert_eq!(bound(&cmp(CmpOp::Eq, Number::Int(7))), Some(7));
+        assert_eq!(bound(&cmp(CmpOp::Ge, Number::Float(4.5))), Some(4)); // floored, safe
+        assert_eq!(bound(&cmp(CmpOp::Le, Number::Int(9))), None);
+        let other = Predicate::Compare {
+            column: "x".to_owned(),
+            op: CmpOp::Ge,
+            value: Number::Int(100),
+        };
+        // AND takes the tighter branch and absorbs an unbounded one.
+        let and = |a, b| Predicate::And(Box::new(a), Box::new(b));
+        let or = |a, b| Predicate::Or(Box::new(a), Box::new(b));
+        assert_eq!(
+            bound(&and(
+                cmp(CmpOp::Ge, Number::Int(5)),
+                cmp(CmpOp::Ge, Number::Int(8))
+            )),
+            Some(8)
+        );
+        assert_eq!(
+            bound(&and(other.clone(), cmp(CmpOp::Ge, Number::Int(5)))),
+            Some(5)
+        );
+        // OR needs both branches bounded and takes the looser.
+        assert_eq!(
+            bound(&or(
+                cmp(CmpOp::Ge, Number::Int(5)),
+                cmp(CmpOp::Ge, Number::Int(8))
+            )),
+            Some(5)
+        );
+        assert_eq!(bound(&or(cmp(CmpOp::Ge, Number::Int(5)), other)), None);
+        // Negation and everything unhandled fall to full recompute.
+        assert_eq!(
+            bound(&Predicate::Not(Box::new(cmp(CmpOp::Lt, Number::Int(5))))),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_row_buckets_fold_and_reassemble_exactly() {
+        // Every other fixture's span collapses the width heuristic to
+        // 1, leaving each hidden bucket a single row — a partial that
+        // mis-folds WITHIN a bucket (FIRST returning the last row,
+        // say) passed everything (found by the repo-wide test review).
+        // 4096 dense rows force width 4: two rows per symbol per
+        // bucket, values varying within the bucket, checked against
+        // recompute for both tranche-2 shapes — and the mid-bucket
+        // floors have real rows between the bucket's low edge and the
+        // floor, so the boundary/assembly seam is exercised INSIDE a
+        // bucket.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 512).unwrap())
+            .unwrap();
+        for i in 0..4096i64 {
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(i),
+                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    storage_lite::RowValue::F64((i % 97) as f64),
+                    storage_lite::RowValue::F64((i % 13) as f64),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view("totals", RUNNING).unwrap();
+        db.create_materialized_view("cum", CUMULATIVE).unwrap();
+        db.refresh_views().unwrap();
+        assert!(
+            db.view("totals").unwrap().width > 1 && db.view("cum").unwrap().width > 1,
+            "the fixture no longer forces multi-row buckets — widths {} and {}",
+            db.view("totals").unwrap().width,
+            db.view("cum").unwrap().width
+        );
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        for floor in [0, 2000, 2001, 2003, 4090] {
+            assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, floor);
+        }
+        // A disjunctive predicate reaches the OR arm of the bound
+        // extraction end to end (looser branch governs).
+        let now = db.table("trades").unwrap().next_sequence();
+        let ranged = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum WHERE ts >= 3000 OR ts >= 2500"
+            ))
+            .unwrap();
+        let truth = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum ASOF {now} WHERE ts >= 3000 OR ts >= 2500"
+            ))
+            .unwrap();
+        assert!(ranged.num_rows() > 0);
+        assert_eq!(sorted_rows(&ranged), sorted_rows(&truth));
+        // A correction inside one multi-row bucket repairs that bucket
+        // alone and the answers still match.
+        db.mutate("UPDATE trades SET x = 777.0 WHERE ts = 1024")
+            .unwrap();
+        db.compact("trades").unwrap();
+        assert_eq!(db.refresh_view("totals").unwrap(), 1);
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        db.refresh_view("cum").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 2001);
     }
 }

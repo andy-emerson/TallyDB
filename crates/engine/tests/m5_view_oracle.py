@@ -32,7 +32,9 @@ Exits nonzero on the first disagreement.
 
 import ctypes
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import duckdb
@@ -135,12 +137,29 @@ def load_library() -> ctypes.CDLL:
 
 
 def engine_rows(lib, context, sql: str):
-    """The engine's answer to `sql`, as sorted row tuples — or None if
-    the engine refused (the caller decides whether refusal was right)."""
+    """The engine's answer to `sql`, as sorted row tuples — or, on
+    refusal, the engine's own stderr line (a str), so a caller
+    expecting a refusal can check it is the RIGHT refusal and not an
+    unrelated failure wearing its clothes."""
     c_stream = ffi.new("struct ArrowArrayStream*")
     ptr = int(ffi.cast("uintptr_t", c_stream))
-    if lib.tallydb_view_query_stream(context, sql.encode(), ctypes.c_void_p(ptr)) != 0:
-        return None
+    # The engine reports refusals on the C library's stderr; capture
+    # fd 2 around the call so the reason is inspectable.
+    captured = tempfile.TemporaryFile()
+    saved = os.dup(2)
+    sys.stderr.flush()
+    os.dup2(captured.fileno(), 2)
+    try:
+        code = lib.tallydb_view_query_stream(context, sql.encode(), ctypes.c_void_p(ptr))
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+    captured.seek(0)
+    message = captured.read().decode(errors="replace")
+    captured.close()
+    if code != 0:
+        return message
+    sys.stderr.write(message)  # pass through anything non-fatal
     table = pa.RecordBatchReader._import_from_c(ptr).read_all()
     rows = []
     for batch in table.to_batches():
@@ -169,8 +188,8 @@ def rows_equal(left, right) -> bool:
 
 
 def diff(name, checks, engine, expected):
-    if engine is None:
-        sys.exit(f"{name} refused at check {checks} where it must answer")
+    if isinstance(engine, str):
+        sys.exit(f"{name} refused at check {checks} where it must answer: {engine}")
     if not engine:
         sys.exit(f"vacuous check: {name} answered no rows at check {checks}")
     if not rows_equal(engine, expected):
@@ -231,11 +250,17 @@ def main() -> None:
                 full = engine_rows(lib, context, f"SELECT {CUM_COLUMNS} FROM cum")
                 if payload:
                     diff("cum full", checks, full, duckdb_rows(oracle, cumulative))
-                elif full is not None:
+                elif not isinstance(full, str):
                     sys.exit(
                         f"cum full ANSWERED at check {checks} over a "
                         "correction-disordered source — the base's windows "
                         "refuse there, and the view must refuse with them"
+                    )
+                elif "not sorted" not in full:
+                    sys.exit(
+                        f"cum full refused at check {checks} for the WRONG "
+                        f"reason — expected the executor's ordering refusal, "
+                        f"got: {full}"
                     )
                 checks += 1
                 print(f"PASS check {checks}"
