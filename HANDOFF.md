@@ -36,107 +36,85 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-08-02 evening: #83 TRANCHE 1 BUILT; reviews done, awaiting merge)
+## Snapshot (2026-08-03: #83 TRANCHE 2 BUILT; reviews done, awaiting merge)
 
-**State:** `main` = `6cf6440` (the M5.0–M5.4 merge, PR #96, landed
-this morning). `claude/dev` restarted from it, **6 commits**, full
-gate green at every push. The Human closed #83's scoping decisions in
-the Plan conversation (recorded on the issue: eligibility (c)
-piecemeal, uniform repair, union read, AS-OF-recomputes, API-first,
-view-as-table, and D6 "build now — research-grade risk retires before
-M5's engineering tail"). Tranche 1 — bucketed single-table maintained
-views — is built, reviewed, and documented:
+**State:** `main` = `a63bf3a` (the #83 tranche-1 merge, PR #97).
+`claude/dev` restarted from it, **5 commits**, full gate green at
+every push. Tranche 2 — running and cumulative maintained views via
+bucket partials — is built, assessed, reviewed, and documented:
 
 | Commit | What |
 |---|---|
-| cycle 1 | definitions, eligibility refusals by name, CRC'd stamp record |
-| cycle 2 | the maintenance pass: derivable dirty buckets, restricted re-fold, stamp advance |
-| cycle 3 | the union read (exact at every coordinate), AS-OF-recomputes, F4 read-only |
-| Assess | the seventh oracle (view vs DuckDB recompute after every step, in CI) + the scaling measurement |
-| review fixes | seven findings: the durability-alignment bug (flush-then-stamp + rebuild floor), the console misopening view dirs, read-only refusal, _seq-on-view, multiplier mismatch, v1 kill sentinel, dedup/vestigial cleanups |
-| doc pass | DESIGN's #83 section, README, console help, session-speak purge |
+| cycle 1 | the partial-decomposition core: `PartialForm`, `decompose`, the combine-contract statement |
+| cycle 2 | running views: hidden-bucket partials materialization, synthesized combine + finalize, width heuristic (span/1024, persisted, record v2), read via partials union |
+| cycle 3 | cumulative views: expanding-window classification, boundary + assembly + adjustment read with conservative lower-bound extraction, AS-OF/no-bound recompute — plus the zone-map metadata fix (a shipped tranche-1 bug: scratch segments silently pruned under any numeric WHERE) |
+| Assess | the m5 oracle grew to three views x 11 checkpoints (refusals asserted by reason); pricing measured: one-row repair 1.6ms vs 140.8ms recompute (0.011); ranged read 33.4ms vs 156.5s full (~0.0002) |
+| review fixes | three reproduced bugs (AVG-over-i64 read panic; cumulative MAX dropping NaN against the NaN-greatest relation; source-named combine keys breaking aliased/unselected running keys) + `__` prefix reservation, answer-shape `schema()`, console view-namespace check, one scratch runner with a stated registry rule, multi-row-bucket battery (width 4), `okey_lower_bound` unit coverage, tightened perf guards |
+| doc passes | DESIGN's tranche-2 record, module docs, README, this file — then the documentation review's truth fixes (the compensated-summation claim was false: shipped folds are plain f64 accumulation; the 1e-12 contract stands on its tests) |
 
-**Evidence:** 471 tests default leg / 85 off-leg (re-run at this
-commit, not carried), 29 suites, **seven** oracle scripts (the gate
-list grew: m5_view_oracle.py joins the six). The subsuming property —
-view equals recompute, whatever the history — holds at each of 160
-states along one seeded interleaving in-crate and at 11 DuckDB-diffed
-scripted checkpoints through the C ABI. Refresh cost measured flat at 4× the table (ratio
-1.09; full recompute scales 32→122ms); union-read staleness premium
-dominated by the tail's live fold (1.0–1.7ms vs 0.24–0.31ms fresh). Three sabotages
-initially passed SILENTLY (merged runs hid bucket-0 edges; an
-UPDATE's reinsert shadowed the history walk; a dropped flush was
-masked by the rebuild belt) — each test strengthened until its guard
-tripped alone. The standing lesson held its ground twice more.
+**Evidence:** 493 tests default leg / 107 off-leg (re-run at this
+commit), seven oracle scripts. The tranche-2 exactness claim — view
+equals recompute through partials, whatever the history — holds through the C ABI at 11 checkpoints x {bucketed, running,
+cumulative-ranged} DuckDB-diffed, with the cumulative full read
+DuckDB-diffed at the 7 window-ordered checkpoints and
+refusal-asserted by reason at the other 4, and in-crate across dense
+multi-row buckets, negative keys, truncation's double-width bucket 0,
+NaN, and i64 arguments. The combine contract (1e-12 relative for
+SUM/AVG, exact otherwise) is exercised on non-dyadic data at both the
+running combine and the cumulative boundary seam.
 
-**The one deep bug this stretch** (found by the repo-wide review, now
-the ghost test): refresh folded source-buffer rows and durably
-stamped past them; a crash under `WalSync::Off`/`Group` rewound the
-source below the stamp, leaving permanent ghost buckets the old code
-silently adopted. The rule now: **refresh flushes the source first —
-a stamp asserts durability, so everything it covers must survive any
-crash the source's WAL contract admits** — with the rebuild floor
-behind it for stamps no crash can explain.
+**Refusal parity, the tranche's one inherited limitation:** cumulative
+reads run real windows, so a full read over uncompacted correction
+segments refuses exactly as the base's windows do (compact heals
+both), and `view AS OF s` refuses once corrections sit in history
+segments. Ranged reads above the correction keep answering (zone maps
+prune; the boundary re-folds with aggregates). The executor's
+expanding-window sweep is quadratic — the 156.5s full read — and an
+incremental sweep in query-lite is the named seat.
 
 **Open follow-ups from the reviews** (living status, none blocking):
-console verbs for creating/refreshing views (API-first ruling's
-deliberate gap); tranche 2 (running/cumulative via bucket-partials)
-and tranche 3 (q-hierarchical joins) hold seats with teaching
-refusals; a Definition cache in MaterializedView if view-read latency
-ever measures hot; an additive manifest field for a history segment's
-largest kill if refresh-over-corrected-history ever measures hot.
-
-**M5.4 is done on TallyDB's side, and its centre of gravity moved.**
-`regr_r2` is ISO-named and shipped. Residual, fitted value and
-multi-factor have no standard SQL name, so #77.1 puts them
-script-side — and the Human ruled (2026-07-30) that they go to
-**MatLua** (github.com/andy-emerson/MatLua), a Lua array + linalg
-crate over faer and arrow-rs. SQL keeps only standard names; #77 was
-**not** amended. A requirements letter for the MatLua team is drafted
-at `scratchpad/matlua-requirements.md` — send it as an issue there.
+incremental expanding-window sweep in query-lite (fixes the
+cumulative full read AND plain expanding-window queries); a per-view
+registration surface if anyone wants custom kernels over views
+(today: register on the base, query the base — uniform refusal);
+console verbs for creating/refreshing views; `CREATE MATERIALIZED
+VIEW` SQL once behavior is proven; a Definition cache if view-read
+latency measures hot; an additive manifest field for history kill
+coordinates if refresh-over-history measures hot; tranche 3
+(q-hierarchical joins) holds its seat with the teaching refusal.
 
 **Standing ruling from the Human (2026-07-30), important:** decisions
-made ad-hoc while building internal tools are *revisitable*; only
-decisions that undermine **what TallyDB is** are non-negotiable. Do
-not defend a choice by citing that it was ruled — give the reason, or
-concede. (Applied: D2's NaN half is ours and revisitable; D2's NULL
-half is SQL's and therefore identity-level.)
+made ad-hoc while building are *revisitable*; only decisions that
+undermine **what TallyDB is** are non-negotiable. Give the reason,
+never cite the ruling.
 
 **Toolchain:** Rust 1.97.1, matching CI.
 
-### What comes next (after the #83 tranche-1 merge)
+### What comes next (after the #83 tranche-2 merge)
 
-The Human's D6 rationale orders the roadmap: **research-grade items
-retire before M5's engineering tail** — "so long as research grade
-stuff is in front of us, this whole project could in theory be a
-pipedream." The remaining research-grade item is **incremental
-multi-factor (#90)** — known-hard numerics (downdating), not
-open-design; per-frame recompute via MatLua is the shipped-correct
-path when it schedules. Then the M5 tail: **M5.5 distribution**
-(Python binding + wheels, ruled 2026-07-29), **bulk Arrow ingest**,
-**M5.7 benchmark suite** (#52, peer/venue decision open). #83's own
-follow-ups: tranche 2 (running/cumulative via bucket-partials),
-tranche 3 (q-hierarchical joins), console view verbs, `CREATE
-MATERIALIZED VIEW` SQL once behavior is proven. Also parked: #62
-ingest hooks (shares the freeze-boundary trigger the views now use),
-MatLua's answer to the requirements letter.
+The Human's D6 rationale orders the roadmap: research-grade items
+retire before M5's engineering tail. Remaining research-grade:
+**tranche 3, q-hierarchical maintained joins** (the last of #83's
+piecemeal reach), and **incremental multi-factor (#90)** (deferred by
+the Human 2026-07-30; per-frame recompute via MatLua is the
+shipped-correct path). Then the M5 tail: **M5.5 distribution**
+(Python binding + wheels), **bulk Arrow ingest**, **M5.7 benchmark
+suite** (#52). Also parked: #62 ingest hooks; MatLua's answer to the
+requirements letter (drafted at `scratchpad/matlua-requirements.md`).
 
 ### Rulings landed since the M5 ruling batch
 
 - **FIRST/LAST = (a)**: `FIRST(x)`/`LAST(x)`, the de-facto TSDB
   names; well-defined here because the ordering key is declared.
-- **#62 split approved**: #62 = ingest hooks (engineering, decisions
-  still open); #83 = continuous queries — whose Plan conversation has
-  now happened and whose tranche 1 is built (see the snapshot).
-- **`_seq` stays `_seq`** — with an open revisit (the Human learned
-  the "never seen" claim was really "never seen *unbidden*"; users
-  do type it).
-- **Delete-flush cost = (a)** accept and document (done): persistent
-  DELETE seals the buffer; reopen trigger recorded in DESIGN.md.
+- **#83 ruling set (2026-08-02, on the issue)**: eligibility (c) full
+  reach piecemeal; uniform repair; union read; AS-OF-recomputes;
+  API-first; view-as-table; D6 build now.
+- **`_seq` stays `_seq`** — with an open revisit.
+- **Delete-flush cost = (a)** accept and document (done).
 
-### Remaining open decisions (none gate the #83 merge)
+### Remaining open decisions (none gate the tranche-2 merge)
 
-- **#82** compaction 2× peak: document vs engineer (deferred).
+- **#82** compaction 2x peak: document vs engineer (deferred).
 - **#57** regex menu (deferred by ruling; option-f sketch on issue).
 - **#46** agentic touchpoints; **#52** benchmark suite (M5.7).
 - Boolean + logical-annotation revisit (parked, flagged
@@ -145,24 +123,26 @@ MatLua's answer to the requirements letter.
 
 ### Standing session facts
 
-- Gate = fmt · clippy both legs `-D warnings` · test both legs ·
-  rustdoc both legs · seven oracle scripts (pyarrow_roundtrip via
+- Gate = fmt | clippy both legs `-D warnings` | test both legs |
+  rustdoc both legs | seven oracle scripts (pyarrow_roundtrip via
   `-p arrow-lite --features oracle-harness`; the other six via
-  `-p engine --features oracle-harness`). **471 tests pass on the
-  default leg and 85 on the off-leg** at the #83 merge (re-run
-  2026-08-02 evening, not carried arithmetic).
-  Doc-only (.md) pushes have gone without the full gate.
+  `-p engine --features oracle-harness`). Check every leg BY EXIT
+  CODE, not by grepping counts. **493 tests pass on the default leg
+  and 107 on the off-leg** at the tranche-2 close (re-run 2026-08-03,
+  not carried arithmetic). Doc-only (.md) pushes have gone without
+  the full gate.
 - CI runs on every pull request **and** on every push to `main`; the
   jobs are check, miri (`arrow-lite`), lua-suite (official 5.4.7 +
-  `ltests`), sanitize. CI stable moves — if clippy
-  fails there and not here, `rustup update stable` and re-run.
+  `ltests`), sanitize. CI stable moves — if clippy fails there and
+  not here, `rustup update stable` and re-run.
 - The scratchpad probe crate lives under the session scratchpad
   (path-deps on real crates); rebuild if needed, never in-repo.
 - sqlparser 0.62.0, GenericDialect. Any new pre-parse lift must
   splice by byte span, skip comments whole, carry adversarial tests.
-- Beta shape (built as of this merge): feed-writer process +
-  read-only consoles (`--read-only`, `.refresh`/`.flush`) over one
-  directory; readers see the durable prefix, old-or-new per
-  mutation.
-- `rm -rf crates/engine/tests/__pycache__` after running oracles
+- Beta shape: feed-writer process + read-only consoles (`--read-only`,
+  `.refresh`/`.flush`) over one directory; readers see the durable
+  prefix, old-or-new per mutation. Read-only view handles serve exact
+  answers over stale materializations, including dirty boundary
+  buckets.
+- `rm -rf crates/*/tests/__pycache__` after running oracles
   (gitignored now, but keep the tree clean).

@@ -71,11 +71,11 @@ impl Database {
         Ok(())
     }
 
-    /// Creates an in-memory maintained view (#83, tranche 1) over the
-    /// named source table — a bucketed single-table aggregate kept
-    /// fresh by refresh; see [`MaterializedView`] for the model and
-    /// what the definition may contain. The name shares the table
-    /// namespace.
+    /// Creates an in-memory maintained view (#83) over the named
+    /// source table — a bucketed, running, or cumulative single-table
+    /// aggregate kept fresh by refresh; see [`MaterializedView`] for
+    /// the three shapes and what a definition may contain. The name
+    /// shares the table namespace.
     pub fn create_materialized_view(&mut self, name: &str, sql: &str) -> Result<(), EngineError> {
         self.claim_name(name)?;
         let source_name = plan(sql)?.table;

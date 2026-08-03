@@ -1369,8 +1369,99 @@ flat-refresh measurement above is a correction-free run) —
 `compact` on the view restores contiguity; the console opens existing
 views correctly (both scan sites route on the definition marker) but
 has no verbs to create or refresh them yet — the API-first ruling's
-deliberate gap; tranches 2 and 3 hold their seats with teaching
-refusals naming them.
+deliberate gap.
+
+### Tranche 2: running and cumulative shapes via bucket partials (built 2026-08-03)
+
+The shapes tranche 1 refused because their blast radius under
+correction is unbounded — a correction at `t` changes every result
+after `t` — are admitted by changing what is stored. The
+materialization holds, per **hidden bucket** of the ordering key, not
+the answer but the **partials** the answer recombines from: a bucket's
+sum, count, (sum, count) for `AVG`, min, max, or edge value. The
+load-bearing fact of the whole representation: **partials and their
+combines are themselves built aggregates**, so the synthesized
+materialization is a legal tranche-1 bucketed plan and every piece of
+tranche-1 machinery — refresh, touched-bucket derivation, the stamp,
+the crash story, the rebuild floor — serves both new shapes unchanged.
+A correction re-folds one hidden bucket; the O(suffix) rewrite never
+exists because no suffix is stored.
+
+**The hidden bucket width** is a heuristic, not a semantic: chosen at
+the first refresh that sees data (observed key span over a target 1024
+buckets, clamped to at least 1), persisted in the definition record
+(format v2, additive; v1 records decode as width-unchosen and
+self-heal) *before* folding under it, so a crash re-folds under the
+same width. A re-widthing is a rebuild, deliberately not a format
+question.
+
+**The running read**: partials union (clean materialized buckets + a
+live partial fold of everything the stamp does not cover) → a
+symbol-keyed **combine** reassembling cross-bucket totals → finalize
+into the user row shape — `AVG` divides once, after the combine (an
+average of averages weights buckets, not rows, and is simply wrong);
+`COUNT`'s NULL sum-of-counts grounds to 0.
+
+**The cumulative read** splits every expanding window at the query
+predicate's ordering-key lower bound (conservatively extracted: `AND`
+takes the tighter branch, `OR` needs both and takes the looser,
+unhandled shapes fall to recompute — a bound may sit below the truth,
+never above it): a **boundary** combine over the partials strictly
+below that bucket, an **assembly** of the user definition over the
+source from the bucket's low edge (truncating division is monotone, so
+the two ranges partition exactly), and a per-column adjustment folding
+boundary into assembly — `AVG` through hidden sum/count helper
+windows, never through its quotient; `MAX` propagates NaN under the
+engine's NaN-greatest relation. A query with no lower bound wants
+every output row and recomputes: the partials cannot shorten an
+O(n)-row answer.
+
+**The combine contract, stated** (2026-08-03, revisitable): combining
+per-bucket f64 sums associates differently than a single pass, so
+`SUM`/`AVG` through partials agree with recompute within **1e-12
+relative** — the tolerance the mutation, as-of, and view oracle
+families apply (the slice and differential families run at 1e-9).
+Both folds run the executor's ordinary aggregates — plain f64
+accumulation; the Neumaier reference in the M5.0 numerics guard is a
+test yardstick, not shipped summation.
+`COUNT`/`MIN`/`MAX`/`FIRST`/`LAST` combine exactly. Exact single-pass
+equality is impossible under any partials representation.
+
+**Refusal parity, inherited**: cumulative reads run real windows, and
+windows refuse disordered data — so a full read over uncompacted
+correction segments refuses exactly as the base's windows do
+(`compact` heals both), and `view AS OF s` refuses once corrections
+sit in history segments (their key ranges interleave with the live
+generation's). `view AS OF s = Q(base AS OF s)` includes the
+refusals. A *ranged* read above an uncompacted correction keeps
+answering exactly — zone maps prune the stray segment and the boundary
+re-folds with aggregates, which need no order.
+
+**Evidence at the build** (2026-08-03, this container): the m5 oracle
+grew to three views over one source — bucketed, running, cumulative —
+diffed against DuckDB recompute at all eleven checkpoints (the
+cumulative full read's refusals are themselves asserted, by reason);
+a 4096-row dense battery forces width 4 so multi-row hidden buckets
+are value-checked (FIRST/LAST inside a bucket, mid-bucket range
+floors, an OR-predicate bound, one-bucket repair at width 4);
+bucket-edge crossings cover negative keys and truncation's
+double-width bucket 0. Pricing, measured as same-run ratios
+(`perf_sanity`, 2026-08-03 run): a one-row correction on a running
+view over 1M rows repairs in 1.6ms vs 140.8ms full recompute (ratio
+0.011, guarded < 0.1); a cumulative ranged read of the last 10k of 1M
+rows costs 33.4ms vs 156.5s for the full read (ratio ~0.0002, guarded
+< 0.05) — the full read pays the executor's quadratic expanding-window
+sweep, which the ranged read never touches.
+
+**Tranche-2 costs and seats**: the executor's expanding-window sweep
+is O(n²) in the frame lengths — an incremental sweep in `query-lite`
+would fix the cumulative full read (and every plain expanding-window
+query) and holds a seat; a view read resolves registered functions
+from the view's own always-empty registry (register on the base,
+query the base — a per-view registration surface is a held seat);
+names beginning with `__` are reserved in running/cumulative
+definitions for the minted hidden columns; tranche 3 (q-hierarchical
+joins) holds its seat with the teaching refusal naming it.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
@@ -1732,7 +1823,8 @@ inside a kernel. This is a real edge, not a wiring slip, and the docs
 claimed it closed until the review caught them. A script wanting
 whole-column work has the vectorized vocabulary (operators,
 `rolling_*`) instead; widening the invariant needs a column-shaped
-host seam, which is where the tranche-2 primitives (#77) would land.
+host seam, which is where #77's script-side primitives would land.
+(That is #77's own second tier — unrelated to #83's "tranche 2".)
 
 Promotion is mechanical:
 one registry name, a Lua implementation swappable for a trait
