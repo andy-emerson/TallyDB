@@ -585,6 +585,14 @@ impl MaterializedView {
         let now_dim = dimension.next_sequence();
         let definition = Definition::of(&self.sql, source, Some(dimension), self.width)?;
         let join = self.join.clone().expect("routed here on Some");
+        let is_asof = definition
+            .plan
+            .join
+            .as_ref()
+            .is_some_and(|join| join.as_of.is_some());
+        if !is_asof {
+            return self.refresh_star(source, dimension, &definition, join);
+        }
         let Some(frontier) = table_okey_max(dimension)? else {
             // No reference rows at all: nothing is materializable
             // (every fact row's match could still arrive in order). If
@@ -627,8 +635,11 @@ impl MaterializedView {
             self.advance_stamp(now_fact)?;
             return Ok(u64::MAX);
         }
-        let mut ranges =
-            joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)?;
+        let JoinedDirty::Ranges(mut ranges) =
+            joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)?
+        else {
+            unreachable!("the ASOF shape derives ranges, never a rebuild")
+        };
         ranges.retain(|&(low, _)| low < ceiling);
         for range in &mut ranges {
             range.1 = range.1.min(ceiling.saturating_sub(1));
@@ -678,6 +689,85 @@ impl MaterializedView {
         Ok(folded)
     }
 
+    /// The star (equi-join) refresh: F4's ruling made concrete. The
+    /// dimension is content, not history — its rows have no time
+    /// axis a fact key range could name — so any dimension change
+    /// re-folds the whole materialization (`u64::MAX`, the rebuild
+    /// count), while fact-only changes fold incrementally. No ceiling:
+    /// an equi match never depends on a reference frontier, so
+    /// everything materializes (the stored ceiling parks at i64::MAX
+    /// after the first refresh).
+    fn refresh_star(
+        &mut self,
+        source: &mut Table,
+        dimension: &mut Table,
+        definition: &Definition,
+        join: JoinState,
+    ) -> Result<u64, EngineError> {
+        let now_fact = source.next_sequence();
+        let now_dim = dimension.next_sequence();
+        let full = [(i64::MIN, i64::MAX)];
+        let rebuild =
+            |view: &mut MaterializedView, source: &mut Table| -> Result<u64, EngineError> {
+                let replacement = source.execute_join_plan(
+                    &definition.restricted_to(
+                        &key_ranges_to_bucket_runs(full.to_vec(), definition.divide),
+                        source,
+                    ),
+                    dimension,
+                )?;
+                view.table.replace_matching(None, &replacement)?;
+                if let Some(join) = view.join.as_mut() {
+                    join.stamp = now_dim;
+                    join.ceiling = i64::MAX;
+                }
+                view.advance_stamp(now_fact)?;
+                Ok(u64::MAX)
+            };
+        if now_fact < self.stamp || now_dim < join.stamp || join.ceiling < i64::MAX {
+            // The rebuild floor on either axis, and the FIRST refresh
+            // (ceiling still below MAX): one full fold either way.
+            return rebuild(self, source);
+        }
+        match joined_touched_ranges(source, dimension, definition, self.stamp, join.stamp)? {
+            JoinedDirty::RebuildAll => rebuild(self, source),
+            JoinedDirty::Ranges(ranges) => {
+                if ranges.is_empty() {
+                    if let Some(join) = self.join.as_mut() {
+                        join.stamp = now_dim;
+                    }
+                    self.advance_stamp(now_fact)?;
+                    return Ok(0);
+                }
+                let runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
+                let folded = match source_span(source)? {
+                    None => 0,
+                    Some((fact_low, fact_high)) => {
+                        let (fact_low, fact_high) =
+                            (fact_low / definition.divide, fact_high / definition.divide);
+                        runs.iter()
+                            .map(|&(low, high)| {
+                                let low = low.max(fact_low) as i128;
+                                let high = high.min(fact_high) as i128;
+                                (high - low + 1).max(0) as u128
+                            })
+                            .sum::<u128>()
+                            .min(u64::MAX as u128) as u64
+                    }
+                };
+                let replacement = source
+                    .execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
+                let victims = definition.view_ranges(&runs);
+                self.table.replace_matching(Some(&victims), &replacement)?;
+                if let Some(join) = self.join.as_mut() {
+                    join.stamp = now_dim;
+                }
+                self.advance_stamp(now_fact)?;
+                Ok(folded)
+            }
+        }
+    }
+
     /// The join view's union read: materialized rows below the ceiling
     /// and outside the dirty ranges, plus a live join over everything
     /// else — the dirty ranges and the whole tail at or above the
@@ -706,7 +796,12 @@ impl MaterializedView {
         }
         let join = self.join.as_ref().expect("routed here on Some");
         let mut ranges =
-            joined_touched_ranges(source, dimension, definition, self.stamp, join.stamp)?;
+            match joined_touched_ranges(source, dimension, definition, self.stamp, join.stamp)? {
+                // A star view with an unfolded dimension change: the
+                // whole answer is live until the rebuild runs.
+                JoinedDirty::RebuildAll => vec![(i64::MIN, i64::MAX)],
+                JoinedDirty::Ranges(ranges) => ranges,
+            };
         // The unmaterialized tail: everything at or above the ceiling
         // lives in the live half (with the ceiling at i64::MIN, that
         // is the whole axis and the read is a plain live join).
@@ -1632,21 +1727,35 @@ fn synthesize_cumulative(
     })
 }
 
-/// The dirty fact-key ranges a join view derives from BOTH knowledge
-/// histories (#83 tranche 3): fact rows born or killed since the fact
-/// stamp (as single-key ranges), and for every reference row born or
-/// killed since the dimension stamp, the correction interval
+/// A join view's dirty set, derived from BOTH knowledge histories.
+enum JoinedDirty {
+    /// Fact-key ranges to re-fold: fact rows born or killed since the
+    /// fact stamp (single-key ranges), plus — for the ASOF shape — the
+    /// correction interval per touched reference row. Unclipped:
+    /// refresh clips below its ceiling, the read unions the tail in.
+    Ranges(Vec<(i64, i64)>),
+    /// The star shape's answer to ANY dimension change (F4, ruled on
+    /// #83): a dimension row's blast radius is every fact bucket
+    /// holding its key — symbol-shaped, which the range machinery
+    /// cannot express — so the whole materialization re-folds.
+    /// O(fact) per rare event, zero new machinery; the per-symbol
+    /// index is a held seat.
+    RebuildAll,
+}
+
+/// The dirty derivation (#83 tranche 3). For the ASOF shape, a
+/// touched reference row at `t` contributes the correction interval
 /// `[t, next reference row for that key strictly after t, in current
-/// state)` — open-ended when no next exists. A reference row with a
-/// NULL key matches nothing and is skipped. Unclipped: refresh clips
-/// below its new ceiling, the read unions the tail in.
+/// state)` — open-ended when no next exists; a NULL-keyed reference
+/// row matches nothing and is skipped. For the equi (star) shape, any
+/// touched dimension row escalates to [`JoinedDirty::RebuildAll`].
 fn joined_touched_ranges(
     source: &Table,
     dimension: &Table,
     definition: &Definition,
     fact_stamp: u64,
     dim_stamp: u64,
-) -> Result<Vec<(i64, i64)>, EngineError> {
+) -> Result<JoinedDirty, EngineError> {
     let join = definition
         .plan
         .join
@@ -1658,6 +1767,12 @@ fn joined_touched_ranges(
     dimension.touched_rows(dim_stamp, &join.dimension_key, |key, value| {
         touched_reference.push((key, value.map(str::to_owned)));
     })?;
+    if join.as_of.is_none() {
+        if !touched_reference.is_empty() {
+            return Ok(JoinedDirty::RebuildAll);
+        }
+        return Ok(JoinedDirty::Ranges(ranges));
+    }
     for (at, value) in touched_reference {
         let Some(value) = value else {
             continue; // a null reference key matches nothing, ever
@@ -1668,7 +1783,7 @@ fn joined_touched_ranges(
             ranges.push((at, high));
         }
     }
-    Ok(ranges)
+    Ok(JoinedDirty::Ranges(ranges))
 }
 
 /// The least reference ordering-key value strictly after `after` for
@@ -2605,12 +2720,6 @@ fn classify_joined(
             join.dimension
         )));
     };
-    if join.as_of.is_none() {
-        return refuse(
-            "a maintained equi-join view — the star shape lands with \
-             tranche 3's next cycle; today's door admits ASOF joins",
-        );
-    }
     if plan.distinct {
         return refuse("DISTINCT in a view definition — deduplicate at read");
     }
@@ -3321,17 +3430,17 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("pass 'dim'"), "{error}");
-        let error = MaterializedView::new(
-            "v",
+        // Cycle 3 ADMITS the equi (star) shape under the widened door
+        // — its repair is rebuild-on-dim-change, tested in the star
+        // battery.
+        MaterializedView::new(
+            "v0",
             "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
              JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4",
             &source,
             Some(&dim),
         )
-        .map(|_| ())
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("equi-join"), "{error}");
+        .unwrap();
         // Cycle 2 ADMITS the bucketed aggregate over the ASOF join —
         // a dimension-valued aggregate included.
         MaterializedView::new(
@@ -5654,6 +5763,185 @@ mod tests {
             .unwrap();
         check(&db); // dirty, unrefreshed
         assert!(db.refresh_view("vbars").unwrap() >= 1);
+        check(&db);
+    }
+
+    /// The star fixture: a fact table and a small keyed dimension
+    /// (sector per symbol) — the lookup-table shape.
+    fn star_db() -> Database {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "dim",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("id", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("sector", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("weight", arrow_lite::ColumnType::F64, false),
+                ]),
+                "id",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..16 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        for (id, sym, sector, weight) in [(0, "A", "tech", 2.0), (1, "B", "energy", 3.0)] {
+            db.append(
+                "dim",
+                &[
+                    storage_lite::RowValue::I64(id),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::Key(sector),
+                    storage_lite::RowValue::F64(weight),
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    const STAR_BARS: &str = "SELECT sector, ts / 4 AS bar, sum(x) AS s, \
+         count(*) AS n FROM trades JOIN dim ON trades.sym = dim.sym \
+         GROUP BY sector, ts / 4";
+
+    fn assert_star_matches(db: &Database, view: &str) {
+        let through = db
+            .query(&format!("SELECT sector, bar, s, n FROM {view}"))
+            .unwrap();
+        let direct = db.query(STAR_BARS).unwrap();
+        assert_eq!(
+            sorted_rows(&through),
+            sorted_rows(&direct),
+            "star view '{view}' diverged from the direct query"
+        );
+        assert!(through.num_rows() > 0, "vacuous star check");
+    }
+
+    #[test]
+    fn a_star_view_folds_facts_incrementally_and_rebuilds_on_dim_change() {
+        let mut db = star_db();
+        db.create_materialized_view("sbars", STAR_BARS).unwrap();
+        assert_star_matches(&db, "sbars"); // stale: all live
+                                           // First refresh is the rebuild (u64::MAX, the rebuild count):
+                                           // a star view has no ceiling, everything materializes.
+        assert_eq!(db.refresh_view("sbars").unwrap(), u64::MAX);
+        assert_star_matches(&db, "sbars");
+        // Fact appends fold incrementally: 4 new keys = 1 new bucket.
+        for i in 16..20 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_star_matches(&db, "sbars"); // stale tail
+        assert_eq!(db.refresh_view("sbars").unwrap(), 1);
+        assert_star_matches(&db, "sbars");
+        // A fact correction folds its bucket alone.
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        assert_star_matches(&db, "sbars");
+        assert_eq!(db.refresh_view("sbars").unwrap(), 1);
+        assert_star_matches(&db, "sbars");
+        // ANY dimension change rebuilds (F4): a sector move shifts
+        // every bucket of that symbol across groups — and the read
+        // must already be exact while the rebuild is pending.
+        db.mutate("UPDATE dim SET sector = 'ai' WHERE sym = 'A'")
+            .unwrap();
+        assert_star_matches(&db, "sbars"); // dirty, unrefreshed: all live
+        assert_eq!(db.refresh_view("sbars").unwrap(), u64::MAX);
+        assert_star_matches(&db, "sbars");
+        // A NEW dimension row (a symbol gaining coverage) is a dim
+        // change like any other: rebuild, and exact while stale.
+        db.append(
+            "trades",
+            &[
+                storage_lite::RowValue::I64(20),
+                storage_lite::RowValue::Key("C"),
+                storage_lite::RowValue::F64(7.0),
+                storage_lite::RowValue::F64(0.0),
+            ],
+        )
+        .unwrap();
+        db.append(
+            "dim",
+            &[
+                storage_lite::RowValue::I64(2),
+                storage_lite::RowValue::Key("C"),
+                storage_lite::RowValue::Key("bio"),
+                storage_lite::RowValue::F64(1.0),
+            ],
+        )
+        .unwrap();
+        assert_star_matches(&db, "sbars");
+        assert_eq!(db.refresh_view("sbars").unwrap(), u64::MAX);
+        assert_star_matches(&db, "sbars");
+        db.compact("trades").unwrap();
+        db.compact("dim").unwrap();
+        assert_star_matches(&db, "sbars");
+        // A duplicate dimension key is the executor's loud error, at
+        // the view exactly as at the base — the door's data-level
+        // precondition (the F7 widening rests on the dim being keyed).
+        db.append(
+            "dim",
+            &[
+                storage_lite::RowValue::I64(3),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::Key("dup"),
+                storage_lite::RowValue::F64(9.0),
+            ],
+        )
+        .unwrap();
+        let error = db
+            .query("SELECT sector, bar, s, n FROM sbars")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not unique"), "{error}");
+    }
+
+    #[test]
+    fn a_star_blotter_enriches_rows_and_rebuilds_on_dim_change() {
+        // The bare-projection star shape: per-row enrichment from the
+        // lookup table (the LEFT form keeps uncovered symbols with
+        // NULL attributes).
+        let mut db = star_db();
+        db.append(
+            "trades",
+            &[
+                storage_lite::RowValue::I64(16),
+                storage_lite::RowValue::Key("C"),
+                storage_lite::RowValue::F64(1.0),
+                storage_lite::RowValue::F64(0.0),
+            ],
+        )
+        .unwrap();
+        const STAR_BLOTTER: &str = "SELECT ts, sym, x, sector, weight FROM trades \
+             LEFT JOIN dim ON trades.sym = dim.sym";
+        db.create_materialized_view("enriched", STAR_BLOTTER)
+            .unwrap();
+        let check = |db: &Database| {
+            let through = db
+                .query("SELECT ts, sym, x, sector, weight FROM enriched")
+                .unwrap();
+            let direct = db.query(STAR_BLOTTER).unwrap();
+            assert_eq!(sorted_rows(&through), sorted_rows(&direct));
+            assert!(through.num_rows() > 0);
+        };
+        check(&db);
+        assert_eq!(db.refresh_view("enriched").unwrap(), u64::MAX);
+        check(&db);
+        db.mutate("UPDATE dim SET weight = 9.0 WHERE sym = 'B'")
+            .unwrap();
+        check(&db); // dirty: whole read live until the rebuild
+        assert_eq!(db.refresh_view("enriched").unwrap(), u64::MAX);
+        check(&db);
+        for i in 17..20 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        check(&db);
+        assert!(db.refresh_view("enriched").unwrap() < u64::MAX); // incremental
         check(&db);
     }
 }
