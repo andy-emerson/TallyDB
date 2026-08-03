@@ -147,3 +147,99 @@ fn view_refresh_scales_with_the_batch_not_the_table() {
         "refresh scaled with the table (x4 table -> x{ratio:.1} refresh)"
     );
 }
+
+/// Tranche 2's repair claim, measured: correcting one row of a RUNNING
+/// view re-folds one hidden bucket, priced against the full recompute
+/// the partials representation exists to avoid (the O(suffix) rewrite
+/// never happens because no suffix is stored). Same run, same table —
+/// the ratio is the evidence, the absolutes are just the record.
+#[test]
+#[ignore = "perf sanity — run explicitly in release mode"]
+fn running_correction_repairs_one_bucket_not_the_answer() {
+    use engine::Database;
+    let rows = 1_000_000i64;
+    let mut db = Database::new();
+    db.add_table(Table::with_segment_rows("trades", schema(), "ts", 8_192).unwrap())
+        .unwrap();
+    for i in 0..rows {
+        db.append("trades", &row(i)).unwrap();
+    }
+    db.create_materialized_view(
+        "totals",
+        "SELECT sym, count(*) AS n, sum(x) AS s, avg(x) AS a, \
+         min(x) AS lo, max(x) AS hi FROM trades GROUP BY sym",
+    )
+    .unwrap();
+    db.refresh_view("totals").unwrap();
+    db.mutate("UPDATE trades SET x = 12345.0 WHERE ts = 500000")
+        .unwrap();
+    let start = Instant::now();
+    let folded = db.refresh_view("totals").unwrap();
+    let repair = start.elapsed();
+    assert_eq!(folded, 1, "a one-row correction re-folds one hidden bucket");
+    let start = Instant::now();
+    let _ = db
+        .table("trades")
+        .unwrap()
+        .query(db.view("totals").unwrap().sql())
+        .unwrap();
+    let recompute = start.elapsed();
+    let ratio = repair.as_secs_f64() / recompute.as_secs_f64().max(1e-9);
+    println!(
+        "one-row correction over {rows} rows: repair {repair:?} (1 bucket) \
+         vs full recompute {recompute:?} — ratio {ratio:.3}"
+    );
+    assert!(
+        ratio < 0.5,
+        "one-bucket repair cost approached full recompute (ratio {ratio:.2})"
+    );
+}
+
+/// Tranche 2's read claim, measured: a CUMULATIVE view's ranged read
+/// prices the requested range (boundary combine over ~span/width
+/// partial rows + assembly over the suffix), not the table — against
+/// the full read of the same view in the same run, which recomputes
+/// every window over every row.
+#[test]
+#[ignore = "perf sanity — run explicitly in release mode"]
+fn cumulative_range_read_prices_the_range_not_the_table() {
+    use engine::Database;
+    let rows = 1_000_000i64;
+    let floor = rows - 10_000;
+    let mut db = Database::new();
+    db.add_table(Table::with_segment_rows("trades", schema(), "ts", 8_192).unwrap())
+        .unwrap();
+    for i in 0..rows {
+        db.append("trades", &row(i)).unwrap();
+    }
+    db.create_materialized_view(
+        "cum",
+        "SELECT ts, sym, \
+         sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs, \
+         avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ca \
+         FROM trades",
+    )
+    .unwrap();
+    db.refresh_view("cum").unwrap();
+    let start = Instant::now();
+    let ranged = db
+        .query(&format!(
+            "SELECT ts, sym, cs, ca FROM cum WHERE ts >= {floor}"
+        ))
+        .unwrap();
+    let ranged_read = start.elapsed();
+    assert_eq!(ranged.num_rows(), 10_000);
+    let start = Instant::now();
+    let full = db.query("SELECT ts, sym, cs, ca FROM cum").unwrap();
+    let full_read = start.elapsed();
+    assert_eq!(full.num_rows(), rows as usize);
+    let ratio = ranged_read.as_secs_f64() / full_read.as_secs_f64().max(1e-9);
+    println!(
+        "cumulative read of the last 10k of {rows} rows: ranged {ranged_read:?} \
+         vs full recompute {full_read:?} — ratio {ratio:.3}"
+    );
+    assert!(
+        ratio < 0.5,
+        "the ranged read cost approached the full recompute (ratio {ratio:.2})"
+    );
+}

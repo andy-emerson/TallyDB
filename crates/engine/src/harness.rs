@@ -878,18 +878,37 @@ pub unsafe extern "C" fn tallydb_m2_mutated_stream(out: *mut ArrowArrayStream) {
 }
 
 // ---------------------------------------------------------------------
-// The maintained-view family (#83, tranche 1): a database holding one
-// source table and one bucketed view over it, driven statement by
-// statement from the oracle script, which mirrors every statement into
-// DuckDB and diffs the VIEW's answer — through the union read, so the
-// oracle covers stale, refreshed, corrected, compacted, and reopened
-// states alike — against DuckDB running the definition from scratch.
+// The maintained-view family (#83, tranches 1 and 2): a database
+// holding one source table and three views over it — bucketed
+// (tranche 1), running, and cumulative (tranche 2) — driven statement
+// by statement from the oracle script, which mirrors every statement
+// into DuckDB and diffs each VIEW's answer — through the union read,
+// so the oracle covers stale, refreshed, corrected, compacted, and
+// reopened states alike — against DuckDB running the definition from
+// scratch.
 
-/// The view family's fixture: the source schema and the definition the
+/// The view family's fixture: the source schema and the definitions the
 /// context creates, exported so the script cannot drift from them.
 pub const VIEW_DEFINITION: &str = "SELECT sym, ts / 5 AS bar, count(*) AS n, \
      sum(x) AS s, min(x) AS lo, max(x) AS hi, first(x) AS o, last(x) AS c \
      FROM trades GROUP BY sym, ts / 5";
+
+/// The running view the fixture maintains beside the bucketed one —
+/// per-symbol totals, no bucket, served from hidden-bucket partials.
+pub const VIEW_RUNNING_DEFINITION: &str = "SELECT sym, count(*) AS n, sum(x) AS s, \
+     avg(x) AS a, min(x) AS lo, max(x) AS hi, first(x) AS o, last(x) AS c \
+     FROM trades GROUP BY sym";
+
+/// The cumulative view the fixture maintains — one row per source row,
+/// every admitted expanding window. Plain SQL in DuckDB too, which is
+/// what makes the mirror exact.
+pub const VIEW_CUMULATIVE_DEFINITION: &str = "SELECT ts, sym, \
+     sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs, \
+     count(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cn, \
+     avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ca, \
+     min(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS clo, \
+     max(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS chi \
+     FROM trades";
 
 /// The context behind the maintained-view oracle family.
 pub struct ViewContext {
@@ -907,30 +926,41 @@ impl ViewContext {
     }
     fn open_at(dir: &std::path::Path) -> Result<Database, crate::EngineError> {
         let source_dir = dir.join("trades");
-        let view_dir = dir.join("bars");
+        let views = [
+            ("bars", VIEW_DEFINITION),
+            ("totals", VIEW_RUNNING_DEFINITION),
+            ("cum", VIEW_CUMULATIVE_DEFINITION),
+        ];
         let existing = source_dir.join(storage_lite::store::MANIFEST).is_file();
         let mut db = Database::new();
-        if existing {
-            let table = Table::open("trades", &source_dir, storage_lite::StoreOptions::default())?;
-            let view = crate::MaterializedView::open(
-                "bars",
-                &view_dir,
-                &table,
-                storage_lite::StoreOptions::default(),
-            )?;
-            db.add_table(table)?;
-            db.add_view(view)?;
+        let table = if existing {
+            Table::open("trades", &source_dir, storage_lite::StoreOptions::default())?
         } else {
-            let table = Table::persistent_with_segment_rows(
+            Table::persistent_with_segment_rows(
                 "trades",
                 asof_schema(),
                 "ts",
                 &source_dir,
                 SEGMENT_ROWS,
-            )?;
-            let view =
-                crate::MaterializedView::persistent("bars", VIEW_DEFINITION, &table, &view_dir)?;
-            db.add_table(table)?;
+            )?
+        };
+        let opened = views
+            .into_iter()
+            .map(|(name, definition)| {
+                if existing {
+                    crate::MaterializedView::open(
+                        name,
+                        dir.join(name),
+                        &table,
+                        storage_lite::StoreOptions::default(),
+                    )
+                } else {
+                    crate::MaterializedView::persistent(name, definition, &table, dir.join(name))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        db.add_table(table)?;
+        for view in opened {
             db.add_view(view)?;
         }
         Ok(db)
@@ -944,19 +974,38 @@ impl ViewContext {
 pub extern "C" fn tallydb_view_open() -> *mut ViewContext {
     let dir = std::env::temp_dir().join(format!("tallydb-view-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("trades")).expect("fixture directories");
-    std::fs::create_dir_all(dir.join("bars")).expect("fixture directories");
+    for sub in ["trades", "bars", "totals", "cum"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("fixture directories");
+    }
     let db = ViewContext::open_at(&dir).expect("view fixture opens");
     Box::into_raw(Box::new(ViewContext { db: Some(db), dir }))
 }
 
-/// The definition the context's view maintains, for the script's DuckDB
-/// mirror. Returns a NUL-terminated static string.
+/// The definition the context's bucketed view maintains, for the
+/// script's DuckDB mirror. Returns a NUL-terminated static string.
 #[no_mangle]
 pub extern "C" fn tallydb_view_definition() -> *const std::os::raw::c_char {
     static DEFINITION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
     DEFINITION
         .get_or_init(|| std::ffi::CString::new(VIEW_DEFINITION).expect("no NULs"))
+        .as_ptr()
+}
+
+/// As [`tallydb_view_definition`], for the running view.
+#[no_mangle]
+pub extern "C" fn tallydb_view_running_definition() -> *const std::os::raw::c_char {
+    static DEFINITION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DEFINITION
+        .get_or_init(|| std::ffi::CString::new(VIEW_RUNNING_DEFINITION).expect("no NULs"))
+        .as_ptr()
+}
+
+/// As [`tallydb_view_definition`], for the cumulative view.
+#[no_mangle]
+pub extern "C" fn tallydb_view_cumulative_definition() -> *const std::os::raw::c_char {
+    static DEFINITION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DEFINITION
+        .get_or_init(|| std::ffi::CString::new(VIEW_CUMULATIVE_DEFINITION).expect("no NULs"))
         .as_ptr()
 }
 
@@ -989,21 +1038,27 @@ pub unsafe extern "C" fn tallydb_view_statement(
     }
 }
 
-/// Refreshes the maintained view. Returns buckets re-folded, or -1 on
-/// failure.
+/// Refreshes every maintained view. Returns buckets re-folded, summed
+/// saturating across the three (a rebuild floor reports `u64::MAX` and
+/// saturates the sum), or -1 on failure.
 ///
 /// # Safety
 /// As for [`tallydb_view_statement`].
 #[no_mangle]
 pub unsafe extern "C" fn tallydb_view_refresh(context: *mut ViewContext) -> i64 {
     // SAFETY: caller contract — a live context.
-    match unsafe { &mut *context }.db_mut().refresh_view("bars") {
-        Ok(folded) => i64::try_from(folded).unwrap_or(i64::MAX),
-        Err(error) => {
-            eprintln!("tallydb_view_refresh: {error}");
-            -1
+    let db = unsafe { &mut *context }.db_mut();
+    let mut folded = 0u64;
+    for name in ["bars", "totals", "cum"] {
+        match db.refresh_view(name) {
+            Ok(count) => folded = folded.saturating_add(count),
+            Err(error) => {
+                eprintln!("tallydb_view_refresh: {name}: {error}");
+                return -1;
+            }
         }
     }
+    i64::try_from(folded).unwrap_or(i64::MAX)
 }
 
 /// Runs one query — against the view or the source — and exports the
