@@ -26,6 +26,23 @@
 
 use query_lite::{AggCall, AggFunction};
 
+/// The expanding-window functions a cumulative view can maintain,
+/// mapped to the aggregate whose decomposition serves them: the
+/// per-bucket partial of `sum(x) OVER (UNBOUNDED PRECEDING..)` is a
+/// plain per-bucket `SUM(x)`, and so on down the family. Anything
+/// else — `var_pop` and friends, `first`/`last` as windows, LAG/LEAD —
+/// is refused by name at the definition door.
+pub(crate) fn expanding_window_function(name: &str) -> Option<AggFunction> {
+    match name {
+        "sum" => Some(AggFunction::Sum),
+        "count" => Some(AggFunction::Count),
+        "avg" => Some(AggFunction::Avg),
+        "min" => Some(AggFunction::Min),
+        "max" => Some(AggFunction::Max),
+        _ => None,
+    }
+}
+
 /// The hidden bucket column's name in a running view's materialization
 /// — reserved like `_seq`, unreachable from user SQL (a definition or
 /// query naming it would need the underscore prefix the planner treats

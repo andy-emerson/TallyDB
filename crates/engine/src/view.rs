@@ -294,7 +294,7 @@ impl MaterializedView {
         source.flush()?;
         let now = source.next_sequence();
         let mut definition = Definition::of(&self.sql, source, self.width)?;
-        if definition.running.is_some() && self.width == 0 {
+        if !matches!(definition.read, ReadShape::Direct) && self.width == 0 {
             // A running view's hidden-bucket width is chosen once, at
             // the first refresh that sees data: the observed key span
             // over a target bucket count. Heuristic, internal, and
@@ -393,8 +393,14 @@ impl MaterializedView {
             )));
         }
         let definition = Definition::of(&self.sql, source, self.width)?;
-        if let Some(running) = &definition.running {
-            return self.query_running(source, &definition, running, user_plan);
+        match &definition.read {
+            ReadShape::Running(running) => {
+                return self.query_running(source, &definition, running, user_plan)
+            }
+            ReadShape::Cumulative(cumulative) => {
+                return self.query_cumulative(source, &definition, cumulative, user_plan)
+            }
+            ReadShape::Direct => {}
         }
         if let Some(cut) = user_plan.as_of {
             let mut past = definition.plan.clone();
@@ -443,17 +449,7 @@ impl MaterializedView {
             let answers = source.execute_plan(&recompute)?;
             return run_over_output(&running.output, answers.batches, &current, source);
         }
-        let partials = match definition.touched_runs(source, self.stamp)? {
-            None => self.table.execute_plan(&select_everything(&self.table)?)?,
-            Some(runs) => {
-                let fresh = source.execute_plan(&definition.restricted_to(&runs, source))?;
-                let mut clean = select_everything(&self.table)?;
-                clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
-                let mut clean = self.table.execute_plan(&clean)?;
-                clean.batches.extend(fresh.batches);
-                clean
-            }
-        };
+        let partials = self.partials_union(source, definition)?;
         let combined = self.over_scratch(
             partials.batches.into_iter(),
             query_lite::QueryOutput {
@@ -469,6 +465,116 @@ impl MaterializedView {
             &current,
             source,
         )
+    }
+
+    /// The cumulative view's read: partials in, per-row answers out.
+    ///
+    /// `AS OF` and the not-yet-sized view recompute the user definition
+    /// directly over the source, like the running read. Otherwise the
+    /// query's own predicate names an ordering-key **lower bound**; its
+    /// bucket `B` splits every expanding window into the boundary
+    /// combine (partials strictly below `B`, per partition) plus the
+    /// assembly (the user definition over the source from `B`'s low
+    /// edge), folded together by the adjustment. A query with no lower
+    /// bound wants every output row, so the assembly would cover the
+    /// whole source anyway — recompute IS that read, and the partials
+    /// cannot shorten an O(n)-row answer.
+    fn query_cumulative(
+        &self,
+        source: &Table,
+        definition: &Definition,
+        cumulative: &CumulativeRead,
+        user_plan: &Plan,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        let mut current = user_plan.clone();
+        current.as_of = None;
+        let recompute_floor = |floor: Option<i64>| -> Option<i64> {
+            if user_plan.as_of.is_some() || self.width == 0 {
+                None
+            } else {
+                floor
+            }
+        };
+        let floor = recompute_floor(
+            user_plan
+                .predicate
+                .as_ref()
+                .and_then(|predicate| okey_lower_bound(predicate, &cumulative.okey_output)),
+        );
+        let Some(floor) = floor else {
+            let mut recompute = cumulative.user.clone();
+            recompute.as_of = user_plan.as_of;
+            let answers = source.execute_plan(&recompute)?;
+            return run_over_rows(
+                &cumulative.output,
+                cumulative.okey_index,
+                answers.batches,
+                &current,
+                source,
+            );
+        };
+        let width = self.width as i64;
+        // The executor's own truncating bucket arithmetic: everything
+        // in buckets below this is boundary, everything from its low
+        // edge up is assembly — disjoint and complete, because
+        // truncating division is monotone.
+        let boundary_bucket = floor / width;
+        let partials = self.partials_union(source, definition)?;
+        let mut combine = cumulative.combine.clone();
+        combine.predicate = Some(Predicate::Compare {
+            column: crate::partials::HIDDEN_BUCKET.to_owned(),
+            op: CmpOp::Lt,
+            value: Number::Int(boundary_bucket),
+        });
+        let combined = self.over_scratch(
+            partials.batches.into_iter(),
+            query_lite::QueryOutput {
+                schema: self.table.schema().clone(),
+                batches: Vec::new(),
+            },
+            &combine,
+        )?;
+        let boundaries = boundary_rows(cumulative, &combined);
+        let mut assembly = cumulative.assembly.clone();
+        let low_edge = Predicate::Compare {
+            column: source.ordering_key().to_owned(),
+            op: CmpOp::Ge,
+            value: Number::Int(bucket_low(boundary_bucket, width)),
+        };
+        assembly.predicate = Some(match assembly.predicate.take() {
+            Some(own) => Predicate::And(Box::new(low_edge), Box::new(own)),
+            None => low_edge,
+        });
+        let assembled = source.execute_plan(&assembly)?;
+        let adjusted = adjust_batches(cumulative, assembled.batches, &boundaries);
+        run_over_rows(
+            &cumulative.output,
+            cumulative.okey_index,
+            adjusted,
+            &current,
+            source,
+        )
+    }
+
+    /// The partials union — the running/cumulative read's first half:
+    /// clean materialized buckets plus a live partial fold of
+    /// everything the stamp does not cover, as view-schema batches.
+    fn partials_union(
+        &self,
+        source: &Table,
+        definition: &Definition,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        match definition.touched_runs(source, self.stamp)? {
+            None => self.table.execute_plan(&select_everything(&self.table)?),
+            Some(runs) => {
+                let fresh = source.execute_plan(&definition.restricted_to(&runs, source))?;
+                let mut clean = select_everything(&self.table)?;
+                clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
+                let mut clean = self.table.execute_plan(&clean)?;
+                clean.batches.extend(fresh.batches);
+                Ok(clean)
+            }
+        }
     }
 
     /// Runs `user_plan` over an ad-hoc union of view-shaped batches, as
@@ -573,15 +679,32 @@ fn read_definition(
 /// A lowered, validated view definition plus its bucket arithmetic —
 /// what both halves of the machinery share: the refresh restricts and
 /// folds with it, the union read restricts and tops up with it. For a
-/// running view, `plan` is the **synthesized partials materialization**
-/// (a legal bucketed plan over the hidden bucket), and `running`
-/// carries what the read needs to reassemble the user-facing answer.
+/// running or cumulative view, `plan` is the **synthesized partials
+/// materialization** (a legal bucketed plan over the hidden bucket),
+/// and `read` carries what that shape's read needs to reassemble the
+/// user-facing answer.
 struct Definition {
     plan: Plan,
     bucket_name: String,
     divide: i64,
     view_scale: i64,
-    running: Option<RunningRead>,
+    read: ReadShape,
+}
+
+/// How a query against the view turns its materialization into
+/// answers.
+enum ReadShape {
+    /// Tranche 1: the materialization IS the answer; the union read
+    /// serves it directly.
+    Direct,
+    /// A running aggregate: combine the partials per group, finalize,
+    /// then the user's query. (Boxed: a read shape is built once per
+    /// read, and the plans inside dwarf the discriminant.)
+    Running(Box<RunningRead>),
+    /// A cumulative window: prefix-combine the partials into per-
+    /// partition boundary values, assemble the queried range from the
+    /// source, adjust by the boundaries, then the user's query.
+    Cumulative(Box<CumulativeRead>),
 }
 
 /// The read-side half of a running view: how partials become answers.
@@ -617,6 +740,71 @@ enum FinalStep {
     AvgDivide { sum: usize, count: usize },
 }
 
+/// The read-side half of a cumulative view: every expanding window is
+/// split at one hidden-bucket boundary `B`, derived per query from the
+/// user predicate's ordering-key lower bound. The **boundary** is a
+/// combine over the partials strictly below `B` (one row per partition
+/// combination — everything before the assembled range, folded); the
+/// **assembly** runs the user definition over the source from `B`'s
+/// low edge; the **adjustment** folds each row's boundary into its
+/// assembled window values. Union of the two ranges is exact and
+/// disjoint: truncating division is monotone, so `bucket < B` is
+/// precisely `key < bucket_low(B)`.
+struct CumulativeRead {
+    /// The user definition, verbatim-lowered — directly executable
+    /// over the source, which is what `AS OF`, the unsized view, and
+    /// the no-lower-bound query run.
+    user: Plan,
+    /// The assembly: the user plan, plus hidden expanding `sum`/`count`
+    /// windows for each `AVG` (an average adjusts through its parts,
+    /// never through its quotient). Its range restriction is ANDed in
+    /// per query.
+    assembly: Plan,
+    /// The boundary combine: a partition-keyed aggregate over the
+    /// partials, `[partition symbols…, combined partials…]`. Its
+    /// `__bucket < B` restriction is ANDed in per query.
+    combine: Plan,
+    /// One step per user output column, indexing into the assembly's
+    /// and the combine's output columns.
+    adjust: Vec<AdjustStep>,
+    /// The partition symbols' column indices in the assembly output —
+    /// what keys a row to its boundary row.
+    partition_assembly: Vec<usize>,
+    /// The ordering-key column's output name — what the query-side
+    /// lower bound is extracted against.
+    okey_output: String,
+    /// The ordering-key column's index in `output` — the scratch
+    /// ordering key (a cumulative answer keeps the source's axis, so
+    /// no `__row` is fabricated).
+    okey_index: usize,
+    /// The user-facing output schema, window columns forced nullable.
+    output: Schema,
+}
+
+/// One user output column of a cumulative view, adjusted by the
+/// row's partition boundary.
+enum AdjustStep {
+    /// A non-window column (the ordering key, a partition symbol):
+    /// the assembly column passes through.
+    Pass(usize),
+    /// `SUM` / `COUNT`: assembled value plus the boundary's, in the
+    /// assembly column's own type (`SUM` windows are f64, `COUNT` i64).
+    Add { column: usize, boundary: usize },
+    /// `MIN`: the smaller of assembled and boundary.
+    MinFold { column: usize, boundary: usize },
+    /// `MAX`: the larger.
+    MaxFold { column: usize, boundary: usize },
+    /// `AVG`: (hidden assembled sum + boundary sum) over (hidden
+    /// assembled count + boundary count), NULL where the total count
+    /// is zero — the division happens once, after the fold.
+    AvgAssemble {
+        sum: usize,
+        count: usize,
+        boundary_sum: usize,
+        boundary_count: usize,
+    },
+}
+
 impl Definition {
     /// Builds the definition for `sql` over `source`. `width` is a
     /// running view's hidden-bucket width in ordering-key units — `0`
@@ -634,10 +822,11 @@ impl Definition {
                     bucket_name,
                     divide,
                     view_scale,
-                    running: None,
+                    read: ReadShape::Direct,
                 })
             }
             Shape::Running => synthesize_running(plan, source, width.max(1) as i64),
+            Shape::Cumulative => synthesize_cumulative(plan, source, width.max(1) as i64),
         }
     }
 
@@ -819,12 +1008,244 @@ fn synthesize_running(user: Plan, source: &Table, width: i64) -> Result<Definiti
         bucket_name: crate::partials::HIDDEN_BUCKET.to_owned(),
         divide: width,
         view_scale: 1,
-        running: Some(RunningRead {
+        read: ReadShape::Running(Box::new(RunningRead {
             user,
             combine,
             finalize,
             output: Schema::new(output_fields),
-        }),
+        })),
+    })
+}
+
+/// Synthesizes a cumulative view's machinery from its user plan. The
+/// materialization is the same hidden-bucket partials plan a running
+/// view stores — grouped by the windows' partition symbols — so every
+/// piece of tranche-1 maintenance (refresh, touched buckets, the
+/// stamp, the crash story) serves it unchanged. The read splits each
+/// expanding window at a per-query bucket boundary; what this function
+/// builds is everything that split needs: the boundary combine, the
+/// assembly plan (with hidden `sum`/`count` helper windows for each
+/// `AVG` — an average adjusts through its parts, never through its
+/// quotient), and the adjustment steps.
+fn synthesize_cumulative(
+    user: Plan,
+    source: &Table,
+    width: i64,
+) -> Result<Definition, EngineError> {
+    use crate::partials::{decompose, expanding_window_function, PartialForm, HIDDEN_BUCKET};
+    use query_lite::plan::WindowCall;
+    use query_lite::{AggCall, AggItem, PlanItem, Projection as Proj};
+    let Proj::Items(items) = &user.projection else {
+        unreachable!("classified Cumulative from an Items projection")
+    };
+    // Partition symbols in first-appearance order (classification
+    // proved every window shares one PARTITION BY list).
+    let mut partition_columns: Vec<String> = Vec::new();
+    for item in items {
+        if let PlanItem::Window {
+            call: WindowCall::Agg { partition_by, .. },
+            ..
+        } = item
+        {
+            for term in partition_by {
+                if let GroupKey::Column(column) = term {
+                    if !partition_columns.iter().any(|have| have == column) {
+                        partition_columns.push(column.clone());
+                    }
+                }
+            }
+        }
+    }
+    let bucket = GroupKey::Bucket {
+        column: source.ordering_key().to_owned(),
+        divide: width,
+        multiply: None,
+    };
+    let mut internal_keys: Vec<GroupKey> = partition_columns
+        .iter()
+        .cloned()
+        .map(GroupKey::Column)
+        .collect();
+    internal_keys.push(bucket.clone());
+    let mut internal_items: Vec<AggItem> = partition_columns
+        .iter()
+        .map(|column| AggItem::Key {
+            key: GroupKey::Column(column.clone()),
+            alias: None,
+        })
+        .collect();
+    let mut combine_items: Vec<AggItem> = internal_items.clone();
+    let mut assembly_items: Vec<PlanItem> = items.clone();
+    let mut adjust: Vec<AdjustStep> = Vec::new();
+    let mut partial_index = 0usize;
+    // The combine's output leads with its partition key columns.
+    let mut combined_index = partition_columns.len();
+    for (index, item) in items.iter().enumerate() {
+        let PlanItem::Window { call, .. } = item else {
+            adjust.push(AdjustStep::Pass(index));
+            continue;
+        };
+        let WindowCall::Agg {
+            function,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        } = call
+        else {
+            unreachable!("classification refused positional windows")
+        };
+        let function =
+            expanding_window_function(function).expect("classification admitted the family");
+        let decomposition = decompose(
+            &AggCall {
+                function,
+                argument: args.first().cloned(),
+                alias: None,
+            },
+            partial_index,
+        );
+        partial_index += decomposition.partials.len();
+        for partial in decomposition.partials {
+            internal_items.push(AggItem::Call(partial));
+        }
+        let combined_first = combined_index;
+        combined_index += decomposition.combines.len();
+        for combine in decomposition.combines {
+            combine_items.push(AggItem::Call(combine));
+        }
+        adjust.push(match decomposition.form {
+            PartialForm::Sum | PartialForm::Count => AdjustStep::Add {
+                column: index,
+                boundary: combined_first,
+            },
+            PartialForm::Min => AdjustStep::MinFold {
+                column: index,
+                boundary: combined_first,
+            },
+            PartialForm::Max => AdjustStep::MaxFold {
+                column: index,
+                boundary: combined_first,
+            },
+            PartialForm::SumCount => {
+                let helper = |function: &str, alias: String| PlanItem::Window {
+                    call: WindowCall::Agg {
+                        function: function.to_owned(),
+                        args: args.clone(),
+                        partition_by: partition_by.clone(),
+                        order_by: order_by.clone(),
+                        frame: *frame,
+                    },
+                    alias: Some(alias),
+                };
+                let sum = assembly_items.len();
+                assembly_items.push(helper("sum", format!("__w{index}_sum")));
+                let count = assembly_items.len();
+                assembly_items.push(helper("count", format!("__w{index}_count")));
+                AdjustStep::AvgAssemble {
+                    sum,
+                    count,
+                    boundary_sum: combined_first,
+                    boundary_count: combined_first + 1,
+                }
+            }
+            PartialForm::First | PartialForm::Last => {
+                unreachable!("first/last are not expanding windows")
+            }
+        });
+    }
+    internal_items.push(AggItem::Key {
+        key: bucket,
+        alias: Some(HIDDEN_BUCKET.to_owned()),
+    });
+    let internal = Plan {
+        table: user.table.clone(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: internal_keys,
+            items: internal_items,
+            having: None,
+        },
+        distinct: false,
+        predicate: user.predicate.clone(),
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    let combine = Plan {
+        table: user.table.clone(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: partition_columns
+                .iter()
+                .cloned()
+                .map(GroupKey::Column)
+                .collect(),
+            items: combine_items,
+            having: None,
+        },
+        distinct: false,
+        predicate: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    let mut assembly = user.clone();
+    assembly.projection = Proj::Items(assembly_items);
+    // The ordering key's output position and name (classification
+    // required it selected), and each partition symbol's — the
+    // adjustment keys assembly rows to boundary rows by these.
+    let output_position = |wanted: &str| {
+        items
+            .iter()
+            .position(|item| matches!(item, PlanItem::Column { name, .. } if name == wanted))
+    };
+    let okey_index = output_position(source.ordering_key())
+        .expect("classification required the ordering key selected");
+    let okey_output = match &items[okey_index] {
+        PlanItem::Column { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+        _ => unreachable!("found as a Column just above"),
+    };
+    let partition_assembly: Vec<usize> = partition_columns
+        .iter()
+        .map(|column| {
+            output_position(column).expect("classification required partition symbols selected")
+        })
+        .collect();
+    // The user-facing output schema: window columns forced nullable —
+    // the adjustment builds validity bitmaps for them regardless of
+    // what the executor inferred over zero rows.
+    let output_fields: Vec<Field> = source
+        .execute_plan_empty(&user)?
+        .schema
+        .fields()
+        .iter()
+        .zip(items)
+        .map(|(field, item)| {
+            if matches!(item, PlanItem::Window { .. }) {
+                Field::new(field.name(), field.column_type(), true)
+            } else {
+                field.clone()
+            }
+        })
+        .collect();
+    Ok(Definition {
+        plan: internal,
+        bucket_name: HIDDEN_BUCKET.to_owned(),
+        divide: width,
+        view_scale: 1,
+        read: ReadShape::Cumulative(Box::new(CumulativeRead {
+            user,
+            assembly,
+            combine,
+            adjust,
+            partition_assembly,
+            okey_output,
+            okey_index,
+            output: Schema::new(output_fields),
+        })),
     })
 }
 
@@ -994,6 +1415,328 @@ fn run_over_output(
     .map_err(EngineError::Query)
 }
 
+/// A conservative ordering-key **lower bound** from a query predicate:
+/// a value `v` such that every row the predicate can accept has
+/// `okey >= v` — `None` when no such bound is derivable, which the
+/// caller answers by full recompute (correct, just unshortened). The
+/// direction of conservatism matters: a bound may be *lower* than the
+/// truth (assembling extra rows the query then filters), never higher.
+/// `AND` takes the tighter branch, `OR` needs both and takes the
+/// looser, `>` weakens to `>=` (one extra value), a float literal
+/// floors, and every unhandled shape is `None`.
+fn okey_lower_bound(predicate: &Predicate, okey: &str) -> Option<i64> {
+    match predicate {
+        Predicate::And(left, right) => {
+            match (okey_lower_bound(left, okey), okey_lower_bound(right, okey)) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (one, other) => one.or(other),
+            }
+        }
+        Predicate::Or(left, right) => {
+            match (okey_lower_bound(left, okey), okey_lower_bound(right, okey)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                _ => None,
+            }
+        }
+        Predicate::Compare { column, op, value } if column == okey => {
+            let floor = match value {
+                Number::Int(value) => *value,
+                Number::Float(value) => value.floor() as i64,
+            };
+            match op {
+                CmpOp::Ge | CmpOp::Eq | CmpOp::Gt => Some(floor),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// One combined-boundary value — the two numeric shapes a combine can
+/// emit. An adjustment reads it in the assembly column's own domain
+/// (a `MIN` window is f64 over an i64 column whose partials stay i64).
+#[derive(Clone, Copy)]
+enum Cell {
+    I64(i64),
+    F64(f64),
+}
+
+impl Cell {
+    fn as_f64(self) -> f64 {
+        match self {
+            Cell::I64(value) => value as f64,
+            Cell::F64(value) => value,
+        }
+    }
+
+    fn as_i64(self) -> i64 {
+        match self {
+            Cell::I64(value) => value,
+            Cell::F64(value) => value as i64,
+        }
+    }
+}
+
+/// The boundary combine's output as a lookup: partition values (in
+/// combine key order) to the full combined row. Absence means no
+/// source rows below the boundary for that partition — the adjustment
+/// then adds nothing, which is exactly right.
+fn boundary_rows(
+    cumulative: &CumulativeRead,
+    combined: &query_lite::QueryOutput,
+) -> std::collections::HashMap<Vec<Option<String>>, Vec<Option<Cell>>> {
+    use arrow_lite::{Column, NumericData};
+    let mut map = std::collections::HashMap::new();
+    // Collapsing stages materialize one batch (QueryOutput's contract);
+    // an empty result has none.
+    let Some(batch) = combined.batches.first() else {
+        return map;
+    };
+    let partitions = cumulative.partition_assembly.len();
+    for row in 0..batch.num_rows() {
+        let key: Vec<Option<String>> = (0..partitions)
+            .map(|column| match &batch.columns()[column] {
+                Column::Key(keys) => keys.value_at(row).map(str::to_owned),
+                _ => None,
+            })
+            .collect();
+        let cells: Vec<Option<Cell>> = batch
+            .columns()
+            .iter()
+            .map(|column| match column {
+                Column::Numeric(NumericData::I64(values)) => values
+                    .is_valid(row)
+                    .then(|| Cell::I64(values.values().as_slice()[row])),
+                Column::Numeric(NumericData::F64(values)) => values
+                    .is_valid(row)
+                    .then(|| Cell::F64(values.values().as_slice()[row])),
+                Column::Key(_) => None,
+            })
+            .collect();
+        map.insert(key, cells);
+    }
+    map
+}
+
+/// Applies a cumulative view's adjustment steps to the assembly's
+/// batches: each row's boundary — looked up by its partition values —
+/// folds into its assembled window columns, and the hidden `AVG`
+/// helper columns collapse into the one user-facing quotient. The
+/// output batches carry the user-facing schema.
+fn adjust_batches(
+    cumulative: &CumulativeRead,
+    batches: Vec<arrow_lite::RecordBatch>,
+    boundaries: &std::collections::HashMap<Vec<Option<String>>, Vec<Option<Cell>>>,
+) -> Vec<arrow_lite::RecordBatch> {
+    use arrow_lite::{Bitmap, Column, NumericColumn, NumericData, RecordBatch};
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            continue;
+        }
+        let row_boundary: Vec<Option<&Vec<Option<Cell>>>> = (0..rows)
+            .map(|row| {
+                let key: Vec<Option<String>> = cumulative
+                    .partition_assembly
+                    .iter()
+                    .map(|&column| match &batch.columns()[column] {
+                        Column::Key(keys) => keys.value_at(row).map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect();
+                boundaries.get(&key)
+            })
+            .collect();
+        let boundary = |row: usize, index: usize| -> Option<Cell> {
+            row_boundary[row].and_then(|cells| cells[index])
+        };
+        let columns: Vec<Column> = cumulative
+            .adjust
+            .iter()
+            .map(|step| match step {
+                AdjustStep::Pass(index) => batch.columns()[*index].clone(),
+                AdjustStep::Add {
+                    column,
+                    boundary: b,
+                } => folded(
+                    &batch.columns()[*column],
+                    rows,
+                    |row| boundary(row, *b),
+                    Fold::Add,
+                ),
+                AdjustStep::MinFold {
+                    column,
+                    boundary: b,
+                } => folded(
+                    &batch.columns()[*column],
+                    rows,
+                    |row| boundary(row, *b),
+                    Fold::Min,
+                ),
+                AdjustStep::MaxFold {
+                    column,
+                    boundary: b,
+                } => folded(
+                    &batch.columns()[*column],
+                    rows,
+                    |row| boundary(row, *b),
+                    Fold::Max,
+                ),
+                AdjustStep::AvgAssemble {
+                    sum,
+                    count,
+                    boundary_sum,
+                    boundary_count,
+                } => {
+                    let Column::Numeric(NumericData::F64(sums)) = &batch.columns()[*sum] else {
+                        unreachable!("an expanding SUM window is f64")
+                    };
+                    let Column::Numeric(NumericData::I64(counts)) = &batch.columns()[*count] else {
+                        unreachable!("an expanding COUNT window is i64")
+                    };
+                    let mut values = Vec::with_capacity(rows);
+                    let mut validity = Vec::with_capacity(rows);
+                    for row in 0..rows {
+                        let assembled_count = if counts.is_valid(row) {
+                            counts.values().as_slice()[row]
+                        } else {
+                            0
+                        };
+                        let total_count = assembled_count
+                            + boundary(row, *boundary_count)
+                                .map(Cell::as_i64)
+                                .unwrap_or(0);
+                        let assembled = sums.is_valid(row).then(|| sums.values().as_slice()[row]);
+                        let total_sum =
+                            match (assembled, boundary(row, *boundary_sum).map(Cell::as_f64)) {
+                                (Some(a), Some(b)) => Some(a + b),
+                                (one, other) => one.or(other),
+                            };
+                        let defined = total_count > 0 && total_sum.is_some();
+                        validity.push(defined);
+                        values.push(if defined {
+                            total_sum.expect("checked") / total_count as f64
+                        } else {
+                            0.0
+                        });
+                    }
+                    Column::Numeric(NumericData::F64(NumericColumn::new_nullable(
+                        values.into_iter().collect(),
+                        Bitmap::from_bools(validity),
+                    )))
+                }
+            })
+            .collect();
+        out.push(RecordBatch::new(cumulative.output.clone(), columns));
+    }
+    out
+}
+
+/// How an assembled window value folds with its boundary.
+#[derive(Clone, Copy)]
+enum Fold {
+    Add,
+    Min,
+    Max,
+}
+
+/// Folds one assembled window column with its per-row boundary cells,
+/// in the column's own numeric domain. A row missing either side keeps
+/// the other; a row missing both is NULL.
+fn folded(
+    column: &arrow_lite::Column,
+    rows: usize,
+    boundary: impl Fn(usize) -> Option<Cell>,
+    fold: Fold,
+) -> arrow_lite::Column {
+    use arrow_lite::{Bitmap, Column, NumericColumn, NumericData};
+    match column {
+        Column::Numeric(NumericData::F64(assembled)) => {
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let own = assembled
+                    .is_valid(row)
+                    .then(|| assembled.values().as_slice()[row]);
+                let other = boundary(row).map(Cell::as_f64);
+                let combined = match (own, other) {
+                    (Some(a), Some(b)) => Some(match fold {
+                        Fold::Add => a + b,
+                        Fold::Min => a.min(b),
+                        Fold::Max => a.max(b),
+                    }),
+                    (one, other) => one.or(other),
+                };
+                validity.push(combined.is_some());
+                values.push(combined.unwrap_or(0.0));
+            }
+            Column::Numeric(NumericData::F64(NumericColumn::new_nullable(
+                values.into_iter().collect(),
+                Bitmap::from_bools(validity),
+            )))
+        }
+        Column::Numeric(NumericData::I64(assembled)) => {
+            let mut values = Vec::with_capacity(rows);
+            let mut validity = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let own = assembled
+                    .is_valid(row)
+                    .then(|| assembled.values().as_slice()[row]);
+                let other = boundary(row).map(Cell::as_i64);
+                let combined = match (own, other) {
+                    (Some(a), Some(b)) => Some(match fold {
+                        Fold::Add => a + b,
+                        Fold::Min => a.min(b),
+                        Fold::Max => a.max(b),
+                    }),
+                    (one, other) => one.or(other),
+                };
+                validity.push(combined.is_some());
+                values.push(combined.unwrap_or(0));
+            }
+            Column::Numeric(NumericData::I64(NumericColumn::new_nullable(
+                values.into_iter().collect(),
+                Bitmap::from_bools(validity),
+            )))
+        }
+        Column::Key(_) => unreachable!("window outputs are numeric"),
+    }
+}
+
+/// Runs `user_plan` over finished cumulative rows as scratch. The
+/// scratch ordering key is the selected ordering-key column itself — a
+/// cumulative answer keeps the source's axis, so no `__row` is
+/// fabricated — and per-batch orderedness is inspected, never assumed.
+fn run_over_rows(
+    output: &Schema,
+    okey: usize,
+    batches: Vec<arrow_lite::RecordBatch>,
+    user_plan: &Plan,
+    source: &Table,
+) -> Result<query_lite::QueryOutput, EngineError> {
+    use storage_lite::{Segment, SegmentHandle};
+    let handles: Vec<SegmentHandle> = batches
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .map(|batch| {
+            let ordered = is_non_decreasing(&batch, okey);
+            SegmentHandle::resident(
+                std::sync::Arc::new(Segment::from_batch_unpruned(batch, okey, ordered)),
+                None,
+            )
+        })
+        .collect();
+    query_lite::execute_with_ordering_key(
+        output,
+        &handles,
+        okey,
+        user_plan,
+        &source.current_registry(),
+    )
+    .map_err(EngineError::Query)
+}
+
 /// A plan projecting every column of `table`, built structurally — an
 /// unaliased bucket's column name (`ts / 4`) cannot round-trip through
 /// SQL text, where it would parse as arithmetic.
@@ -1074,6 +1817,10 @@ enum Shape {
     /// so the materialization stores per-hidden-bucket **partials**
     /// and the answer is assembled at read by combining them.
     Running,
+    /// Tranche 2's remainder: a cumulative window — one output row per
+    /// source row, each carrying an expanding aggregate. The same
+    /// partials, read as per-partition **boundary** values.
+    Cumulative,
 }
 
 /// The eligibility check: classifies a definition as bucketed
@@ -1116,11 +1863,7 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
         having,
     } = &plan.projection
     else {
-        return refuse(
-            "a row-per-row view — a maintained view maintains aggregates; \
-             cumulative window shapes are the remainder of tranche 2 \
-             (#83)",
-        );
+        return classify_cumulative(plan, source);
     };
     if having.is_some() {
         return refuse(
@@ -1210,6 +1953,156 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
             ))
         })?;
     Ok(Shape::Bucketed(bucket.clone(), name))
+}
+
+/// Classifies a row-per-row projection: a **cumulative** view when it
+/// carries expanding windows in the admitted family, a refusal by name
+/// otherwise. The requirements mirror tranche 1's "select your bucket"
+/// rule: the ordering key must be selected (it is the output's axis
+/// and the range-read's handle), and so must every partition symbol
+/// (the boundary adjustment looks partitions up by their output
+/// values).
+fn classify_cumulative(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
+    use crate::partials::expanding_window_function;
+    use query_lite::plan::WindowCall;
+    use query_lite::PlanItem;
+    let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
+    let Projection::Items(items) = &plan.projection else {
+        unreachable!("classified from an Items projection")
+    };
+    let mut selected_columns: Vec<&str> = Vec::new();
+    let mut windows = 0usize;
+    let mut partition_columns: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            PlanItem::Column { name, .. } => selected_columns.push(name),
+            PlanItem::Window { call, .. } => {
+                windows += 1;
+                let WindowCall::Agg {
+                    function,
+                    partition_by,
+                    order_by,
+                    frame,
+                    ..
+                } = call
+                else {
+                    return refuse(
+                        "LAG/LEAD in a view definition — positional lookups \
+                         are not running state; query them over the base",
+                    );
+                };
+                if expanding_window_function(function).is_none() {
+                    return refuse(
+                        "a window outside sum/count/avg/min/max in a view \
+                         definition — only those decompose into bucket \
+                         partials today",
+                    );
+                }
+                if !matches!(frame, query_lite::Frame::Rows(None)) {
+                    return refuse(
+                        "a bounded window frame in a view definition — a \
+                         maintained view holds running state; rolling \
+                         windows derive at read (from the base, or by \
+                         differencing a cumulative view)",
+                    );
+                }
+                if order_by.as_deref() != Some(source.ordering_key()) {
+                    return refuse(
+                        "a cumulative window not ordered by the ordering key \
+                         in a view definition",
+                    );
+                }
+                for term in partition_by {
+                    match term {
+                        GroupKey::Column(column) if column != source.ordering_key() => {
+                            if !partition_columns.contains(column) {
+                                partition_columns.push(column.clone());
+                            }
+                        }
+                        _ => {
+                            return refuse(
+                                "a cross-sectional partition in a cumulative \
+                                 view definition — partition by symbols; the \
+                                 instant direction is not running state",
+                            )
+                        }
+                    }
+                }
+            }
+            PlanItem::Computed { .. } => {
+                return refuse(
+                    "a computed expression in a cumulative view definition — \
+                     select columns and whole windows; compose expressions \
+                     at read",
+                )
+            }
+        }
+    }
+    if windows == 0 {
+        return refuse(
+            "a row-per-row view with no window — a maintained view \
+             maintains aggregates; a plain projection is just a query",
+        );
+    }
+    if !selected_columns
+        .iter()
+        .any(|name| *name == source.ordering_key())
+    {
+        return refuse(
+            "a cumulative view whose SELECT list omits the ordering key — \
+             it is the output's axis, so select it",
+        );
+    }
+    for partition in &partition_columns {
+        if !selected_columns.iter().any(|name| name == partition) {
+            return refuse(
+                "a cumulative view whose SELECT list omits a partition \
+                 symbol — the boundary adjustment reads it from the output, \
+                 so select it",
+            );
+        }
+    }
+    // Every window must agree on its partitioning: the boundary is
+    // computed once per partition combination.
+    for item in items {
+        if let PlanItem::Window {
+            call: WindowCall::Agg { partition_by, .. },
+            ..
+        } = item
+        {
+            let mut named: Vec<&str> = partition_by
+                .iter()
+                .filter_map(|term| match term {
+                    GroupKey::Column(column) => Some(column.as_str()),
+                    _ => None,
+                })
+                .collect();
+            named.sort_unstable();
+            let mut expected: Vec<&str> = partition_columns.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            if named != expected {
+                return refuse(
+                    "cumulative windows with different PARTITION BY \
+                     lists in one view definition — one partitioning \
+                     per view; split the view",
+                );
+            }
+        }
+    }
+    for reserved in [crate::partials::HIDDEN_BUCKET] {
+        if source
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| f.name() == reserved)
+        {
+            return refuse(
+                "a cumulative view over a source with a '__bucket' column — \
+                 the name is reserved for the partials materialization",
+            );
+        }
+    }
+    Ok(Shape::Cumulative)
 }
 
 /// The bucket term's arithmetic: `(divide, view_scale)`. `divide` maps
@@ -1442,10 +2335,11 @@ mod tests {
             "SELECT ts / 4 AS b, sum(_seq) FROM trades GROUP BY ts / 4",
             "'_seq' in a view definition",
         );
-        // The deferred refusal names the tranche remainder. (The
-        // no-bucket aggregate tranche 1 refused here is now the
-        // RUNNING shape — accepted, tested in the running battery.)
-        refused("SELECT x FROM trades", "tranche 2");
+        // A row-per-row projection with no window maintains nothing.
+        // (The no-bucket aggregate tranche 1 refused is now the
+        // RUNNING shape, and windowed projections the CUMULATIVE one
+        // — both accepted, tested in their own batteries.)
+        refused("SELECT x FROM trades", "no window");
         // A view is a table: what composes at read is refused in the
         // definition.
         refused(
@@ -2441,5 +3335,462 @@ mod tests {
         assert_running_matches(&db, "totals", RUNNING_COLUMNS);
         assert!(db.refresh_view("totals").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cumulative battery's definition: every admitted expanding
+    /// window, partitioned by symbol. `y` gives MIN/MAX motion in both
+    /// directions (increasing for A, decreasing for B).
+    const CUMULATIVE: &str = "SELECT ts, sym, \
+         sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs, \
+         count(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cn, \
+         avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ca, \
+         min(y) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS clo, \
+         max(y) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS chi \
+         FROM trades";
+    const CUMULATIVE_COLUMNS: &str = "ts, sym, cs, cn, ca, clo, chi";
+
+    /// The cumulative A/B: the same ranged query through the two code
+    /// paths — the boundary + assembly split, against the recompute
+    /// path forced via `ASOF` at the current watermark (the definition
+    /// over `base AS OF now` *is* the current answer). Returns the row
+    /// count so callers can refuse vacuous agreement.
+    fn cumulative_ab(db: &Database, view: &str, columns: &str, floor: i64) -> usize {
+        let now = db
+            .table(db.view(view).unwrap().source())
+            .unwrap()
+            .next_sequence();
+        let ranged = db
+            .query(&format!("SELECT {columns} FROM {view} WHERE ts >= {floor}"))
+            .unwrap();
+        let truth = db
+            .query(&format!(
+                "SELECT {columns} FROM {view} ASOF {now} WHERE ts >= {floor}"
+            ))
+            .unwrap();
+        assert_eq!(
+            sorted_rows(&ranged),
+            sorted_rows(&truth),
+            "cumulative view '{view}' range read from {floor} diverged from recompute"
+        );
+        ranged.num_rows()
+    }
+
+    fn assert_cumulative_matches(db: &Database, view: &str, columns: &str, floor: i64) {
+        assert!(
+            cumulative_ab(db, view, columns, floor) > 0,
+            "vacuous cumulative check: no rows at or above {floor}"
+        );
+    }
+
+    #[test]
+    fn a_cumulative_view_answers_exactly_through_every_state() {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..24 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("cum", CUMULATIVE).unwrap();
+        // Unsized (width 0, nothing folded): answers by recompute.
+        assert_eq!(db.view("cum").unwrap().stamp(), 0);
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // First refresh sizes the hidden bucket and folds partials;
+        // range reads from several floors — including 0, where the
+        // boundary is empty and assembly covers everything — all agree.
+        assert!(db.refresh_view("cum").unwrap() >= 1);
+        assert!(db.view("cum").unwrap().stamp() > 0);
+        for floor in [0, 5, 12, 23] {
+            assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, floor);
+        }
+        // Stale tail: appended rows the stamp does not cover reach the
+        // boundary through the live half of the partials union.
+        // The last spent coordinate — ASOF is inclusive.
+        let before = db.table("trades").unwrap().next_sequence() - 1;
+        for i in 24..30 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // AS OF the pre-append watermark answers the shorter world —
+        // nontrivially, since the materialization already reflects it.
+        let past = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum ASOF {before}"
+            ))
+            .unwrap();
+        let past_base = db
+            .table("trades")
+            .unwrap()
+            .query(&format!("{CUMULATIVE} ASOF {before}"))
+            .unwrap();
+        assert_eq!(sorted_rows(&past), sorted_rows(&past_base));
+        assert_eq!(past.num_rows(), 24);
+        db.refresh_view("cum").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // A correction BELOW the floor: the ranged read never sees the
+        // corrected row itself, only its effect on the boundary — the
+        // seam this whole read exists for. (Compaction first: windows
+        // refuse disordered segments — the same refusal the base gives
+        // — and the reinsert lands out of order until compacted; the
+        // view stays dirty regardless, since compaction moves kills to
+        // history without refreshing anything.)
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        db.compact("trades").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12); // dirty, unrefreshed
+        db.refresh_view("cum").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // Deleting that row pulls the running MAX back down for every
+        // later row — the correction no accumulator can produce.
+        db.mutate("DELETE FROM trades WHERE ts = 3").unwrap();
+        db.refresh_view("cum").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // A refresh after a single-row correction folds ONE hidden
+        // bucket — the same pricing the running battery proves.
+        db.mutate("UPDATE trades SET x = 7.5 WHERE ts = 20")
+            .unwrap();
+        db.compact("trades").unwrap();
+        assert_eq!(db.refresh_view("cum").unwrap(), 1);
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+        // AS OF once corrections sit in history: the past's rows live
+        // in history segments whose key ranges interleave with the
+        // live generation's, and windows refuse what they cannot
+        // order — on the view exactly as on the base. `view AS OF s =
+        // Q(base AS OF s)` includes the refusals.
+        let view_error = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum ASOF {before}"
+            ))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        let base_error = db
+            .table("trades")
+            .unwrap()
+            .query(&format!("{CUMULATIVE} ASOF {before}"))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(view_error.contains("not sorted"), "{view_error}");
+        assert!(base_error.contains("not sorted"), "{base_error}");
+    }
+
+    #[test]
+    fn a_global_cumulative_view_has_one_partition_that_stays_true() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..10 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view(
+            "gcum",
+            "SELECT ts, sum(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs, \
+             avg(x) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ca FROM trades",
+        )
+        .unwrap();
+        db.refresh_view("gcum").unwrap();
+        assert_cumulative_matches(&db, "gcum", "ts, cs, ca", 4);
+        db.mutate("DELETE FROM trades WHERE ts < 3").unwrap();
+        assert_cumulative_matches(&db, "gcum", "ts, cs, ca", 4); // stale
+        db.refresh_view("gcum").unwrap();
+        assert_cumulative_matches(&db, "gcum", "ts, cs, ca", 4);
+        // A floor past all data: both paths answer empty, not wrongly.
+        assert_eq!(cumulative_ab(&db, "gcum", "ts, cs, ca", 1_000), 0);
+    }
+
+    #[test]
+    fn cumulative_range_reads_cross_bucket_edges_exactly() {
+        // A width wide enough that floors land mid-bucket, and data
+        // straddling zero so the double-width bucket 0 of truncating
+        // division is on the path. Every floor — edges, mid-bucket,
+        // negative, at both ends — meets the same A/B.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..31i64 {
+            let ts = -1000 + i * 100;
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    storage_lite::RowValue::F64(i as f64),
+                    storage_lite::RowValue::F64(-(i as f64)),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view("cum", CUMULATIVE).unwrap();
+        db.refresh_view("cum").unwrap();
+        assert!(db.view("cum").unwrap().stamp() > 0);
+        for floor in [-1000, -101, -100, -99, -1, 0, 1, 99, 100, 950, 2000] {
+            assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, floor);
+        }
+        // And a correction below a mid-bucket floor still lands in the
+        // boundary while unrefreshed.
+        db.mutate("UPDATE trades SET x = 400.0 WHERE ts = -500")
+            .unwrap();
+        db.compact("trades").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 950);
+        db.refresh_view("cum").unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 950);
+    }
+
+    #[test]
+    fn cumulative_sums_meet_the_stated_tolerance_on_non_dyadic_data() {
+        // The combine contract again, at the boundary seam: folding a
+        // boundary sum into an assembled window associates differently
+        // than the recompute's single pass. Thirds force the difference
+        // to exist if it ever will; agreement is the contract's 1e-12
+        // relative, not exact equality.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..200i64 {
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(i),
+                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    storage_lite::RowValue::F64(i as f64 / 3.0),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view(
+            "c2",
+            "SELECT ts, sym, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs, \
+             avg(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ca FROM trades",
+        )
+        .unwrap();
+        db.refresh_view("c2").unwrap();
+        let now = db.table("trades").unwrap().next_sequence();
+        for column in ["cs", "ca"] {
+            let ranged = db
+                .query(&format!(
+                    "SELECT {column} FROM c2 WHERE ts >= 150 ORDER BY ts"
+                ))
+                .unwrap();
+            let truth = db
+                .query(&format!(
+                    "SELECT {column} FROM c2 ASOF {now} WHERE ts >= 150 ORDER BY ts"
+                ))
+                .unwrap();
+            let ranged = crate::table::tests::flatten(&ranged, 0);
+            let truth = crate::table::tests::flatten(&truth, 0);
+            assert_eq!(ranged.len(), truth.len());
+            assert!(!ranged.is_empty());
+            for (view, base) in ranged.iter().zip(&truth) {
+                let (view, base) = (view.unwrap(), base.unwrap());
+                assert!(
+                    ((view - base) / base).abs() < 1e-12,
+                    "{column} drifted past the contract: {view} vs {base}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cumulative_view_persists_its_width_and_serves_read_only() {
+        let dir =
+            std::env::temp_dir().join(format!("tallydb-view-cumulative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("cum");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut source = Table::persistent("trades", m1_schema(), "ts", &source_dir).unwrap();
+        for i in 0..16 {
+            source.append(&linear_row(i)).unwrap();
+        }
+        {
+            let mut view =
+                MaterializedView::persistent("cum", CUMULATIVE, &source, &view_dir).unwrap();
+            view.refresh(&mut source).unwrap();
+        }
+        let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
+        let (_, width, _, _) = decode_definition(&record).unwrap();
+        assert!(width > 0, "the chosen width was not persisted");
+        let mut view =
+            MaterializedView::open("cum", &view_dir, &source, StoreOptions::default()).unwrap();
+        source
+            .mutate("UPDATE trades SET x = 50.0 WHERE ts = 2")
+            .unwrap();
+        assert_eq!(view.refresh(&mut source).unwrap(), 1);
+        drop(view);
+        source
+            .mutate("UPDATE trades SET x = 60.0 WHERE ts = 9")
+            .unwrap();
+        // Compaction restores cross-segment order (windows refuse
+        // disorder); the view is still stale about ts = 9, which is
+        // the read-only staleness this test wants.
+        source.compact().unwrap();
+        source.flush().unwrap();
+        let ro_source = Table::open_read_only("trades", &source_dir).unwrap();
+        let mut db = Database::new();
+        db.add_table(ro_source).unwrap();
+        let ro_view =
+            MaterializedView::open_read_only("cum", &view_dir, db.table("trades").unwrap())
+                .unwrap();
+        db.add_view(ro_view).unwrap();
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 8);
+        assert!(db.refresh_view("cum").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cumulative_view_over_an_empty_source_stays_well_defined() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        db.create_materialized_view(
+            "cum",
+            "SELECT ts, sym, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM trades",
+        )
+        .unwrap();
+        // No rows: nothing to size, nothing to fold — and both read
+        // paths answer empty rather than failing.
+        assert_eq!(db.refresh_view("cum").unwrap(), 0);
+        assert_eq!(db.query("SELECT cs FROM cum").unwrap().num_rows(), 0);
+        assert_eq!(
+            db.query("SELECT cs FROM cum WHERE ts >= 5")
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        // Rows arriving after the empty refresh serve by recompute
+        // until the next refresh chooses a width.
+        for i in 0..6 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_cumulative_matches(&db, "cum", "ts, sym, cs", 2);
+        assert!(db.refresh_view("cum").unwrap() >= 1);
+        assert_cumulative_matches(&db, "cum", "ts, sym, cs", 2);
+    }
+
+    #[test]
+    fn a_cumulative_read_over_uncompacted_corrections_refuses_like_the_base() {
+        // Windows require ordered data, and a correction's reinsert
+        // lands out of order until compaction. The FULL read recomputes
+        // over the whole source, so it meets that segment and refuses
+        // LOUDLY — the same refusal the base gives, never a silently
+        // wrong answer. A ranged read ABOVE the correction, though,
+        // never touches the stray segment (zone maps prune it) and its
+        // boundary re-folds with aggregates, which need no order — it
+        // keeps answering exactly, dirty and uncompacted alike. That
+        // asymmetry is the partials paying rent.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..24 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("cum", CUMULATIVE).unwrap();
+        db.refresh_view("cum").unwrap();
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        let through_view = db
+            .query(&format!("SELECT {CUMULATIVE_COLUMNS} FROM cum"))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        let over_base = db
+            .table("trades")
+            .unwrap()
+            .query(CUMULATIVE)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(through_view.contains("not sorted"), "{through_view}");
+        assert!(over_base.contains("not sorted"), "{over_base}");
+        let while_dirty = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum WHERE ts >= 12"
+            ))
+            .unwrap();
+        db.compact("trades").unwrap();
+        let after_compact = db
+            .query(&format!(
+                "SELECT {CUMULATIVE_COLUMNS} FROM cum WHERE ts >= 12"
+            ))
+            .unwrap();
+        assert!(while_dirty.num_rows() > 0);
+        assert_eq!(sorted_rows(&while_dirty), sorted_rows(&after_compact));
+        assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 12);
+    }
+
+    #[test]
+    fn a_stale_union_read_survives_a_numeric_where() {
+        // Regression: the resident-handle metadata used to turn a
+        // scratch segment's "no zone maps at all" into per-column
+        // `None` maps, which `can_match` reads as "no valid values" —
+        // silently pruning the union read's entire live half under any
+        // numeric WHERE. The stale answer just lost rows.
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..12 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("ohlc", OHLC).unwrap();
+        // Entirely unrefreshed: the whole answer is the live half.
+        let stale = db
+            .query("SELECT sym, bar, o, c FROM ohlc WHERE bar >= 1")
+            .unwrap();
+        db.refresh_view("ohlc").unwrap();
+        let fresh = db
+            .query("SELECT sym, bar, o, c FROM ohlc WHERE bar >= 1")
+            .unwrap();
+        assert!(fresh.num_rows() > 0);
+        assert_eq!(sorted_rows(&stale), sorted_rows(&fresh));
+    }
+
+    #[test]
+    fn ineligible_cumulative_definitions_are_refused_by_name() {
+        let source = source();
+        let refused = |sql: &str, needle: &str| {
+            let error = MaterializedView::new("v", sql, &source)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{sql}: {error}");
+        };
+        refused(
+            "SELECT ts, sym, lag(x, 1) OVER (PARTITION BY sym ORDER BY ts) AS p FROM trades",
+            "LAG/LEAD",
+        );
+        refused(
+            "SELECT ts, sym, first(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS f FROM trades",
+            "outside sum/count/avg/min/max",
+        );
+        refused(
+            "SELECT ts, sym, sum(x) OVER (PARTITION BY sym ORDER BY ts \
+             ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS r FROM trades",
+            "bounded window frame",
+        );
+        refused(
+            "SELECT ts, sym, sum(x) OVER (PARTITION BY sym ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM trades",
+            "not ordered by the ordering key",
+        );
+        refused(
+            "SELECT ts, sum(x) OVER (PARTITION BY ts / 4 ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM trades",
+            "cross-sectional partition",
+        );
+        refused(
+            "SELECT ts, sym, x + 0.0 AS xx, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s \
+             FROM trades",
+            "computed expression",
+        );
+        refused(
+            "SELECT sym, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM trades",
+            "omits the ordering key",
+        );
+        refused(
+            "SELECT ts, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM trades",
+            "omits a partition symbol",
+        );
+        refused(
+            "SELECT ts, sym, sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS a, \
+             sum(y) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS b FROM trades",
+            "different PARTITION BY lists",
+        );
     }
 }

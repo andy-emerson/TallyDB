@@ -317,9 +317,19 @@ impl SegmentMeta {
             ordered: segment.is_ordered(),
             sequence_end: segment.sequence_end(),
             diverged: segment.sequence_info() != &SequenceInfo::RowIds,
-            zone_maps: (0..segment.batch().columns().len())
-                .map(|index| segment.zone_map(index).copied())
-                .collect(),
+            // Preserve map-less-ness: a segment built without zone maps
+            // (`from_batch_unpruned`) must stay "no maps at all" here,
+            // not become a map of all-`None` columns — a per-column
+            // `None` means "no valid values, prune", and promoting the
+            // former into the latter silently prunes every scratch
+            // segment a numeric predicate touches.
+            zone_maps: if segment.zone_maps_present() {
+                (0..segment.batch().columns().len())
+                    .map(|index| segment.zone_map(index).copied())
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
