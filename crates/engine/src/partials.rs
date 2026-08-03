@@ -43,13 +43,14 @@ pub(crate) fn expanding_window_function(name: &str) -> Option<AggFunction> {
     }
 }
 
-/// The hidden bucket column's name in a running view's materialization
-/// — reserved like `_seq`, unreachable from user SQL (a definition or
-/// query naming it would need the underscore prefix the planner treats
-/// as reserved for `_seq` alone; these never collide with user columns
-/// because ingest refuses `__`-prefixed names nowhere — so the guard is
-/// the view layer's own: a source column with this name is refused at
-/// create).
+/// The hidden bucket column's name in a running or cumulative view's
+/// materialization. The whole `__` prefix is reserved at the view
+/// layer's definition door: a running/cumulative definition that
+/// references or aliases any `__`-prefixed name is refused at create
+/// (the synthesis mints `__bucket`, `__p{i}`, `__row`, and
+/// `__w{i}_sum`/`__w{i}_count` there, and a user name shadowing a
+/// minted one would produce a view that creates fine and can never be
+/// read).
 pub(crate) const HIDDEN_BUCKET: &str = "__bucket";
 
 /// How one user-facing aggregate of a running view decomposes: the

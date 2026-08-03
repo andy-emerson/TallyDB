@@ -1,49 +1,79 @@
-//! Maintained views (#83, tranche 1): bucketed single-table aggregates
-//! kept fresh as ordered data arrives.
+//! Maintained views (#83, tranches 1 and 2): single-table aggregates —
+//! bucketed, running, and cumulative — kept fresh as ordered data
+//! arrives.
 //!
 //! ## The model, in one paragraph
 //!
 //! A maintained view is a **fold over the ingest sequence**: a real
-//! table (segments, WAL, `AS OF` — all inherited) holding the result of
-//! a bucketed aggregate query, plus a **stamp** — the source table's
-//! ingest-sequence watermark below which the materialization is
-//! complete. Everything at or above the stamp is the view's unfolded
-//! tail; a refresh folds it and advances the stamp, and a query never
-//! waits for one: the **union read** answers exactly however stale the
-//! materialization — clean materialized buckets plus a live fold of
-//! whatever the stamp does not cover — and a past coordinate answers
-//! by recompute (`view AS OF s` is the definition over
-//! `base AS OF s`; the materialization is never the authority). Corrections need no
-//! bookkeeping of their own: the buckets they touch are **derivable**
-//! from the source's knowledge history, so the only durable view state
-//! is the stamp, written strictly after the materialization it
-//! describes is flushed — everything a stamp covers therefore survives
-//! any crash the source's own WAL contract admits, and a crash
-//! elsewhere just leaves the stamp old, which the next refresh heals.
-//! Repair is always re-fold-from-base (uniform repair, ruled
-//! 2026-08-02 on #83): no accumulator state, no delta arithmetic, no
-//! f64 subtraction hazard.
+//! table (segments, WAL, `AS OF` — all inherited) holding a bucketed
+//! materialization of the definition, plus a **stamp** — the source
+//! table's ingest-sequence watermark below which the materialization
+//! is complete. Everything at or above the stamp is the view's
+//! unfolded tail; a refresh folds it and advances the stamp, and a
+//! query never waits for one: the **union read** answers exactly
+//! however stale the materialization — clean materialized buckets plus
+//! a live fold of whatever the stamp does not cover — and a past
+//! coordinate answers by recompute (`view AS OF s` is the definition
+//! over `base AS OF s`; the materialization is never the authority).
+//! Corrections need no bookkeeping of their own: the buckets they
+//! touch are **derivable** from the source's knowledge history, so the
+//! only durable view state is the stamp (plus, for the partials
+//! shapes, the chosen bucket width), written strictly after the
+//! materialization it describes is flushed — everything a stamp covers
+//! therefore survives any crash the source's own WAL contract admits,
+//! and a crash elsewhere just leaves the stamp old, which the next
+//! refresh heals. Repair is always re-fold-from-base (uniform repair,
+//! ruled 2026-08-02 on #83): no accumulator state, no delta
+//! arithmetic, no f64 subtraction hazard.
 //!
-//! ## What tranche 1 admits, and why the line sits there
+//! ## The three admitted shapes
 //!
-//! The definition must be a single-table `GROUP BY` over **one bucket
-//! of the ordering key** (`ts / 60`, `(ts / 60) * 60`, or bare `ts`),
-//! plus any symbol-column keys, with the built aggregates and an
-//! optional row-local `WHERE`. That shape is exactly what re-fold
-//! repair makes maintainable: every output row belongs to one bucket,
-//! so a correction's blast radius is its bucket and repair is the
-//! stored query over a restricted range. Shapes outside it are refused
-//! **by name** with the tranche that will admit them:
+//! **Bucketed** (tranche 1): a `GROUP BY` over one bucket of the
+//! ordering key (`ts / 60`, `(ts / 60) * 60`, or bare `ts`), plus any
+//! symbol keys, built aggregates, optional row-local `WHERE`. The
+//! materialization IS the answer: every output row belongs to one
+//! bucket, so a correction's blast radius is its bucket.
 //!
-//! - running/cumulative shapes (no bucket) — a correction at `t`
-//!   touches every result after `t`; tranche 2's bucket-partials
-//!   representation prices that honestly.
+//! **Running** (tranche 2): the same aggregates with NO bucket —
+//! per-symbol or global totals. The materialization stores per-bucket
+//! **partials** under a hidden bucket of the ordering key (width
+//! chosen at the first refresh with data, persisted in the definition
+//! record), and the read combines them per group and finalizes (`AVG`
+//! divides once, after the combine). A correction still re-folds one
+//! hidden bucket; the O(suffix) rewrite never exists because no
+//! suffix is stored.
+//!
+//! **Cumulative** (tranche 2): a row-per-row projection of expanding
+//! windows (`sum`/`count`/`avg`/`min`/`max` OVER unbounded-preceding
+//! frames, ordered by the ordering key, partitioned by symbols; the
+//! ordering key and every partition symbol selected; one PARTITION BY
+//! list per view). Same partials materialization; the read splits each
+//! window at the query predicate's ordering-key lower bound — a
+//! **boundary** combine over the partials strictly below that bucket,
+//! an **assembly** of the definition over the source from the bucket's
+//! low edge, and a per-column adjustment folding the two (`AVG`
+//! through hidden sum/count helper windows, never through its
+//! quotient). A query with no lower bound wants every output row, so
+//! it recomputes — the partials cannot shorten an O(n)-row answer.
+//! Because the assembly and recompute run real windows, they inherit
+//! the executor's ordered-data requirement: a read that meets
+//! uncompacted correction segments refuses exactly as the base's
+//! windows do (`compact` heals both), and `view AS OF s` refuses once
+//! corrections sit in history segments — refusal parity, not a gap:
+//! `view AS OF s = Q(base AS OF s)`, refusals included.
+//!
+//! ## What stays refused, and why
+//!
 //! - joins — tranche 3, q-hierarchical only (the PODS 2017 dichotomy
 //!   names exactly which joins can be maintained in O(1)).
 //! - `AS OF` / `_seq` in the definition — refused permanently, not
 //!   deferred: a view definition must read within one knowledge
 //!   snapshot, or `view AS OF s = Q(base AS OF s)` stops being
 //!   well-defined (snapshot reducibility).
+//! - other window functions, bounded frames, LAG/LEAD, cross-sectional
+//!   partitions — refused by name; rolling windows derive at read.
+//! - names beginning with `__` in a running/cumulative definition —
+//!   the synthesis mints its hidden columns there.
 //!
 //! `ORDER BY` / `LIMIT` / `OFFSET` / `DISTINCT` / `HAVING` are refused
 //! because a view is a table: order, limit, and filter at read, where
