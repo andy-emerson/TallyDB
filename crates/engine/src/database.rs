@@ -191,7 +191,7 @@ impl Database {
     /// A query naming a maintained view answers **exactly**, however
     /// stale the materialization: clean materialized buckets unioned
     /// with a live fold of everything the view's stamp does not cover
-    /// (see [`MaterializedView::query_union`]). `AS OF` on a view
+    /// (the union read; see [`MaterializedView`]). `AS OF` on a view
     /// recomputes the definition over the source as of that cut — the
     /// materialization accelerates current reads, it is never the
     /// authority.
