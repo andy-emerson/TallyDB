@@ -50,12 +50,14 @@ bucket partials — is built, assessed, reviewed, and documented:
 | cycle 3 | cumulative views: expanding-window classification, boundary + assembly + adjustment read with conservative lower-bound extraction, AS-OF/no-bound recompute — plus the zone-map metadata fix (a shipped tranche-1 bug: scratch segments silently pruned under any numeric WHERE) |
 | Assess | the m5 oracle grew to three views x 11 checkpoints (refusals asserted by reason); pricing measured: one-row repair 1.6ms vs 140.8ms recompute (0.011); ranged read 33.4ms vs 156.5s full (~0.0002) |
 | review fixes | three reproduced bugs (AVG-over-i64 read panic; cumulative MAX dropping NaN against the NaN-greatest relation; source-named combine keys breaking aliased/unselected running keys) + `__` prefix reservation, answer-shape `schema()`, console view-namespace check, one scratch runner with a stated registry rule, multi-row-bucket battery (width 4), `okey_lower_bound` unit coverage, tightened perf guards |
+| doc passes | DESIGN's tranche-2 record, module docs, README, this file — then the documentation review's truth fixes (the compensated-summation claim was false: shipped folds are plain f64 accumulation; the 1e-12 contract stands on its tests) |
 
 **Evidence:** 493 tests default leg / 107 off-leg (re-run at this
 commit), seven oracle scripts. The tranche-2 exactness claim — view
-equals recompute through partials, whatever the history — holds at 11
-DuckDB-diffed checkpoints x {bucketed, running, cumulative-ranged,
-cumulative-full} through the C ABI, and in-crate across dense
+equals recompute through partials, whatever the history — holds through the C ABI at 11 checkpoints x {bucketed, running,
+cumulative-ranged} DuckDB-diffed, with the cumulative full read
+DuckDB-diffed at the 7 window-ordered checkpoints and
+refusal-asserted by reason at the other 4, and in-crate across dense
 multi-row buckets, negative keys, truncation's double-width bucket 0,
 NaN, and i64 arguments. The combine contract (1e-12 relative for
 SUM/AVG, exact otherwise) is exercised on non-dyadic data at both the

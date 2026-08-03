@@ -15,12 +15,14 @@
 //!
 //! Combining per-bucket f64 sums associates differently than a single
 //! pass over the rows, so a running view's `SUM`/`AVG` may differ from
-//! a from-scratch recompute in the final ulps. The partials fold and
-//! the cross-bucket combine both use compensated (Neumaier) summation
-//! — the M5.0 discipline — and the contract is agreement with
-//! recompute within 1e-12 relative, the same tolerance every DuckDB
-//! oracle family already applies. `COUNT`, `MIN`, `MAX`, `FIRST`, and
-//! `LAST` combine exactly. (Stated 2026-08-03 with the tranche-2 plan;
+//! a from-scratch recompute in the final ulps. Both folds run the
+//! executor's ordinary aggregates (plain f64 accumulation — the
+//! Neumaier reference in the M5.0 numerics guard is a test yardstick,
+//! not shipped summation), and the contract is agreement with
+//! recompute within 1e-12 relative — the tolerance the mutation,
+//! as-of, and view oracle families apply (the slice and differential
+//! families run at 1e-9). `COUNT`, `MIN`, `MAX`, `FIRST`, and `LAST`
+//! combine exactly. (Stated 2026-08-03 with the tranche-2 plan;
 //! revisitable, but exact single-pass equality is impossible under any
 //! partials representation.)
 
@@ -137,7 +139,7 @@ pub(crate) fn decompose(call: &AggCall, next_index: usize) -> Decomposition {
 /// form may serve several aggregates (`AVG` rides `SumCount`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PartialForm {
-    /// One column: the bucket's compensated sum. Combines by addition.
+    /// One column: the bucket's f64 sum. Combines by addition.
     Sum,
     /// One column: the bucket's non-null count. Combines by addition,
     /// exactly (i64).

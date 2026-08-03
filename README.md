@@ -291,8 +291,9 @@ partials, recombined at read, so a correction still repairs one
 bucket), and read through a union that tops the materialization up
 with a live fold of whatever the stamp does not cover, so a view
 answers exactly however stale its materialization (a seventh oracle
-family diffs all three shapes against DuckDB recompute after every
-scripted step, in CI) — registering `regr_slope` /
+family diffs all three shapes against DuckDB recompute at eleven
+scripted checkpoints spanning stale, corrected, compacted, and
+reopened states, in CI) — registering `regr_slope` /
 `regr_intercept` / `regr_r2`, `covar_pop` / `corr`, `var_pop` /
 `stddev_pop`, and `eigen_max` (the window's first
 principal-component variance) as SQL window functions — every window

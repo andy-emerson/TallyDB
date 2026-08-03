@@ -6,8 +6,9 @@
 //! `target/debug/libengine.so`. Every hook here is called by name from
 //! one of them — `m1_slice_oracle`, `m2_mutation_oracle`,
 //! `m2_differential_oracle`, `m2_lua_window_oracle` (which also covers
-//! the SQL-in-Lua driver pipeline), `m4_asof_oracle`, and the latency
-//! benchmark — so nothing in this module is reachable from Rust.
+//! the SQL-in-Lua driver pipeline), `m4_asof_oracle`,
+//! `m5_view_oracle`, and the latency benchmark — so nothing in this
+//! module is reachable from Rust.
 //!
 //! The fixtures are deterministic (a fixed linear-congruential
 //! generator — no ambient randomness, so every run and every hook sees
@@ -968,8 +969,8 @@ impl ViewContext {
 }
 
 /// Opens the view-family fixture: an empty persistent source table and
-/// a maintained view over it. The script drives every row in via SQL,
-/// so its DuckDB mirror is exact by construction.
+/// the three maintained views over it. The script drives every row in
+/// via SQL, so its DuckDB mirror is exact by construction.
 #[no_mangle]
 pub extern "C" fn tallydb_view_open() -> *mut ViewContext {
     let dir = std::env::temp_dir().join(format!("tallydb-view-{}", std::process::id()));
@@ -1113,9 +1114,9 @@ pub unsafe extern "C" fn tallydb_view_compact(context: *mut ViewContext) -> i32 
 }
 
 /// Closes and reopens the whole fixture from its directory — the
-/// storage round trip for source AND view: manifest, segments, WAL,
-/// and the view's definition record with its stamp. Returns 0 on
-/// success.
+/// storage round trip for the source AND all three views: manifest,
+/// segments, WAL, and each view's definition record with its stamp.
+/// Returns 0 on success.
 ///
 /// # Safety
 /// As for [`tallydb_view_statement`].

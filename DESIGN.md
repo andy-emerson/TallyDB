@@ -1419,10 +1419,13 @@ O(n)-row answer.
 **The combine contract, stated** (2026-08-03, revisitable): combining
 per-bucket f64 sums associates differently than a single pass, so
 `SUM`/`AVG` through partials agree with recompute within **1e-12
-relative** — the tolerance every DuckDB oracle family applies; both
-folds use compensated summation. `COUNT`/`MIN`/`MAX`/`FIRST`/`LAST`
-combine exactly. Exact single-pass equality is impossible under any
-partials representation.
+relative** — the tolerance the mutation, as-of, and view oracle
+families apply (the slice and differential families run at 1e-9).
+Both folds run the executor's ordinary aggregates — plain f64
+accumulation; the Neumaier reference in the M5.0 numerics guard is a
+test yardstick, not shipped summation.
+`COUNT`/`MIN`/`MAX`/`FIRST`/`LAST` combine exactly. Exact single-pass
+equality is impossible under any partials representation.
 
 **Refusal parity, inherited**: cumulative reads run real windows, and
 windows refuse disordered data — so a full read over uncompacted
@@ -1820,7 +1823,8 @@ inside a kernel. This is a real edge, not a wiring slip, and the docs
 claimed it closed until the review caught them. A script wanting
 whole-column work has the vectorized vocabulary (operators,
 `rolling_*`) instead; widening the invariant needs a column-shaped
-host seam, which is where the tranche-2 primitives (#77) would land.
+host seam, which is where #77's script-side primitives would land.
+(That is #77's own second tier — unrelated to #83's "tranche 2".)
 
 Promotion is mechanical:
 one registry name, a Lua implementation swappable for a trait
