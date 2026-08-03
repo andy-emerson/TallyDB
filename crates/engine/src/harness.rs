@@ -876,3 +876,220 @@ pub unsafe extern "C" fn tallydb_m2_mutated_stream(out: *mut ArrowArrayStream) {
         Err(error) => panic!("mutated fixture query failed: {error}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// The maintained-view family (#83, tranche 1): a database holding one
+// source table and one bucketed view over it, driven statement by
+// statement from the oracle script, which mirrors every statement into
+// DuckDB and diffs the VIEW's answer — through the union read, so the
+// oracle covers stale, refreshed, corrected, compacted, and reopened
+// states alike — against DuckDB running the definition from scratch.
+
+/// The view family's fixture: the source schema and the definition the
+/// context creates, exported so the script cannot drift from them.
+pub const VIEW_DEFINITION: &str = "SELECT sym, ts / 5 AS bar, count(*) AS n, \
+     sum(x) AS s, min(x) AS lo, max(x) AS hi, first(x) AS o, last(x) AS c \
+     FROM trades GROUP BY sym, ts / 5";
+
+/// The context behind the maintained-view oracle family.
+pub struct ViewContext {
+    /// `None` transiently during [`tallydb_view_reopen`].
+    db: Option<Database>,
+    dir: std::path::PathBuf,
+}
+
+impl ViewContext {
+    fn db(&self) -> &Database {
+        self.db.as_ref().expect("context holds an open database")
+    }
+    fn db_mut(&mut self) -> &mut Database {
+        self.db.as_mut().expect("context holds an open database")
+    }
+    fn open_at(dir: &std::path::Path) -> Result<Database, crate::EngineError> {
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("bars");
+        let existing = source_dir.join(storage_lite::store::MANIFEST).is_file();
+        let mut db = Database::new();
+        if existing {
+            let table = Table::open("trades", &source_dir, storage_lite::StoreOptions::default())?;
+            let view = crate::MaterializedView::open(
+                "bars",
+                &view_dir,
+                &table,
+                storage_lite::StoreOptions::default(),
+            )?;
+            db.add_table(table)?;
+            db.add_view(view)?;
+        } else {
+            let table = Table::persistent_with_segment_rows(
+                "trades",
+                asof_schema(),
+                "ts",
+                &source_dir,
+                SEGMENT_ROWS,
+            )?;
+            let view =
+                crate::MaterializedView::persistent("bars", VIEW_DEFINITION, &table, &view_dir)?;
+            db.add_table(table)?;
+            db.add_view(view)?;
+        }
+        Ok(db)
+    }
+}
+
+/// Opens the view-family fixture: an empty persistent source table and
+/// a maintained view over it. The script drives every row in via SQL,
+/// so its DuckDB mirror is exact by construction.
+#[no_mangle]
+pub extern "C" fn tallydb_view_open() -> *mut ViewContext {
+    let dir = std::env::temp_dir().join(format!("tallydb-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("trades")).expect("fixture directories");
+    std::fs::create_dir_all(dir.join("bars")).expect("fixture directories");
+    let db = ViewContext::open_at(&dir).expect("view fixture opens");
+    Box::into_raw(Box::new(ViewContext { db: Some(db), dir }))
+}
+
+/// The definition the context's view maintains, for the script's DuckDB
+/// mirror. Returns a NUL-terminated static string.
+#[no_mangle]
+pub extern "C" fn tallydb_view_definition() -> *const std::os::raw::c_char {
+    static DEFINITION: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DEFINITION
+        .get_or_init(|| std::ffi::CString::new(VIEW_DEFINITION).expect("no NULs"))
+        .as_ptr()
+}
+
+/// Runs one INSERT / UPDATE / DELETE against the source table. Returns
+/// rows changed, or -1 on failure (printed to stderr).
+///
+/// # Safety
+/// `context` must come from [`tallydb_view_open`] and not be closed;
+/// `sql` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_statement(
+    context: *mut ViewContext,
+    sql: *const std::os::raw::c_char,
+) -> i64 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_view_statement: SQL is not UTF-8");
+            return -1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.db_mut().mutate(sql) {
+        Ok(changed) => i64::try_from(changed).unwrap_or(i64::MAX),
+        Err(error) => {
+            eprintln!("tallydb_view_statement: {sql}: {error}");
+            -1
+        }
+    }
+}
+
+/// Refreshes the maintained view. Returns buckets re-folded, or -1 on
+/// failure.
+///
+/// # Safety
+/// As for [`tallydb_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_refresh(context: *mut ViewContext) -> i64 {
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.db_mut().refresh_view("bars") {
+        Ok(folded) => i64::try_from(folded).unwrap_or(i64::MAX),
+        Err(error) => {
+            eprintln!("tallydb_view_refresh: {error}");
+            -1
+        }
+    }
+}
+
+/// Runs one query — against the view or the source — and exports the
+/// result as an `ArrowArrayStream`. Returns 0 on success.
+///
+/// # Safety
+/// As for [`tallydb_view_statement`]; `out` must be valid and writable.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_query_stream(
+    context: *mut ViewContext,
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_view_query_stream: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &*context }.db().query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_view_query_stream: {sql}: {error}");
+            1
+        }
+    }
+}
+
+/// Compacts the source table (kills move to history — the branch of
+/// the touched-bucket derivation nothing else exercises end-to-end).
+/// Returns 0 on success.
+///
+/// # Safety
+/// As for [`tallydb_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_compact(context: *mut ViewContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.db_mut().compact("trades") {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tallydb_view_compact: {error}");
+            1
+        }
+    }
+}
+
+/// Closes and reopens the whole fixture from its directory — the
+/// storage round trip for source AND view: manifest, segments, WAL,
+/// and the view's definition record with its stamp. Returns 0 on
+/// success.
+///
+/// # Safety
+/// As for [`tallydb_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_reopen(context: *mut ViewContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    let context = unsafe { &mut *context };
+    context.db = None; // drop both handles before the directories reopen
+    match ViewContext::open_at(&context.dir) {
+        Ok(db) => {
+            context.db = Some(db);
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_view_reopen: {error}");
+            1
+        }
+    }
+}
+
+/// Closes the context and removes its directory.
+///
+/// # Safety
+/// `context` must come from [`tallydb_view_open`]; exactly one close.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_view_close(context: *mut ViewContext) {
+    // SAFETY: caller contract — exactly one close per open.
+    let context = unsafe { Box::from_raw(context) };
+    let dir = context.dir.clone();
+    drop(context);
+    let _ = std::fs::remove_dir_all(dir);
+}

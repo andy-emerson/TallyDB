@@ -378,7 +378,7 @@ impl Table {
     }
 
     /// The registry as of now — a cheap `Arc` clone under a brief lock.
-    fn current_registry(&self) -> Arc<Registry> {
+    pub(crate) fn current_registry(&self) -> Arc<Registry> {
         Arc::clone(&self.registry.lock().expect("registry lock poisoned"))
     }
 
@@ -432,6 +432,21 @@ impl Table {
             });
         }
         self.execute_plan(&plan)
+    }
+
+    /// Runs an already-planned query over **zero segments** — no rows
+    /// read, no fault-in paid. What comes back is the executor's own
+    /// output schema for the plan, which is how a maintained view
+    /// derives its table schema at create (and re-validates its
+    /// definition at open) without scanning the source.
+    pub(crate) fn execute_plan_empty(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
+        Ok(execute_with_ordering_key(
+            self.store.schema(),
+            &[],
+            self.store.ordering_key(),
+            plan,
+            &self.current_registry(),
+        )?)
     }
 
     /// Runs an already-planned query (the database handle plans once to
@@ -965,6 +980,69 @@ impl Table {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Calls `touch` with the ordering-key value of every row born or
+    /// killed after `since` — the maintained-view refresh's dirty
+    /// derivation (see [`KnowledgeSnapshot::touched_ordering_keys`]).
+    ///
+    /// [`KnowledgeSnapshot::touched_ordering_keys`]:
+    ///     storage_lite::store::KnowledgeSnapshot::touched_ordering_keys
+    pub(crate) fn touched_ordering_keys(
+        &self,
+        since: u64,
+        touch: impl FnMut(i64),
+    ) -> Result<(), EngineError> {
+        Ok(self
+            .store
+            .knowledge_snapshot()?
+            .touched_ordering_keys(since, touch)?)
+    }
+
+    /// Supersedes every live row matching `predicate` with the rows of
+    /// `replacements` — the maintained-view refresh's write half: the
+    /// old buckets out, the re-folded ones in. Where both sides are
+    /// non-empty this is one knowledge event (issue #73's supersede);
+    /// a first fold (no victims) appends, and an emptied bucket (no
+    /// replacements) tombstones.
+    pub(crate) fn replace_matching(
+        &mut self,
+        predicate: Option<&query_lite::Predicate>,
+        replacements: &QueryOutput,
+    ) -> Result<(), EngineError> {
+        let views = materialize(&self.store.snapshot()?)?;
+        let victims = self.matched_row_ids(&views, predicate)?;
+        let mut corrected: Vec<Vec<OwnedValue>> = Vec::new();
+        for batch in &replacements.batches {
+            for row in 0..batch.num_rows() {
+                corrected.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| OwnedValue::from_cell(column, row))
+                        .collect(),
+                );
+            }
+        }
+        if corrected.is_empty() {
+            if !victims.is_empty() {
+                self.store.tombstone(&victims)?;
+            }
+            return Ok(());
+        }
+        if victims.is_empty() {
+            for cells in &corrected {
+                let row: Vec<RowValue<'_>> = cells.iter().map(OwnedValue::as_row_value).collect();
+                self.append(&row)?;
+            }
+            return Ok(());
+        }
+        let rows: Vec<Vec<RowValue<'_>>> = corrected
+            .iter()
+            .map(|cells| cells.iter().map(OwnedValue::as_row_value).collect())
+            .collect();
+        self.store.supersede(&rows, &victims)?;
         Ok(())
     }
 
@@ -1799,11 +1877,11 @@ fn shifted_sweep(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow_lite::{Column, ColumnType, Field, NumericColumn, NumericData, RecordBatch};
 
-    pub(super) fn m1_schema() -> Schema {
+    pub(crate) fn m1_schema() -> Schema {
         Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
             Field::new("sym", ColumnType::Key, false),
@@ -1838,7 +1916,7 @@ mod tests {
         }
     }
 
-    pub(super) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
+    pub(crate) fn linear_row(i: i64) -> [RowValue<'static>; 4] {
         let x = i as f64;
         let (sym, y) = if i % 2 == 0 {
             ("A", 2.0 * x + 5.0)

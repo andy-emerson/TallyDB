@@ -53,7 +53,11 @@ pub const DEFAULT_SEGMENT_ROWS: usize = 65_536;
 /// record (schema, ordering key, and the table's current **generation**,
 /// see below) with its own magic, CRC, and versioning; the format lives
 /// in `format.rs` beside the segment's.
-const MANIFEST: &str = "table.tlym";
+/// The manifest's filename — public because it is the marker a
+/// directory scanner (the console, the oracle harness) tests to
+/// recognize a store directory, and two hand-rolled copies of the
+/// literal had already grown before this was exported.
+pub const MANIFEST: &str = "table.tlym";
 
 /// The write-ahead log's one name per table. Its header carries the
 /// generation, so a log stranded by a crashed compaction is recognized
@@ -533,6 +537,16 @@ impl SegmentHandle {
         !self.slot.meta().zone_maps.is_empty()
     }
 
+    /// One past the largest birth sequence in this segment — same
+    /// meaning as [`Segment::sequence_end`], served without touching
+    /// the segment file. A maintained view's refresh (#83) skips every
+    /// segment where this is at or below its stamp, which is what
+    /// keeps refresh cost proportional to what changed rather than to
+    /// the table.
+    pub fn sequence_end(&self) -> u64 {
+        self.slot.meta().sequence_end
+    }
+
     /// Bit per row, `true` = live; `None` when nothing is tombstoned.
     pub fn live(&self) -> Option<&Bitmap> {
         self.live.as_ref()
@@ -842,6 +856,95 @@ impl KnowledgeSnapshot {
             out.push(SegmentHandle::resident(segment, live));
         }
         Ok(out)
+    }
+
+    /// Calls `touch` with the ordering-key value of every row **born or
+    /// killed** by an ingest-sequence coordinate at or after `since` —
+    /// the watermark below which the caller's derived state is
+    /// complete (the first coordinate it does *not* cover,
+    /// [`Store::next_sequence`]'s convention), so the filter is
+    /// inclusive. This is the derivation a maintained view's refresh
+    /// (#83) runs to learn which buckets need re-folding; the dirty
+    /// list is derivable state, which is why a view needs no durable
+    /// bookkeeping beyond its watermark. ("Stamp" in this function's
+    /// comments means a KILL's coordinate — the sense this module
+    /// already used — never the view-side watermark.)
+    ///
+    /// Cost is proportional to what changed, not to the table: a live
+    /// segment whose every birth is at or below `since`
+    /// ([`SegmentHandle::sequence_end`], answered from metadata) is
+    /// skipped without touching its file, kills are walked from the
+    /// pending-tombstone map (one faulted segment per killed row's
+    /// home), and only **history** segments are scanned
+    /// unconditionally — their kill coordinates live in the segment,
+    /// not the metadata, and history only exists after a correction has
+    /// already been compacted. (An additive manifest field for a
+    /// history segment's largest kill would remove that scan; worth it
+    /// only if refresh-over-corrected-history ever measures hot.)
+    pub fn touched_ordering_keys(
+        &self,
+        since: u64,
+        mut touch: impl FnMut(i64),
+    ) -> Result<(), StorageError> {
+        let key_of = |segment: &Segment, row: usize| -> i64 {
+            let Column::Numeric(NumericData::I64(column)) =
+                &segment.batch().columns()[segment.ordering_key()]
+            else {
+                unreachable!("the ordering key is validated as i64 at construction")
+            };
+            column.values().as_slice()[row]
+        };
+        // Births at or after the stamp, in live segments.
+        for handle in &self.latest {
+            if handle.sequence_end() <= since {
+                // One past the largest birth is at most the stamp:
+                // every birth here is covered. Metadata only, no fault.
+                continue;
+            }
+            let segment = handle.view()?.segment;
+            for row in 0..segment.batch().num_rows() {
+                if segment.sequence_at(row) >= since {
+                    touch(key_of(&segment, row));
+                }
+            }
+        }
+        // Kills after the stamp, still pending (uncompacted): the map
+        // names the row id; its home segment names the value.
+        for (&row_id, &kill) in &self.stamps {
+            // kill == 0 is the v1 sentinel, "killed at an unknown
+            // coordinate". `as_of` reads it conservatively (never
+            // visible); this walk must be conservative in the OTHER
+            // direction — an unknown kill may postdate any watermark,
+            // so it always touches. (`kill >= since` covers it only
+            // while since is 0.)
+            if kill != 0 && kill < since {
+                continue;
+            }
+            let home = self.latest.iter().find(|handle| {
+                handle.base_row_id() <= row_id
+                    && row_id < handle.base_row_id() + handle.rows() as u64
+            });
+            if let Some(handle) = home {
+                let segment = handle.view()?.segment;
+                let row = (row_id - segment.base_row_id()) as usize;
+                touch(key_of(&segment, row));
+            }
+        }
+        // Kills (and births — a row both born and killed since the
+        // stamp reports the same value) already compacted into history.
+        for slot in &self.history {
+            let segment = slot.segment()?;
+            let kills = segment.superseded();
+            for row in 0..segment.batch().num_rows() {
+                let kill = kills.map_or(0, |kills| kills[row]);
+                // kill == 0: the v1 killed-at-unknown sentinel —
+                // always touched, as in the pending walk above.
+                if kill == 0 || kill >= since || segment.sequence_at(row) >= since {
+                    touch(key_of(&segment, row));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

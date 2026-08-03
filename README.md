@@ -24,11 +24,14 @@
 > `WindowAggregate` trait as the primary extension path, Lua behind an
 > off-by-default feature the console turns on, corrections on a
 > knowledge axis (`AS OF` reads the table as it was known), and
-> SQL-in-Lua driver scripts. M5 (desk adoption) is built on the
-> working branch: the ordered-axis dividends — as-of joins, time
-> bucketing, `RANGE` frames, `LAG`/`LEAD`, cross-sectional
-> partitioning, `regr_r2` — and lazy residency, so a table need not
-> fit in memory. The settled
+> SQL-in-Lua driver scripts. M5 (desk adoption) landed the ordered-axis
+> dividends — as-of joins, time bucketing, `RANGE` frames, `LAG`/`LEAD`,
+> cross-sectional partitioning, `regr_r2` — and lazy residency, so a
+> table need not fit in memory — and, with it, the first tranche of
+> **maintained views** (#83): bucketed aggregates kept fresh
+> incrementally as data arrives, exact across corrections via the
+> knowledge axis, with refresh cost proportional to what changed
+> rather than to the table. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -279,7 +282,14 @@ where grouping or partitioning needs them, and a generated
 differential harness diffs query families against DuckDB over the
 corpus in CI;
 `engine` ties them together behind a
-multi-table `Database` handle, registering `regr_slope` /
+multi-table `Database` handle — which also carries **maintained
+views** (#83): a bucketed aggregate materialized as a real table plus
+a stamp (the source watermark it reflects), refreshed by re-folding
+only the buckets the knowledge history says changed, and read through
+a union that tops the materialization up with a live fold of whatever
+the stamp does not cover, so a view answers exactly however stale its
+materialization (a seventh oracle family diffs it against DuckDB
+recompute after every scripted step, in CI) — registering `regr_slope` /
 `regr_intercept` / `regr_r2`, `covar_pop` / `corr`, `var_pop` /
 `stddev_pop`, and `eigen_max` (the window's first
 principal-component variance) as SQL window functions — every window

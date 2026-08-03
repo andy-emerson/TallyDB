@@ -56,6 +56,8 @@ jobs:
         run: python3 crates/engine/tests/m2_lua_window_oracle.py target/debug/libengine.so
       - name: M4.4 as-of oracle — DuckDB over an explicit history table (issue #75)
         run: python3 crates/engine/tests/m4_asof_oracle.py target/debug/libengine.so
+      - name: Maintained-view oracle — DuckDB recompute at scripted checkpoints (issue #83)
+        run: python3 crates/engine/tests/m5_view_oracle.py target/debug/libengine.so
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
         run: cargo test -p compute-lua --features apicheck
 

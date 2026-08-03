@@ -15,7 +15,10 @@
 //! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
 
 use arrow_lite::{Column, ColumnType, NumericData, Schema};
-use engine::{schema_from_create, type_name, Database, LogSink, RowValue, StoreOptions, Table};
+use engine::{
+    schema_from_create, type_name, Database, LogSink, MaterializedView, RowValue, StoreOptions,
+    Table,
+};
 use query_lite::{parse_statement, QueryOutput, Statement};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,30 @@ pub struct Console {
     /// A read-only console (F4): every table opened read-only, no
     /// lock taken; `.refresh` re-reads what the writer has flushed.
     read_only: bool,
+}
+
+/// Opens a maintained-view directory against its already-open source
+/// table — the console's half of the #83 model: the definition record
+/// names the source, so tables open first and views resolve against
+/// them.
+fn open_view(
+    database: &Database,
+    name: &str,
+    path: &Path,
+    read_only: bool,
+    options: StoreOptions,
+) -> Result<MaterializedView, String> {
+    let source_name = MaterializedView::stored_source(path)
+        .map_err(|error| format!("reading view '{name}': {error}"))?;
+    let source = database.table(&source_name).ok_or_else(|| {
+        format!("view '{name}' is over '{source_name}', which this directory does not hold")
+    })?;
+    if read_only {
+        MaterializedView::open_read_only(name, path, source)
+    } else {
+        MaterializedView::open(name, path, source, options)
+    }
+    .map_err(|error| format!("opening view '{name}': {error}"))
 }
 
 /// What one executed line produces.
@@ -138,10 +165,19 @@ impl Console {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|error| format!("reading {}: {error}", dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir() && path.join("table.tlym").is_file())
+            .filter(|path| path.is_dir() && path.join(engine::MANIFEST).is_file())
             .collect();
         entries.sort();
-        for path in entries {
+        // A directory carrying a view definition is a maintained view,
+        // not a plain table (engine::view::DEFINITION_FILE is the
+        // marker): opening it as a table would serve the raw
+        // materialization — silently stale, no union read — and let
+        // INSERT/UPDATE corrupt it past what any refresh repairs.
+        // Views open after every table, since each names its source.
+        let (views, tables): (Vec<PathBuf>, Vec<PathBuf>) = entries
+            .into_iter()
+            .partition(|path| path.join(engine::view::DEFINITION_FILE).is_file());
+        for path in tables {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -158,6 +194,15 @@ impl Console {
                 .add_table(table)
                 .map_err(|error| error.to_string())?;
         }
+        for path in views {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("unreadable view directory {}", path.display()))?
+                .to_owned();
+            let view = open_view(&database, &name, &path, read_only, options)?;
+            database.add_view(view).map_err(|error| error.to_string())?;
+        }
         database.set_script_log_sink(Arc::clone(&sink));
         Ok(Console {
             database,
@@ -169,7 +214,8 @@ impl Console {
         })
     }
 
-    /// Re-reads every table's durable state, and opens tables the
+    /// Re-reads every table's durable state, and opens tables — and
+    /// maintained views — the
     /// writer created since (read-only consoles only): the polling
     /// half of the cross-process story — the reader decides when to
     /// look, the engine never pushes.
@@ -183,15 +229,24 @@ impl Console {
             table.refresh().map_err(|error| error.to_string())?;
             refreshed += 1;
         }
-        // Tables the writer created after this console opened.
+        // Tables and views the writer created after this console
+        // opened. (A view already open needs nothing here: its stamp
+        // and materialization form a consistent pair, and the union
+        // read tops up everything after the stamp from the refreshed
+        // source — an older pair only means more live work, never a
+        // wrong answer.)
         let known = self.database.table_names();
+        let known_views = self.database.view_names();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&self.dir)
             .map_err(|error| format!("reading {}: {error}", self.dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir() && path.join("table.tlym").is_file())
+            .filter(|path| path.is_dir() && path.join(engine::MANIFEST).is_file())
             .collect();
         entries.sort();
-        for path in entries {
+        let (views, tables): (Vec<PathBuf>, Vec<PathBuf>) = entries
+            .into_iter()
+            .partition(|path| path.join(engine::view::DEFINITION_FILE).is_file());
+        for path in tables {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -206,6 +261,21 @@ impl Console {
             table.set_lua_log_sink(Arc::clone(&self.sink));
             self.database
                 .add_table(table)
+                .map_err(|error| error.to_string())?;
+            refreshed += 1;
+        }
+        for path in views {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("unreadable view directory {}", path.display()))?
+                .to_owned();
+            if known_views.contains(&name) {
+                continue;
+            }
+            let view = open_view(&self.database, &name, &path, true, self.options)?;
+            self.database
+                .add_view(view)
                 .map_err(|error| error.to_string())?;
             refreshed += 1;
         }
@@ -654,6 +724,12 @@ covar_pop/corr/eigen_max and LAG/LEAD, with PARTITION BY over symbols
 or the ordering key; scalar expressions, incl. over window results;
 CASE; IS NULL; LIKE on symbols), INSERT, UPDATE, DELETE,
 CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
+Maintained views open from their directories and answer exactly,
+however stale (materialized rows topped up live from the source);
+query them like tables. Writes to them are refused — correct the
+base. Creating, refreshing, and listing views is engine-API-only for
+now (.tables and .schema show base tables only; #83, surface ruled
+API-first).
 
 Commands:
   .help                     this text
@@ -1000,5 +1076,68 @@ mod tests {
         let rendered = table(&mut console, "SELECT x FROM t;");
         assert!(rendered.contains("2.5"), "{rendered}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_view_directory_opens_as_a_view_not_a_writable_table() {
+        // Found by the repo-wide code review: the scan admitted any
+        // directory with a table manifest, and a view's directory has
+        // one — so the console opened the materialization as a plain
+        // table: silently stale reads, and INSERT/UPDATE corrupting it
+        // past what any refresh repairs. Both consoles now open it as
+        // the view it is.
+        let dir = std::env::temp_dir().join(format!("tallydb-shell-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("bars");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let schema = Schema::new(vec![
+            arrow_lite::Field::new("ts", ColumnType::I64, false),
+            arrow_lite::Field::new("x", ColumnType::F64, false),
+        ]);
+        {
+            let mut source = Table::persistent("trades", schema, "ts", &source_dir).unwrap();
+            for i in 0..8i64 {
+                source
+                    .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                    .unwrap();
+            }
+            let mut view = MaterializedView::persistent(
+                "bars",
+                "SELECT ts / 4 AS bar, sum(x) AS s FROM trades GROUP BY ts / 4",
+                &source,
+                &view_dir,
+            )
+            .unwrap();
+            view.refresh(&mut source).unwrap();
+            // A correction the view has NOT folded: the console's read
+            // must still answer exactly, through the union read.
+            source
+                .mutate("UPDATE trades SET x = 100.0 WHERE ts = 1")
+                .unwrap();
+            source.flush().unwrap();
+        }
+        let mut console = Console::open(&dir).unwrap();
+        let Outcome::Table(rendered) = console.execute("SELECT bar, s FROM bars;").unwrap() else {
+            panic!("expected a rendered result")
+        };
+        // Bucket 0's sum with the correction folded in live: 0 + 100 +
+        // 2 + 3 = 105. The raw materialization holds 6 — seeing 6 here
+        // means the view opened as a table.
+        assert!(rendered.contains("105"), "{rendered}");
+        // Writes to the view meet the engine's derived-data refusal.
+        let error = console
+            .execute("INSERT INTO bars (bar, s) VALUES (9, 9.0);")
+            .unwrap_err();
+        assert!(error.contains("maintained view"), "{error}");
+        drop(console);
+        // The read-only console: same routing, same exactness, no lock.
+        let mut reader = Console::open_read_only(&dir).unwrap();
+        let Outcome::Table(rendered) = reader.execute("SELECT bar, s FROM bars;").unwrap() else {
+            panic!("expected a rendered result")
+        };
+        assert!(rendered.contains("105"), "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
