@@ -1502,9 +1502,11 @@ it, so a fact materialized against today's last quote is invalidated
 by tomorrow's perfectly ordinary in-order quote append — maintenance
 cost where the design promises none. The fix inverts the intuition
 that fresher is better: refresh materializes fact keys strictly below
-the **ceiling** — the dimension frontier's bucket edge,
-`bucket_low(frontier / divide) · divide` — and leaves everything at or
-above it to the union read's live half. An in-order quote arrival
+the **ceiling** — the low edge of the bucket holding the dimension
+frontier, `bucket_low(frontier / divide, divide)` in the code's terms
+(truncating division, so negative frontiers land in the double-width
+bucket around zero and the edge is still correct) — and leaves
+everything at or above it to the union read's live half. An in-order quote arrival
 lands at or above the frontier by definition, touching only live
 territory: zero materialized damage, no refresh owed. A **frontier
 regression** (a correction deletes the newest quote) lowers the
@@ -1530,9 +1532,11 @@ unchanged by any edit at `t`, so the match is unchanged; if
 below, so a row present or absent at `t` is never the max and the
 match is again unchanged; what remains is exactly
 `t ≤ u < next(s, t)`, one contiguous interval per corrected row
-(`StrictlyBefore` shifts both edges by one key: `(t, next]`). The
-literature states no such theorem — it is folklore embodied in
-Feldera's ASOF operator and Flink's versioned-table state cleanup —
+(under `StrictlyBefore` the exact set is `(t, next]`; the
+implementation conservatively re-folds `[t, next]`, one key wider).
+We found no statement of this in the literature — it appears as
+folklore embodied in Feldera's ASOF operator and Flink's
+versioned-table state cleanup —
 so the proof lives here, and executably: a test prices a late quote's
 refresh at exactly its interval width. The lemma is why corrections
 need no bookkeeping: the dirty set stays derivable from the knowledge
@@ -1550,9 +1554,10 @@ oracle family (`m5_join_oracle.py`, in CI) drives all three shapes
 through facts-ahead-of-quotes, in-order appends while stale, late
 quotes below the ceiling, quote amends and deletes, a dimension
 change, fact corrections, compaction, and a reopen — 17 checkpoints,
-each diffing all three views against **DuckDB's native ASOF JOIN**
-recomputing from scratch (an independent implementation of the
-matching rule itself, not just of folding; quote keys stay unique per
+each diffing the two as-of views against **DuckDB's native ASOF
+JOIN** recomputing from scratch (an independent implementation of the
+matching rule itself, not just of folding) and the star view against
+DuckDB's ordinary join (quote keys stay unique per
 symbol so DuckDB's tie rule never meets ours — ties are pinned
 in-crate against the F8 rule instead). In-crate batteries cover the
 lemma under multi-correction windows (kill-then-rebirth chains, a

@@ -32,7 +32,8 @@
 > views (the as-of blotter, aggregates over the as-of join, star
 > aggregates), kept fresh incrementally as data arrives, exact across
 > corrections via the knowledge axis, with refresh cost proportional
-> to what changed rather than to the table. The settled
+> to what changed (plus, for join views, the dimension's touched
+> history — see DESIGN) rather than to the fact table. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).
@@ -299,8 +300,9 @@ blotter (every trade carrying its as-of quote), aggregates over the
 as-of join, and star aggregates over an equi-joined dimension — a
 late quote repairs exactly its correction interval, an in-order one
 costs nothing (facts at or above the quote frontier stay live), and
-an eighth oracle family diffs all three against DuckDB's native
-ASOF JOIN at seventeen checkpoints, in CI — registering `regr_slope` /
+an eighth oracle family diffs the as-of shapes against DuckDB's
+native ASOF JOIN — the star bars against its ordinary join — at
+seventeen checkpoints, in CI — registering `regr_slope` /
 `regr_intercept` / `regr_r2`, `covar_pop` / `corr`, `var_pop` /
 `stddev_pop`, and `eigen_max` (the window's first
 principal-component variance) as SQL window functions — every window

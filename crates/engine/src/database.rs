@@ -231,7 +231,8 @@ impl Database {
     /// (the union read; see [`MaterializedView`]). `AS OF` on a view
     /// recomputes the definition over the source as of that cut — the
     /// materialization accelerates current reads, it is never the
-    /// authority.
+    /// authority. (A join view refuses `AS OF`: one coordinate cannot
+    /// span two sequence spaces; the two-cut form is #99.)
     pub fn query(&self, sql: &str) -> Result<QueryOutput, EngineError> {
         let plan = plan(sql)?;
         if let Some(join) = &plan.join {

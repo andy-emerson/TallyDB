@@ -20,7 +20,8 @@
 //! Corrections need no bookkeeping of their own: the buckets they
 //! touch are **derivable** from the source's knowledge history, so the
 //! only durable view state is the stamp (plus, for the partials
-//! shapes, the chosen bucket width), written strictly after the
+//! shapes, the chosen bucket width; for join views, the dimension's
+//! stamp and the ceiling), written strictly after the
 //! materialization it describes is flushed — everything a stamp covers
 //! therefore survives any crash the source's own WAL contract admits,
 //! and a crash elsewhere just leaves the stamp old, which the next
@@ -3466,11 +3467,10 @@ mod tests {
 
     #[test]
     fn join_definitions_meet_the_tranche_3_door() {
-        // The join door (#83 tranche 3, cycle 1): a joined definition
-        // without its dimension table is told what to pass; an
-        // EQUI-join is refused by name until the star cycle; an
-        // aggregate over the ASOF join is refused by name until the
-        // next cycle.
+        // The join door (#83 tranche 3): a joined definition without
+        // its dimension table is told what to pass; the equi and
+        // asof-aggregate shapes are admitted; what stays refused is
+        // asserted by name below.
         let source = source();
         let dim = Table::new(
             "dim",
@@ -5233,7 +5233,7 @@ mod tests {
 
     /// The blotter fixture: a fact table and a quote history whose
     /// streams interleave — facts run AHEAD of quotes at the frontier,
-    /// which is exactly the min-frontier case the ceiling exists for.
+    /// which is exactly the case the ceiling exists for.
     fn blotter_db() -> Database {
         let mut db = Database::new();
         db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
@@ -5312,8 +5312,8 @@ mod tests {
         assert_eq!(folded, 12, "trades 0..=11 sit below the frontier");
         assert_blotter_matches(&db, "blotter");
         // In-order quote appends land ABOVE the ceiling: no
-        // materialized row dirties, the answer stays exact unrefreshed
-        // (the min-frontier property).
+        // materialized row dirties, the answer stays exact
+        // unrefreshed — the property the ceiling exists to buy.
         for (qts, sym, bid) in [(13, "B", 2.13), (16, "A", 1.16)] {
             db.append(
                 "quotes",

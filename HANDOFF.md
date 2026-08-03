@@ -48,10 +48,10 @@ tranche-3 section:
 | Commit | What |
 |---|---|
 | cycle 0 | prereqs: as-of ties break by birth sequence engine-wide (F8, with compaction-preserves-winners test); the touched walk yields (ordering key, join key) pairs (F5) |
-| cycle 1 | the enriched blotter: bare ASOF join views — `JoinState` (dimension stamp + ceiling, record v3), the min-frontier ceiling, correction intervals from the lemma, union read with a joined live half |
+| cycle 1 | the enriched blotter: bare ASOF join views — `JoinState` (dimension stamp + ceiling, record v3), materialization strictly below the dimension frontier (the ceiling), correction intervals from the lemma, union read with a joined live half |
 | cycle 2 | bucketed aggregates over the as-of join (group keys and arguments from either side) |
 | cycle 3 | star equi-join views under the widened door (F7): any dimension touch → whole rebuild, ceiling parked, read serves live while pending |
-| Assess | the eighth oracle (`m5_join_oracle.py`, in CI): 17 checkpoints x {blotter, as-of bars, star bars} vs DuckDB's NATIVE ASOF JOIN; pricing: refresh ratio 2.73 at 4x facts (guard < 3.0, honestly O(batch + touched quotes)); late-quote correction on 1M facts re-folds 399 keys in 41.6ms |
+| Assess | the eighth oracle (`m5_join_oracle.py`, in CI): 17 checkpoints x {blotter, as-of bars, star bars} vs DuckDB — its NATIVE ASOF JOIN for the as-of shapes, its ordinary join for the star; pricing: refresh ratio 2.73 at 4x facts (guard < 3.0, honestly O(batch + touched quotes)); late-quote correction on 1M facts re-folds 399 keys in 41.6ms |
 | review fixes | three reproduced bugs: a frontier REGRESSION stranded materialized rows and nothing healed (fix: dematerialize the shrink band, always store the ceiling); StrictlyBefore correction intervals stopped one key short of their inclusive edge; the tampered-stamp rebuild floor fed key-space ranges where bucket runs were expected. Plus four regression tests (regression, strict edge, floor-vs-ceiling, negative keys) |
 | doc pass | DESIGN's tranche-3 record (rulings, the ceiling, the lemma + proof, evidence, seats), module headers, README, this file |
 
@@ -59,7 +59,9 @@ tranche-3 section:
 commit), eight oracle scripts. The join-view exactness claim — view
 equals recompute at the current coordinate, both sources' histories
 included — holds through the C ABI at 17 checkpoints x 3 shapes
-against DuckDB's independent ASOF JOIN implementation, and in-crate
+against DuckDB recompute (its native ASOF JOIN, an independent
+implementation of the matching rule, for the two as-of shapes; its
+ordinary join for the star), and in-crate
 across multi-correction windows, kill-then-rebirth chains, the
 strict-mode edge, frontier regression, negative keys, and the
 symbol-seam discriminating case (a symbol-blind interval endpoint is

@@ -5,9 +5,10 @@ Drives the `oracle-harness` join-view context in libengine: a fact
 table, a quote history, a small keyed dimension, and three maintained
 join views — the ASOF blotter, bucketed aggregates over the ASOF join,
 and star bars over the equi join. Every statement is mirrored into
-DuckDB, whose NATIVE ASOF JOIN is the independent recompute; at each
-scripted checkpoint every view is diffed against DuckDB running the
-definition from scratch. The script walks the states the tranche-3
+DuckDB, whose NATIVE ASOF JOIN independently recomputes the two
+as-of views (the star view diffs against DuckDB's ordinary join); at
+each scripted checkpoint every view is diffed against DuckDB running
+the definition from scratch. The script walks the states the tranche-3
 design bets on: facts running ahead of quotes (the ceiling), in-order
 quote appends while stale (must stay exact, unrefreshed), late quotes
 below the ceiling (the correction interval), quote amends and deletes,
@@ -220,8 +221,9 @@ def main() -> None:
         lib.tallydb_join_view_close(context)
     print(
         f"Maintained join-view families validated end-to-end: {checks} checks "
-        f"x {{blotter, asof-bars, star-bars}} against DuckDB's native ASOF "
-        f"JOIN across stale/late-quote/dim-changed/compacted/reopened states "
+        f"x {{blotter, asof-bars, star-bars}} against DuckDB recompute — "
+        f"native ASOF JOIN for the as-of shapes, ordinary join for the star "
+        f"— across stale/late-quote/dim-changed/compacted/reopened states "
         f"(duckdb {duckdb.__version__})"
     )
 
