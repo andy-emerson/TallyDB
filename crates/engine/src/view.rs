@@ -125,17 +125,47 @@ pub struct MaterializedView {
     /// materialization stores internal columns (`__p{i}`, `__bucket`)
     /// no query ever answers with.
     answers: Schema,
+    /// A join view's second-source state (#83 tranche 3): the
+    /// dimension's name, its stamp, and the materialization ceiling.
+    /// `None` for single-source views, whose record stays format v2.
+    join: Option<JoinState>,
     /// Opened via [`MaterializedView::open_read_only`]: refresh
     /// refuses, the union read serves.
     read_only: bool,
+}
+
+/// A join view's durable second-source state, carried beside the
+/// fact-side stamp in the v3 definition record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JoinState {
+    /// The dimension (reference) table's name — the quote side of an
+    /// as-of blotter.
+    dimension: String,
+    /// The dimension's ingest-sequence watermark below which its
+    /// corrections are folded in — the second half of the pair stamp.
+    stamp: u64,
+    /// The materialization **ceiling**: the fact ordering-key value
+    /// below which rows are materialized (exclusive). Held at the
+    /// dimension's ordering-key frontier at the last refresh: a fact
+    /// row below it can only be changed by a CORRECTION (which the
+    /// dimension's knowledge history reports); a row at or above it
+    /// would be re-matched by ordinary in-order dimension appends, so
+    /// it stays in the union read's live half — staleness, never
+    /// wrongness. `i64::MIN` = nothing materialized yet.
+    ceiling: i64,
 }
 
 impl MaterializedView {
     /// Creates an in-memory maintained view over `source`. The
     /// definition is validated against the source's schema and refused
     /// by name outside tranche 1's shape (see the module doc).
-    pub fn new(name: &str, sql: &str, source: &Table) -> Result<MaterializedView, EngineError> {
-        let (schema, bucket, answers) = validated_definition(sql, source)?;
+    pub fn new(
+        name: &str,
+        sql: &str,
+        source: &Table,
+        dimension: Option<&Table>,
+    ) -> Result<MaterializedView, EngineError> {
+        let (schema, bucket, answers, join) = validated_definition(sql, source, dimension)?;
         let table = Table::new(name, schema, &bucket)?;
         Ok(MaterializedView {
             table,
@@ -145,6 +175,7 @@ impl MaterializedView {
             width: 0,
             dir: None,
             answers,
+            join,
             read_only: false,
         })
     }
@@ -156,9 +187,10 @@ impl MaterializedView {
         name: &str,
         sql: &str,
         source: &Table,
+        dimension: Option<&Table>,
         dir: impl AsRef<Path>,
     ) -> Result<MaterializedView, EngineError> {
-        let (schema, bucket, answers) = validated_definition(sql, source)?;
+        let (schema, bucket, answers, join) = validated_definition(sql, source, dimension)?;
         let table = Table::persistent(name, schema, &bucket, dir.as_ref())?;
         let view = MaterializedView {
             table,
@@ -168,6 +200,7 @@ impl MaterializedView {
             width: 0,
             dir: Some(dir.as_ref().to_path_buf()),
             answers,
+            join,
             read_only: false,
         };
         view.write_definition(dir.as_ref())?;
@@ -184,10 +217,11 @@ impl MaterializedView {
         name: &str,
         dir: impl AsRef<Path>,
         source: &Table,
+        dimension: Option<&Table>,
         options: StoreOptions,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, width, source_name, sql, answers) =
-            read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql, answers, join) =
+            read_definition(dir.as_ref(), name, source, dimension)?;
         let table = Table::open(name, dir.as_ref(), options)?;
         Ok(MaterializedView {
             table,
@@ -197,6 +231,7 @@ impl MaterializedView {
             width,
             dir: Some(dir.as_ref().to_path_buf()),
             answers,
+            join,
             read_only: false,
         })
     }
@@ -212,9 +247,10 @@ impl MaterializedView {
         name: &str,
         dir: impl AsRef<Path>,
         source: &Table,
+        dimension: Option<&Table>,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, width, source_name, sql, answers) =
-            read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql, answers, join) =
+            read_definition(dir.as_ref(), name, source, dimension)?;
         let table = Table::open_read_only(name, dir.as_ref())?;
         Ok(MaterializedView {
             table,
@@ -226,6 +262,7 @@ impl MaterializedView {
             // ever written back.
             dir: None,
             answers,
+            join,
             read_only: true,
         })
     }
@@ -236,8 +273,25 @@ impl MaterializedView {
     pub fn stored_source(dir: impl AsRef<Path>) -> Result<String, EngineError> {
         let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
             .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-        let (_, _, source, _) = decode_definition(&record)?;
+        let (_, _, source, _, _) = decode_definition(&record)?;
         Ok(source)
+    }
+
+    /// The dimension-table name a persisted JOIN view's record names,
+    /// `None` for single-source views — the scanner reads it beside
+    /// [`MaterializedView::stored_source`] to open both tables before
+    /// the view.
+    pub fn stored_dimension(dir: impl AsRef<Path>) -> Result<Option<String>, EngineError> {
+        let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
+            .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
+        let (_, _, _, _, join) = decode_definition(&record)?;
+        Ok(join.map(|join| join.dimension))
+    }
+
+    /// The dimension (reference) table's name, `None` for
+    /// single-source views.
+    pub fn dimension(&self) -> Option<&str> {
+        self.join.as_ref().map(|join| join.dimension.as_str())
     }
 
     /// The view's name.
@@ -321,7 +375,15 @@ impl MaterializedView {
     /// cadence — refresh at the freeze boundary — the buffer is empty
     /// and the flush is free; a mid-buffer refresh pays one early
     /// freeze, the price of durably stamping what it folds.
-    pub fn refresh(&mut self, source: &mut Table) -> Result<u64, EngineError> {
+    /// A JOIN view (#83 tranche 3) refreshes through `dimension`: pass
+    /// its reference table, which is flushed and stamped by the same
+    /// discipline. A single-source view refuses `Some`, a join view
+    /// refuses `None` — both by name.
+    pub fn refresh(
+        &mut self,
+        source: &mut Table,
+        dimension: Option<&mut Table>,
+    ) -> Result<u64, EngineError> {
         if source.name() != self.source {
             return Err(EngineError::WrongTable {
                 expected: self.source.clone(),
@@ -336,9 +398,33 @@ impl MaterializedView {
                     .to_owned(),
             )));
         }
+        match (&self.join, dimension) {
+            (Some(join), Some(dimension)) => {
+                if dimension.name() != join.dimension {
+                    return Err(EngineError::WrongTable {
+                        expected: join.dimension.clone(),
+                        got: dimension.name().to_owned(),
+                    });
+                }
+                return self.refresh_joined(source, dimension);
+            }
+            (Some(join), None) => {
+                return Err(definition_error(format!(
+                    "this view joins '{}': refresh with both tables",
+                    join.dimension
+                )));
+            }
+            (None, Some(dimension)) => {
+                return Err(definition_error(format!(
+                    "'{}' passed to a single-source view's refresh",
+                    dimension.name()
+                )));
+            }
+            (None, None) => {}
+        }
         source.flush()?;
         let now = source.next_sequence();
-        let mut definition = Definition::of(&self.sql, source, self.width)?;
+        let mut definition = Definition::of(&self.sql, source, None, self.width)?;
         if !matches!(definition.read, ReadShape::Direct) && self.width == 0 {
             // A running view's hidden-bucket width is chosen once, at
             // the first refresh that sees data: the observed key span
@@ -356,7 +442,7 @@ impl MaterializedView {
                     let span = (high as i128 - low as i128 + 1).max(1);
                     let width = ((span + TARGET_BUCKETS - 1) / TARGET_BUCKETS).max(1) as u64;
                     self.width = width;
-                    definition = Definition::of(&self.sql, source, width)?;
+                    definition = Definition::of(&self.sql, source, None, width)?;
                     // Persist the width before folding under it: a
                     // crash between the two re-folds under the SAME
                     // width, never a different one.
@@ -422,6 +508,7 @@ impl MaterializedView {
     pub(crate) fn query_union(
         &self,
         source: &Table,
+        dimension: Option<&Table>,
         user_plan: &Plan,
     ) -> Result<query_lite::QueryOutput, EngineError> {
         if user_plan.referenced_columns().contains(SEQUENCE_COLUMN) {
@@ -437,13 +524,17 @@ impl MaterializedView {
                     .to_owned(),
             )));
         }
-        let definition = Definition::of(&self.sql, source, self.width)?;
+        let definition = Definition::of(&self.sql, source, dimension, self.width)?;
         match &definition.read {
             ReadShape::Running(running) => {
                 return self.query_running(source, &definition, running, user_plan)
             }
             ReadShape::Cumulative(cumulative) => {
                 return self.query_cumulative(source, &definition, cumulative, user_plan)
+            }
+            ReadShape::Joined => {
+                let dimension = dimension.expect("a joined definition validated its dimension");
+                return self.query_joined(source, dimension, &definition, user_plan);
             }
             ReadShape::Direct => {}
         }
@@ -461,6 +552,161 @@ impl MaterializedView {
         // The live half: the definition over exactly the uncovered
         // buckets. The clean half: every materialized row outside them.
         let fresh = source.execute_plan(&definition.restricted_to(&runs, source))?;
+        let mut clean = select_everything(&self.table)?;
+        clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
+        let clean = self.table.execute_plan(&clean)?;
+        self.over_scratch(clean.batches.into_iter(), fresh, user_plan)
+    }
+
+    /// The join-view refresh (#83 tranche 3): both sources flushed,
+    /// both watermarks captured, dirty fact-key ranges derived from
+    /// BOTH knowledge histories, one restricted join re-fold, both
+    /// stamps and the ceiling advanced — strictly after the fold is
+    /// durable, per the single-source discipline.
+    ///
+    /// The dirty set has three parts: fact rows born or killed since
+    /// the fact stamp; the **correction intervals** `[t, next
+    /// reference row for that key after t)` for every reference row
+    /// born or killed since the dimension stamp (the tranche-3 lemma —
+    /// the proof lives in DESIGN's tranche-3 section); and the
+    /// **ceiling advance** `[old ceiling, new frontier)`, the fact
+    /// rows that became materializable because the reference frontier
+    /// moved. Everything clips below the new ceiling: rows at or above
+    /// it stay in the union read's live half, where ordinary in-order
+    /// reference appends can re-match them at no maintenance cost.
+    fn refresh_joined(
+        &mut self,
+        source: &mut Table,
+        dimension: &mut Table,
+    ) -> Result<u64, EngineError> {
+        source.flush()?;
+        dimension.flush()?;
+        let now_fact = source.next_sequence();
+        let now_dim = dimension.next_sequence();
+        let definition = Definition::of(&self.sql, source, Some(dimension), self.width)?;
+        let join = self.join.clone().expect("routed here on Some");
+        let Some(frontier) = table_okey_max(dimension)? else {
+            // No reference rows at all: nothing is materializable
+            // (every fact row's match could still arrive in order). If
+            // corrections emptied the reference table, the
+            // materialization must empty with it.
+            if join.ceiling > i64::MIN {
+                let nothing = source
+                    .execute_join_plan(&definition.restricted_to(&[(1, 0)], source), dimension)?;
+                self.table.replace_matching(None, &nothing)?;
+            }
+            if let Some(join) = self.join.as_mut() {
+                join.stamp = now_dim;
+                join.ceiling = i64::MIN;
+            }
+            self.advance_stamp(now_fact)?;
+            return Ok(0);
+        };
+        // Materialize strictly below the frontier: an in-order arrival
+        // lands at or above it (a tie at the frontier included), so
+        // every materialized row can only be changed by a correction —
+        // which the dimension's knowledge history reports.
+        let ceiling = frontier;
+        if now_fact < self.stamp || now_dim < join.stamp {
+            // The rebuild floor, on either axis: a watermark below its
+            // stamp cannot come from a crash under flush-then-stamp —
+            // only from a foreign or tampered pairing. Trust nothing.
+            let replacement = source.execute_join_plan(
+                &definition.restricted_to(&[(i64::MIN, ceiling - 1)], source),
+                dimension,
+            )?;
+            self.table.replace_matching(None, &replacement)?;
+            if let Some(join) = self.join.as_mut() {
+                join.stamp = now_dim;
+                join.ceiling = ceiling;
+            }
+            self.advance_stamp(now_fact)?;
+            return Ok(u64::MAX);
+        }
+        let mut ranges =
+            joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)?;
+        ranges.retain(|&(low, _)| low < ceiling);
+        for range in &mut ranges {
+            range.1 = range.1.min(ceiling - 1);
+        }
+        if join.ceiling < ceiling {
+            // The frontier moved: fact rows between the old ceiling
+            // and the new one just became stable, and no touched
+            // signal names them — the ceiling does.
+            ranges.push((join.ceiling, ceiling - 1));
+        }
+        if ranges.is_empty() {
+            if let Some(join) = self.join.as_mut() {
+                join.stamp = now_dim;
+            }
+            self.advance_stamp(now_fact)?;
+            return Ok(0);
+        }
+        let runs = merge_key_ranges(ranges);
+        // The re-fold count clips to the fact table's actual key span:
+        // the ceiling-advance range opens at i64::MIN on a first
+        // refresh, and "keys re-folded" should mean keys that exist,
+        // not the width of the axis.
+        let folded = match source_span(source)? {
+            None => 0,
+            Some((fact_low, fact_high)) => runs
+                .iter()
+                .map(|&(low, high)| {
+                    let low = low.max(fact_low) as i128;
+                    let high = high.min(fact_high) as i128;
+                    (high - low + 1).max(0) as u128
+                })
+                .sum::<u128>()
+                .min(u64::MAX as u128) as u64,
+        };
+        let replacement =
+            source.execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
+        let victims = definition.view_ranges(&runs);
+        self.table.replace_matching(Some(&victims), &replacement)?;
+        if let Some(join) = self.join.as_mut() {
+            join.stamp = now_dim;
+            join.ceiling = ceiling;
+        }
+        self.advance_stamp(now_fact)?;
+        Ok(folded)
+    }
+
+    /// The join view's union read: materialized rows below the ceiling
+    /// and outside the dirty ranges, plus a live join over everything
+    /// else — the dirty ranges and the whole tail at or above the
+    /// ceiling (where in-order reference arrivals land). Exact however
+    /// stale, like every union read.
+    ///
+    /// `AS OF` is refused: one coordinate cannot span two tables'
+    /// independent sequence spaces, and the base's own AS OF-with-JOIN
+    /// is refused for the same reason — refusal parity (the two-cut
+    /// form is issue #99).
+    fn query_joined(
+        &self,
+        source: &Table,
+        dimension: &Table,
+        definition: &Definition,
+        user_plan: &Plan,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        if user_plan.as_of.is_some() {
+            return Err(EngineError::Query(QueryError::Unsupported(
+                "ASOF on a join view — one knowledge coordinate cannot span \
+                 two tables' sequence spaces (the base refuses AS OF with a \
+                 JOIN for the same reason); a two-coordinate form is issue \
+                 #99"
+                .to_owned(),
+            )));
+        }
+        let join = self.join.as_ref().expect("routed here on Some");
+        let mut ranges =
+            joined_touched_ranges(source, dimension, definition, self.stamp, join.stamp)?;
+        // The unmaterialized tail: everything at or above the ceiling
+        // lives in the live half (with the ceiling at i64::MIN, that
+        // is the whole axis and the read is a plain live join).
+        ranges.push((join.ceiling, i64::MAX));
+        let runs = merge_key_ranges(ranges);
+        let fresh =
+            source.execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
         let mut clean = select_everything(&self.table)?;
         clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
         let clean = self.table.execute_plan(&clean)?;
@@ -679,7 +925,13 @@ impl MaterializedView {
     /// two leaves an old stamp and the next refresh re-folds — never a
     /// stamp describing a materialization that does not exist.
     fn write_definition(&self, dir: &Path) -> Result<(), EngineError> {
-        let record = encode_definition(self.stamp, self.width, &self.source, &self.sql);
+        let record = encode_definition(
+            self.stamp,
+            self.width,
+            &self.source,
+            &self.sql,
+            self.join.as_ref(),
+        );
         let path = dir.join(DEFINITION_FILE);
         let staging = dir.join(format!("{DEFINITION_FILE}.staging"));
         std::fs::write(&staging, &record)
@@ -693,22 +945,55 @@ impl MaterializedView {
 /// the record's stamp, source name, and SQL, with the wrong-source
 /// pairing and any schema drift refused loudly here rather than
 /// answered wrongly later.
+#[allow(clippy::type_complexity)]
 fn read_definition(
     dir: &Path,
     name: &str,
     source: &Table,
-) -> Result<(u64, u64, String, String, Schema), EngineError> {
+    dimension: Option<&Table>,
+) -> Result<(u64, u64, String, String, Schema, Option<JoinState>), EngineError> {
     let record = std::fs::read(dir.join(DEFINITION_FILE))
         .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-    let (stamp, width, source_name, sql) = decode_definition(&record)?;
+    let (stamp, width, source_name, sql, stored_join) = decode_definition(&record)?;
     if source_name != source.name() {
         return Err(definition_error(format!(
             "view '{name}' is over '{source_name}', not '{}'",
             source.name()
         )));
     }
-    let (_, _, answers) = validated_definition(&sql, source)?;
-    Ok((stamp, width, source_name, sql, answers))
+    if let Some(stored) = &stored_join {
+        match dimension {
+            None => {
+                return Err(definition_error(format!(
+                    "view '{name}' joins '{}' — open it with that table",
+                    stored.dimension
+                )))
+            }
+            Some(dimension) if dimension.name() != stored.dimension => {
+                return Err(definition_error(format!(
+                    "view '{name}' joins '{}', not '{}'",
+                    stored.dimension,
+                    dimension.name()
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let (_, _, answers, join) = validated_definition(&sql, source, dimension)?;
+    // The validated shape says whether this is a join view; the STORED
+    // stamps say where its maintenance stands. Marry them: shape from
+    // the SQL, state from the record.
+    let join = match (join, stored_join) {
+        (Some(_), Some(stored)) => Some(stored),
+        (None, None) => None,
+        _ => {
+            return Err(definition_error(format!(
+                "view '{name}': the record's source count disagrees with \
+                 its own SQL — the record is corrupt or hand-edited"
+            )))
+        }
+    };
+    Ok((stamp, width, source_name, sql, answers, join))
 }
 
 /// A lowered, validated view definition plus its bucket arithmetic —
@@ -740,6 +1025,11 @@ enum ReadShape {
     /// partition boundary values, assemble the queried range from the
     /// source, adjust by the boundaries, then the user's query.
     Cumulative(Box<CumulativeRead>),
+    /// Tranche 3, cycle 1: a bare as-of join (the enriched blotter).
+    /// The materialization IS the answer, keyed by the fact ordering
+    /// key; the read tops it up with a live join over the dirty ranges
+    /// and the unmaterialized tail at or above the ceiling.
+    Joined,
 }
 
 /// The read-side half of a running view: how partials become answers.
@@ -847,9 +1137,14 @@ impl Definition {
     /// and the caller must not fold with an unsized definition; a
     /// placeholder width of 1 keeps the synthesized plan well-formed
     /// for schema derivation.
-    fn of(sql: &str, source: &Table, width: u64) -> Result<Definition, EngineError> {
+    fn of(
+        sql: &str,
+        source: &Table,
+        dimension: Option<&Table>,
+        width: u64,
+    ) -> Result<Definition, EngineError> {
         let plan = lower_plan(sql).map_err(EngineError::Query)?;
-        match eligible_shape(&plan, source)? {
+        match eligible_shape(&plan, source, dimension)? {
             Shape::Bucketed(bucket, bucket_name) => {
                 let (divide, view_scale) = bucket_arithmetic(&bucket);
                 Ok(Definition {
@@ -862,6 +1157,15 @@ impl Definition {
             }
             Shape::Running => synthesize_running(plan, source, width.max(1) as i64),
             Shape::Cumulative => synthesize_cumulative(plan, source, width.max(1) as i64),
+            Shape::Joined(okey_name) => Ok(Definition {
+                plan,
+                bucket_name: okey_name,
+                // A blotter row's "bucket" is its own fact ordering-key
+                // value: repair granularity is the key itself.
+                divide: 1,
+                view_scale: 1,
+                read: ReadShape::Joined,
+            }),
         }
     }
 
@@ -1309,6 +1613,156 @@ fn synthesize_cumulative(
             output: Schema::new(output_fields),
         })),
     })
+}
+
+/// The dirty fact-key ranges a join view derives from BOTH knowledge
+/// histories (#83 tranche 3): fact rows born or killed since the fact
+/// stamp (as single-key ranges), and for every reference row born or
+/// killed since the dimension stamp, the correction interval
+/// `[t, next reference row for that key strictly after t, in current
+/// state)` — open-ended when no next exists. A reference row with a
+/// NULL key matches nothing and is skipped. Unclipped: refresh clips
+/// below its new ceiling, the read unions the tail in.
+fn joined_touched_ranges(
+    source: &Table,
+    dimension: &Table,
+    definition: &Definition,
+    fact_stamp: u64,
+    dim_stamp: u64,
+) -> Result<Vec<(i64, i64)>, EngineError> {
+    let join = definition
+        .plan
+        .join
+        .as_ref()
+        .expect("a joined definition carries its join");
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    source.touched_ordering_keys(fact_stamp, |key| ranges.push((key, key)))?;
+    let mut touched_reference: Vec<(i64, Option<String>)> = Vec::new();
+    dimension.touched_rows(dim_stamp, &join.dimension_key, |key, value| {
+        touched_reference.push((key, value.map(str::to_owned)));
+    })?;
+    for (at, value) in touched_reference {
+        let Some(value) = value else {
+            continue; // a null reference key matches nothing, ever
+        };
+        let next = next_reference_key(dimension, &join.dimension_key, &value, at)?;
+        let high = next.map_or(i64::MAX, |next| next - 1);
+        if at <= high {
+            ranges.push((at, high));
+        }
+    }
+    Ok(ranges)
+}
+
+/// The least reference ordering-key value strictly after `after` for
+/// `value`'s rows, in the dimension's CURRENT state — the correction
+/// interval's exclusive end (`None` = open-ended). One small prunable
+/// aggregate per touched reference row; corrections are rare, and the
+/// lookup is what keeps their blast radius an interval instead of a
+/// suffix.
+fn next_reference_key(
+    dimension: &Table,
+    key_column: &str,
+    value: &str,
+    after: i64,
+) -> Result<Option<i64>, EngineError> {
+    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    let plan = Plan {
+        table: dimension.name().to_owned(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: Vec::new(),
+            items: vec![AggItem::Call(AggCall {
+                function: AggFunction::Min,
+                argument: Some(dimension.ordering_key().to_owned()),
+                alias: Some("__next".to_owned()),
+            })],
+            having: None,
+        },
+        distinct: false,
+        predicate: Some(Predicate::And(
+            Box::new(Predicate::KeyEquals {
+                column: key_column.to_owned(),
+                value: value.to_owned(),
+                negated: false,
+            }),
+            Box::new(Predicate::Compare {
+                column: dimension.ordering_key().to_owned(),
+                op: CmpOp::Gt,
+                value: Number::Int(after),
+            }),
+        )),
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    let output = dimension.execute_plan(&plan)?;
+    let Some(batch) = output.batches.first().filter(|batch| batch.num_rows() > 0) else {
+        return Ok(None);
+    };
+    use arrow_lite::{Column, NumericData};
+    Ok(match &batch.columns()[0] {
+        Column::Numeric(NumericData::I64(column)) => {
+            column.is_valid(0).then(|| column.values().as_slice()[0])
+        }
+        _ => None,
+    })
+}
+
+/// The dimension's current ordering-key frontier (its greatest value),
+/// `None` when empty — what a join view's materialization ceiling
+/// advances to.
+fn table_okey_max(table: &Table) -> Result<Option<i64>, EngineError> {
+    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    let plan = Plan {
+        table: table.name().to_owned(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: Vec::new(),
+            items: vec![AggItem::Call(AggCall {
+                function: AggFunction::Max,
+                argument: Some(table.ordering_key().to_owned()),
+                alias: Some("__hi".to_owned()),
+            })],
+            having: None,
+        },
+        distinct: false,
+        predicate: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    let output = table.execute_plan(&plan)?;
+    let Some(batch) = output.batches.first().filter(|batch| batch.num_rows() > 0) else {
+        return Ok(None);
+    };
+    use arrow_lite::{Column, NumericData};
+    Ok(match &batch.columns()[0] {
+        Column::Numeric(NumericData::I64(column)) => {
+            column.is_valid(0).then(|| column.values().as_slice()[0])
+        }
+        _ => None,
+    })
+}
+
+/// Sorts and merges overlapping or adjacent key ranges — the join
+/// view's dirty set arrives as arbitrary intervals (single keys,
+/// correction spans, the ceiling advance), and one merged run list
+/// keeps the fold's predicate small.
+fn merge_key_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    for (low, high) in ranges {
+        match merged.last_mut() {
+            Some((_, last_high)) if low <= last_high.saturating_add(1) => {
+                *last_high = (*last_high).max(high);
+            }
+            _ => merged.push((low, high)),
+        }
+    }
+    merged
 }
 
 /// The source's ordering-key span `(min, max)`, `None` when empty —
@@ -1864,10 +2318,12 @@ fn is_non_decreasing(batch: &arrow_lite::RecordBatch, index: usize) -> bool {
 /// materialization's own for a bucketed view; the user definition's
 /// for the partials shapes, whose materialization stores internal
 /// columns no query ever answers with).
+#[allow(clippy::type_complexity)]
 fn validated_definition(
     sql: &str,
     source: &Table,
-) -> Result<(Schema, String, Schema), EngineError> {
+    dimension: Option<&Table>,
+) -> Result<(Schema, String, Schema, Option<JoinState>), EngineError> {
     let plan = lower_plan(sql).map_err(EngineError::Query)?;
     if plan.table != source.name() {
         return Err(EngineError::WrongTable {
@@ -1875,11 +2331,33 @@ fn validated_definition(
             got: plan.table,
         });
     }
+    match (&plan.join, dimension) {
+        (Some(join), Some(dimension)) if join.dimension != dimension.name() => {
+            return Err(EngineError::WrongTable {
+                expected: join.dimension.clone(),
+                got: dimension.name().to_owned(),
+            });
+        }
+        (None, Some(dimension)) => {
+            return Err(definition_error(format!(
+                "'{}' passed as a dimension, but the definition joins nothing",
+                dimension.name()
+            )));
+        }
+        _ => {} // a joined plan with no dimension is refused by the door
+    }
     // A placeholder width of 1 keeps a running synthesis well-formed;
     // the schema does not depend on the width's value.
-    let definition = Definition::of(sql, source, 1)?;
+    let definition = Definition::of(sql, source, dimension, 1)?;
     let bucket = definition.bucket_name.clone();
-    let schema = output_schema(&definition.plan, source)?;
+    let schema = match (&definition.read, dimension) {
+        (ReadShape::Joined, Some(dimension)) => {
+            source
+                .execute_join_plan_empty(&definition.plan, dimension)?
+                .schema
+        }
+        _ => output_schema(&definition.plan, source)?,
+    };
     // The bucket column is the view table's ordering key; the executor
     // may mark aggregate outputs nullable, but a bucket of a NOT NULL
     // ordering key is never null, and Table::new requires NOT NULL.
@@ -1896,11 +2374,22 @@ fn validated_definition(
         .collect();
     let materialization = Schema::new(fields);
     let answers = match &definition.read {
-        ReadShape::Direct => materialization.clone(),
+        ReadShape::Direct | ReadShape::Joined => materialization.clone(),
         ReadShape::Running(running) => source.execute_plan_empty(&running.user)?.schema,
         ReadShape::Cumulative(cumulative) => source.execute_plan_empty(&cumulative.user)?.schema,
     };
-    Ok((materialization, bucket, answers))
+    // A fresh join view starts with nothing folded on either axis:
+    // both stamps 0, the ceiling at i64::MIN (the constructors persist
+    // this; `open` replaces it with the record's stored state).
+    let join = match &definition.read {
+        ReadShape::Joined => Some(JoinState {
+            dimension: dimension.expect("checked above").name().to_owned(),
+            stamp: 0,
+            ceiling: i64::MIN,
+        }),
+        _ => None,
+    };
+    Ok((materialization, bucket, answers, join))
 }
 
 /// What kind of maintainable definition a plan is.
@@ -1916,12 +2405,19 @@ enum Shape {
     /// source row, each carrying an expanding aggregate. The same
     /// partials, read as per-partition **boundary** values.
     Cumulative,
+    /// Tranche 3, cycle 1: a bare as-of join, carrying the fact
+    /// ordering key's OUTPUT name (the view table's ordering key).
+    Joined(String),
 }
 
 /// The eligibility check: classifies a definition as bucketed
 /// (tranche 1) or running (tranche 2), and refuses everything else by
 /// name — naming the tranche that will admit it where one is planned.
-fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
+fn eligible_shape(
+    plan: &Plan,
+    source: &Table,
+    dimension: Option<&Table>,
+) -> Result<Shape, EngineError> {
     let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
     if plan.as_of.is_some() {
         return refuse(
@@ -1937,11 +2433,7 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
         );
     }
     if plan.join.is_some() {
-        return refuse(
-            "a join in a view definition — maintained joins are tranche 3 \
-             of #83 (q-hierarchical only); maintain a view per table and \
-             join them at read",
-        );
+        return classify_joined(plan, source, dimension);
     }
     if plan.distinct {
         return refuse("DISTINCT in a view definition — deduplicate at read");
@@ -2054,6 +2546,97 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
             ))
         })?;
     Ok(Shape::Bucketed(bucket.clone(), name))
+}
+
+/// Classifies a definition whose FROM clause is a join (#83
+/// tranche 3). Cycle 1 admits the **enriched blotter**: a bare
+/// projection over one `ASOF LEFT/INNER JOIN`, the fact ordering key
+/// selected (it is the view's axis). Later cycles are refused by
+/// name; a view must fold or match something, and the blotter
+/// materializes the match.
+fn classify_joined(
+    plan: &Plan,
+    source: &Table,
+    dimension: Option<&Table>,
+) -> Result<Shape, EngineError> {
+    use query_lite::PlanItem;
+    let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
+    let join = plan.join.as_ref().expect("routed here on Some");
+    let Some(dimension) = dimension else {
+        return Err(definition_error(format!(
+            "a join view needs its dimension table: pass '{}'",
+            join.dimension
+        )));
+    };
+    if join.as_of.is_none() {
+        return refuse(
+            "a maintained equi-join view — the star shape lands with \
+             tranche 3's next cycle; today's door admits ASOF joins",
+        );
+    }
+    if plan.distinct {
+        return refuse("DISTINCT in a view definition — deduplicate at read");
+    }
+    if plan.order_by.is_some() || plan.limit.is_some() || plan.offset.is_some() {
+        return refuse(
+            "ORDER BY / LIMIT / OFFSET in a view definition — a view is a \
+             table; order and limit at read, where they compose",
+        );
+    }
+    let Projection::Items(items) = &plan.projection else {
+        return refuse(
+            "an aggregate over a join in a view definition — bucketed \
+             aggregates over the ASOF join land with tranche 3's next \
+             cycle; the blotter (a bare projection) is what this cycle \
+             maintains",
+        );
+    };
+    for item in items {
+        match item {
+            PlanItem::Column { .. } => {}
+            PlanItem::Window { .. } => {
+                return refuse(
+                    "a window over a join in a view definition — windows \
+                     compose at read, over the blotter",
+                )
+            }
+            PlanItem::Computed { .. } => {
+                return refuse(
+                    "a computed expression in a join view definition — \
+                     select columns; compose expressions at read",
+                )
+            }
+        }
+    }
+    // The fact ordering key is the view's axis: it must be selected,
+    // and its output name (the alias, if any) is the view table's
+    // ordering key.
+    let okey = items
+        .iter()
+        .find_map(|item| match item {
+            PlanItem::Column { name, alias } if name == source.ordering_key() => {
+                Some(alias.clone().unwrap_or_else(|| name.clone()))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            EngineError::Query(QueryError::Unsupported(
+                "a join view whose SELECT list omits the fact ordering key — \
+                 it is the view's axis, so select it (alias it to taste)"
+                    .to_owned(),
+            ))
+        })?;
+    // The dimension must be keyed... for the AS OF shape it is a
+    // history (many rows per key) — but its ordering key must exist
+    // and differ from the fact's by name (the executor refuses the
+    // clash; failing here keeps the error at the definition door).
+    if dimension.ordering_key() == source.ordering_key() {
+        return refuse(
+            "a join view whose two tables share an ordering-key NAME — \
+             rename the dimension's (the as-of executor refuses the clash)",
+        );
+    }
+    Ok(Shape::Joined(okey))
 }
 
 /// Refuses a running or cumulative definition that touches the `__`
@@ -2335,22 +2918,43 @@ fn definition_error(message: String) -> EngineError {
 /// everything before it. Little-endian throughout, like the segment
 /// format. Version 1 records (no width field) decode with width 0,
 /// which self-heals: a running view's first refresh chooses one.
-fn encode_definition(stamp: u64, width: u64, source: &str, sql: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 2 + 8 + 8 + 8 + source.len() + sql.len() + 4);
+/// Version 3 (#83 tranche 3) is the JOIN-view form: after the SQL it
+/// carries the dimension stamp, the materialization ceiling, and the
+/// length-prefixed dimension name. Single-source views keep writing
+/// v2 — the version IS the source count, and an old binary meeting a
+/// v3 record refuses loudly instead of misreading it.
+fn encode_definition(
+    stamp: u64,
+    width: u64,
+    source: &str,
+    sql: &str,
+    join: Option<&JoinState>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 2 + 8 + 8 + 8 + source.len() + sql.len() + 24 + 4);
     out.extend_from_slice(b"TDBV");
-    out.extend_from_slice(&2u16.to_le_bytes());
+    let version: u16 = if join.is_some() { 3 } else { 2 };
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&stamp.to_le_bytes());
     out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&(source.len() as u32).to_le_bytes());
     out.extend_from_slice(source.as_bytes());
     out.extend_from_slice(&(sql.len() as u32).to_le_bytes());
     out.extend_from_slice(sql.as_bytes());
+    if let Some(join) = join {
+        out.extend_from_slice(&join.stamp.to_le_bytes());
+        out.extend_from_slice(&join.ceiling.to_le_bytes());
+        out.extend_from_slice(&(join.dimension.len() as u32).to_le_bytes());
+        out.extend_from_slice(join.dimension.as_bytes());
+    }
     let crc = crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
-fn decode_definition(bytes: &[u8]) -> Result<(u64, u64, String, String), EngineError> {
+#[allow(clippy::type_complexity)]
+fn decode_definition(
+    bytes: &[u8],
+) -> Result<(u64, u64, String, String, Option<JoinState>), EngineError> {
     let corrupt = |what: &str| definition_error(format!("{DEFINITION_FILE} is corrupt: {what}"));
     if bytes.len() < 4 + 2 + 8 + 4 + 4 + 4 {
         return Err(corrupt("truncated"));
@@ -2364,11 +2968,11 @@ fn decode_definition(bytes: &[u8]) -> Result<(u64, u64, String, String), EngineE
         return Err(corrupt("bad magic"));
     }
     let version = u16::from_le_bytes(payload[4..6].try_into().expect("sized"));
-    if version != 1 && version != 2 {
+    if !(1..=3).contains(&version) {
         return Err(corrupt(&format!("unknown version {version}")));
     }
     let stamp = u64::from_le_bytes(payload[6..14].try_into().expect("sized"));
-    let (width, mut at) = if version == 2 {
+    let (width, mut at) = if version >= 2 {
         if payload.len() < 22 {
             return Err(corrupt("truncated width"));
         }
@@ -2395,7 +2999,38 @@ fn decode_definition(bytes: &[u8]) -> Result<(u64, u64, String, String), EngineE
     };
     let source = read_string("source name")?;
     let sql = read_string("definition SQL")?;
-    Ok((stamp, width, source, sql))
+    let join = if version == 3 {
+        let fixed_end = at.checked_add(16).filter(|&e| e <= payload.len());
+        let Some(fixed_end) = fixed_end else {
+            return Err(corrupt("truncated join state"));
+        };
+        let dim_stamp = u64::from_le_bytes(payload[at..at + 8].try_into().expect("sized"));
+        let ceiling = i64::from_le_bytes(payload[at + 8..fixed_end].try_into().expect("sized"));
+        at = fixed_end;
+        let mut read_string = |what: &str| -> Result<String, EngineError> {
+            let len_end = at.checked_add(4).filter(|&e| e <= payload.len());
+            let Some(len_end) = len_end else {
+                return Err(corrupt(&format!("truncated {what} length")));
+            };
+            let len = u32::from_le_bytes(payload[at..len_end].try_into().expect("sized")) as usize;
+            let end = len_end.checked_add(len).filter(|&e| e <= payload.len());
+            let Some(end) = end else {
+                return Err(corrupt(&format!("truncated {what}")));
+            };
+            at = end;
+            String::from_utf8(payload[len_end..end].to_vec())
+                .map_err(|_| corrupt(&format!("{what} is not UTF-8")))
+        };
+        let dimension = read_string("dimension name")?;
+        Some(JoinState {
+            dimension,
+            stamp: dim_stamp,
+            ceiling,
+        })
+    } else {
+        None
+    };
+    Ok((stamp, width, source, sql, join))
 }
 
 #[cfg(test)]
@@ -2418,7 +3053,7 @@ mod tests {
     #[test]
     fn a_view_definition_is_validated_and_shapes_its_table() {
         let source = source();
-        let view = MaterializedView::new("ohlc", OHLC, &source).unwrap();
+        let view = MaterializedView::new("ohlc", OHLC, &source, None).unwrap();
         assert_eq!(view.name(), "ohlc");
         assert_eq!(view.source(), "trades");
         assert_eq!(view.sql(), OHLC);
@@ -2442,12 +3077,14 @@ mod tests {
             "bars",
             "SELECT (ts / 4) * 4, sum(x) FROM trades GROUP BY (ts / 4) * 4",
             &source,
+            None,
         )
         .unwrap();
         MaterializedView::new(
             "instants",
             "SELECT ts, count(*) AS n FROM trades GROUP BY ts",
             &source,
+            None,
         )
         .unwrap();
     }
@@ -2456,7 +3093,7 @@ mod tests {
     fn ineligible_definitions_are_refused_by_name() {
         let source = source();
         let refused = |sql: &str, needle: &str| {
-            let error = MaterializedView::new("v", sql, &source)
+            let error = MaterializedView::new("v", sql, &source, None)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
@@ -2505,6 +3142,7 @@ mod tests {
             "v",
             "SELECT ts / 4 AS b, sum(nope) AS s FROM trades GROUP BY ts / 4",
             &source,
+            None,
         )
         .map(|_| ())
         .unwrap_err()
@@ -2515,6 +3153,7 @@ mod tests {
             "v",
             "SELECT ts / 4 AS b, sum(x) AS s FROM elsewhere GROUP BY ts / 4",
             &source,
+            None,
         )
         .map(|_| ())
         .unwrap_err()
@@ -2523,18 +3162,56 @@ mod tests {
     }
 
     #[test]
-    fn a_join_in_a_definition_is_refused() {
+    fn join_definitions_meet_the_tranche_3_door() {
+        // The join door (#83 tranche 3, cycle 1): a joined definition
+        // without its dimension table is told what to pass; an
+        // EQUI-join is refused by name until the star cycle; an
+        // aggregate over the ASOF join is refused by name until the
+        // next cycle.
         let source = source();
+        let dim = Table::new(
+            "dim",
+            arrow_lite::Schema::new(vec![
+                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                arrow_lite::Field::new("w", arrow_lite::ColumnType::F64, false),
+            ]),
+            "qts",
+        )
+        .unwrap();
         let error = MaterializedView::new(
             "v",
             "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
              JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4",
             &source,
+            None,
         )
         .map(|_| ())
         .unwrap_err()
         .to_string();
-        assert!(error.contains("tranche 3"), "{error}");
+        assert!(error.contains("pass 'dim'"), "{error}");
+        let error = MaterializedView::new(
+            "v",
+            "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
+             JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4",
+            &source,
+            Some(&dim),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("equi-join"), "{error}");
+        let error = MaterializedView::new(
+            "v",
+            "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
+             ASOF LEFT JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4",
+            &source,
+            Some(&dim),
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("aggregate over a join"), "{error}");
     }
 
     #[test]
@@ -2544,11 +3221,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let source = source();
         {
-            let view = MaterializedView::persistent("ohlc", OHLC, &source, &dir).unwrap();
+            let view = MaterializedView::persistent("ohlc", OHLC, &source, None, &dir).unwrap();
             assert_eq!(view.stamp(), 0);
         }
         let reopened =
-            MaterializedView::open("ohlc", &dir, &source, StoreOptions::default()).unwrap();
+            MaterializedView::open("ohlc", &dir, &source, None, StoreOptions::default()).unwrap();
         assert_eq!(reopened.sql(), OHLC);
         assert_eq!(reopened.source(), "trades");
         assert_eq!(reopened.stamp(), 0);
@@ -2559,15 +3236,15 @@ mod tests {
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0x01;
         std::fs::write(&path, &bytes).unwrap();
-        let error = MaterializedView::open("ohlc", &dir, &source, StoreOptions::default())
+        let error = MaterializedView::open("ohlc", &dir, &source, None, StoreOptions::default())
             .map(|_| ())
             .unwrap_err()
             .to_string();
         assert!(error.contains("checksum mismatch"), "{error}");
         // And a view opened against the wrong source is refused by
         // name, not answered wrongly.
-        std::fs::write(&path, encode_definition(0, 0, "quotes", OHLC)).unwrap();
-        let error = MaterializedView::open("ohlc", &dir, &source, StoreOptions::default())
+        std::fs::write(&path, encode_definition(0, 0, "quotes", OHLC, None)).unwrap();
+        let error = MaterializedView::open("ohlc", &dir, &source, None, StoreOptions::default())
             .map(|_| ())
             .unwrap_err()
             .to_string();
@@ -2631,6 +3308,7 @@ mod tests {
             "v2",
             "SELECT ts, count(*) AS n FROM orphan GROUP BY ts",
             &orphan_source,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2857,8 +3535,9 @@ mod tests {
             source.append(&linear_row(i)).unwrap();
         }
         {
-            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
-            view.refresh(&mut source).unwrap();
+            let mut view =
+                MaterializedView::persistent("ohlc", OHLC, &source, None, &view_dir).unwrap();
+            view.refresh(&mut source, None).unwrap();
             let stamp = view.stamp();
             // Mutate the source; crash before any refresh.
             source
@@ -2869,8 +3548,9 @@ mod tests {
         // Reopen: the stamp is honest about what it covers, and one
         // refresh converges the view.
         let mut view =
-            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
-        assert_eq!(view.refresh(&mut source).unwrap(), 1);
+            MaterializedView::open("ohlc", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
+        assert_eq!(view.refresh(&mut source, None).unwrap(), 1);
         let recomputed = source.query(OHLC).unwrap();
         let view_columns = "sym, bar, o, h, l, c";
         let materialized = view
@@ -2882,12 +3562,13 @@ mod tests {
         // only ever conservative: the re-fold is idempotent. (Drop
         // first: one writer per store directory.)
         drop(view);
-        let record = encode_definition(0, 0, "trades", OHLC);
+        let record = encode_definition(0, 0, "trades", OHLC, None);
         std::fs::write(view_dir.join(DEFINITION_FILE), record).unwrap();
         let mut view =
-            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
+            MaterializedView::open("ohlc", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
         assert_eq!(view.stamp(), 0);
-        view.refresh(&mut source).unwrap();
+        view.refresh(&mut source, None).unwrap();
         let materialized = view
             .table
             .query(&format!("SELECT {view_columns} FROM ohlc"))
@@ -3077,8 +3758,9 @@ mod tests {
             writer.append(&linear_row(i)).unwrap();
         }
         {
-            let mut view = MaterializedView::persistent("ohlc", OHLC, &writer, &view_dir).unwrap();
-            view.refresh(&mut writer).unwrap();
+            let mut view =
+                MaterializedView::persistent("ohlc", OHLC, &writer, None, &view_dir).unwrap();
+            view.refresh(&mut writer, None).unwrap();
         }
         // The writer keeps going — a correction and new rows the
         // reader's materialization has never seen — and flushes.
@@ -3095,7 +3777,7 @@ mod tests {
         let mut db = Database::new();
         db.add_table(ro_source).unwrap();
         let ro_view =
-            MaterializedView::open_read_only("ohlc", &view_dir, db.table("trades").unwrap())
+            MaterializedView::open_read_only("ohlc", &view_dir, db.table("trades").unwrap(), None)
                 .unwrap();
         db.add_view(ro_view).unwrap();
         assert_matches_recompute(&db, "ohlc");
@@ -3134,8 +3816,9 @@ mod tests {
                 source.append(&linear_row(i)).unwrap();
             }
             source.flush().unwrap();
-            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
-            view.refresh(&mut source).unwrap();
+            let mut view =
+                MaterializedView::persistent("ohlc", OHLC, &source, None, &view_dir).unwrap();
+            view.refresh(&mut source, None).unwrap();
             // Refresh flushes the source, so anything IT saw is
             // durable; the losable tail is what arrives after the
             // last refresh.
@@ -3145,11 +3828,12 @@ mod tests {
             // The critical refresh: it sees the buffered tail, so its
             // stamp covers it — which is exactly why it must make the
             // tail durable first.
-            view.refresh(&mut source).unwrap();
+            view.refresh(&mut source, None).unwrap();
             let recomputed = source.query(OHLC).unwrap();
             let via_union = view
                 .query_union(
                     &source,
+                    None,
                     &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
                 )
                 .unwrap();
@@ -3167,12 +3851,14 @@ mod tests {
              loss here means refresh stamped unflushed rows"
         );
         let mut view =
-            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
-        view.refresh(&mut source).unwrap();
+            MaterializedView::open("ohlc", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
+        view.refresh(&mut source, None).unwrap();
         let recomputed = source.query(OHLC).unwrap();
         let materialized = view
             .query_union(
                 &source,
+                None,
                 &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
             )
             .unwrap();
@@ -3201,22 +3887,25 @@ mod tests {
             source.append(&linear_row(i)).unwrap();
         }
         {
-            let mut view = MaterializedView::persistent("ohlc", OHLC, &source, &view_dir).unwrap();
-            view.refresh(&mut source).unwrap();
+            let mut view =
+                MaterializedView::persistent("ohlc", OHLC, &source, None, &view_dir).unwrap();
+            view.refresh(&mut source, None).unwrap();
         }
         // The tamper: a stamp far past anything the source has spent.
         std::fs::write(
             view_dir.join(DEFINITION_FILE),
-            encode_definition(1_000_000, 0, "trades", OHLC),
+            encode_definition(1_000_000, 0, "trades", OHLC, None),
         )
         .unwrap();
         let mut view =
-            MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
-        assert_eq!(view.refresh(&mut source).unwrap(), u64::MAX);
+            MaterializedView::open("ohlc", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
+        assert_eq!(view.refresh(&mut source, None).unwrap(), u64::MAX);
         let recomputed = source.query(OHLC).unwrap();
         let materialized = view
             .query_union(
                 &source,
+                None,
                 &lower_plan("SELECT sym, bar, o, h, l, c FROM ohlc").unwrap(),
             )
             .unwrap();
@@ -3439,21 +4128,22 @@ mod tests {
         }
         {
             let mut view =
-                MaterializedView::persistent("totals", RUNNING, &source, &view_dir).unwrap();
-            view.refresh(&mut source).unwrap();
+                MaterializedView::persistent("totals", RUNNING, &source, None, &view_dir).unwrap();
+            view.refresh(&mut source, None).unwrap();
         }
         // The width survives the record round trip (v2) — read back
         // from the bytes, not inferred — and the reopened view keeps
         // folding under it rather than re-sizing.
         let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
-        let (_, width, _, _) = decode_definition(&record).unwrap();
+        let (_, width, _, _, _) = decode_definition(&record).unwrap();
         assert!(width > 0, "the chosen width was not persisted");
         let mut view =
-            MaterializedView::open("totals", &view_dir, &source, StoreOptions::default()).unwrap();
+            MaterializedView::open("totals", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
         source
             .mutate("UPDATE trades SET x = 50.0 WHERE ts = 2")
             .unwrap();
-        assert_eq!(view.refresh(&mut source).unwrap(), 1);
+        assert_eq!(view.refresh(&mut source, None).unwrap(), 1);
         drop(view);
         // Read-only: exact answers over a stale materialization, no
         // writes, refresh refused.
@@ -3464,9 +4154,13 @@ mod tests {
         let ro_source = Table::open_read_only("trades", &source_dir).unwrap();
         let mut db = Database::new();
         db.add_table(ro_source).unwrap();
-        let ro_view =
-            MaterializedView::open_read_only("totals", &view_dir, db.table("trades").unwrap())
-                .unwrap();
+        let ro_view = MaterializedView::open_read_only(
+            "totals",
+            &view_dir,
+            db.table("trades").unwrap(),
+            None,
+        )
+        .unwrap();
         db.add_view(ro_view).unwrap();
         assert_running_matches(&db, "totals", RUNNING_COLUMNS);
         assert!(db.refresh_view("totals").is_err());
@@ -3744,18 +4438,19 @@ mod tests {
         }
         {
             let mut view =
-                MaterializedView::persistent("cum", CUMULATIVE, &source, &view_dir).unwrap();
-            view.refresh(&mut source).unwrap();
+                MaterializedView::persistent("cum", CUMULATIVE, &source, None, &view_dir).unwrap();
+            view.refresh(&mut source, None).unwrap();
         }
         let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
-        let (_, width, _, _) = decode_definition(&record).unwrap();
+        let (_, width, _, _, _) = decode_definition(&record).unwrap();
         assert!(width > 0, "the chosen width was not persisted");
         let mut view =
-            MaterializedView::open("cum", &view_dir, &source, StoreOptions::default()).unwrap();
+            MaterializedView::open("cum", &view_dir, &source, None, StoreOptions::default())
+                .unwrap();
         source
             .mutate("UPDATE trades SET x = 50.0 WHERE ts = 2")
             .unwrap();
-        assert_eq!(view.refresh(&mut source).unwrap(), 1);
+        assert_eq!(view.refresh(&mut source, None).unwrap(), 1);
         drop(view);
         source
             .mutate("UPDATE trades SET x = 60.0 WHERE ts = 9")
@@ -3769,7 +4464,7 @@ mod tests {
         let mut db = Database::new();
         db.add_table(ro_source).unwrap();
         let ro_view =
-            MaterializedView::open_read_only("cum", &view_dir, db.table("trades").unwrap())
+            MaterializedView::open_read_only("cum", &view_dir, db.table("trades").unwrap(), None)
                 .unwrap();
         db.add_view(ro_view).unwrap();
         assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 8);
@@ -3892,7 +4587,7 @@ mod tests {
     fn ineligible_cumulative_definitions_are_refused_by_name() {
         let source = source();
         let refused = |sql: &str, needle: &str| {
-            let error = MaterializedView::new("v", sql, &source)
+            let error = MaterializedView::new("v", sql, &source, None)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
@@ -4046,7 +4741,7 @@ mod tests {
         ]);
         let source = Table::new("t", schema, "ts").unwrap();
         let refused = |sql: &str| {
-            let error = MaterializedView::new("v", sql, &source)
+            let error = MaterializedView::new("v", sql, &source, None)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
@@ -4057,7 +4752,13 @@ mod tests {
         refused("SELECT sum(x) AS __row FROM t");
         // A bucketed view mints no hidden names and keeps the wider
         // name space — the prefix rule is the partials shapes' alone.
-        MaterializedView::new("ok", "SELECT ts, sum(x) AS s FROM t GROUP BY ts", &source).unwrap();
+        MaterializedView::new(
+            "ok",
+            "SELECT ts, sum(x) AS s FROM t GROUP BY ts",
+            &source,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4072,11 +4773,12 @@ mod tests {
             "r",
             "SELECT sym, avg(x) AS a FROM trades GROUP BY sym",
             &source,
+            None,
         )
         .unwrap();
         let names: Vec<&str> = running.schema().fields().iter().map(|f| f.name()).collect();
         assert_eq!(names, ["sym", "a"]);
-        let bucketed = MaterializedView::new("b", OHLC, &source).unwrap();
+        let bucketed = MaterializedView::new("b", OHLC, &source, None).unwrap();
         let names: Vec<&str> = bucketed
             .schema()
             .fields()
@@ -4201,5 +4903,448 @@ mod tests {
         assert_running_matches(&db, "totals", RUNNING_COLUMNS);
         db.refresh_view("cum").unwrap();
         assert_cumulative_matches(&db, "cum", CUMULATIVE_COLUMNS, 2001);
+    }
+
+    /// The blotter fixture: a fact table and a quote history whose
+    /// streams interleave — facts run AHEAD of quotes at the frontier,
+    /// which is exactly the min-frontier case the ceiling exists for.
+    fn blotter_db() -> Database {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..20 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        // Quotes every 4 ticks per symbol, frontier at 12 — trades
+        // 13..19 run ahead of every quote.
+        for (qts, sym, bid) in [
+            (0, "A", 1.0),
+            (1, "B", 2.0),
+            (4, "A", 1.4),
+            (5, "B", 2.5),
+            (8, "A", 1.8),
+            (9, "B", 2.9),
+            (12, "A", 1.12),
+        ] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    const BLOTTER: &str = "SELECT ts, sym, x, bid FROM trades \
+         ASOF LEFT JOIN quotes ON trades.sym = quotes.sym";
+
+    /// The blotter A/B: the view's answer against the SAME join run
+    /// directly over the base tables — an independent leg (the direct
+    /// join never touches view machinery), exact at every state.
+    fn assert_blotter_matches(db: &Database, view: &str) {
+        let through = db
+            .query(&format!("SELECT ts, sym, x, bid FROM {view}"))
+            .unwrap();
+        let direct = db.query(BLOTTER).unwrap();
+        assert_eq!(
+            sorted_rows(&through),
+            sorted_rows(&direct),
+            "blotter view '{view}' diverged from the direct join"
+        );
+        assert!(through.num_rows() > 0, "vacuous blotter check");
+    }
+
+    #[test]
+    fn a_blotter_view_answers_exactly_through_every_state() {
+        let mut db = blotter_db();
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        assert_eq!(db.view("blotter").unwrap().dimension(), Some("quotes"));
+        // Stale: nothing folded, the whole answer is the live join.
+        assert_blotter_matches(&db, "blotter");
+        // First refresh: the ceiling lands at the quote frontier (12),
+        // so exactly the trades below it materialize; the tail 12..19
+        // stays live — and the answer is identical either way.
+        let folded = db.refresh_view("blotter").unwrap();
+        assert_eq!(folded, 12, "trades 0..=11 sit below the frontier");
+        assert_blotter_matches(&db, "blotter");
+        // In-order quote appends land ABOVE the ceiling: no
+        // materialized row dirties, the answer stays exact unrefreshed
+        // (the min-frontier property).
+        for (qts, sym, bid) in [(13, "B", 2.13), (16, "A", 1.16)] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        assert_blotter_matches(&db, "blotter"); // stale, still exact
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        // A LATE quote strictly below the ceiling: a correction. Its
+        // blast radius is [6, 8) for B — the interval lemma — and the
+        // unrefreshed read must already fold it live.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(6),
+                storage_lite::RowValue::Key("B"),
+                storage_lite::RowValue::F64(9.9),
+            ],
+        )
+        .unwrap();
+        assert_blotter_matches(&db, "blotter"); // dirty, unrefreshed
+        let folded = db.refresh_view("blotter").unwrap();
+        assert!(folded >= 1, "the late quote dirtied its interval");
+        assert_blotter_matches(&db, "blotter");
+        // Amend and then delete a quote below the ceiling: the value
+        // flips, then falls back to the predecessor — the delete
+        // branch of the lemma.
+        db.mutate("UPDATE quotes SET bid = 7.7 WHERE qts = 4")
+            .unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.mutate("DELETE FROM quotes WHERE qts = 4").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        // Fact-side corrections repair through the fact stamp.
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.mutate("DELETE FROM trades WHERE ts = 7").unwrap();
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        // Compaction on either side changes nothing.
+        db.compact("trades").unwrap();
+        db.compact("quotes").unwrap();
+        assert_blotter_matches(&db, "blotter");
+    }
+
+    #[test]
+    fn a_blotter_correction_repairs_its_interval_not_the_prefix() {
+        // The interval lemma, priced: a late quote at t dirties
+        // [t, next quote for that symbol) — and nothing else, so the
+        // refresh count equals that interval's width (plus nothing).
+        let mut db = blotter_db();
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        db.refresh_view("blotter").unwrap();
+        // Late quote for A at 2: A's next quote is 4, so the interval
+        // is [2, 4) — but the fold rounds to whole keys of BOTH
+        // symbols in [2, 3], which is 2 keys.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(2),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::F64(8.8),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.refresh_view("blotter").unwrap(), 2);
+        assert_blotter_matches(&db, "blotter");
+        // A tie correction (cycle 0's rule, end to end): a second
+        // quote at A's qts = 8 — its rebirth is the newest knowledge
+        // at that timestamp, and the blotter must serve it.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(8),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::F64(4.4),
+            ],
+        )
+        .unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.compact("quotes").unwrap();
+        assert_blotter_matches(&db, "blotter");
+    }
+
+    #[test]
+    fn a_blotter_persists_its_pair_stamp_and_serves_read_only() {
+        let dir = std::env::temp_dir().join(format!("tallydb-blotter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let trades_dir = dir.join("trades");
+        let quotes_dir = dir.join("quotes");
+        let view_dir = dir.join("blotter");
+        for sub in [&trades_dir, &quotes_dir, &view_dir] {
+            std::fs::create_dir_all(sub).unwrap();
+        }
+        let mut trades = Table::persistent("trades", m1_schema(), "ts", &trades_dir).unwrap();
+        let mut quotes = Table::persistent(
+            "quotes",
+            arrow_lite::Schema::new(vec![
+                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            ]),
+            "qts",
+            &quotes_dir,
+        )
+        .unwrap();
+        for i in 0..10 {
+            trades.append(&linear_row(i)).unwrap();
+        }
+        for (qts, sym, bid) in [(0, "A", 1.0), (1, "B", 2.0), (6, "A", 1.6), (7, "B", 2.7)] {
+            quotes
+                .append(&[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ])
+                .unwrap();
+        }
+        {
+            let mut view =
+                MaterializedView::persistent("blotter", BLOTTER, &trades, Some(&quotes), &view_dir)
+                    .unwrap();
+            view.refresh(&mut trades, Some(&mut quotes)).unwrap();
+        }
+        // The record is v3: both stamps and the ceiling round-trip.
+        let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
+        let (stamp, _, source_name, _, join) = decode_definition(&record).unwrap();
+        assert!(stamp > 0);
+        assert_eq!(source_name, "trades");
+        let join = join.expect("a blotter records its dimension");
+        assert_eq!(join.dimension, "quotes");
+        assert!(join.stamp > 0);
+        assert_eq!(join.ceiling, 7, "the ceiling is the quote frontier");
+        assert_eq!(
+            MaterializedView::stored_dimension(&view_dir)
+                .unwrap()
+                .as_deref(),
+            Some("quotes")
+        );
+        // Reopen writable: the pair survives; a correction below the
+        // ceiling repairs.
+        let mut view = MaterializedView::open(
+            "blotter",
+            &view_dir,
+            &trades,
+            Some(&quotes),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        quotes
+            .mutate("UPDATE quotes SET bid = 9.0 WHERE qts = 0")
+            .unwrap();
+        assert!(view.refresh(&mut trades, Some(&mut quotes)).unwrap() >= 1);
+        drop(view);
+        // Opening without the dimension is refused by name; so is a
+        // wrong pairing.
+        let error =
+            MaterializedView::open("blotter", &view_dir, &trades, None, StoreOptions::default())
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("joins 'quotes'"), "{error}");
+        // Read-only over both tables: exact answers, refresh refused —
+        // including a stale correction only the union can serve.
+        quotes
+            .mutate("UPDATE quotes SET bid = 6.0 WHERE qts = 6")
+            .unwrap();
+        quotes.flush().unwrap();
+        trades.flush().unwrap();
+        drop(quotes);
+        drop(trades);
+        let ro_trades = Table::open_read_only("trades", &trades_dir).unwrap();
+        let ro_quotes = Table::open_read_only("quotes", &quotes_dir).unwrap();
+        let mut db = Database::new();
+        db.add_table(ro_trades).unwrap();
+        db.add_table(ro_quotes).unwrap();
+        let ro_view = MaterializedView::open_read_only(
+            "blotter",
+            &view_dir,
+            db.table("trades").unwrap(),
+            Some(db.table("quotes").unwrap()),
+        )
+        .unwrap();
+        db.add_view(ro_view).unwrap();
+        assert_blotter_matches(&db, "blotter");
+        assert!(db.refresh_view("blotter").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blotter_refusals_are_by_name() {
+        let mut db = blotter_db();
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        // AS OF on a join view: one coordinate cannot span two
+        // sequence spaces (refusal parity with the base; #99).
+        let error = db
+            .query("SELECT ts, bid FROM blotter ASOF 5")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("#99"), "{error}");
+        // '_seq' on a view: unchanged refusal, doubly true here.
+        let error = db
+            .query("SELECT ts, _seq FROM blotter")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'_seq' on a maintained view"), "{error}");
+        // The refresh arity errors, both directions: a join view
+        // without its dimension, and a single-source view given one.
+        let mut arity = blotter_db();
+        arity.create_materialized_view("b2", BLOTTER).unwrap();
+        let mut trades = Table::new("trades", m1_schema(), "ts").unwrap();
+        let mut quotes_alone = Table::new(
+            "quotes",
+            arrow_lite::Schema::new(vec![
+                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            ]),
+            "qts",
+        )
+        .unwrap();
+        let mut standalone =
+            MaterializedView::new("b3", BLOTTER, &trades, Some(&quotes_alone)).unwrap();
+        let error = standalone
+            .refresh(&mut trades, None)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refresh with both tables"), "{error}");
+        let mut single = MaterializedView::new("s", OHLC, &trades, None).unwrap();
+        let error = single
+            .refresh(&mut trades, Some(&mut quotes_alone))
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single-source view"), "{error}");
+        // Definition-door refusals.
+        let refused = |sql: &str, needle: &str| {
+            let error = {
+                let mut db = blotter_db();
+                db.create_materialized_view("v", sql).map(|_| ())
+            }
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(needle), "{sql}: {error}");
+        };
+        refused(
+            "SELECT sym, x, bid FROM trades ASOF LEFT JOIN quotes \
+             ON trades.sym = quotes.sym",
+            "omits the fact ordering key",
+        );
+        refused(
+            "SELECT ts, sym, x + 0.0 AS xx, bid FROM trades ASOF LEFT JOIN quotes \
+             ON trades.sym = quotes.sym",
+            "computed expression",
+        );
+        refused(
+            "SELECT DISTINCT ts, sym FROM trades ASOF LEFT JOIN quotes \
+             ON trades.sym = quotes.sym",
+            "DISTINCT",
+        );
+        refused(
+            "SELECT ts, sym, bid FROM trades ASOF LEFT JOIN quotes \
+             ON trades.sym = quotes.sym ORDER BY ts",
+            "ORDER BY / LIMIT / OFFSET",
+        );
+        refused(
+            "SELECT ts, sym, \
+             sum(x) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s, \
+             bid FROM trades ASOF LEFT JOIN quotes ON trades.sym = quotes.sym",
+            "window over a join",
+        );
+    }
+
+    #[test]
+    fn a_late_quote_repairs_to_its_own_symbols_next_not_the_global_next() {
+        // The seam F5 exists for, made discriminating: after a late
+        // quote for A at 2, A's own next quote is 20 — but ANOTHER
+        // symbol's quote sits at 10. A symbol-blind endpoint would
+        // stop the repair interval at [2, 10) and leave the A-fact at
+        // ts = 15 silently matched to the OLD quote; the sound
+        // interval [2, 20) re-folds it.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Facts: A on even keys through 24 — 15 is B, so use 14/16.
+        for i in 0..24 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        for (qts, sym, bid) in [
+            (0, "A", 1.0),
+            (1, "B", 2.0),
+            (10, "B", 3.0),
+            (20, "A", 4.0),
+            (21, "B", 5.0),
+        ] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        db.refresh_view("blotter").unwrap();
+        // The late quote: A at 2. Its interval ends at A's OWN next
+        // (20), not the global next (10); A-facts at 12..18 sit
+        // between the two and flip to bid 8.5.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(2),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::F64(8.5),
+            ],
+        )
+        .unwrap();
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        // Pin the flipped value directly, so this cannot pass by both
+        // legs sharing a wrong fold: the A-fact at 14 now carries the
+        // late quote's bid.
+        let row = db.query("SELECT bid FROM blotter WHERE ts = 14").unwrap();
+        let bids = crate::table::tests::flatten(&row, 0);
+        assert_eq!(bids, [Some(8.5)]);
     }
 }

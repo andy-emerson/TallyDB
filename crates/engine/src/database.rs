@@ -73,17 +73,27 @@ impl Database {
 
     /// Creates an in-memory maintained view (#83) over the named
     /// source table — a bucketed, running, or cumulative single-table
-    /// aggregate kept fresh by refresh; see [`MaterializedView`] for
-    /// the three shapes and what a definition may contain. The name
-    /// shares the table namespace.
+    /// aggregate, or a bare as-of join (the enriched blotter, whose
+    /// second table is resolved from the definition's own JOIN
+    /// clause) — kept fresh by refresh; see [`MaterializedView`] for
+    /// the shapes and what a definition may contain. The name shares
+    /// the table namespace.
     pub fn create_materialized_view(&mut self, name: &str, sql: &str) -> Result<(), EngineError> {
         self.claim_name(name)?;
-        let source_name = plan(sql)?.table;
+        let lowered = plan(sql)?;
         let source = self
             .tables
-            .get(&source_name)
-            .ok_or_else(|| EngineError::UnknownTable(source_name.clone()))?;
-        let view = MaterializedView::new(name, sql, source)?;
+            .get(&lowered.table)
+            .ok_or_else(|| EngineError::UnknownTable(lowered.table.clone()))?;
+        let dimension = match &lowered.join {
+            None => None,
+            Some(join) => Some(
+                self.tables
+                    .get(&join.dimension)
+                    .ok_or_else(|| EngineError::UnknownTable(join.dimension.clone()))?,
+            ),
+        };
+        let view = MaterializedView::new(name, sql, source, dimension)?;
         self.views.insert(name.to_owned(), view);
         Ok(())
     }
@@ -96,6 +106,11 @@ impl Database {
         self.claim_name(view.name())?;
         if !self.tables.contains_key(view.source()) {
             return Err(EngineError::UnknownTable(view.source().to_owned()));
+        }
+        if let Some(dimension) = view.dimension() {
+            if !self.tables.contains_key(dimension) {
+                return Err(EngineError::UnknownTable(dimension.to_owned()));
+            }
         }
         self.views.insert(view.name().to_owned(), view);
         Ok(())
@@ -123,11 +138,32 @@ impl Database {
             .views
             .get_mut(name)
             .ok_or_else(|| EngineError::UnknownTable(name.to_owned()))?;
-        let source = self
-            .tables
-            .get_mut(view.source())
-            .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
-        view.refresh(source)
+        match view.dimension().map(str::to_owned) {
+            None => {
+                let source = self
+                    .tables
+                    .get_mut(view.source())
+                    .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
+                view.refresh(source, None)
+            }
+            Some(dimension) => {
+                // Two disjoint mutable borrows from one map — the
+                // definition door refuses a self-join, so the names
+                // always differ.
+                let source_name = view.source().to_owned();
+                let [source, dimension] = self
+                    .tables
+                    .get_disjoint_mut([source_name.as_str(), dimension.as_str()]);
+                let source =
+                    source.ok_or_else(|| EngineError::UnknownTable(source_name.clone()))?;
+                let dimension = dimension.ok_or_else(|| {
+                    EngineError::UnknownTable(
+                        view.dimension().expect("matched Some above").to_owned(),
+                    )
+                })?;
+                view.refresh(source, Some(dimension))
+            }
+        }
     }
 
     /// Refreshes every maintained view, in arbitrary order — the
@@ -212,7 +248,15 @@ impl Database {
                     .tables
                     .get(view.source())
                     .ok_or_else(|| EngineError::UnknownTable(view.source().to_owned()))?;
-                return view.query_union(source, &plan);
+                let dimension = match view.dimension() {
+                    None => None,
+                    Some(name) => Some(
+                        self.tables
+                            .get(name)
+                            .ok_or_else(|| EngineError::UnknownTable(name.to_owned()))?,
+                    ),
+                };
+                return view.query_union(source, dimension, &plan);
             }
             return Err(EngineError::UnknownTable(plan.table.clone()));
         };

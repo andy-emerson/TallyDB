@@ -346,13 +346,24 @@ pub fn execute_join(
             registry,
         );
     };
-    // A join reads both sides whole (the gather touches every fact row
-    // and any dimension row a key can reach), so both sides materialize
-    // here; single-table pruning happens after the join, on the joined
-    // intermediate, exactly as before.
+    // The dimension side reads whole (any dimension row is reachable
+    // from any fact key); the fact side prunes FIRST: a fact segment
+    // whose zone maps prove the plan's predicate cannot match is never
+    // materialized or gathered. Sound because the predicate applies to
+    // the joined intermediate, where fact columns keep their names and
+    // values — a fact row the post-join filter would drop contributes
+    // no output row under INNER or LEFT alike — and `can_match`
+    // answers "might match" for any conjunct it cannot see (dimension
+    // columns resolve to nothing against the fact schema). This is
+    // what keeps a maintained join view's restricted re-fold (#83
+    // tranche 3) proportional to the dirty ranges, not the fact table.
     let fact_views = fact
         .handles
         .iter()
+        .filter(|handle| match &plan.predicate {
+            Some(predicate) => can_match(predicate, fact_schema, handle),
+            None => true,
+        })
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
     let fact_views = &fact_views[..];

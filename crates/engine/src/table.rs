@@ -487,6 +487,30 @@ impl Table {
         self.store.next_sequence()
     }
 
+    /// As [`Table::execute_join_plan`], over zero segments — the
+    /// executor's own output schema for a join, with no rows paid for
+    /// (the join-view analogue of [`Table::execute_plan_empty`]).
+    pub(crate) fn execute_join_plan_empty(
+        &self,
+        plan: &Plan,
+        dimension: &Table,
+    ) -> Result<QueryOutput, EngineError> {
+        Ok(query_lite::execute_join(
+            query_lite::JoinSide {
+                schema: self.store.schema(),
+                handles: &[],
+                ordering_key: self.store.ordering_key(),
+            },
+            query_lite::JoinSide {
+                schema: dimension.store.schema(),
+                handles: &[],
+                ordering_key: dimension.store.ordering_key(),
+            },
+            plan,
+            &self.current_registry(),
+        )?)
+    }
+
     /// Runs a join plan with `self` as the fact table (the database
     /// handle resolves the dimension and calls this).
     pub(crate) fn execute_join_plan(

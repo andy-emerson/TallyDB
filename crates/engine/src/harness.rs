@@ -953,10 +953,17 @@ impl ViewContext {
                         name,
                         dir.join(name),
                         &table,
+                        None,
                         storage_lite::StoreOptions::default(),
                     )
                 } else {
-                    crate::MaterializedView::persistent(name, definition, &table, dir.join(name))
+                    crate::MaterializedView::persistent(
+                        name,
+                        definition,
+                        &table,
+                        None,
+                        dir.join(name),
+                    )
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;

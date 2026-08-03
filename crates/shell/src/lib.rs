@@ -72,10 +72,19 @@ fn open_view(
     let source = database.table(&source_name).ok_or_else(|| {
         format!("view '{name}' is over '{source_name}', which this directory does not hold")
     })?;
+    // A join view's record also names its dimension (#83 tranche 3).
+    let dimension_name = MaterializedView::stored_dimension(path)
+        .map_err(|error| format!("reading view '{name}': {error}"))?;
+    let dimension = match &dimension_name {
+        None => None,
+        Some(dimension) => Some(database.table(dimension).ok_or_else(|| {
+            format!("view '{name}' joins '{dimension}', which this directory does not hold")
+        })?),
+    };
     if read_only {
-        MaterializedView::open_read_only(name, path, source)
+        MaterializedView::open_read_only(name, path, source, dimension)
     } else {
-        MaterializedView::open(name, path, source, options)
+        MaterializedView::open(name, path, source, dimension, options)
     }
     .map_err(|error| format!("opening view '{name}': {error}"))
 }
@@ -1116,10 +1125,11 @@ mod tests {
                 "bars",
                 "SELECT ts / 4 AS bar, sum(x) AS s FROM trades GROUP BY ts / 4",
                 &source,
+                None,
                 &view_dir,
             )
             .unwrap();
-            view.refresh(&mut source).unwrap();
+            view.refresh(&mut source, None).unwrap();
             // A correction the view has NOT folded: the console's read
             // must still answer exactly, through the union read.
             source
