@@ -6330,4 +6330,30 @@ mod tests {
             .unwrap();
         assert_eq!(sorted_rows(&through), sorted_rows(&direct));
     }
+
+    #[test]
+    fn a_blotter_repairs_same_symbol_multi_corrections_in_one_window() {
+        // The interval lemma's hardest case: several corrections to
+        // ONE symbol land in a single refresh window, so a killed
+        // quote's current-state next skips other rows killed in the
+        // same window and the per-row intervals must union to cover
+        // every changed match. Amend A@8 (a kill-then-rebirth chain),
+        // kill the rebirth, and kill A@4 — the kill at 4's surviving
+        // next is 12, two touched rows away.
+        let mut db = blotter_db();
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        db.refresh_view("blotter").unwrap();
+        db.mutate("UPDATE quotes SET bid = 8.8 WHERE qts = 8")
+            .unwrap();
+        db.mutate("DELETE FROM quotes WHERE qts = 8").unwrap();
+        db.mutate("DELETE FROM quotes WHERE qts = 4").unwrap();
+        assert_blotter_matches(&db, "blotter"); // dirty, unrefreshed
+        let folded = db.refresh_view("blotter").unwrap();
+        assert!(folded >= 1, "the correction window dirtied its intervals");
+        assert_blotter_matches(&db, "blotter");
+        // The concrete fallback: with A@4 and both rows at A@8 dead,
+        // an A fact between them reaches all the way back to A@0.
+        let bid = db.query("SELECT bid FROM blotter WHERE ts = 10").unwrap();
+        assert_eq!(crate::table::tests::flatten(&bid, 0), [Some(1.0)]);
+    }
 }
