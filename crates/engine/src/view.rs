@@ -7,15 +7,20 @@
 //! table (segments, WAL, `AS OF` — all inherited) holding the result of
 //! a bucketed aggregate query, plus a **stamp** — the source table's
 //! ingest-sequence watermark below which the materialization is
-//! complete. Everything at or above the stamp is the view's tail, not
-//! yet folded; a refresh (cycle 2) folds it and advances the stamp.
-//! Corrections need no bookkeeping of their own: the buckets they touch
-//! are **derivable** from the source's knowledge history — buckets
-//! touched by any coordinate in `(stamp, now]` — so the only state that
-//! must persist correctly is the stamp itself, and a crash anywhere
-//! simply leaves it old, which the next refresh heals. Repair is always
-//! re-fold-from-base (uniform repair, ruled 2026-08-02 on #83): no
-//! accumulator state, no delta arithmetic, no f64 subtraction hazard.
+//! complete. Everything at or above the stamp is the view's unfolded
+//! tail; a refresh folds it and advances the stamp, and a query never
+//! waits for one: the **union read** answers exactly at every
+//! knowledge coordinate — clean materialized buckets plus a live fold
+//! of whatever the stamp does not cover. Corrections need no
+//! bookkeeping of their own: the buckets they touch are **derivable**
+//! from the source's knowledge history, so the only durable view state
+//! is the stamp, written strictly after the materialization it
+//! describes is flushed — everything a stamp covers therefore survives
+//! any crash the source's own WAL contract admits, and a crash
+//! elsewhere just leaves the stamp old, which the next refresh heals.
+//! Repair is always re-fold-from-base (uniform repair, ruled
+//! 2026-08-02 on #83): no accumulator state, no delta arithmetic, no
+//! f64 subtraction hazard.
 //!
 //! ## What tranche 1 admits, and why the line sits there
 //!
@@ -63,8 +68,8 @@ pub struct MaterializedView {
     /// view's bucket column.
     table: Table,
     /// The definition, verbatim SQL — the durable form. The lowered
-    /// plan is re-derived from it wherever needed (the refresh will
-    /// hold one), never persisted.
+    /// plan is re-derived from it wherever needed (each refresh and
+    /// union read builds a [`Definition`]), never persisted.
     sql: String,
     /// The source table's name.
     source: String,

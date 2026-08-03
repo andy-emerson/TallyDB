@@ -723,6 +723,10 @@ covar_pop/corr/eigen_max and LAG/LEAD, with PARTITION BY over symbols
 or the ordering key; scalar expressions, incl. over window results;
 CASE; IS NULL; LIKE on symbols), INSERT, UPDATE, DELETE,
 CREATE TABLE (BIGINT | DOUBLE | SYMBOL, one ORDERING KEY column).
+Maintained views open from their directories and answer exactly via
+the union read; query them like tables (writes to them are refused —
+correct the base). Creating and refreshing views is engine-API-only
+for now (#83, surface ruled API-first).
 
 Commands:
   .help                     this text
