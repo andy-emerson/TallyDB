@@ -81,6 +81,11 @@ pub struct MaterializedView {
     /// a freshly created view materializes nothing; the first refresh
     /// folds everything below the then-current watermark.
     stamp: u64,
+    /// A running view's hidden-bucket width in ordering-key units;
+    /// `0` = not yet chosen (the first refresh with data chooses it
+    /// from the observed key span and persists it). Bucketed views
+    /// carry it as 0, unused.
+    width: u64,
     /// Where the definition record persists; `None` for in-memory
     /// views, whose stamp lives only as long as they do.
     dir: Option<std::path::PathBuf>,
@@ -101,6 +106,7 @@ impl MaterializedView {
             sql: sql.to_owned(),
             source: source.name().to_owned(),
             stamp: 0,
+            width: 0,
             dir: None,
             read_only: false,
         })
@@ -122,6 +128,7 @@ impl MaterializedView {
             sql: sql.to_owned(),
             source: source.name().to_owned(),
             stamp: 0,
+            width: 0,
             dir: Some(dir.as_ref().to_path_buf()),
             read_only: false,
         };
@@ -141,13 +148,14 @@ impl MaterializedView {
         source: &Table,
         options: StoreOptions,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
         let table = Table::open(name, dir.as_ref(), options)?;
         Ok(MaterializedView {
             table,
             sql,
             source: source_name,
             stamp,
+            width,
             dir: Some(dir.as_ref().to_path_buf()),
             read_only: false,
         })
@@ -165,13 +173,14 @@ impl MaterializedView {
         dir: impl AsRef<Path>,
         source: &Table,
     ) -> Result<MaterializedView, EngineError> {
-        let (stamp, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
+        let (stamp, width, source_name, sql) = read_definition(dir.as_ref(), name, source)?;
         let table = Table::open_read_only(name, dir.as_ref())?;
         Ok(MaterializedView {
             table,
             sql,
             source: source_name,
             stamp,
+            width,
             // Read-only: the stamp is never advanced, so nothing is
             // ever written back.
             dir: None,
@@ -185,7 +194,7 @@ impl MaterializedView {
     pub fn stored_source(dir: impl AsRef<Path>) -> Result<String, EngineError> {
         let record = std::fs::read(dir.as_ref().join(DEFINITION_FILE))
             .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-        let (_, source, _) = decode_definition(&record)?;
+        let (_, _, source, _) = decode_definition(&record)?;
         Ok(source)
     }
 
@@ -284,7 +293,34 @@ impl MaterializedView {
         }
         source.flush()?;
         let now = source.next_sequence();
-        let definition = Definition::of(&self.sql, source)?;
+        let mut definition = Definition::of(&self.sql, source, self.width)?;
+        if definition.running.is_some() && self.width == 0 {
+            // A running view's hidden-bucket width is chosen once, at
+            // the first refresh that sees data: the observed key span
+            // over a target bucket count. Heuristic, internal, and
+            // recorded in the definition record — a later re-widthing
+            // is a rebuild, not a format question.
+            match source_span(source)? {
+                None => {
+                    // No rows yet: nothing to fold, nothing to size.
+                    self.advance_stamp(now)?;
+                    return Ok(0);
+                }
+                Some((low, high)) => {
+                    const TARGET_BUCKETS: i128 = 1024;
+                    let span = (high as i128 - low as i128 + 1).max(1);
+                    let width = ((span + TARGET_BUCKETS - 1) / TARGET_BUCKETS).max(1) as u64;
+                    self.width = width;
+                    definition = Definition::of(&self.sql, source, width)?;
+                    // Persist the width before folding under it: a
+                    // crash between the two re-folds under the SAME
+                    // width, never a different one.
+                    if let Some(dir) = self.dir.clone() {
+                        self.write_definition(&dir)?;
+                    }
+                }
+            }
+        }
         if now < self.stamp {
             // The source's watermark sits BELOW the stamp: with the
             // flush-then-stamp discipline this cannot come from a
@@ -356,7 +392,10 @@ impl MaterializedView {
                     .to_owned(),
             )));
         }
-        let definition = Definition::of(&self.sql, source)?;
+        let definition = Definition::of(&self.sql, source, self.width)?;
+        if let Some(running) = &definition.running {
+            return self.query_running(source, &definition, running, user_plan);
+        }
         if let Some(cut) = user_plan.as_of {
             let mut past = definition.plan.clone();
             past.as_of = Some(cut);
@@ -375,6 +414,61 @@ impl MaterializedView {
         clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
         let clean = self.table.execute_plan(&clean)?;
         self.over_scratch(clean.batches.into_iter(), fresh, user_plan)
+    }
+
+    /// The running view's read: partials in, answers out.
+    ///
+    /// `AS OF` and the not-yet-sized view (width 0, nothing ever
+    /// folded) recompute the **user definition** directly over the
+    /// source — it is ordinary SQL there, and for `AS OF` that IS the
+    /// definition of the answer. Otherwise: the partials union (clean
+    /// materialized buckets + a live partial fold of everything the
+    /// stamp does not cover) runs through the **combine** — a
+    /// symbol-keyed aggregate reassembling cross-bucket totals — and
+    /// **finalize** turns combined columns into the user-facing row
+    /// shape (`AVG` divides here, once). The user's query then runs
+    /// over that row set as scratch.
+    fn query_running(
+        &self,
+        source: &Table,
+        definition: &Definition,
+        running: &RunningRead,
+        user_plan: &Plan,
+    ) -> Result<query_lite::QueryOutput, EngineError> {
+        let mut current = user_plan.clone();
+        current.as_of = None;
+        if user_plan.as_of.is_some() || self.width == 0 {
+            let mut recompute = running.user.clone();
+            recompute.as_of = user_plan.as_of;
+            let answers = source.execute_plan(&recompute)?;
+            return run_over_output(&running.output, answers.batches, &current, source);
+        }
+        let partials = match definition.touched_runs(source, self.stamp)? {
+            None => self.table.execute_plan(&select_everything(&self.table)?)?,
+            Some(runs) => {
+                let fresh = source.execute_plan(&definition.restricted_to(&runs, source))?;
+                let mut clean = select_everything(&self.table)?;
+                clean.predicate = Some(Predicate::Not(Box::new(definition.view_ranges(&runs))));
+                let mut clean = self.table.execute_plan(&clean)?;
+                clean.batches.extend(fresh.batches);
+                clean
+            }
+        };
+        let combined = self.over_scratch(
+            partials.batches.into_iter(),
+            query_lite::QueryOutput {
+                schema: self.table.schema().clone(),
+                batches: Vec::new(),
+            },
+            &running.combine,
+        )?;
+        let finalized = finalize_combined(running, &combined)?;
+        run_over_output(
+            &running.output,
+            finalized.into_iter().collect(),
+            &current,
+            source,
+        )
     }
 
     /// Runs `user_plan` over an ad-hoc union of view-shaped batches, as
@@ -444,7 +538,7 @@ impl MaterializedView {
     /// two leaves an old stamp and the next refresh re-folds — never a
     /// stamp describing a materialization that does not exist.
     fn write_definition(&self, dir: &Path) -> Result<(), EngineError> {
-        let record = encode_definition(self.stamp, &self.source, &self.sql);
+        let record = encode_definition(self.stamp, self.width, &self.source, &self.sql);
         let path = dir.join(DEFINITION_FILE);
         let staging = dir.join(format!("{DEFINITION_FILE}.staging"));
         std::fs::write(&staging, &record)
@@ -462,10 +556,10 @@ fn read_definition(
     dir: &Path,
     name: &str,
     source: &Table,
-) -> Result<(u64, String, String), EngineError> {
+) -> Result<(u64, u64, String, String), EngineError> {
     let record = std::fs::read(dir.join(DEFINITION_FILE))
         .map_err(|error| definition_error(format!("reading {DEFINITION_FILE}: {error}")))?;
-    let (stamp, source_name, sql) = decode_definition(&record)?;
+    let (stamp, width, source_name, sql) = decode_definition(&record)?;
     if source_name != source.name() {
         return Err(definition_error(format!(
             "view '{name}' is over '{source_name}', not '{}'",
@@ -473,30 +567,78 @@ fn read_definition(
         )));
     }
     validated_definition(&sql, source)?;
-    Ok((stamp, source_name, sql))
+    Ok((stamp, width, source_name, sql))
 }
 
 /// A lowered, validated view definition plus its bucket arithmetic —
 /// what both halves of the machinery share: the refresh restricts and
-/// folds with it, the union read restricts and tops up with it.
+/// folds with it, the union read restricts and tops up with it. For a
+/// running view, `plan` is the **synthesized partials materialization**
+/// (a legal bucketed plan over the hidden bucket), and `running`
+/// carries what the read needs to reassemble the user-facing answer.
 struct Definition {
     plan: Plan,
     bucket_name: String,
     divide: i64,
     view_scale: i64,
+    running: Option<RunningRead>,
+}
+
+/// The read-side half of a running view: how partials become answers.
+struct RunningRead {
+    /// The user definition, verbatim-lowered — directly executable
+    /// over the source, which is what `AS OF` and the rebuild/unsized
+    /// paths run.
+    user: Plan,
+    /// The combine: a symbol-keyed aggregate over the partials, run on
+    /// the partials union as scratch. Its output is
+    /// `[user keys…, combined partials…]` in user-item order.
+    combine: Plan,
+    /// Finalize steps, one per user output column, over the combine's
+    /// output columns by index.
+    finalize: Vec<FinalStep>,
+    /// The user-facing output schema (from the user plan), plus the
+    /// appended `__row` scratch ordering key as its last field.
+    output: Schema,
+}
+
+/// One user output column, assembled from combined-partial columns.
+enum FinalStep {
+    /// The combined column at this index passes through (keys, SUM,
+    /// MIN, MAX, FIRST, LAST).
+    Pass(usize),
+    /// `COUNT`: the combined column with NULL grounded to zero — a
+    /// count's combine is a SUM of counts, and SUM over an empty
+    /// group is NULL where COUNT is 0.
+    CountZero(usize),
+    /// `AVG`: combined sum over combined count, NULL where the count
+    /// is zero — the division happens once, after the cross-bucket
+    /// combine, never per bucket.
+    AvgDivide { sum: usize, count: usize },
 }
 
 impl Definition {
-    fn of(sql: &str, source: &Table) -> Result<Definition, EngineError> {
+    /// Builds the definition for `sql` over `source`. `width` is a
+    /// running view's hidden-bucket width in ordering-key units — `0`
+    /// means not yet chosen (the first refresh with data chooses it),
+    /// and the caller must not fold with an unsized definition; a
+    /// placeholder width of 1 keeps the synthesized plan well-formed
+    /// for schema derivation.
+    fn of(sql: &str, source: &Table, width: u64) -> Result<Definition, EngineError> {
         let plan = lower_plan(sql).map_err(EngineError::Query)?;
-        let (bucket, bucket_name) = eligible_shape(&plan, source)?;
-        let (divide, view_scale) = bucket_arithmetic(&bucket);
-        Ok(Definition {
-            plan,
-            bucket_name,
-            divide,
-            view_scale,
-        })
+        match eligible_shape(&plan, source)? {
+            Shape::Bucketed(bucket, bucket_name) => {
+                let (divide, view_scale) = bucket_arithmetic(&bucket);
+                Ok(Definition {
+                    plan,
+                    bucket_name,
+                    divide,
+                    view_scale,
+                    running: None,
+                })
+            }
+            Shape::Running => synthesize_running(plan, source, width.max(1) as i64),
+        }
     }
 
     /// The touched buckets since `stamp`, as maximal runs of
@@ -555,6 +697,303 @@ impl Definition {
     }
 }
 
+/// Synthesizes a running view's machinery from its user plan: the
+/// partials materialization plan (bucketed on the hidden bucket — a
+/// legal tranche-1 plan, which is what lets refresh, touched-bucket
+/// derivation, and the stamp serve running views unchanged), the
+/// combine plan, and the finalize steps.
+fn synthesize_running(user: Plan, source: &Table, width: i64) -> Result<Definition, EngineError> {
+    use crate::partials::{decompose, HIDDEN_BUCKET};
+    use query_lite::{AggItem, Projection as Proj};
+    let Proj::Aggregate { keys, items, .. } = &user.projection else {
+        unreachable!("classified Running from an aggregate projection")
+    };
+    // The materialization: user keys + the hidden bucket, user key
+    // items + the bucket item + the partial calls.
+    let mut internal_keys = keys.clone();
+    internal_keys.push(GroupKey::Bucket {
+        column: source.ordering_key().to_owned(),
+        divide: width,
+        multiply: None,
+    });
+    let mut internal_items: Vec<AggItem> = Vec::new();
+    let mut combine_items: Vec<AggItem> = Vec::new();
+    let mut finalize: Vec<FinalStep> = Vec::new();
+    let mut partial_index = 0usize;
+    let mut combined_index = 0usize;
+    for item in items {
+        match item {
+            AggItem::Key { .. } => {
+                internal_items.push(item.clone());
+                combine_items.push(item.clone());
+                finalize.push(FinalStep::Pass(combined_index));
+                combined_index += 1;
+            }
+            AggItem::Call(call) => {
+                let decomposition = decompose(call, partial_index);
+                partial_index += decomposition.partials.len();
+                for partial in decomposition.partials {
+                    internal_items.push(AggItem::Call(partial));
+                }
+                let combined_first = combined_index;
+                combined_index += decomposition.combines.len();
+                let form = decomposition.form;
+                for combine in decomposition.combines {
+                    combine_items.push(AggItem::Call(combine));
+                }
+                finalize.push(match form {
+                    crate::partials::PartialForm::SumCount => FinalStep::AvgDivide {
+                        sum: combined_first,
+                        count: combined_first + 1,
+                    },
+                    crate::partials::PartialForm::Count => FinalStep::CountZero(combined_first),
+                    _ => FinalStep::Pass(combined_first),
+                });
+            }
+        }
+    }
+    internal_items.push(AggItem::Key {
+        key: GroupKey::Bucket {
+            column: source.ordering_key().to_owned(),
+            divide: width,
+            multiply: None,
+        },
+        alias: Some(HIDDEN_BUCKET.to_owned()),
+    });
+    let internal = Plan {
+        table: user.table.clone(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: internal_keys,
+            items: internal_items,
+            having: None,
+        },
+        distinct: false,
+        predicate: user.predicate.clone(),
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    // The combine groups by the user's symbol keys alone — the hidden
+    // bucket has done its job once the partials are assembled.
+    let combine = Plan {
+        table: user.table.clone(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: keys.clone(),
+            items: combine_items,
+            having: None,
+        },
+        distinct: false,
+        predicate: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    // The user-facing output schema, from the user plan itself — plus
+    // `__row`, the finalized scratch's ordering key (a running answer
+    // has no natural i64 axis; scratch segments need one).
+    let mut output_fields: Vec<Field> = source
+        .execute_plan_empty(&user)?
+        .schema
+        .fields()
+        .iter()
+        .map(|field| {
+            // Every aggregate output can be NULL (the average of an
+            // emptied group, say), and finalize always builds a
+            // validity bitmap for AVG — so non-key outputs are
+            // nullable in the scratch schema regardless of what the
+            // executor inferred over zero rows.
+            if field.column_type() == ColumnType::Key {
+                field.clone()
+            } else {
+                Field::new(field.name(), field.column_type(), true)
+            }
+        })
+        .collect();
+    output_fields.push(Field::new("__row", ColumnType::I64, false));
+    Ok(Definition {
+        plan: internal,
+        bucket_name: crate::partials::HIDDEN_BUCKET.to_owned(),
+        divide: width,
+        view_scale: 1,
+        running: Some(RunningRead {
+            user,
+            combine,
+            finalize,
+            output: Schema::new(output_fields),
+        }),
+    })
+}
+
+/// The source's ordering-key span `(min, max)`, `None` when empty —
+/// what sizes a running view's hidden bucket. Runs as one global
+/// aggregate; exactness past 2^53 is irrelevant here because the width
+/// is a heuristic, not a semantic.
+fn source_span(source: &Table) -> Result<Option<(i64, i64)>, EngineError> {
+    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    let call = |function, alias: &str| {
+        AggItem::Call(AggCall {
+            function,
+            argument: Some(source.ordering_key().to_owned()),
+            alias: Some(alias.to_owned()),
+        })
+    };
+    let plan = Plan {
+        table: source.name().to_owned(),
+        join: None,
+        projection: Proj::Aggregate {
+            keys: Vec::new(),
+            items: vec![
+                call(AggFunction::Min, "__lo"),
+                call(AggFunction::Max, "__hi"),
+            ],
+            having: None,
+        },
+        distinct: false,
+        predicate: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        as_of: None,
+    };
+    let output = source.execute_plan(&plan)?;
+    let Some(batch) = output.batches.first().filter(|batch| batch.num_rows() > 0) else {
+        return Ok(None);
+    };
+    let cell = |index: usize| -> Option<i64> {
+        use arrow_lite::{Column, NumericData};
+        match &batch.columns()[index] {
+            Column::Numeric(NumericData::I64(column)) => {
+                column.is_valid(0).then(|| column.values().as_slice()[0])
+            }
+            Column::Numeric(NumericData::F64(column)) => column
+                .is_valid(0)
+                .then(|| column.values().as_slice()[0] as i64),
+            Column::Key(_) => None,
+        }
+    };
+    Ok(match (cell(0), cell(1)) {
+        (Some(low), Some(high)) => Some((low, high)),
+        _ => None,
+    })
+}
+
+/// Turns the combine's output into the user-facing row shape: one
+/// column per finalize step, plus the `__row` scratch ordering key.
+/// `AVG` divides its combined sum by its combined count here — once,
+/// after the cross-bucket combine — and is NULL where the count is
+/// zero, standard SQL's average of nothing.
+fn finalize_combined(
+    running: &RunningRead,
+    combined: &query_lite::QueryOutput,
+) -> Result<Option<arrow_lite::RecordBatch>, EngineError> {
+    use arrow_lite::{Bitmap, Buffer, Column, NumericColumn, NumericData, RecordBatch};
+    // Collapsing stages materialize one batch (QueryOutput's contract);
+    // an empty result has none, and finalizes to none.
+    let Some(batch) = combined.batches.first() else {
+        return Ok(None);
+    };
+    let rows = batch.num_rows();
+    let mut columns: Vec<Column> = Vec::with_capacity(running.finalize.len() + 1);
+    for step in &running.finalize {
+        columns.push(match step {
+            FinalStep::Pass(index) => batch.columns()[*index].clone(),
+            FinalStep::CountZero(index) => {
+                let Column::Numeric(NumericData::I64(counts)) = &batch.columns()[*index] else {
+                    unreachable!("a COUNT combine is an exact i64 sum")
+                };
+                let values: Buffer<i64> = (0..rows)
+                    .map(|row| {
+                        if counts.is_valid(row) {
+                            counts.values().as_slice()[row]
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                Column::Numeric(NumericData::I64(NumericColumn::new_non_null(values)))
+            }
+            FinalStep::AvgDivide { sum, count } => {
+                let Column::Numeric(NumericData::F64(sums)) = &batch.columns()[*sum] else {
+                    unreachable!("an AVG decomposition's sum partial is f64")
+                };
+                let Column::Numeric(NumericData::I64(counts)) = &batch.columns()[*count] else {
+                    unreachable!("an AVG decomposition's count partial is i64")
+                };
+                let mut values = Vec::with_capacity(rows);
+                let mut validity = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    let count = if counts.is_valid(row) {
+                        counts.values().as_slice()[row]
+                    } else {
+                        0
+                    };
+                    let defined = count > 0 && sums.is_valid(row);
+                    validity.push(defined);
+                    values.push(if defined {
+                        sums.values().as_slice()[row] / count as f64
+                    } else {
+                        0.0
+                    });
+                }
+                Column::Numeric(NumericData::F64(NumericColumn::new_nullable(
+                    values.into_iter().collect(),
+                    Bitmap::from_bools(validity),
+                )))
+            }
+        });
+    }
+    columns.push(Column::Numeric(NumericData::I64(
+        NumericColumn::new_non_null((0..rows as i64).collect::<Buffer<i64>>()),
+    )));
+    Ok(Some(RecordBatch::new(running.output.clone(), columns)))
+}
+
+/// Runs `user_plan` over finished output rows as scratch, appending
+/// the `__row` axis where the rows arrived without one (the recompute
+/// paths, whose batches carry the bare user schema).
+fn run_over_output(
+    output: &Schema,
+    batches: Vec<arrow_lite::RecordBatch>,
+    user_plan: &Plan,
+    source: &Table,
+) -> Result<query_lite::QueryOutput, EngineError> {
+    use arrow_lite::{Column, NumericColumn, NumericData, RecordBatch};
+    use storage_lite::{Segment, SegmentHandle};
+    let ordering_key = output.fields().len() - 1; // __row, by construction
+    let handles: Vec<SegmentHandle> = batches
+        .into_iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .map(|batch| {
+            let batch = if batch.columns().len() == output.fields().len() {
+                batch
+            } else {
+                let rows = batch.num_rows() as i64;
+                let mut columns = batch.columns().to_vec();
+                columns.push(Column::Numeric(NumericData::I64(
+                    NumericColumn::new_non_null((0..rows).collect::<arrow_lite::Buffer<i64>>()),
+                )));
+                RecordBatch::new(output.clone(), columns)
+            };
+            SegmentHandle::resident(
+                std::sync::Arc::new(Segment::from_batch_unpruned(batch, ordering_key, true)),
+                None,
+            )
+        })
+        .collect();
+    query_lite::execute_with_ordering_key(
+        output,
+        &handles,
+        ordering_key,
+        user_plan,
+        &source.current_registry(),
+    )
+    .map_err(EngineError::Query)
+}
+
 /// A plan projecting every column of `table`, built structurally — an
 /// unaliased bucket's column name (`ts / 4`) cannot round-trip through
 /// SQL text, where it would parse as arithmetic.
@@ -593,7 +1032,9 @@ fn is_non_decreasing(batch: &arrow_lite::RecordBatch, index: usize) -> bool {
 }
 
 /// Lowers and validates a view definition against its source, returning
-/// the view table's schema and its ordering-key (bucket) column name.
+/// the **materialization** table's schema and its ordering-key column
+/// name — the definition's own bucket for a bucketed view, the hidden
+/// bucket of the partials for a running one.
 fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), EngineError> {
     let plan = lower_plan(sql).map_err(EngineError::Query)?;
     if plan.table != source.name() {
@@ -602,8 +1043,11 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
             got: plan.table,
         });
     }
-    let (_, bucket) = eligible_shape(&plan, source)?;
-    let schema = output_schema(&plan, source)?;
+    // A placeholder width of 1 keeps a running synthesis well-formed;
+    // the schema does not depend on the width's value.
+    let definition = Definition::of(sql, source, 1)?;
+    let bucket = definition.bucket_name.clone();
+    let schema = output_schema(&definition.plan, source)?;
     // The bucket column is the view table's ordering key; the executor
     // may mark aggregate outputs nullable, but a bucket of a NOT NULL
     // ordering key is never null, and Table::new requires NOT NULL.
@@ -621,11 +1065,21 @@ fn validated_definition(sql: &str, source: &Table) -> Result<(Schema, String), E
     Ok((Schema::new(fields), bucket))
 }
 
-/// The tranche-1 eligibility check: refuses, by name, every definition
-/// shape outside "single-table bucketed aggregate" — naming the tranche
-/// that will admit it where one is planned. Returns the bucket term and
-/// its output column name.
-fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), EngineError> {
+/// What kind of maintainable definition a plan is.
+enum Shape {
+    /// Tranche 1: a bucketed aggregate — the materialization IS the
+    /// answer, keyed on the definition's own bucket.
+    Bucketed(GroupKey, String),
+    /// Tranche 2: a running aggregate — no bucket in the definition,
+    /// so the materialization stores per-hidden-bucket **partials**
+    /// and the answer is assembled at read by combining them.
+    Running,
+}
+
+/// The eligibility check: classifies a definition as bucketed
+/// (tranche 1) or running (tranche 2), and refuses everything else by
+/// name — naming the tranche that will admit it where one is planned.
+fn eligible_shape(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
     let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
     if plan.as_of.is_some() {
         return refuse(
@@ -664,7 +1118,8 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), Eng
     else {
         return refuse(
             "a row-per-row view — a maintained view maintains aggregates; \
-             running and cumulative shapes are tranche 2 of #83",
+             cumulative window shapes are the remainder of tranche 2 \
+             (#83)",
         );
     };
     if having.is_some() {
@@ -673,16 +1128,47 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), Eng
              filter at read",
         );
     }
+    for key in keys {
+        if let GroupKey::Column(column) = key {
+            if column != source.ordering_key()
+                && source
+                    .schema()
+                    .fields()
+                    .iter()
+                    .any(|f| f.name() == column && f.column_type() != ColumnType::Key)
+            {
+                return refuse(
+                    "a non-symbol, non-bucket GROUP BY key in a view \
+                     definition — group by symbols and at most one bucket \
+                     of the ordering key",
+                );
+            }
+        }
+    }
     let mut bucket_terms = keys.iter().filter(|key| {
         matches!(key, GroupKey::Bucket { .. })
             || matches!(key, GroupKey::Column(column) if column == source.ordering_key())
     });
     let Some(bucket) = bucket_terms.next() else {
-        return refuse(
-            "a view with no bucket of the ordering key in GROUP BY — \
-             without one, a correction's blast radius is unbounded; \
-             running shapes are tranche 2 of #83",
-        );
+        // No bucket: a RUNNING aggregate — totals per symbol group, or
+        // one global row. The materialization stores per-hidden-bucket
+        // partials, so a correction's blast radius is one hidden
+        // bucket, never the whole answer. The reserved names the
+        // synthesis will add must be free.
+        for reserved in [crate::partials::HIDDEN_BUCKET] {
+            if source
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == reserved)
+            {
+                return refuse(
+                    "a running view over a source with a '__bucket' column — \
+                     the name is reserved for the partials materialization",
+                );
+            }
+        }
+        return Ok(Shape::Running);
     };
     if bucket_terms.next().is_some() {
         return refuse("two buckets of the ordering key in one GROUP BY");
@@ -705,23 +1191,6 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), Eng
             );
         }
     }
-    for key in keys {
-        if let GroupKey::Column(column) = key {
-            if column != source.ordering_key()
-                && source
-                    .schema()
-                    .fields()
-                    .iter()
-                    .any(|f| f.name() == column && f.column_type() != ColumnType::Key)
-            {
-                return refuse(
-                    "a non-symbol, non-bucket GROUP BY key in a view \
-                     definition — group by symbols and one bucket of the \
-                     ordering key",
-                );
-            }
-        }
-    }
     // The bucket is the view table's ordering key, so it must be a
     // SELECT output — and its output name is the alias when the query
     // wrote one.
@@ -740,7 +1209,7 @@ fn eligible_shape(plan: &Plan, source: &Table) -> Result<(GroupKey, String), Eng
                     .to_owned(),
             ))
         })?;
-    Ok((bucket.clone(), name))
+    Ok(Shape::Bucketed(bucket.clone(), name))
 }
 
 /// The bucket term's arithmetic: `(divide, view_scale)`. `divide` maps
@@ -831,14 +1300,18 @@ fn definition_error(message: String) -> EngineError {
     EngineError::Query(QueryError::Unsupported(message))
 }
 
-/// The definition record: `b"TDBV"`, a format version, the stamp, then
-/// length-prefixed source name and SQL, then CRC-32C of everything
-/// before it. Little-endian throughout, like the segment format.
-fn encode_definition(stamp: u64, source: &str, sql: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 2 + 8 + 8 + source.len() + sql.len() + 4);
+/// The definition record: `b"TDBV"`, a format version, the stamp, the
+/// hidden-bucket width (version 2's addition; 0 = unchosen or unused),
+/// then length-prefixed source name and SQL, then CRC-32C of
+/// everything before it. Little-endian throughout, like the segment
+/// format. Version 1 records (no width field) decode with width 0,
+/// which self-heals: a running view's first refresh chooses one.
+fn encode_definition(stamp: u64, width: u64, source: &str, sql: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 2 + 8 + 8 + 8 + source.len() + sql.len() + 4);
     out.extend_from_slice(b"TDBV");
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&stamp.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&(source.len() as u32).to_le_bytes());
     out.extend_from_slice(source.as_bytes());
     out.extend_from_slice(&(sql.len() as u32).to_le_bytes());
@@ -848,7 +1321,7 @@ fn encode_definition(stamp: u64, source: &str, sql: &str) -> Vec<u8> {
     out
 }
 
-fn decode_definition(bytes: &[u8]) -> Result<(u64, String, String), EngineError> {
+fn decode_definition(bytes: &[u8]) -> Result<(u64, u64, String, String), EngineError> {
     let corrupt = |what: &str| definition_error(format!("{DEFINITION_FILE} is corrupt: {what}"));
     if bytes.len() < 4 + 2 + 8 + 4 + 4 + 4 {
         return Err(corrupt("truncated"));
@@ -862,11 +1335,21 @@ fn decode_definition(bytes: &[u8]) -> Result<(u64, String, String), EngineError>
         return Err(corrupt("bad magic"));
     }
     let version = u16::from_le_bytes(payload[4..6].try_into().expect("sized"));
-    if version != 1 {
+    if version != 1 && version != 2 {
         return Err(corrupt(&format!("unknown version {version}")));
     }
     let stamp = u64::from_le_bytes(payload[6..14].try_into().expect("sized"));
-    let mut at = 14usize;
+    let (width, mut at) = if version == 2 {
+        if payload.len() < 22 {
+            return Err(corrupt("truncated width"));
+        }
+        (
+            u64::from_le_bytes(payload[14..22].try_into().expect("sized")),
+            22usize,
+        )
+    } else {
+        (0, 14usize)
+    };
     let mut read_string = |what: &str| -> Result<String, EngineError> {
         let len_end = at.checked_add(4).filter(|&e| e <= payload.len());
         let Some(len_end) = len_end else {
@@ -883,7 +1366,7 @@ fn decode_definition(bytes: &[u8]) -> Result<(u64, String, String), EngineError>
     };
     let source = read_string("source name")?;
     let sql = read_string("definition SQL")?;
-    Ok((stamp, source, sql))
+    Ok((stamp, width, source, sql))
 }
 
 #[cfg(test)]
@@ -959,12 +1442,10 @@ mod tests {
             "SELECT ts / 4 AS b, sum(_seq) FROM trades GROUP BY ts / 4",
             "'_seq' in a view definition",
         );
-        // The deferred refusals, each naming its tranche.
+        // The deferred refusal names the tranche remainder. (The
+        // no-bucket aggregate tranche 1 refused here is now the
+        // RUNNING shape — accepted, tested in the running battery.)
         refused("SELECT x FROM trades", "tranche 2");
-        refused(
-            "SELECT sym, sum(x) AS s FROM trades GROUP BY sym",
-            "no bucket of the ordering key",
-        );
         // A view is a table: what composes at read is refused in the
         // definition.
         refused(
@@ -1055,7 +1536,7 @@ mod tests {
         assert!(error.contains("checksum mismatch"), "{error}");
         // And a view opened against the wrong source is refused by
         // name, not answered wrongly.
-        std::fs::write(&path, encode_definition(0, "quotes", OHLC)).unwrap();
+        std::fs::write(&path, encode_definition(0, 0, "quotes", OHLC)).unwrap();
         let error = MaterializedView::open("ohlc", &dir, &source, StoreOptions::default())
             .map(|_| ())
             .unwrap_err()
@@ -1371,7 +1852,7 @@ mod tests {
         // only ever conservative: the re-fold is idempotent. (Drop
         // first: one writer per store directory.)
         drop(view);
-        let record = encode_definition(0, "trades", OHLC);
+        let record = encode_definition(0, 0, "trades", OHLC);
         std::fs::write(view_dir.join(DEFINITION_FILE), record).unwrap();
         let mut view =
             MaterializedView::open("ohlc", &view_dir, &source, StoreOptions::default()).unwrap();
@@ -1696,7 +2177,7 @@ mod tests {
         // The tamper: a stamp far past anything the source has spent.
         std::fs::write(
             view_dir.join(DEFINITION_FILE),
-            encode_definition(1_000_000, "trades", OHLC),
+            encode_definition(1_000_000, 0, "trades", OHLC),
         )
         .unwrap();
         let mut view =
@@ -1753,5 +2234,212 @@ mod tests {
             error.contains("multiplier differs from its width"),
             "{error}"
         );
+    }
+
+    /// The running battery's comparison: exact where the fixture's
+    /// values are dyadic (every sum representable), and the module's
+    /// stated 1e-12-relative contract is exercised separately by the
+    /// non-dyadic case below.
+    const RUNNING: &str = "SELECT sym, count(*) AS n, sum(x) AS s, avg(x) AS a, \
+                           min(x) AS lo, max(x) AS hi, first(x) AS o, last(x) AS c \
+                           FROM trades GROUP BY sym";
+    const RUNNING_COLUMNS: &str = "sym, n, s, a, lo, hi, o, c";
+
+    fn assert_running_matches(db: &Database, view: &str, columns: &str) {
+        let sql = db.view(view).unwrap().sql().to_owned();
+        let recomputed = db
+            .table(db.view(view).unwrap().source())
+            .unwrap()
+            .query(&sql)
+            .unwrap();
+        let materialized = db.query(&format!("SELECT {columns} FROM {view}")).unwrap();
+        assert_eq!(
+            sorted_rows(&materialized),
+            sorted_rows(&recomputed),
+            "running view '{view}' diverged from recompute"
+        );
+    }
+
+    #[test]
+    fn a_running_view_answers_exactly_through_every_state() {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..24 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view("totals", RUNNING).unwrap();
+        // Unsized (width 0, nothing folded): answers by recompute.
+        assert_eq!(db.view("totals").unwrap().stamp(), 0);
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        // First refresh sizes the hidden bucket and folds partials.
+        assert!(db.refresh_view("totals").unwrap() >= 1);
+        assert!(db.view("totals").unwrap().stamp() > 0);
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        // Fresh, stale-with-tail, corrected, and deleted states all
+        // meet the same equality.
+        for i in 24..30 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS); // stale tail
+        db.refresh_view("totals").unwrap();
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS); // dirty, unrefreshed
+        db.refresh_view("totals").unwrap();
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        // The extremum case a running MIN/MAX cannot fake: deleting
+        // the maximum forces the answer DOWN, which no accumulator
+        // can produce — only the re-fold of its bucket can.
+        db.mutate("DELETE FROM trades WHERE x = 500.0").unwrap();
+        db.refresh_view("totals").unwrap();
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        // AS OF recomputes the pre-correction world.
+        let before = db.table("trades").unwrap().next_sequence() - 1;
+        db.mutate("UPDATE trades SET x = -9.0 WHERE ts = 10")
+            .unwrap();
+        db.refresh_view("totals").unwrap();
+        let past = db
+            .query(&format!(
+                "SELECT {RUNNING_COLUMNS} FROM totals ASOF {before}"
+            ))
+            .unwrap();
+        let past_base = db
+            .table("trades")
+            .unwrap()
+            .query(&format!(
+                "SELECT sym, count(*) AS n, sum(x) AS s, avg(x) AS a, min(x) AS lo, \
+                 max(x) AS hi, first(x) AS o, last(x) AS c \
+                 FROM trades ASOF {before} GROUP BY sym"
+            ))
+            .unwrap();
+        assert_eq!(sorted_rows(&past), sorted_rows(&past_base));
+        // A refresh after a single-bucket correction folds ONE hidden
+        // bucket — the pricing the partials exist for.
+        db.mutate("UPDATE trades SET x = 7.5 WHERE ts = 20")
+            .unwrap();
+        assert_eq!(db.refresh_view("totals").unwrap(), 1);
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+    }
+
+    #[test]
+    fn a_global_running_view_is_one_row_that_stays_true() {
+        let mut db = Database::new();
+        db.create_table("trades", m1_schema(), "ts").unwrap();
+        for i in 0..10 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        db.create_materialized_view(
+            "overall",
+            "SELECT count(*) AS n, sum(x) AS s, avg(x) AS a FROM trades",
+        )
+        .unwrap();
+        db.refresh_view("overall").unwrap();
+        assert_running_matches(&db, "overall", "n, s, a");
+        db.mutate("DELETE FROM trades WHERE ts >= 5").unwrap();
+        assert_running_matches(&db, "overall", "n, s, a"); // stale
+        db.refresh_view("overall").unwrap();
+        assert_running_matches(&db, "overall", "n, s, a");
+        // Empty it entirely: the global aggregate of nothing is one
+        // row of COUNT 0 with NULL sum and average — via the partials
+        // path exactly as via recompute.
+        db.mutate("DELETE FROM trades WHERE ts >= 0").unwrap();
+        db.refresh_view("overall").unwrap();
+        assert_running_matches(&db, "overall", "n, s, a");
+    }
+
+    #[test]
+    fn running_sums_meet_the_stated_tolerance_on_non_dyadic_data() {
+        // The combine contract: partial-then-combine association may
+        // differ from single-pass in the final ulps, within 1e-12
+        // relative. Non-dyadic values (thirds) force the difference to
+        // exist if it ever will; the comparison here is the contract's,
+        // not exact equality.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 8).unwrap())
+            .unwrap();
+        for i in 0..200i64 {
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(i),
+                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    storage_lite::RowValue::F64(i as f64 / 3.0),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view(
+            "t2",
+            "SELECT sym, sum(x) AS s, avg(x) AS a FROM trades GROUP BY sym",
+        )
+        .unwrap();
+        db.refresh_view("t2").unwrap();
+        let through_view = db.query("SELECT s, a FROM t2 ORDER BY s").unwrap();
+        let recomputed = db
+            .table("trades")
+            .unwrap()
+            .query("SELECT sym, sum(x) AS s, avg(x) AS a FROM trades GROUP BY sym ORDER BY s")
+            .unwrap();
+        let view_s = crate::table::tests::flatten(&through_view, 0);
+        let base_s = crate::table::tests::flatten(&recomputed, 1);
+        assert_eq!(view_s.len(), base_s.len());
+        for (view, base) in view_s.iter().zip(&base_s) {
+            let (view, base) = (view.unwrap(), base.unwrap());
+            assert!(
+                ((view - base) / base).abs() < 1e-12,
+                "combine drifted past the contract: {view} vs {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_view_persists_its_width_and_serves_read_only() {
+        let dir = std::env::temp_dir().join(format!("tallydb-view-running-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("trades");
+        let view_dir = dir.join("totals");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&view_dir).unwrap();
+        let mut source = Table::persistent("trades", m1_schema(), "ts", &source_dir).unwrap();
+        for i in 0..16 {
+            source.append(&linear_row(i)).unwrap();
+        }
+        {
+            let mut view =
+                MaterializedView::persistent("totals", RUNNING, &source, &view_dir).unwrap();
+            view.refresh(&mut source).unwrap();
+        }
+        // The width survives the record round trip (v2) — read back
+        // from the bytes, not inferred — and the reopened view keeps
+        // folding under it rather than re-sizing.
+        let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
+        let (_, width, _, _) = decode_definition(&record).unwrap();
+        assert!(width > 0, "the chosen width was not persisted");
+        let mut view =
+            MaterializedView::open("totals", &view_dir, &source, StoreOptions::default()).unwrap();
+        source
+            .mutate("UPDATE trades SET x = 50.0 WHERE ts = 2")
+            .unwrap();
+        assert_eq!(view.refresh(&mut source).unwrap(), 1);
+        drop(view);
+        // Read-only: exact answers over a stale materialization, no
+        // writes, refresh refused.
+        source
+            .mutate("UPDATE trades SET x = 60.0 WHERE ts = 9")
+            .unwrap();
+        source.flush().unwrap();
+        let ro_source = Table::open_read_only("trades", &source_dir).unwrap();
+        let mut db = Database::new();
+        db.add_table(ro_source).unwrap();
+        let ro_view =
+            MaterializedView::open_read_only("totals", &view_dir, db.table("trades").unwrap())
+                .unwrap();
+        db.add_view(ro_view).unwrap();
+        assert_running_matches(&db, "totals", RUNNING_COLUMNS);
+        assert!(db.refresh_view("totals").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

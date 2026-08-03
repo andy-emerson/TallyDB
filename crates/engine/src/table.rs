@@ -1952,7 +1952,7 @@ pub(crate) mod tests {
     }
 
     /// Flattens one f64 output column across batches.
-    pub(super) fn flatten(output: &QueryOutput, index: usize) -> Vec<Option<f64>> {
+    pub(crate) fn flatten(output: &QueryOutput, index: usize) -> Vec<Option<f64>> {
         output
             .batches
             .iter()
