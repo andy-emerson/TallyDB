@@ -236,8 +236,9 @@ impl Database {
         if let Some(join) = &plan.join {
             if self.views.contains_key(&plan.table) || self.views.contains_key(&join.dimension) {
                 return Err(EngineError::Query(QueryError::Unsupported(
-                    "a maintained view in a join — query the view alone, or \
-                     join the base tables (views in joins are tranche 3 of #83)"
+                    "a maintained view as a join OPERAND — query the view \
+                     alone, or join the base tables. (Views OVER joins are \
+                     built: define the join inside the view instead.)"
                         .to_owned(),
                 )));
             }

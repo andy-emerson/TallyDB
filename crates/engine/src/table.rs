@@ -1033,9 +1033,6 @@ impl Table {
     ///
     /// [`KnowledgeSnapshot::touched_rows`]:
     ///     storage_lite::store::KnowledgeSnapshot::touched_rows
-    // Caller lands with the join-view refresh (#83 tranche 3 cycle 1);
-    // remove the allow when it does. Added 2026-08-03.
-    #[allow(dead_code)]
     pub(crate) fn touched_rows(
         &self,
         since: u64,

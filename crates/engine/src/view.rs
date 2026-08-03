@@ -623,10 +623,16 @@ impl MaterializedView {
             // The rebuild floor, on either axis: a watermark below its
             // stamp cannot come from a crash under flush-then-stamp —
             // only from a foreign or tampered pairing. Trust nothing.
-            let replacement = source.execute_join_plan(
-                &definition.restricted_to(&[(i64::MIN, ceiling - 1)], source),
-                dimension,
-            )?;
+            // (The range converts to BUCKET runs like every fold —
+            // restricted_to speaks bucket indices; the key-space form
+            // over-folded past the ceiling for divide > 1, found by
+            // the repo-wide code review.)
+            let below = key_ranges_to_bucket_runs(
+                vec![(i64::MIN, ceiling.saturating_sub(1))],
+                definition.divide,
+            );
+            let replacement =
+                source.execute_join_plan(&definition.restricted_to(&below, source), dimension)?;
             self.table.replace_matching(None, &replacement)?;
             if let Some(join) = self.join.as_mut() {
                 join.stamp = now_dim;
@@ -635,51 +641,58 @@ impl MaterializedView {
             self.advance_stamp(now_fact)?;
             return Ok(u64::MAX);
         }
-        let JoinedDirty::Ranges(mut ranges) =
-            joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)?
-        else {
-            unreachable!("the ASOF shape derives ranges, never a rebuild")
-        };
+        // A RebuildAll from the derivation would mean the shape split
+        // drifted; fold everything below the ceiling rather than
+        // panicking (defensive — correct either way).
+        let mut ranges =
+            match joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)? {
+                JoinedDirty::Ranges(ranges) => ranges,
+                JoinedDirty::RebuildAll => vec![(i64::MIN, i64::MAX)],
+            };
+        // The fold covers dirty rows BELOW the new ceiling; the victim
+        // set additionally covers the shrink band when the frontier
+        // REGRESSED (a correction deleted or moved the frontier
+        // reference row): rows in [new ceiling, old ceiling) leave the
+        // materialization — they are live-half territory again — and
+        // folding them would be wrong, but forgetting to victimize
+        // them left them stranded as "clean" while their knowledge
+        // coordinates were swallowed by the stamp advance (the
+        // silent-corruption bug the repo-wide code review reproduced).
         ranges.retain(|&(low, _)| low < ceiling);
         for range in &mut ranges {
             range.1 = range.1.min(ceiling.saturating_sub(1));
         }
+        let mut victim_ranges = ranges.clone();
         if join.ceiling < ceiling {
-            // The frontier moved: fact rows between the old ceiling
+            // The frontier advanced: fact rows between the old ceiling
             // and the new one just became stable, and no touched
             // signal names them — the ceiling does.
             ranges.push((join.ceiling, ceiling.saturating_sub(1)));
+            victim_ranges.push((join.ceiling, ceiling.saturating_sub(1)));
         }
-        if ranges.is_empty() {
+        if ceiling < join.ceiling {
+            victim_ranges.push((ceiling, join.ceiling.saturating_sub(1)));
+        }
+        if victim_ranges.is_empty() {
             if let Some(join) = self.join.as_mut() {
                 join.stamp = now_dim;
+                join.ceiling = ceiling;
             }
             self.advance_stamp(now_fact)?;
             return Ok(0);
         }
-        let runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
-        // The re-fold count clips to the fact table's actual span (in
-        // bucket units): the ceiling-advance range opens at i64::MIN
-        // on a first refresh, and "buckets re-folded" should mean
-        // buckets that exist, not the width of the axis.
-        let folded = match source_span(source)? {
-            None => 0,
-            Some((fact_low, fact_high)) => {
-                let (fact_low, fact_high) =
-                    (fact_low / definition.divide, fact_high / definition.divide);
-                runs.iter()
-                    .map(|&(low, high)| {
-                        let low = low.max(fact_low) as i128;
-                        let high = high.min(fact_high) as i128;
-                        (high - low + 1).max(0) as u128
-                    })
-                    .sum::<u128>()
-                    .min(u64::MAX as u128) as u64
-            }
+        let fold_runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
+        let victim_runs =
+            key_ranges_to_bucket_runs(merge_key_ranges(victim_ranges), definition.divide);
+        let folded = folded_bucket_count(source, &fold_runs, definition.divide)?;
+        // An all-shrink refresh folds nothing; an inverted range keeps
+        // the plan well-formed and empty.
+        let replacement = if fold_runs.is_empty() {
+            source.execute_join_plan(&definition.restricted_to(&[(1, 0)], source), dimension)?
+        } else {
+            source.execute_join_plan(&definition.restricted_to(&fold_runs, source), dimension)?
         };
-        let replacement =
-            source.execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
-        let victims = definition.view_ranges(&runs);
+        let victims = definition.view_ranges(&victim_runs);
         self.table.replace_matching(Some(&victims), &replacement)?;
         if let Some(join) = self.join.as_mut() {
             join.stamp = now_dim;
@@ -740,21 +753,7 @@ impl MaterializedView {
                     return Ok(0);
                 }
                 let runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
-                let folded = match source_span(source)? {
-                    None => 0,
-                    Some((fact_low, fact_high)) => {
-                        let (fact_low, fact_high) =
-                            (fact_low / definition.divide, fact_high / definition.divide);
-                        runs.iter()
-                            .map(|&(low, high)| {
-                                let low = low.max(fact_low) as i128;
-                                let high = high.min(fact_high) as i128;
-                                (high - low + 1).max(0) as u128
-                            })
-                            .sum::<u128>()
-                            .min(u64::MAX as u128) as u64
-                    }
-                };
+                let folded = folded_bucket_count(source, &runs, definition.divide)?;
                 let replacement = source
                     .execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
                 let victims = definition.view_ranges(&runs);
@@ -1727,6 +1726,47 @@ fn synthesize_cumulative(
     })
 }
 
+/// The re-fold count for a run list, clipped to the fact table's
+/// actual span in bucket units: a first refresh's range opens at
+/// i64::MIN, and "buckets re-folded" should mean buckets that exist,
+/// not the width of the axis. One body for both join refresh paths.
+fn folded_bucket_count(
+    source: &Table,
+    runs: &[(i64, i64)],
+    divide: i64,
+) -> Result<u64, EngineError> {
+    Ok(match source_span(source)? {
+        None => 0,
+        Some((fact_low, fact_high)) => {
+            let (fact_low, fact_high) = (fact_low / divide, fact_high / divide);
+            runs.iter()
+                .map(|&(low, high)| {
+                    let low = low.max(fact_low) as i128;
+                    let high = high.min(fact_high) as i128;
+                    (high - low + 1).max(0) as u128
+                })
+                .sum::<u128>()
+                .min(u64::MAX as u128) as u64
+        }
+    })
+}
+
+/// The first cell of a single-column, single-row i64 aggregate — the
+/// shared tail of the structural MIN/MAX probes below.
+fn single_i64_cell(output: &query_lite::QueryOutput) -> Option<i64> {
+    use arrow_lite::{Column, NumericData};
+    let batch = output
+        .batches
+        .first()
+        .filter(|batch| batch.num_rows() > 0)?;
+    match &batch.columns()[0] {
+        Column::Numeric(NumericData::I64(column)) => {
+            column.is_valid(0).then(|| column.values().as_slice()[0])
+        }
+        _ => None,
+    }
+}
+
 /// A join view's dirty set, derived from BOTH knowledge histories.
 enum JoinedDirty {
     /// Fact-key ranges to re-fold: fact rows born or killed since the
@@ -1778,7 +1818,18 @@ fn joined_touched_ranges(
             continue; // a null reference key matches nothing, ever
         };
         let next = next_reference_key(dimension, &join.dimension_key, &value, at)?;
-        let high = next.map_or(i64::MAX, |next| next - 1);
+        // The interval's exclusive end is the symbol's next reference
+        // row — but "reaches" differs by match mode: under AtOrBefore
+        // a fact at exactly `next` already matches `next`, so the
+        // interval stops at `next - 1`; under StrictlyBefore that fact
+        // still matches the row BEFORE `next`, so the correction at
+        // `at` reaches it and the interval includes `next` itself
+        // (found by the repo-wide code review — the off-by-one left a
+        // fact at exactly `next` silently stale under the strict form).
+        let high = match join.as_of.expect("ranges with intervals only for ASOF") {
+            query_lite::AsOfMatch::AtOrBefore => next.map_or(i64::MAX, |next| next - 1),
+            query_lite::AsOfMatch::StrictlyBefore => next.unwrap_or(i64::MAX),
+        };
         if at <= high {
             ranges.push((at, high));
         }
@@ -1829,17 +1880,7 @@ fn next_reference_key(
         offset: None,
         as_of: None,
     };
-    let output = dimension.execute_plan(&plan)?;
-    let Some(batch) = output.batches.first().filter(|batch| batch.num_rows() > 0) else {
-        return Ok(None);
-    };
-    use arrow_lite::{Column, NumericData};
-    Ok(match &batch.columns()[0] {
-        Column::Numeric(NumericData::I64(column)) => {
-            column.is_valid(0).then(|| column.values().as_slice()[0])
-        }
-        _ => None,
-    })
+    Ok(single_i64_cell(&dimension.execute_plan(&plan)?))
 }
 
 /// The dimension's current ordering-key frontier (its greatest value),
@@ -1866,17 +1907,7 @@ fn table_okey_max(table: &Table) -> Result<Option<i64>, EngineError> {
         offset: None,
         as_of: None,
     };
-    let output = table.execute_plan(&plan)?;
-    let Some(batch) = output.batches.first().filter(|batch| batch.num_rows() > 0) else {
-        return Ok(None);
-    };
-    use arrow_lite::{Column, NumericData};
-    Ok(match &batch.columns()[0] {
-        Column::Numeric(NumericData::I64(column)) => {
-            column.is_valid(0).then(|| column.values().as_slice()[0])
-        }
-        _ => None,
-    })
+    Ok(single_i64_cell(&table.execute_plan(&plan)?))
 }
 
 /// Key-space ranges to bucket-index runs under the definition's
@@ -3564,7 +3595,7 @@ mod tests {
             .query("SELECT ohlc.o FROM ohlc JOIN dim ON ohlc.sym = dim.sym")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("view in a join"), "{error}");
+        assert!(error.contains("view as a join OPERAND"), "{error}");
         // A view over a missing source cannot be added.
         let orphan_source = Table::new("orphan", m1_schema(), "ts").unwrap();
         let orphan = MaterializedView::new(
@@ -5943,5 +5974,328 @@ mod tests {
         check(&db);
         assert!(db.refresh_view("enriched").unwrap() < u64::MAX); // incremental
         check(&db);
+    }
+
+    #[test]
+    fn a_frontier_regression_dematerializes_the_stranded_band() {
+        // Found by the repo-wide code review, reproduced there: when a
+        // correction LOWERS the reference frontier, the old refresh
+        // clipped the correction interval against the new ceiling,
+        // swallowed its knowledge coordinate, and left the rows in
+        // [new ceiling, old ceiling) marked clean but permanently
+        // stale. The refresh must victimize that band — those rows are
+        // live-half territory again.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for ts in [60, 70, 90] {
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::Key("A"),
+                    storage_lite::RowValue::F64(ts as f64),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        for (qts, bid) in [(50, 1.0), (100, 2.0)] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key("A"),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        db.refresh_view("blotter").unwrap(); // ceiling 100; ts 60/70/90 materialized
+        assert_blotter_matches(&db, "blotter");
+        // The frontier REGRESSES: delete the frontier quote.
+        db.mutate("DELETE FROM quotes WHERE qts = 100").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap(); // ceiling shrinks to 50
+        assert_blotter_matches(&db, "blotter");
+        // An in-order arrival BELOW the old ceiling: under the bug the
+        // band [50, 100) was still marked clean and this quote's birth
+        // was swallowed — ts = 90 stayed matched to the dead world.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(80),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::F64(3.0),
+            ],
+        )
+        .unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        let bid = db.query("SELECT bid FROM blotter WHERE ts = 90").unwrap();
+        assert_eq!(crate::table::tests::flatten(&bid, 0), [Some(3.0)]);
+    }
+
+    #[test]
+    fn a_strict_asof_blotter_repairs_through_its_inclusive_edge() {
+        // Found by the repo-wide code review, reproduced there: under
+        // StrictlyBefore, a fact at exactly the symbol's NEXT
+        // reference key still matches the corrected row before it, so
+        // the correction interval must include `next` itself — the
+        // at-or-before endpoint left that fact silently stale.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        db.append(
+            "trades",
+            &[
+                storage_lite::RowValue::I64(20),
+                storage_lite::RowValue::Key("A"),
+                storage_lite::RowValue::F64(1.0),
+                storage_lite::RowValue::F64(0.0),
+            ],
+        )
+        .unwrap();
+        for (qts, bid) in [(10, 1.0), (20, 7.0), (100, 9.0)] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key("A"),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        const STRICT: &str = "SELECT ts, sym, x, bid FROM trades \
+             ASOF LEFT JOIN quotes \
+             ON trades.sym = quotes.sym AND quotes.qts < trades.ts";
+        db.create_materialized_view("strict", STRICT).unwrap();
+        db.refresh_view("strict").unwrap();
+        // Strictly-before: the ts = 20 fact matches the quote at 10,
+        // never the one at 20.
+        let bid = db.query("SELECT bid FROM strict WHERE ts = 20").unwrap();
+        assert_eq!(crate::table::tests::flatten(&bid, 0), [Some(1.0)]);
+        // Correct the matched quote: its interval must reach THROUGH
+        // qts = 20 (the fact at exactly 20 still matches it).
+        db.mutate("UPDATE quotes SET bid = 5.0 WHERE qts = 10")
+            .unwrap();
+        let check = |db: &Database| {
+            let through = db.query("SELECT ts, sym, x, bid FROM strict").unwrap();
+            let direct = db.query(STRICT).unwrap();
+            assert_eq!(sorted_rows(&through), sorted_rows(&direct));
+            let bid = db.query("SELECT bid FROM strict WHERE ts = 20").unwrap();
+            assert_eq!(crate::table::tests::flatten(&bid, 0), [Some(5.0)]);
+        };
+        check(&db); // dirty, unrefreshed
+        db.refresh_view("strict").unwrap();
+        check(&db);
+    }
+
+    #[test]
+    fn a_join_views_rebuild_floor_folds_only_below_the_ceiling() {
+        // The tamper path, exercised for join views: a stamp no crash
+        // can explain meets the rebuild floor, and the rebuild's fold
+        // converts its range to BUCKET runs — the key-space form
+        // over-folded past the ceiling for widths > 1 (found by both
+        // reviewers, previously untested).
+        let dir = std::env::temp_dir().join(format!("tallydb-jfloor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let trades_dir = dir.join("trades");
+        let quotes_dir = dir.join("quotes");
+        let view_dir = dir.join("jb");
+        for sub in [&trades_dir, &quotes_dir, &view_dir] {
+            std::fs::create_dir_all(sub).unwrap();
+        }
+        let mut trades = Table::persistent("trades", m1_schema(), "ts", &trades_dir).unwrap();
+        let mut quotes = Table::persistent(
+            "quotes",
+            arrow_lite::Schema::new(vec![
+                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            ]),
+            "qts",
+            &quotes_dir,
+        )
+        .unwrap();
+        for i in 0..20 {
+            trades.append(&linear_row(i)).unwrap();
+        }
+        for (qts, sym, bid) in [(0, "A", 1.0), (1, "B", 2.0), (10, "A", 1.5), (11, "B", 2.5)] {
+            quotes
+                .append(&[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ])
+                .unwrap();
+        }
+        const JB: &str = "SELECT sym, ts / 4 AS bar, count(*) AS n, avg(bid) AS ab \
+             FROM trades ASOF LEFT JOIN quotes ON trades.sym = quotes.sym \
+             GROUP BY sym, ts / 4";
+        {
+            let mut view =
+                MaterializedView::persistent("jb", JB, &trades, Some(&quotes), &view_dir).unwrap();
+            view.refresh(&mut trades, Some(&mut quotes)).unwrap();
+        }
+        // Tamper: a fact stamp far past anything spent.
+        let record = std::fs::read(view_dir.join(DEFINITION_FILE)).unwrap();
+        let (_, _, _, _, join) = decode_definition(&record).unwrap();
+        let join = join.unwrap();
+        std::fs::write(
+            view_dir.join(DEFINITION_FILE),
+            encode_definition(1_000_000, 0, "trades", JB, Some(&join)),
+        )
+        .unwrap();
+        let mut view = MaterializedView::open(
+            "jb",
+            &view_dir,
+            &trades,
+            Some(&quotes),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            view.refresh(&mut trades, Some(&mut quotes)).unwrap(),
+            u64::MAX
+        );
+        // The rebuild honored the ceiling (frontier 11 rounds to
+        // bucket edge 8 under width 4): only buckets 0..=1 hold rows.
+        let max_bar = single_i64_cell(&view.table.query("SELECT max(bar) AS m FROM jb").unwrap())
+            .expect("the rebuild materialized no rows");
+        assert!(
+            max_bar < 8,
+            "the rebuild materialized past the ceiling: max bar {max_bar}"
+        );
+        // And the union read is exact regardless.
+        let mut db = Database::new();
+        db.add_table(trades).unwrap();
+        db.add_table(quotes).unwrap();
+        db.add_view(view).unwrap();
+        let through = db.query("SELECT sym, bar, n, ab FROM jb").unwrap();
+        let direct = db.query(JB).unwrap();
+        assert_eq!(sorted_rows(&through), sorted_rows(&direct));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_views_hold_on_negative_keys_and_composed_reads() {
+        // Negative fact and reference keys put truncating division's
+        // double-width bucket 0 and negative ceilings on the path (no
+        // oracle covers negatives — this is their in-crate home); the
+        // read side composes a WHERE and an aggregate over the view.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..20i64 {
+            let ts = -30 + i * 3;
+            db.append(
+                "trades",
+                &[
+                    storage_lite::RowValue::I64(ts),
+                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    storage_lite::RowValue::F64(i as f64),
+                    storage_lite::RowValue::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        for (qts, sym, bid) in [
+            (-25, "A", 1.0),
+            (-24, "B", 2.0),
+            (-10, "A", 1.5),
+            (-9, "B", 2.5),
+            (5, "A", 1.9),
+        ] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view("blotter", BLOTTER).unwrap();
+        db.refresh_view("blotter").unwrap(); // negative-through-zero ceiling path
+        assert_blotter_matches(&db, "blotter");
+        // A late quote at a negative key repairs its interval.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(-20),
+                storage_lite::RowValue::Key("B"),
+                storage_lite::RowValue::F64(9.9),
+            ],
+        )
+        .unwrap();
+        assert_blotter_matches(&db, "blotter");
+        db.refresh_view("blotter").unwrap();
+        assert_blotter_matches(&db, "blotter");
+        // Composed reads over the view: a WHERE crossing zero, and an
+        // aggregate over the view's rows — both against the direct
+        // join under the same composition.
+        let through = db
+            .query("SELECT ts, sym, x, bid FROM blotter WHERE ts >= -12")
+            .unwrap();
+        let direct_rows = db.query(&format!("{BLOTTER} WHERE ts >= -12")).unwrap();
+        assert!(through.num_rows() > 0);
+        assert_eq!(sorted_rows(&through), sorted_rows(&direct_rows));
+        let through = db
+            .query("SELECT sym, avg(bid) AS ab FROM blotter GROUP BY sym")
+            .unwrap();
+        let direct = db
+            .query(
+                "SELECT sym, avg(bid) AS ab FROM trades \
+                 ASOF LEFT JOIN quotes ON trades.sym = quotes.sym GROUP BY sym",
+            )
+            .unwrap();
+        assert_eq!(sorted_rows(&through), sorted_rows(&direct));
     }
 }
