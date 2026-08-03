@@ -250,3 +250,97 @@ fn cumulative_range_read_prices_the_range_not_the_table() {
         "the ranged read cost approached the full recompute (ratio {ratio:.2})"
     );
 }
+
+/// Tranche 3's pricing, measured honestly. A blotter refresh is
+/// O(changed) on the FACT side but pays the quote-side index build
+/// (O(Q log Q)) every call — #92's pruned dimension is the named seat
+/// — so the claim guarded here is the fact-side one: at 4x the fact
+/// table with the same small batch, refresh cost must not scale with
+/// the table. The correction claim rides the same run: one late quote
+/// re-folds its interval, priced against the full rebuild.
+#[test]
+#[ignore = "perf sanity — run explicitly in release mode"]
+fn blotter_refresh_scales_with_the_batch_not_the_fact_table() {
+    use engine::Database;
+    let batch = 2_000i64;
+    let mut costs = Vec::new();
+    for &rows in &[250_000i64, 1_000_000] {
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", schema(), "ts", 8_192).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                Schema::new(vec![
+                    Field::new("qts", ColumnType::I64, false),
+                    Field::new("sym", ColumnType::Key, false),
+                    Field::new("bid", ColumnType::F64, false),
+                ]),
+                "qts",
+                8_192,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..rows {
+            db.append("trades", &row(i)).unwrap();
+        }
+        // One quote per 100 fact keys, frontier past the facts so the
+        // ceiling covers (almost) everything.
+        for q in 0..(rows / 100 + 2) {
+            let i = q * 100;
+            db.append(
+                "quotes",
+                &[
+                    RowValue::I64(i),
+                    RowValue::Key(["AAPL", "MSFT", "TSLA", "NVDA"][(q % 4) as usize]),
+                    RowValue::F64(q as f64),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_materialized_view(
+            "blotter",
+            "SELECT ts, sym, x, bid FROM trades \
+             ASOF LEFT JOIN quotes ON trades.sym = quotes.sym",
+        )
+        .unwrap();
+        db.refresh_view("blotter").unwrap();
+        for i in rows..rows + batch {
+            db.append("trades", &row(i)).unwrap();
+        }
+        let start = Instant::now();
+        let folded = db.refresh_view("blotter").unwrap();
+        let refresh = start.elapsed();
+        assert!(folded < u64::MAX, "a batch refresh must not rebuild");
+        // The correction leg: one late quote, one interval.
+        db.append(
+            "quotes",
+            &[
+                RowValue::I64(rows / 2 + 1),
+                RowValue::Key("AAPL"),
+                RowValue::F64(9.9),
+            ],
+        )
+        .unwrap();
+        let start = Instant::now();
+        let corrected = db.refresh_view("blotter").unwrap();
+        let correction = start.elapsed();
+        println!(
+            "rows {rows}: batch refresh {refresh:?} ({folded} keys), late-quote \
+             correction {correction:?} ({corrected} keys)"
+        );
+        costs.push(refresh);
+    }
+    let ratio = costs[1].as_secs_f64() / costs[0].as_secs_f64().max(1e-9);
+    println!("blotter refresh cost ratio at 4x the fact table: {ratio:.2}");
+    // The quote-side O(Q) term grows 4x too (quotes scale with facts
+    // here), so the honest guard is looser than the single-table
+    // one — what it still catches is an O(fact) gather regression
+    // (the fact-side pruning failing), which would push the ratio
+    // toward 4.
+    assert!(
+        ratio < 3.0,
+        "blotter refresh scaled with the fact table (x4 -> x{ratio:.1})"
+    );
+}

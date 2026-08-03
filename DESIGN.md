@@ -1300,8 +1300,10 @@ materialization is complete.)
 **The ruling set** (each with its rejected alternatives recorded on the
 issue): eligibility is **(c) the full reach, taken piecemeal** —
 tranche 1 is bucketed single-table views, tranche 2 running/cumulative
-shapes via bucket-partials, tranche 3 joins (q-hierarchical only, per
-the PODS 2017 dichotomy); correction semantics is **the versioned view
+shapes via bucket-partials, tranche 3 join views (ruled q-hierarchical
+only at first, per the PODS 2017 dichotomy; the door was widened by F7
+on 2026-08-03 — see the tranche-3 record below); correction semantics
+is **the versioned view
 with uniform repair** — every correction marks its bucket, repair is
 always re-fold-from-base, the class-split delta fast path rejected for
 v1 (a second code path plus an f64 subtraction hazard for a path
@@ -1460,8 +1462,127 @@ query) and holds a seat; a view read resolves registered functions
 from the view's own always-empty registry (register on the base,
 query the base — a per-view registration surface is a held seat);
 names beginning with `__` are reserved in running/cumulative
-definitions for the minted hidden columns; tranche 3 (q-hierarchical
-joins) holds its seat with the teaching refusal naming it.
+definitions for the minted hidden columns.
+
+### Tranche 3: maintained join views (ruled 2026-08-03, built the same day)
+
+Views whose FROM clause is a join over two tables: the **enriched
+blotter** (a bare projection over `fact ASOF LEFT/INNER JOIN
+reference` — every fact row carrying its matched quote), bucketed
+**aggregates over the as-of join**, and **star aggregates over the
+equi join** (fact rows enriched with keyed dimension attributes,
+folded into bars). The full ruling set (F1–F8, each with its rejected
+alternatives) is recorded on #83; the load-bearing rulings:
+
+- **F1, the pair stamp**: a join view's durable state grows the
+  dimension's own stamp next to the fact stamp (record format v3,
+  additive; single-source views keep v2) — the live-dimension variant,
+  which would have re-derived the dimension's state per read, was
+  rejected as an always-paid cost for a rarely-taken freshness gain.
+- **F3, the blotter admitted**: a bare projection is admissible only
+  over a join — a view must fold or match something, and the blotter
+  materializes the match. Bare single-table projections stay refused.
+- **F7, the widened door**: eligibility is "q-hierarchical, OR acyclic
+  with the join key a key of the small side." The as-of join is
+  q-hierarchical; the equi join rides the second clause with its
+  precondition — the join key unique on the dimension side — checked
+  loudly at execution, not assumed.
+- **F8, the tie rule**: among as-of candidates sharing an ordering
+  key, the match is the row with the greatest birth sequence
+  (`_seq`) — knowledge order, engine-wide, in the executor itself.
+  Storage order had been the tie-breaker by unguarded coincidence;
+  a test pins that compaction preserves tie winners.
+- **F2, `AS OF` over a join view refused**: the answer is a function
+  of two knowledge coordinates, so a single `s` is ambiguous; the
+  honest two-cut form (`AS OF (s_fact, s_dim)`) is seated as #99.
+
+**The ceiling.** The one genuinely new maintenance idea. An as-of
+match is not bucket-local: the newest quote matches every fact after
+it, so a fact materialized against today's last quote is invalidated
+by tomorrow's perfectly ordinary in-order quote append — maintenance
+cost where the design promises none. The fix inverts the intuition
+that fresher is better: refresh materializes fact keys strictly below
+the **ceiling** — the low edge of the bucket holding the dimension
+frontier, `bucket_low(frontier / divide, divide)` in the code's terms
+(truncating division, so negative frontiers land in the double-width
+bucket around zero and the edge is still correct) — and leaves
+everything at or above it to the union read's live half. An in-order quote arrival
+lands at or above the frontier by definition, touching only live
+territory: zero materialized damage, no refresh owed. A **frontier
+regression** (a correction deletes the newest quote) lowers the
+ceiling, stranding materialized rows built against knowledge the
+dimension no longer holds; refresh dematerializes the stranded band
+`[new ceiling, old ceiling)` and always stores the new ceiling. (The
+repo-wide code review caught this as the build's one severe bug —
+refresh itself corrupted and nothing healed; the regression test
+replays it.) The star shape needs no ceiling: any dimension change
+rebuilds the materialization whole (F4 — a dimension row's blast
+radius is every fact bucket holding its key, so surgical repair
+degenerates), and the union read serves the whole answer live while a
+rebuild is pending, so the parked state is never wrong, only slower.
+
+**The interval lemma.** A dimension correction touching row `(s, t)`
+changes the join result only for fact rows of symbol `s` with keys in
+`[t, next(s, t))`, where `next(s, t)` is the key of `s`'s next
+dimension row after `t` in the corrected state. Proof, from the
+max-before definition: a fact `(s, u)` matches the dimension row for
+`s` with the greatest key `≤ u`; if `u < t`, the set of keys `≤ u` is
+unchanged by any edit at `t`, so the match is unchanged; if
+`u ≥ next(s, t)`, a surviving row at `next > t` bounds the max from
+below, so a row present or absent at `t` is never the max and the
+match is again unchanged; what remains is exactly
+`t ≤ u < next(s, t)`, one contiguous interval per corrected row
+(under `StrictlyBefore` the exact set is `(t, next]`; the
+implementation conservatively re-folds `[t, next]`, one key wider).
+We found no statement of this in the literature — it appears as
+folklore embodied in Feldera's ASOF operator and Flink's
+versioned-table state cleanup —
+so the proof lives here, and executably: a test prices a late quote's
+refresh at exactly its interval width. The lemma is why corrections
+need no bookkeeping: the dirty set stays derivable from the knowledge
+history, now read through a seam that yields each touched row's
+`(ordering key, join key)` pair (F5 — a symbol-blind endpoint is
+provably unsound: the *global* next quote truncates another symbol's
+interval, silently under-repairing; the discriminating test wedges a
+foreign quote between a correction and its true endpoint). Edge case,
+named honestly: correcting a symbol's **last** quote makes the
+interval `[t, frontier)` — contiguous still, but O(that symbol's
+facts); bounded by data, not by a constant.
+
+**Evidence at the build** (2026-08-03, this container): the eighth
+oracle family (`m5_join_oracle.py`, in CI) drives all three shapes
+through facts-ahead-of-quotes, in-order appends while stale, late
+quotes below the ceiling, quote amends and deletes, a dimension
+change, fact corrections, compaction, and a reopen — 17 checkpoints,
+each diffing the two as-of views against **DuckDB's native ASOF
+JOIN** recomputing from scratch (an independent implementation of the
+matching rule itself, not just of folding) and the star view against
+DuckDB's ordinary join (quote keys stay unique per
+symbol so DuckDB's tie rule never meets ours — ties are pinned
+in-crate against the F8 rule instead). In-crate batteries cover the
+lemma under multi-correction windows (kill-then-rebirth chains, a
+kill whose current-state next is itself touched), the strict-mode
+inclusive edge, frontier regression, negative keys through bucket
+zero, the tampered-stamp rebuild floor honoring the ceiling, and the
+symbol seam's discriminating case. Pricing, measured as same-run
+ratios (`perf_sanity`, 2026-08-03 run): blotter refresh of a fixed
+2,000-row batch at 4× the fact table costs ratio 2.73 (guarded
+< 3.0) — **not** tranche 1's flat 1.09, and honestly so: each
+refresh's dirty derivation walks the dimension's touched history,
+O(Q) until #92-style pruning, and the guard's headroom says "scales
+with the batch and the quote book, not the fact table"; a late-quote
+correction against 1M facts re-folded 399 keys in 41.6ms — the
+interval, not the suffix.
+
+**Tranche-3 costs and seats**: refresh is O(changed facts + touched
+dimension history) — the dimension-side scan holds the #92 seat
+(manifest pruning would cut it) and a per-symbol touched index holds
+another; `AS OF` over join views waits on #99's two-cut form;
+running/cumulative shapes over a join compose in principle (the
+partials are tranche-1 plans) but hold their seat unbuilt; the
+refusal strings for the single-table and joined doors repeat some
+phrasing — noted, not worth a shared constant yet; console verbs and
+SQL DDL for views remain the API-first ruling's deliberate gap.
 
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 

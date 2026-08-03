@@ -346,13 +346,24 @@ pub fn execute_join(
             registry,
         );
     };
-    // A join reads both sides whole (the gather touches every fact row
-    // and any dimension row a key can reach), so both sides materialize
-    // here; single-table pruning happens after the join, on the joined
-    // intermediate, exactly as before.
+    // The dimension side reads whole (any dimension row is reachable
+    // from any fact key); the fact side prunes FIRST: a fact segment
+    // whose zone maps prove the plan's predicate cannot match is never
+    // materialized or gathered. Sound because the predicate applies to
+    // the joined intermediate, where fact columns keep their names and
+    // values — a fact row the post-join filter would drop contributes
+    // no output row under INNER or LEFT alike — and `can_match`
+    // answers "might match" for any conjunct it cannot see (dimension
+    // columns resolve to nothing against the fact schema). This is
+    // what keeps a maintained join view's restricted re-fold (#83
+    // tranche 3) proportional to the dirty ranges, not the fact table.
     let fact_views = fact
         .handles
         .iter()
+        .filter(|handle| match &plan.predicate {
+            Some(predicate) => can_match(predicate, fact_schema, handle),
+            None => true,
+        })
         .map(SegmentHandle::view)
         .collect::<Result<Vec<SegmentView>, _>>()?;
     let fact_views = &fact_views[..];
@@ -492,7 +503,9 @@ pub fn execute_join(
 
 /// One key's dimension rows for an as-of match: `(ordering-key value,
 /// view, row)`, ascending, with the tie order the match rule wants.
-type KeyHistory = Vec<(i64, usize, usize)>;
+/// One key's as-of history: `(clock, birth sequence, view, row)`,
+/// ascending by `(clock, sequence)` — the sequence is the tie rule.
+type KeyHistory = Vec<(i64, u64, usize, usize)>;
 
 /// The dimension side, indexed for whichever question the fact rows
 /// are going to ask it.
@@ -532,16 +545,21 @@ impl DimensionIndex {
     }
 
     /// The as-of index: per key value, that key's live rows as
-    /// `(clock, view, row)` in ascending clock order.
+    /// `(clock, sequence, view, row)` in ascending `(clock, sequence)`
+    /// order.
     ///
-    /// Rows are collected in ingest order and then sorted by clock with
-    /// a *stable* sort, which costs a linear scan over the ordered data
-    /// TallyDB expects and does the right thing over data that arrived
-    /// out of order — this is where an as-of join stops depending on
-    /// the ordering key having actually been ordered. Stability is also
-    /// what settles ties: among dimension rows sharing a timestamp, the
-    /// last-ingested one is the match, the same "newest version wins"
-    /// rule corrections already follow.
+    /// The sort by clock is what lets an as-of join stop depending on
+    /// the ordering key having actually been ordered (it costs a
+    /// linear scan over the ordered data TallyDB expects and does the
+    /// right thing over data that arrived out of order). Ties — rows
+    /// sharing a timestamp — are settled by **birth sequence**: the
+    /// latest-known version is the match, making the join a pure
+    /// function of (data, knowledge) rather than of physical layout.
+    /// Before this, ties fell to storage order, which happened to
+    /// track ingest order only as a coincidence of the compaction
+    /// merge's sort key — an invariant nothing guarded (#83
+    /// tranche 3, F8: a compaction could in principle change a query's
+    /// answer at exactly-tied timestamps).
     fn history(
         dimension_views: &[SegmentView],
         key_index: usize,
@@ -559,15 +577,17 @@ impl DimensionIndex {
                 let Some(value) = keys.value_at(row) else {
                     continue; // a null dimension key matches nothing
                 };
-                history
-                    .entry(value.to_owned())
-                    .or_default()
-                    .push((clocks[row], view_index, row));
+                history.entry(value.to_owned()).or_default().push((
+                    clocks[row],
+                    view.segment.sequence_at(row),
+                    view_index,
+                    row,
+                ));
             }
         }
 
         for rows in history.values_mut() {
-            rows.sort_by_key(|&(clock, _, _)| clock);
+            rows.sort_by_key(|&(clock, sequence, _, _)| (clock, sequence));
         }
         DimensionIndex::History(history, matching)
     }
@@ -618,15 +638,15 @@ impl DimensionIndex {
                         // clock has reached; the match is the last of it.
                         let reached = match matching {
                             AsOfMatch::AtOrBefore => {
-                                candidates.partition_point(|&(at, _, _)| at <= clock)
+                                candidates.partition_point(|&(at, _, _, _)| at <= clock)
                             }
                             AsOfMatch::StrictlyBefore => {
-                                candidates.partition_point(|&(at, _, _)| at < clock)
+                                candidates.partition_point(|&(at, _, _, _)| at < clock)
                             }
                         };
                         reached
                             .checked_sub(1)
-                            .map(|last| (candidates[last].1, candidates[last].2))
+                            .map(|last| (candidates[last].2, candidates[last].3))
                     })
                     .collect()
             }
@@ -5495,5 +5515,85 @@ mod query1_tests {
             "SELECT ts / 60 AS bucket, count(*) FROM t GROUP BY ts / 60"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn asof_ties_break_by_birth_sequence_not_storage_order() {
+        // #83 tranche 3, F8. Among dimension rows sharing a timestamp,
+        // the match is the LATEST-KNOWN version (highest birth
+        // sequence) — a pure function of (data, knowledge). Before the
+        // rule, ties fell to storage position, which tracked ingest
+        // order only as a coincidence of the compaction merge's sort
+        // key; these segments are built with knowledge order and
+        // storage order deliberately DISAGREEING — the corrected
+        // quote (sequence 5) sits in the EARLIER segment, a stale
+        // version (sequence 2) in the later one — which no table-level
+        // ingest can produce today, and a future layout change could.
+        use crate::plan::plan;
+        use storage_lite::{RowValue, SequenceInfo, WriteBuffer};
+        let quote_schema = Schema::new(vec![
+            Field::new("qts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("bid", ColumnType::F64, false),
+        ]);
+        let quote_segment = |bid: f64, sequence: u64, base: u64| {
+            let mut buffer = WriteBuffer::new(quote_schema.clone(), 0).unwrap();
+            buffer
+                .append(&[RowValue::I64(20), RowValue::Key("A"), RowValue::F64(bid)])
+                .unwrap();
+            SegmentHandle::resident(
+                Arc::new(
+                    buffer
+                        .freeze_at(base)
+                        .unwrap()
+                        .with_sequence(SequenceInfo::Explicit(vec![sequence])),
+                ),
+                None,
+            )
+        };
+        // Storage order: [sequence 5, sequence 2] — latest knowledge FIRST.
+        let quotes = vec![quote_segment(99.0, 5, 0), quote_segment(1.0, 2, 1)];
+        let trade_schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut buffer = WriteBuffer::new(trade_schema.clone(), 0).unwrap();
+        buffer
+            .append(&[RowValue::I64(25), RowValue::Key("A"), RowValue::F64(0.0)])
+            .unwrap();
+        let trades = vec![SegmentHandle::resident(
+            Arc::new(buffer.freeze().unwrap()),
+            None,
+        )];
+        let joined = execute_join(
+            JoinSide {
+                schema: &trade_schema,
+                handles: &trades,
+                ordering_key: 0,
+            },
+            JoinSide {
+                schema: &quote_schema,
+                handles: &quotes,
+                ordering_key: 0,
+            },
+            &plan(
+                "SELECT ts, bid FROM trades ASOF LEFT JOIN quotes \
+                 ON trades.sym = quotes.sym",
+            )
+            .unwrap(),
+            &Registry::new(),
+        )
+        .unwrap();
+        let batch = joined.batches.first().expect("one fact segment");
+        let Column::Numeric(NumericData::F64(bids)) = &batch.columns()[1] else {
+            panic!("bid is f64")
+        };
+        assert_eq!(
+            bids.values().as_slice(),
+            [99.0],
+            "the tie must go to the latest-known version (sequence 5), \
+             not the last row in storage order (sequence 2)"
+        );
     }
 }

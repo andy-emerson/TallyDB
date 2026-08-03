@@ -487,6 +487,30 @@ impl Table {
         self.store.next_sequence()
     }
 
+    /// As [`Table::execute_join_plan`], over zero segments — the
+    /// executor's own output schema for a join, with no rows paid for
+    /// (the join-view analogue of [`Table::execute_plan_empty`]).
+    pub(crate) fn execute_join_plan_empty(
+        &self,
+        plan: &Plan,
+        dimension: &Table,
+    ) -> Result<QueryOutput, EngineError> {
+        Ok(query_lite::execute_join(
+            query_lite::JoinSide {
+                schema: self.store.schema(),
+                handles: &[],
+                ordering_key: self.store.ordering_key(),
+            },
+            query_lite::JoinSide {
+                schema: dimension.store.schema(),
+                handles: &[],
+                ordering_key: dimension.store.ordering_key(),
+            },
+            plan,
+            &self.current_registry(),
+        )?)
+    }
+
     /// Runs a join plan with `self` as the fact table (the database
     /// handle resolves the dimension and calls this).
     pub(crate) fn execute_join_plan(
@@ -998,6 +1022,34 @@ impl Table {
             .store
             .knowledge_snapshot()?
             .touched_ordering_keys(since, touch)?)
+    }
+
+    /// As [`Table::touched_ordering_keys`], additionally yielding the
+    /// touched row's value in the named key column — the seam a
+    /// maintained join view's refresh needs (#83 tranche 3): a
+    /// reference-side correction's blast radius is a fact-key range
+    /// *per join-key value*, so the walk must say whose row changed
+    /// (see [`KnowledgeSnapshot::touched_rows`]).
+    ///
+    /// [`KnowledgeSnapshot::touched_rows`]:
+    ///     storage_lite::store::KnowledgeSnapshot::touched_rows
+    pub(crate) fn touched_rows(
+        &self,
+        since: u64,
+        key_column: &str,
+        touch: impl FnMut(i64, Option<&str>),
+    ) -> Result<(), EngineError> {
+        let index = self
+            .store
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == key_column)
+            .ok_or_else(|| EngineError::Query(QueryError::UnknownColumn(key_column.to_owned())))?;
+        Ok(self
+            .store
+            .knowledge_snapshot()?
+            .touched_rows(since, index, touch)?)
     }
 
     /// Supersedes every live row matching `predicate` with the rows of
