@@ -73,8 +73,9 @@ impl Database {
 
     /// Creates an in-memory maintained view (#83) over the named
     /// source table — a bucketed, running, or cumulative single-table
-    /// aggregate, or a bare as-of join (the enriched blotter, whose
-    /// second table is resolved from the definition's own JOIN
+    /// aggregate, or a join view (the enriched blotter, aggregates
+    /// over the as-of join, or star aggregates over the equi join;
+    /// the second table is resolved from the definition's own JOIN
     /// clause) — kept fresh by refresh; see [`MaterializedView`] for
     /// the shapes and what a definition may contain. The name shares
     /// the table namespace.

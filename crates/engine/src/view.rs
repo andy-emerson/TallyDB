@@ -1,6 +1,8 @@
-//! Maintained views (#83, tranches 1 and 2): single-table aggregates —
-//! bucketed, running, and cumulative — kept fresh as ordered data
-//! arrives.
+//! Maintained views (#83): single-table aggregates — bucketed,
+//! running, and cumulative — and join views over a fact table and a
+//! second source — the enriched blotter, aggregates over the as-of
+//! join, and star aggregates over the equi join — kept fresh as
+//! ordered data arrives.
 //!
 //! ## The model, in one paragraph
 //!
@@ -26,7 +28,7 @@
 //! ruled 2026-08-02 on #83): no accumulator state, no delta
 //! arithmetic, no f64 subtraction hazard.
 //!
-//! ## The three admitted shapes
+//! ## The single-table shapes
 //!
 //! **Bucketed** (tranche 1): a `GROUP BY` over one bucket of the
 //! ordering key (`ts / 60`, `(ts / 60) * 60`, or bare `ts`), plus any
@@ -62,10 +64,40 @@
 //! corrections sit in history segments — refusal parity, not a gap:
 //! `view AS OF s = Q(base AS OF s)`, refusals included.
 //!
+//! ## Join views (tranche 3)
+//!
+//! A join view has TWO sources: the **fact** table, whose ordering
+//! key is the view's axis, and a **dimension** — a quote history for
+//! the as-of shapes, a keyed attribute table for the star shape. The
+//! durable state grows a pair: the dimension's own stamp and the
+//! **ceiling**, the fact-key bound below which materialization is
+//! allowed. The ceiling is the dimension frontier's bucket edge:
+//! a fact key at or above it could still change matches when the
+//! next in-order quote arrives, so refresh materializes strictly
+//! below it and the union read answers the rest live. In-order
+//! dimension arrivals therefore never dirty the materialization; a
+//! LATE quote below the ceiling dirties exactly its **correction
+//! interval** — from its key to the same symbol's next quote —
+//! derivable from the dimension's knowledge history like every other
+//! correction (the interval lemma; proof in DESIGN's tranche-3
+//! record). A frontier regression (a correction deletes the newest
+//! quote) lowers the ceiling and dematerializes the stranded band.
+//! The star shape needs no ceiling: any dimension change rebuilds
+//! the materialization whole (F4, ruled on #83), and the read serves
+//! the answer live while a rebuild is pending. As-of ties break by
+//! birth sequence (`_seq`), engine-wide (F8). Eligibility (F7): the
+//! as-of join is q-hierarchical; the equi join is admitted with the
+//! join key unique on the dimension side, checked loudly at
+//! execution.
+//!
 //! ## What stays refused, and why
 //!
-//! - joins — tranche 3, q-hierarchical only (the PODS 2017 dichotomy
-//!   names exactly which joins can be maintained in O(1)).
+//! - bare projections over a single table — a view must fold or
+//!   match something; the blotter is admitted exactly because it
+//!   materializes the match.
+//! - `AS OF` over a join view — a join view's answer is a function
+//!   of TWO knowledge coordinates, so a single `s` is ambiguous; the
+//!   honest two-cut form is seated as #99.
 //! - `AS OF` / `_seq` in the definition — refused permanently, not
 //!   deferred: a view definition must read within one knowledge
 //!   snapshot, or `view AS OF s = Q(base AS OF s)` stops being
@@ -2732,11 +2764,11 @@ fn eligible_shape(
 }
 
 /// Classifies a definition whose FROM clause is a join (#83
-/// tranche 3). Cycle 1 admits the **enriched blotter**: a bare
-/// projection over one `ASOF LEFT/INNER JOIN`, the fact ordering key
-/// selected (it is the view's axis). Later cycles are refused by
-/// name; a view must fold or match something, and the blotter
-/// materializes the match.
+/// tranche 3). Bare projections admit the **enriched blotter**: one
+/// `ASOF LEFT/INNER JOIN`, the fact ordering key selected (it is the
+/// view's axis) — a view must fold or match something, and the
+/// blotter materializes the match. Aggregate projections route to
+/// [`classify_joined_aggregate`] (ASOF and equi both).
 fn classify_joined(
     plan: &Plan,
     source: &Table,
