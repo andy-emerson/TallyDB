@@ -1156,3 +1156,294 @@ pub unsafe extern "C" fn tallydb_view_close(context: *mut ViewContext) {
     drop(context);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---------------------------------------------------------------------
+// The maintained JOIN-view family (#83, tranche 3): a database holding
+// a fact table, a quote history, a small keyed dimension, and three
+// join views over them — the ASOF blotter, bucketed aggregates over
+// the ASOF join, and star bars over the equi join. The script mirrors
+// every statement into DuckDB (whose native ASOF JOIN is the
+// independent recompute) and diffs each view's answer at scripted
+// checkpoints across stale, refreshed, late-quote-corrected,
+// dim-changed, compacted, and reopened states.
+
+/// The join fixture's definitions, exported so the script cannot
+/// drift. Quote timestamps are kept unique per symbol by the script,
+/// so DuckDB's tie rule never meets ours (ties have their own
+/// in-crate tests against the ruled `_seq` rule).
+pub const JOIN_BLOTTER_DEFINITION: &str = "SELECT ts, sym, x, bid FROM trades \
+     ASOF LEFT JOIN quotes ON trades.sym = quotes.sym";
+
+/// Bucketed aggregates over the ASOF join.
+pub const JOIN_BARS_DEFINITION: &str = "SELECT sym, ts / 5 AS bar, count(*) AS n, \
+     avg(bid) AS ab, sum(x) AS s FROM trades \
+     ASOF LEFT JOIN quotes ON trades.sym = quotes.sym GROUP BY sym, ts / 5";
+
+/// Star bars over the equi join (sector per symbol).
+pub const JOIN_STAR_DEFINITION: &str = "SELECT sector, ts / 5 AS bar, sum(x) AS s, \
+     count(*) AS n FROM trades JOIN dim ON trades.sym = dim.sym \
+     GROUP BY sector, ts / 5";
+
+/// The context behind the join-view oracle family.
+pub struct JoinViewContext {
+    /// `None` transiently during [`tallydb_join_view_reopen`].
+    db: Option<Database>,
+    dir: std::path::PathBuf,
+}
+
+impl JoinViewContext {
+    fn db(&self) -> &Database {
+        self.db.as_ref().expect("context holds an open database")
+    }
+    fn db_mut(&mut self) -> &mut Database {
+        self.db.as_mut().expect("context holds an open database")
+    }
+    fn open_at(dir: &std::path::Path) -> Result<Database, crate::EngineError> {
+        let existing = dir
+            .join("trades")
+            .join(storage_lite::store::MANIFEST)
+            .is_file();
+        let options = storage_lite::StoreOptions::default;
+        let mut db = Database::new();
+        let quote_schema = Schema::new(vec![
+            Field::new("qts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("bid", ColumnType::F64, false),
+        ]);
+        let dim_schema = Schema::new(vec![
+            Field::new("id", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("sector", ColumnType::Key, false),
+        ]);
+        let (trades, quotes, dim) = if existing {
+            (
+                Table::open("trades", dir.join("trades"), options())?,
+                Table::open("quotes", dir.join("quotes"), options())?,
+                Table::open("dim", dir.join("dim"), options())?,
+            )
+        } else {
+            (
+                Table::persistent_with_segment_rows(
+                    "trades",
+                    asof_schema(),
+                    "ts",
+                    dir.join("trades"),
+                    SEGMENT_ROWS,
+                )?,
+                Table::persistent_with_segment_rows(
+                    "quotes",
+                    quote_schema,
+                    "qts",
+                    dir.join("quotes"),
+                    SEGMENT_ROWS,
+                )?,
+                Table::persistent_with_segment_rows(
+                    "dim",
+                    dim_schema,
+                    "id",
+                    dir.join("dim"),
+                    SEGMENT_ROWS,
+                )?,
+            )
+        };
+        let views: [(&str, &str, &Table); 3] = [
+            ("blotter", JOIN_BLOTTER_DEFINITION, &quotes),
+            ("jbars", JOIN_BARS_DEFINITION, &quotes),
+            ("sbars", JOIN_STAR_DEFINITION, &dim),
+        ];
+        let mut opened = Vec::new();
+        for (name, definition, dimension) in views {
+            opened.push(if existing {
+                crate::MaterializedView::open(
+                    name,
+                    dir.join(name),
+                    &trades,
+                    Some(dimension),
+                    options(),
+                )?
+            } else {
+                crate::MaterializedView::persistent(
+                    name,
+                    definition,
+                    &trades,
+                    Some(dimension),
+                    dir.join(name),
+                )?
+            });
+        }
+        db.add_table(trades)?;
+        db.add_table(quotes)?;
+        db.add_table(dim)?;
+        for view in opened {
+            db.add_view(view)?;
+        }
+        Ok(db)
+    }
+}
+
+/// Opens the join-view fixture: empty persistent tables and the three
+/// join views. The script drives every row in via SQL, so its DuckDB
+/// mirror is exact by construction.
+#[no_mangle]
+pub extern "C" fn tallydb_join_view_open() -> *mut JoinViewContext {
+    let dir = std::env::temp_dir().join(format!("tallydb-join-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["trades", "quotes", "dim", "blotter", "jbars", "sbars"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("fixture directories");
+    }
+    let db = JoinViewContext::open_at(&dir).expect("join fixture opens");
+    Box::into_raw(Box::new(JoinViewContext { db: Some(db), dir }))
+}
+
+/// The three definitions, NUL-terminated, for the script's mirrors.
+#[no_mangle]
+pub extern "C" fn tallydb_join_view_definitions() -> *const std::os::raw::c_char {
+    static DEFINITIONS: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DEFINITIONS
+        .get_or_init(|| {
+            std::ffi::CString::new(format!(
+                "{JOIN_BLOTTER_DEFINITION}\n{JOIN_BARS_DEFINITION}\n{JOIN_STAR_DEFINITION}"
+            ))
+            .expect("no NULs")
+        })
+        .as_ptr()
+}
+
+/// Runs one INSERT / UPDATE / DELETE against any of the three base
+/// tables. Returns rows changed, or -1 on failure.
+///
+/// # Safety
+/// `context` must come from [`tallydb_join_view_open`] and not be
+/// closed; `sql` must be a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_statement(
+    context: *mut JoinViewContext,
+    sql: *const std::os::raw::c_char,
+) -> i64 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_join_view_statement: SQL is not UTF-8");
+            return -1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &mut *context }.db_mut().mutate(sql) {
+        Ok(changed) => i64::try_from(changed).unwrap_or(i64::MAX),
+        Err(error) => {
+            eprintln!("tallydb_join_view_statement: {sql}: {error}");
+            -1
+        }
+    }
+}
+
+/// Refreshes every join view. Returns the saturating sum of re-fold
+/// counts, or -1 on failure.
+///
+/// # Safety
+/// As for [`tallydb_join_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_refresh(context: *mut JoinViewContext) -> i64 {
+    // SAFETY: caller contract — a live context.
+    let db = unsafe { &mut *context }.db_mut();
+    let mut folded = 0u64;
+    for name in ["blotter", "jbars", "sbars"] {
+        match db.refresh_view(name) {
+            Ok(count) => folded = folded.saturating_add(count),
+            Err(error) => {
+                eprintln!("tallydb_join_view_refresh: {name}: {error}");
+                return -1;
+            }
+        }
+    }
+    i64::try_from(folded).unwrap_or(i64::MAX)
+}
+
+/// Runs one query — against a view or a base table — and exports the
+/// result as an `ArrowArrayStream`. Returns 0 on success.
+///
+/// # Safety
+/// As for [`tallydb_join_view_statement`]; `out` must be valid and
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_query_stream(
+    context: *mut JoinViewContext,
+    sql: *const std::os::raw::c_char,
+    out: *mut ArrowArrayStream,
+) -> i32 {
+    // SAFETY: caller contract — a valid NUL-terminated string.
+    let sql = match unsafe { std::ffi::CStr::from_ptr(sql) }.to_str() {
+        Ok(sql) => sql,
+        Err(_) => {
+            eprintln!("tallydb_join_view_query_stream: SQL is not UTF-8");
+            return 1;
+        }
+    };
+    // SAFETY: caller contract — a live context.
+    match unsafe { &*context }.db().query_stream(sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => {
+            unsafe { out.write(stream) };
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_join_view_query_stream: {sql}: {error}");
+            1
+        }
+    }
+}
+
+/// Compacts all three base tables. Returns 0 on success.
+///
+/// # Safety
+/// As for [`tallydb_join_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_compact(context: *mut JoinViewContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    let db = unsafe { &mut *context }.db_mut();
+    for name in ["trades", "quotes", "dim"] {
+        if let Err(error) = db.compact(name) {
+            eprintln!("tallydb_join_view_compact: {name}: {error}");
+            return 1;
+        }
+    }
+    0
+}
+
+/// Closes and reopens the whole fixture from its directories — the
+/// storage round trip for all three tables AND the three v3 view
+/// records with their stamp pairs and ceilings. Returns 0 on success.
+///
+/// # Safety
+/// As for [`tallydb_join_view_statement`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_reopen(context: *mut JoinViewContext) -> i32 {
+    // SAFETY: caller contract — a live context.
+    let context = unsafe { &mut *context };
+    context.db = None; // drop every handle before the directories reopen
+    match JoinViewContext::open_at(&context.dir) {
+        Ok(db) => {
+            context.db = Some(db);
+            0
+        }
+        Err(error) => {
+            eprintln!("tallydb_join_view_reopen: {error}");
+            1
+        }
+    }
+}
+
+/// Closes the context and removes its directory.
+///
+/// # Safety
+/// `context` must come from [`tallydb_join_view_open`]; exactly one
+/// close.
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_join_view_close(context: *mut JoinViewContext) {
+    // SAFETY: caller contract — exactly one close per open.
+    let context = unsafe { Box::from_raw(context) };
+    let dir = context.dir.clone();
+    drop(context);
+    let _ = std::fs::remove_dir_all(dir);
+}

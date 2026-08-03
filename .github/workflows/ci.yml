@@ -58,6 +58,8 @@ jobs:
         run: python3 crates/engine/tests/m4_asof_oracle.py target/debug/libengine.so
       - name: Maintained-view oracle — DuckDB recompute at scripted checkpoints (issue #83)
         run: python3 crates/engine/tests/m5_view_oracle.py target/debug/libengine.so
+      - name: Join-view oracle — DuckDB's native ASOF JOIN as recompute (issue #83, tranche 3)
+        run: python3 crates/engine/tests/m5_join_oracle.py target/debug/libengine.so
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
         run: cargo test -p compute-lua --features apicheck
 
