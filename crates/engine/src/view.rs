@@ -605,8 +605,12 @@ impl MaterializedView {
         // Materialize strictly below the frontier: an in-order arrival
         // lands at or above it (a tie at the frontier included), so
         // every materialized row can only be changed by a correction —
-        // which the dimension's knowledge history reports.
-        let ceiling = frontier;
+        // which the dimension's knowledge history reports. For a
+        // bucketed aggregate the ceiling rounds DOWN to its bucket's
+        // low edge — the bucket containing the frontier is partially
+        // unstable, so none of it materializes (identity when
+        // divide == 1, the blotter).
+        let ceiling = bucket_low(frontier / definition.divide, definition.divide);
         if now_fact < self.stamp || now_dim < join.stamp {
             // The rebuild floor, on either axis: a watermark below its
             // stamp cannot come from a crash under flush-then-stamp —
@@ -627,13 +631,13 @@ impl MaterializedView {
             joined_touched_ranges(source, dimension, &definition, self.stamp, join.stamp)?;
         ranges.retain(|&(low, _)| low < ceiling);
         for range in &mut ranges {
-            range.1 = range.1.min(ceiling - 1);
+            range.1 = range.1.min(ceiling.saturating_sub(1));
         }
         if join.ceiling < ceiling {
             // The frontier moved: fact rows between the old ceiling
             // and the new one just became stable, and no touched
             // signal names them — the ceiling does.
-            ranges.push((join.ceiling, ceiling - 1));
+            ranges.push((join.ceiling, ceiling.saturating_sub(1)));
         }
         if ranges.is_empty() {
             if let Some(join) = self.join.as_mut() {
@@ -642,22 +646,25 @@ impl MaterializedView {
             self.advance_stamp(now_fact)?;
             return Ok(0);
         }
-        let runs = merge_key_ranges(ranges);
-        // The re-fold count clips to the fact table's actual key span:
-        // the ceiling-advance range opens at i64::MIN on a first
-        // refresh, and "keys re-folded" should mean keys that exist,
-        // not the width of the axis.
+        let runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
+        // The re-fold count clips to the fact table's actual span (in
+        // bucket units): the ceiling-advance range opens at i64::MIN
+        // on a first refresh, and "buckets re-folded" should mean
+        // buckets that exist, not the width of the axis.
         let folded = match source_span(source)? {
             None => 0,
-            Some((fact_low, fact_high)) => runs
-                .iter()
-                .map(|&(low, high)| {
-                    let low = low.max(fact_low) as i128;
-                    let high = high.min(fact_high) as i128;
-                    (high - low + 1).max(0) as u128
-                })
-                .sum::<u128>()
-                .min(u64::MAX as u128) as u64,
+            Some((fact_low, fact_high)) => {
+                let (fact_low, fact_high) =
+                    (fact_low / definition.divide, fact_high / definition.divide);
+                runs.iter()
+                    .map(|&(low, high)| {
+                        let low = low.max(fact_low) as i128;
+                        let high = high.min(fact_high) as i128;
+                        (high - low + 1).max(0) as u128
+                    })
+                    .sum::<u128>()
+                    .min(u64::MAX as u128) as u64
+            }
         };
         let replacement =
             source.execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
@@ -704,7 +711,7 @@ impl MaterializedView {
         // lives in the live half (with the ceiling at i64::MIN, that
         // is the whole axis and the read is a plain live join).
         ranges.push((join.ceiling, i64::MAX));
-        let runs = merge_key_ranges(ranges);
+        let runs = key_ranges_to_bucket_runs(merge_key_ranges(ranges), definition.divide);
         let fresh =
             source.execute_join_plan(&definition.restricted_to(&runs, source), dimension)?;
         let mut clean = select_everything(&self.table)?;
@@ -1166,6 +1173,16 @@ impl Definition {
                 view_scale: 1,
                 read: ReadShape::Joined,
             }),
+            Shape::JoinedBucketed(bucket, bucket_name) => {
+                let (divide, view_scale) = bucket_arithmetic(&bucket);
+                Ok(Definition {
+                    plan,
+                    bucket_name,
+                    divide,
+                    view_scale,
+                    read: ReadShape::Joined,
+                })
+            }
         }
     }
 
@@ -1745,6 +1762,22 @@ fn table_okey_max(table: &Table) -> Result<Option<i64>, EngineError> {
         }
         _ => None,
     })
+}
+
+/// Key-space ranges to bucket-index runs under the definition's
+/// truncating bucket width — merged again afterward, since adjacent
+/// keys can share a bucket. Identity when `divide == 1` (the blotter,
+/// whose repair granularity is the key itself).
+fn key_ranges_to_bucket_runs(ranges: Vec<(i64, i64)>, divide: i64) -> Vec<(i64, i64)> {
+    if divide == 1 {
+        return ranges;
+    }
+    merge_key_ranges(
+        ranges
+            .into_iter()
+            .map(|(low, high)| (low / divide, high / divide))
+            .collect(),
+    )
 }
 
 /// Sorts and merges overlapping or adjacent key ranges — the join
@@ -2408,6 +2441,10 @@ enum Shape {
     /// Tranche 3, cycle 1: a bare as-of join, carrying the fact
     /// ordering key's OUTPUT name (the view table's ordering key).
     Joined(String),
+    /// Tranche 3, cycle 2: a bucketed aggregate over an as-of join —
+    /// the tranche-1 shape whose FROM is a join. Carries the bucket
+    /// term and its output name.
+    JoinedBucketed(GroupKey, String),
 }
 
 /// The eligibility check: classifies a definition as bucketed
@@ -2584,12 +2621,7 @@ fn classify_joined(
         );
     }
     let Projection::Items(items) = &plan.projection else {
-        return refuse(
-            "an aggregate over a join in a view definition — bucketed \
-             aggregates over the ASOF join land with tranche 3's next \
-             cycle; the blotter (a bare projection) is what this cycle \
-             maintains",
-        );
+        return classify_joined_aggregate(plan, source, dimension);
     };
     for item in items {
         match item {
@@ -2637,6 +2669,105 @@ fn classify_joined(
         );
     }
     Ok(Shape::Joined(okey))
+}
+
+/// Classifies a bucketed aggregate over an as-of join (#83 tranche 3,
+/// cycle 2): the tranche-1 shape — one bucket of the FACT ordering key
+/// plus symbol keys, built aggregates, optional row-local WHERE — with
+/// the FROM clause a shipped ASOF join. Group keys and aggregate
+/// arguments may name either side's columns (a dimension attribute as
+/// a group key rides the same interval repair: a quote correction
+/// re-folds its buckets whole).
+fn classify_joined_aggregate(
+    plan: &Plan,
+    source: &Table,
+    dimension: &Table,
+) -> Result<Shape, EngineError> {
+    let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
+    let Projection::Aggregate {
+        keys,
+        items,
+        having,
+    } = &plan.projection
+    else {
+        unreachable!("routed here from the Aggregate arm")
+    };
+    if having.is_some() {
+        return refuse(
+            "HAVING in a view definition — a view stores every group; \
+             filter at read",
+        );
+    }
+    let symbol_on_either = |column: &str| {
+        source
+            .schema()
+            .fields()
+            .iter()
+            .chain(dimension.schema().fields().iter())
+            .any(|field| field.name() == column && field.column_type() == ColumnType::Key)
+    };
+    for key in keys {
+        if let GroupKey::Column(column) = key {
+            if column != source.ordering_key() && !symbol_on_either(column) {
+                return refuse(
+                    "a non-symbol, non-bucket GROUP BY key in a join view \
+                     definition — group by symbols (either side's) and at \
+                     most one bucket of the fact ordering key",
+                );
+            }
+        }
+    }
+    let mut bucket_terms = keys.iter().filter(|key| {
+        matches!(key, GroupKey::Bucket { column, .. } if column == source.ordering_key())
+            || matches!(key, GroupKey::Column(column) if column == source.ordering_key())
+    });
+    let Some(bucket) = bucket_terms.next() else {
+        return refuse(
+            "an aggregate over a join with no bucket of the fact ordering \
+             key — running and cumulative shapes over joins hold their \
+             seats; bucket the fact axis, or maintain a single-table view",
+        );
+    };
+    if bucket_terms.next().is_some() {
+        return refuse("two buckets of the ordering key in one GROUP BY");
+    }
+    if keys.iter().any(
+        |key| matches!(key, GroupKey::Bucket { column, .. } if column != source.ordering_key()),
+    ) {
+        return refuse(
+            "a bucket of a non-fact column in a join view definition — the \
+             view's axis is the fact ordering key",
+        );
+    }
+    if let GroupKey::Bucket {
+        divide,
+        multiply: Some(multiply),
+        ..
+    } = bucket
+    {
+        if multiply != divide {
+            return refuse(
+                "a bucket whose multiplier differs from its width in a view \
+                 definition — a bucket start is (ts / w) * w, same w",
+            );
+        }
+    }
+    let name = items
+        .iter()
+        .find_map(|item| match item {
+            query_lite::AggItem::Key { key, alias } if key == bucket => {
+                Some(alias.clone().unwrap_or_else(|| key.output_name()))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            EngineError::Query(QueryError::Unsupported(
+                "a view whose SELECT list omits its bucket — the bucket is \
+                 the view's ordering key, so select it (alias it to taste)"
+                    .to_owned(),
+            ))
+        })?;
+    Ok(Shape::JoinedBucketed(bucket.clone(), name))
 }
 
 /// Refuses a running or cumulative definition that touches the `__`
@@ -3201,17 +3332,40 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("equi-join"), "{error}");
-        let error = MaterializedView::new(
+        // Cycle 2 ADMITS the bucketed aggregate over the ASOF join —
+        // a dimension-valued aggregate included.
+        MaterializedView::new(
             "v",
             "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
              ASOF LEFT JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4",
             &source,
             Some(&dim),
         )
-        .map(|_| ())
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("aggregate over a join"), "{error}");
+        .unwrap();
+        // What stays refused around it, by name.
+        let refused = |sql: &str, needle: &str| {
+            let error = MaterializedView::new("v", sql, &source, Some(&dim))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{sql}: {error}");
+        };
+        refused(
+            "SELECT sym, sum(w) AS s FROM trades \
+             ASOF LEFT JOIN dim ON trades.sym = dim.sym GROUP BY sym",
+            "no bucket of the fact ordering key",
+        );
+        refused(
+            "SELECT qts / 4 AS b, sum(w) AS s FROM trades \
+             ASOF LEFT JOIN dim ON trades.sym = dim.sym GROUP BY qts / 4",
+            "no bucket of the fact ordering key",
+        );
+        refused(
+            "SELECT ts / 4 AS b, sum(w) AS s FROM trades \
+             ASOF LEFT JOIN dim ON trades.sym = dim.sym GROUP BY ts / 4 \
+             HAVING sum(w) > 1",
+            "HAVING",
+        );
     }
 
     #[test]
@@ -5346,5 +5500,160 @@ mod tests {
         let row = db.query("SELECT bid FROM blotter WHERE ts = 14").unwrap();
         let bids = crate::table::tests::flatten(&row, 0);
         assert_eq!(bids, [Some(8.5)]);
+    }
+
+    const JOINED_BARS: &str = "SELECT sym, ts / 4 AS bar, count(*) AS n, \
+         avg(bid) AS ab, min(x) AS lo FROM trades \
+         ASOF LEFT JOIN quotes ON trades.sym = quotes.sym \
+         GROUP BY sym, ts / 4";
+
+    /// The cycle-2 A/B: the aggregate view against the SAME aggregate
+    /// run directly over the base join — independent leg, exact at
+    /// every state.
+    fn assert_joined_bars_match(db: &Database, view: &str) {
+        let through = db
+            .query(&format!("SELECT sym, bar, n, ab, lo FROM {view}"))
+            .unwrap();
+        let direct = db.query(JOINED_BARS).unwrap();
+        assert_eq!(
+            sorted_rows(&through),
+            sorted_rows(&direct),
+            "joined-aggregate view '{view}' diverged from the direct query"
+        );
+        assert!(through.num_rows() > 0, "vacuous joined-bars check");
+    }
+
+    #[test]
+    fn a_bucketed_aggregate_over_an_asof_join_answers_exactly() {
+        let mut db = blotter_db();
+        db.create_materialized_view("bars", JOINED_BARS).unwrap();
+        // Stale: the whole answer is a live join-fold.
+        assert_joined_bars_match(&db, "bars");
+        // First refresh: frontier 12 rounds to its own bucket's low
+        // edge (12 = bucket 3's edge under width 4), so buckets 0..=2
+        // materialize — 3 buckets folded, everything else live.
+        assert_eq!(db.refresh_view("bars").unwrap(), 3);
+        assert_joined_bars_match(&db, "bars");
+        // In-order quote appends land above the ceiling: exact while
+        // stale, no materialized bucket dirtied.
+        for (qts, sym, bid) in [(13, "B", 2.13), (16, "A", 1.16)] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        assert_joined_bars_match(&db, "bars");
+        db.refresh_view("bars").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        // A late quote below the ceiling dirties its interval's
+        // buckets — whole buckets, the aggregate's repair granularity.
+        db.append(
+            "quotes",
+            &[
+                storage_lite::RowValue::I64(6),
+                storage_lite::RowValue::Key("B"),
+                storage_lite::RowValue::F64(9.9),
+            ],
+        )
+        .unwrap();
+        assert_joined_bars_match(&db, "bars"); // dirty, unrefreshed
+        db.refresh_view("bars").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        // Quote amend + delete below the ceiling; fact corrections.
+        db.mutate("UPDATE quotes SET bid = 7.7 WHERE qts = 4")
+            .unwrap();
+        db.refresh_view("bars").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        db.mutate("DELETE FROM quotes WHERE qts = 4").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        db.refresh_view("bars").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        db.mutate("UPDATE trades SET x = 500.0 WHERE ts = 3")
+            .unwrap();
+        assert_joined_bars_match(&db, "bars");
+        db.refresh_view("bars").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        db.compact("trades").unwrap();
+        db.compact("quotes").unwrap();
+        assert_joined_bars_match(&db, "bars");
+        // AS OF stays refused on join views, aggregate shape included.
+        let error = db
+            .query("SELECT bar FROM bars ASOF 5")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("#99"), "{error}");
+    }
+
+    #[test]
+    fn a_dimension_attribute_group_key_rides_the_interval_repair() {
+        // Group by a DIMENSION symbol (the quote venue): a quote
+        // correction can move rows between groups, and the whole-
+        // bucket re-fold must carry them — the "either side's columns"
+        // half of the cycle-2 door.
+        let mut db = Database::new();
+        db.add_table(Table::with_segment_rows("trades", m1_schema(), "ts", 4).unwrap())
+            .unwrap();
+        db.add_table(
+            Table::with_segment_rows(
+                "quotes",
+                arrow_lite::Schema::new(vec![
+                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
+                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("venue", arrow_lite::ColumnType::Key, false),
+                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                ]),
+                "qts",
+                4,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..16 {
+            db.append("trades", &linear_row(i)).unwrap();
+        }
+        for (qts, sym, venue, bid) in [
+            (0, "A", "X", 1.0),
+            (1, "B", "Y", 2.0),
+            (6, "A", "Y", 1.6),
+            (7, "B", "X", 2.7),
+            (12, "A", "X", 1.12),
+            (13, "B", "Y", 2.13),
+        ] {
+            db.append(
+                "quotes",
+                &[
+                    storage_lite::RowValue::I64(qts),
+                    storage_lite::RowValue::Key(sym),
+                    storage_lite::RowValue::Key(venue),
+                    storage_lite::RowValue::F64(bid),
+                ],
+            )
+            .unwrap();
+        }
+        const BY_VENUE: &str = "SELECT venue, ts / 4 AS bar, sum(bid) AS s \
+             FROM trades ASOF LEFT JOIN quotes ON trades.sym = quotes.sym \
+             GROUP BY venue, ts / 4";
+        db.create_materialized_view("vbars", BY_VENUE).unwrap();
+        db.refresh_view("vbars").unwrap();
+        let check = |db: &Database| {
+            let through = db.query("SELECT venue, bar, s FROM vbars").unwrap();
+            let direct = db.query(BY_VENUE).unwrap();
+            assert_eq!(sorted_rows(&through), sorted_rows(&direct));
+            assert!(through.num_rows() > 0);
+        };
+        check(&db);
+        // A venue correction below the ceiling MOVES rows across
+        // groups; the interval re-fold replaces the buckets whole.
+        db.mutate("UPDATE quotes SET venue = 'Z' WHERE qts = 6")
+            .unwrap();
+        check(&db); // dirty, unrefreshed
+        assert!(db.refresh_view("vbars").unwrap() >= 1);
+        check(&db);
     }
 }
