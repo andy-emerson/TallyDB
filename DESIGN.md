@@ -1584,6 +1584,89 @@ refusal strings for the single-table and joined doors repeat some
 phrasing — noted, not worth a shared constant yet; console verbs and
 SQL DDL for views remain the API-first ruling's deliberate gap.
 
+### Rolling multi-factor regression (#90, ruled and built 2026-08-03)
+
+A rolling least-squares fit of a response on **K factors**, `K > 2`,
+maintained across the window's slide rather than re-solved per frame.
+Above two parameters there is no closed form, so this is the first op
+that needed a solve at all — the reopen trigger the no-LAPACK record
+set, fired at last.
+
+**Why moments, not a factorization.** The issue proposed rank-one
+up/downdating of a Cholesky factor. Research closed that: downdating is
+an **ill-posed problem**, not merely a delicate algorithm — when the
+departing row leaves the window near-rank-deficient, the digits needed
+were rounded away when the row was added, and no algorithm holding only
+the factor and the row can recover them (Stewart 1979; Pan 1993;
+Eldén–Park 1996). Signal processing reached the same conclusion decades
+ago and standardised on periodic restart or exponential forgetting;
+PostgreSQL refuses float inverse transition functions for the adjacent
+reason, and DuckDB uses subtraction-free segment trees. Measurement
+agreed with the literature: factor downdating was the worst of six
+candidates tried, in every case, even with a periodic rebuild to rescue
+it. What ships instead is the **anchored moment carrier** — `XᵀX` and
+`Xᵀy` as sums of deviations from a data-row anchor — re-solved per
+frame at `O(K³)`, which at these K is nothing, and maintained at
+`O(K²)` per row.
+
+**The three disciplines, inherited from K ≤ 2.** Anchoring (every value
+enters and leaves as a deviation from a point taken from the data, so
+sums stay at the window's scale); periodic rebuild (re-anchor and
+refold every `w` steps, bounding drift to one period); and one shared
+`fit()` for both evaluation schedules, so per-frame and incremental
+cannot disagree about NULL. A fourth rule is new here: non-finite rows
+break the sliding identity, so those frames fall back to exact
+per-frame arithmetic — and the fallback must be decided **before** the
+accumulator is touched, or the frame pays for a fold it discards. The
+repo-wide review caught exactly that inversion, which had made the
+"incremental" path roughly half the speed of the recompute it replaces
+on 1%-NaN data while answering correctly throughout.
+
+**What a frame refuses.** Fewer rows than parameters, or a design whose
+factors are near-dependent, yields NULL for that frame — never an error
+for the query, the convention the non-finite path already set. The
+pivot floor tests near-linear-**dependence**, not conditioning: it
+rejects when a factor's variance, after the earlier factors are
+projected out, falls below `1e-12` of its own. For collinearity that
+lands near `κ(X) ≈ 1e6` (accepted at 3.1e5, refused at 3.1e6); a merely
+badly *scaled* design passes at any κ, which is right — scale is an
+equilibration question, not a rank one.
+
+**Surface.** No SQL name (#77.1 stands): the kernel is reached by
+registration, so the dialect never grew `regr_multi`. The solve is
+ours for now under F2(c) — a hand-rolled `K × K` Cholesky behind a
+single function — with adoption of MatLua the standing reopen trigger
+once its endpoints land and the two can be compared.
+
+**Evidence** (2026-08-03, this container). Accuracy is judged against
+two references that share no computational path with the shipped route:
+Householder QR in-tree, and NumPy `lstsq` through the C ABI. Against
+QR over eight adversarial corpora at 64-row windows, the sweep holds
+1.3e-14 benign, 2.6e-14 / 9.1e-15 / 3.7e-15 at offsets 1e6 / 1e9 /
+1e12, 1.7e-13 on a drifting level (where per-frame recompute is
+3.8e-12 — the sweep is *better*), 1.2e-14 on scale spread, and 3.3e-5
+on near-collinearity, with windows collinear to 1e-6 refused outright.
+The ninth oracle diffs 228 windows × {intercept, three coefficients,
+R²} against `lstsq`, worst 4.7e-11, plus 12 rank-deficient windows
+refused as ruled. Speed: 4.2×–37.6× over per-frame recompute across
+K ∈ {4, 8, 16} and windows {32, 64, 256}, and the shape confirms the
+cost model — the sweep's time is **flat** in the window (13.9 / 13.8 /
+14.0 ms at K = 8) where per-frame scales with it (77.1 / 139.2 / 499.4
+ms). On 1%-non-finite data the sweep is 1.4×, near parity, because
+those frames delegate to the recompute they are timed against.
+
+**Costs and seats.** The per-frame baseline allocates a fresh carrier
+per call, so the published ratios carry a few percent of allocator
+overhead in the *baseline*, flattering nothing about the sweep. Scale
+spread is handled by anchoring but not equilibrated — a Jacobi
+diagonal scaling at solve time is the seat if a workload needs it.
+`ROWS` frames get the sweep; `RANGE` and unbounded frames still take
+per-frame recompute, the same gap the K ≤ 2 kernels have. And the
+sweep skeleton now exists twice — here and in `shifted_sweep` — in
+subtly different forms; the review noted that divergence is exactly
+what let the fallback-ordering bug in, so a shared helper is worth
+considering.
+
 ## Things that are settled "no"s — don't relitigate without a specific trigger
 
 - **A boolean column type — no for now, with the Human's explicit
@@ -1712,8 +1795,25 @@ faer directly: MatLua already depends on it, and Cargo unifies
 semver-compatible versions, so reaching linear algebra *through* MatLua
 costs no second copy.
 
-*Status: ruled, not built.* Nothing in the tree depends on MatLua
-today. A requirements letter is out — what would break TallyDB if
+*Superseded in part, 2026-08-03 (F2(c) on #90) — see the tranche below.*
+When #90 came to be built, MatLua's Rust API had grown a working solver
+family but its host-integration endpoints had not landed, and the Human
+ruled that TallyDB should not wait: build our own `K × K` solve now,
+compare it against MatLua's when that lands, and adopt MatLua once the
+comparison is made. So the sentence above — "the answer is not a faer
+dependency of our own" — still holds (we took no faer dependency), but
+"TallyDB does not build the solver" no longer describes the tree: a
+hand-rolled Cholesky lives in `engine::multifactor::solve_spd`, behind
+one function precisely so the swap is a one-line change. What survives
+intact is the part that mattered most in this record — the reason the
+solver was kept out was the pressure it would put on item 3, and that
+pressure was answered instead by giving the op **no SQL name at all**:
+it is reachable only by registration, so the dialect never grew a
+`regr_multi`.
+
+*Status: ruled, partly built.* The solve is ours for now; the
+adoption of MatLua is the standing reopen trigger, recorded on #90.
+A requirements letter is out — what would break TallyDB if
 MatLua chose otherwise (a Lua face that works against a host-owned
 interpreter, no `Drop` value live across a `longjmp`, no panic across
 the C boundary, `i64` exactness with no implicit widening at the
@@ -1798,6 +1898,23 @@ condition number and degrades a thousand-fold earlier (five digits gone
 at offset 1e6). It may return later as an explicit opt-in fast path
 with its accuracy caveat documented; reopen trigger: profiling shows
 per-window factorization dominating a real workload.
+
+*The reopen clause fired, 2026-08-03 (#90), and the rejection needs
+splitting in two to stay true.* What was rejected in 2026-07-24 was
+**raw** running sums, and the κ² blowup that condemned them is the
+LARGE-OFFSET case — which anchoring removes outright: the K > 2 build
+maintains sums of deviations from a data-row anchor and lands 3.7e-15
+at offset 1e12, *better* than a per-frame solve centered on a computed
+mean, because that mean is itself a length-W summation carrying its own
+error. So the old objection does not transfer to the anchored form.
+What does transfer is COLLINEARITY: any normal-equations route pays κ²
+there, anchored or not, and the K > 2 path measures 3.3e-5 on a design
+whose third factor is nearly the sum of the other two. That is the
+accuracy caveat this record asked to see documented, and it is
+enforced rather than merely written down — near-dependent windows are
+refused outright (see the tranche below). At K ≤ 2 nothing changed:
+the closed form still ships, because a two-parameter fit has an exact
+solution and needs no moments at all.
 
 *Updated 2026-07-27:* the factorization is gone — the window solves in
 closed form (see *Curated compute*) — and the centering it required

@@ -52,8 +52,16 @@
 //! a bug in the API shape.
 //!
 //! ## Explicitly NOT in scope
-//! No solver-class routines — TallyDB builds none at all (see the scope
-//! note above). No autodiff. No general tensor operations.
+//! No solver-class routines *here*. No autodiff. No general tensor
+//! operations.
+//!
+//! This crate stays multiplication-class. The one solve TallyDB does
+//! own — a fixed-size symmetric `K × K` Cholesky for the rolling
+//! multi-factor fit (#90, ruled 2026-08-03) — deliberately does **not**
+//! live behind this trait: it is a few dozen lines operating on
+//! moments the window layer already maintains, it needs no backend
+//! negotiation, and putting it here would turn a private detail into a
+//! general solver surface. See `engine::multifactor`.
 
 pub mod backend;
 
