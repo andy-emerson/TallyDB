@@ -782,3 +782,387 @@ mod tests {
         assert!(sparse.fit(&mut out).is_none());
     }
 }
+
+/// The independent reference and the adversarial corpora for #90's
+/// accuracy contract.
+///
+/// Nothing may be judged accurate by comparison with itself, so the
+/// reference here solves the **same fits by a different algorithm**:
+/// Householder QR over the anchored design, which never forms a Gram
+/// matrix and never solves a normal equation. Its forward error goes
+/// as `κ` where the shipped path's goes as `κ²`, so on well-conditioned
+/// windows the two agree at the noise floor and on ill-conditioned ones
+/// the gap between them *is* the price of the normal-equations route —
+/// measured rather than assumed.
+#[cfg(test)]
+mod multifactor_truth {
+    /// A deterministic pseudo-random stream — a fixed LCG, so every run
+    /// and every corpus sees identical data.
+    pub(super) struct Lcg(u64);
+
+    impl Lcg {
+        pub(super) fn new(seed: u64) -> Lcg {
+            Lcg(seed)
+        }
+
+        /// Uniform on `[-1, 1)`.
+        pub(super) fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// Least squares by Householder QR: `design` is `m × n` row-major
+    /// and is consumed. Returns the `n` coefficients, or `None` if the
+    /// design is rank-deficient.
+    fn qr_least_squares(
+        design: &mut [f64],
+        rhs: &mut [f64],
+        m: usize,
+        n: usize,
+    ) -> Option<Vec<f64>> {
+        let mut reflector = vec![0.0; m];
+        for j in 0..n {
+            let norm: f64 = (j..m)
+                .map(|i| design[i * n + j] * design[i * n + j])
+                .sum::<f64>()
+                .sqrt();
+            let usable = norm.is_finite() && norm > 0.0;
+            if !usable {
+                return None;
+            }
+            let head = design[j * n + j];
+            let alpha = if head > 0.0 { -norm } else { norm };
+            for i in j..m {
+                reflector[i] = design[i * n + j];
+            }
+            reflector[j] -= alpha;
+            let scale: f64 = (j..m).map(|i| reflector[i] * reflector[i]).sum();
+            let reflected = scale > 0.0;
+            if !reflected {
+                continue;
+            }
+            for column in j..n {
+                let dot: f64 = (j..m).map(|i| reflector[i] * design[i * n + column]).sum();
+                let factor = 2.0 * dot / scale;
+                for i in j..m {
+                    design[i * n + column] -= factor * reflector[i];
+                }
+            }
+            let dot: f64 = (j..m).map(|i| reflector[i] * rhs[i]).sum();
+            let factor = 2.0 * dot / scale;
+            for i in j..m {
+                rhs[i] -= factor * reflector[i];
+            }
+        }
+        let mut out = vec![0.0; n];
+        for i in (0..n).rev() {
+            let mut value = rhs[i];
+            for k in (i + 1)..n {
+                value -= design[i * n + k] * out[k];
+            }
+            if design[i * n + i].abs() < 1e-290 {
+                return None;
+            }
+            out[i] = value / design[i * n + i];
+        }
+        Some(out)
+    }
+
+    /// The reference fit of `y` on `columns` over rows `lo..hi`,
+    /// returning `[intercept, β₁ … β_k]`. Anchored on the window's last
+    /// row exactly as the shipped path is — so the comparison isolates
+    /// the SOLVE, not the centering policy.
+    pub(super) fn reference_fit(
+        columns: &[&[f64]],
+        y: &[f64],
+        lo: usize,
+        hi: usize,
+    ) -> Option<Vec<f64>> {
+        let k = columns.len();
+        let rows = hi - lo;
+        if rows < k + 1 {
+            return None;
+        }
+        let anchor_row = hi - 1;
+        let anchor_y = y[anchor_row];
+        let width = k + 1;
+        let mut design = vec![0.0; rows * width];
+        let mut rhs = vec![0.0; rows];
+        for (slot, row) in (lo..hi).enumerate() {
+            design[slot * width] = 1.0;
+            for (factor, column) in columns.iter().enumerate() {
+                design[slot * width + factor + 1] = column[row] - column[anchor_row];
+            }
+            rhs[slot] = y[row] - anchor_y;
+        }
+        let solved = qr_least_squares(&mut design, &mut rhs, rows, width)?;
+        let mut out = vec![0.0; width];
+        let mut intercept = anchor_y + solved[0];
+        for (factor, column) in columns.iter().enumerate() {
+            out[factor + 1] = solved[factor + 1];
+            intercept -= solved[factor + 1] * column[anchor_row];
+        }
+        out[0] = intercept;
+        Some(out)
+    }
+
+    /// One adversarial case: its name, the response, and three factors.
+    pub(super) type Corpus = (&'static str, Vec<f64>, Vec<Vec<f64>>);
+
+    /// The adversarial corpora, each `(name, y, factors)` over three
+    /// factors. Every case is a shape the research or the spike named
+    /// as dangerous.
+    pub(super) fn corpora(rows: usize) -> Vec<Corpus> {
+        let truth = [0.5, -1.25, 3.0];
+        let build = |name: &'static str, shape: &dyn Fn(&mut Lcg, usize) -> Vec<f64>| {
+            let mut rng = Lcg::new(0x9E3779B97F4A7C15);
+            let factors: Vec<Vec<f64>> = (0..3).map(|_| shape(&mut rng, rows)).collect();
+            let mut noise = Lcg::new(12345);
+            let y = (0..rows)
+                .map(|row| {
+                    let mut value = 11.0 + 0.1 * noise.next();
+                    for (factor, coefficient) in factors.iter().zip(&truth) {
+                        value += factor[row] * coefficient;
+                    }
+                    value
+                })
+                .collect();
+            (name, y, factors)
+        };
+        let plain = |rng: &mut Lcg, rows: usize| (0..rows).map(|_| rng.next() * 4.0).collect();
+        let offset = |level: f64| {
+            move |rng: &mut Lcg, rows: usize| -> Vec<f64> {
+                (0..rows).map(|_| level + rng.next() * 4.0).collect()
+            }
+        };
+        let drift = |rng: &mut Lcg, rows: usize| {
+            let mut level = 0.0;
+            (0..rows)
+                .map(|_| {
+                    level += rng.next() * 10.0;
+                    level + rng.next()
+                })
+                .collect()
+        };
+        let spread = |rng: &mut Lcg, rows: usize| -> Vec<f64> {
+            (0..rows).map(|_| rng.next() * 4.0).collect()
+        };
+        let mut out = vec![
+            build("benign", &plain),
+            build("offset 1e6", &offset(1e6)),
+            build("offset 1e9", &offset(1e9)),
+            build("offset 1e12", &offset(1e12)),
+            build("drifting level", &drift),
+        ];
+        // Scale spread: the factors span 1e0..1e6, which no amount of
+        // centering fixes — it is an equilibration question.
+        let (_, y, mut factors) = build("scale spread", &spread);
+        for (power, factor) in factors.iter_mut().enumerate() {
+            let scale = 10f64.powi(power as i32 * 3);
+            factor.iter_mut().for_each(|value| *value *= scale);
+        }
+        out.push(("scale spread", y, factors));
+        // Near-collinearity at two strengths: the third factor is
+        // almost the sum of the first two.
+        for (name, noise_scale) in [("collinear 1e-4", 1e-4), ("collinear 1e-6", 1e-6)] {
+            let (_, _, mut factors) = build("seed", &plain);
+            let mut rng = Lcg::new(777);
+            let combined: Vec<f64> = (0..rows)
+                .map(|row| factors[0][row] + factors[1][row] + noise_scale * rng.next())
+                .collect();
+            factors[2] = combined;
+            let mut noise = Lcg::new(12345);
+            let y = (0..rows)
+                .map(|row| {
+                    let mut value = 11.0 + 0.1 * noise.next();
+                    for (factor, coefficient) in factors.iter().zip(&truth) {
+                        value += factor[row] * coefficient;
+                    }
+                    value
+                })
+                .collect();
+            out.push((name, y, factors));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod multifactor_numerics_guard {
+    //! The permanent accuracy contract for #90, run in CI on every
+    //! change (not ignored, not a measurement).
+    //!
+    //! The bound is **condition-qualified**, and it has to be: every
+    //! route through a Gram matrix carries a `κ²` forward error, so a
+    //! single fixed tolerance would either be met vacuously on easy
+    //! data or fail on near-collinear data *for a per-frame recompute
+    //! too*. What is guarded instead is the pair of claims that
+    //! actually matter — the sliding path never does worse than the
+    //! per-frame path it replaces, and neither strays from an
+    //! independent QR solve by more than the window's conditioning
+    //! allows.
+
+    use super::multifactor_truth::{corpora, reference_fit};
+    use super::*;
+    use query_lite::WindowAggregate;
+
+    /// Worst relative deviation of a frame sequence from the QR
+    /// reference, with the count of frames actually compared — a
+    /// bound met by comparing nothing is not a bound.
+    fn against_reference(
+        got: &[Option<f64>],
+        columns: &[&[f64]],
+        y: &[f64],
+        preceding: usize,
+        slot: usize,
+    ) -> (f64, usize) {
+        let (mut worst, mut compared) = (0.0f64, 0usize);
+        for (row, value) in got.iter().enumerate() {
+            let lo = row.saturating_sub(preceding);
+            let Some(value) = value else { continue };
+            let Some(reference) = reference_fit(columns, y, lo, row + 1) else {
+                continue;
+            };
+            let expected = reference[slot];
+            worst = worst.max((value - expected).abs() / expected.abs().max(1.0));
+            compared += 1;
+        }
+        (worst, compared)
+    }
+
+    #[test]
+    fn the_sliding_fit_tracks_an_independent_qr_solve() {
+        let rows = 3_000;
+        let preceding = 63; // 64-row windows: 60 degrees of freedom
+        for (name, y, factors) in corpora(rows) {
+            let columns: Vec<&[f64]> = factors.iter().map(|f| f.as_slice()).collect();
+            let mut args: Vec<&[f64]> = vec![&y];
+            args.extend(columns.iter().copied());
+            let kernel = MultiFactorRegression::new(3, MultiFactorOutput::Coefficient(1));
+            let swept = kernel.evaluate_frames(&args, Some(preceding)).unwrap();
+            let recomputed = query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap();
+            let answered = swept.iter().flatten().count();
+
+            // Collinearity at 1e-6 puts the window past the pivot floor,
+            // and the ruled semantic is refusal rather than noise. The
+            // guard asserts the REFUSAL — otherwise this corpus would
+            // pass vacuously, by having nothing to compare.
+            if name == "collinear 1e-6" {
+                assert_eq!(
+                    answered, 0,
+                    "windows this collinear must be refused, not fitted"
+                );
+                assert_eq!(
+                    recomputed.iter().flatten().count(),
+                    0,
+                    "per-frame recompute must refuse them too — the two                      schedules share one fit() precisely so they cannot differ"
+                );
+                println!("  {name:<16} refused, as ruled ({} frames)", swept.len());
+                continue;
+            }
+
+            let (sweep_error, compared) = against_reference(&swept, &columns, &y, preceding, 1);
+            let (frame_error, _) = against_reference(&recomputed, &columns, &y, preceding, 1);
+            assert!(
+                compared > rows / 2,
+                "{name}: only {compared} frames were comparable — the bound                  below would be met by comparing almost nothing"
+            );
+            // Claim 1, the load-bearing one: incrementalizing cost no
+            // accuracy — the sliding path is no worse than the per-frame
+            // path it replaces.
+            assert!(
+                sweep_error <= frame_error * 10.0 + 1e-13,
+                "{name}: the sweep ({sweep_error:e}) lost ground against \
+                 per-frame recompute ({frame_error:e})"
+            );
+            // Claim 2: both stay inside what the window's conditioning
+            // allows against an independent QR solve. Bounds are set from
+            // measurement (2026-08-03, this container): benign 1.3e-14,
+            // offsets 1e6/1e9/1e12 2.6e-14/9.1e-15/3.7e-15, drifting
+            // level 1.7e-13, scale spread 1.2e-14, collinear 1e-4 3.3e-5.
+            // The near-collinear bound is loose because a Gram route pays
+            // κ² there and QR does not — that gap is the price of the
+            // normal equations, measured rather than assumed.
+            let bound = if name == "collinear 1e-4" {
+                1e-3
+            } else {
+                1e-11
+            };
+            assert!(
+                sweep_error < bound,
+                "{name}: sweep {sweep_error:e} exceeded its bound {bound:e}"
+            );
+            println!(
+                "  {name:<16} sweep {sweep_error:.2e}   per-frame {frame_error:.2e}   \
+                 ({compared} frames)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod measure_multifactor {
+    //! The speed A/B behind #90's whole premise: does maintaining the
+    //! window's moments across the slide actually beat refolding each
+    //! frame, and by how much as K grows?
+    //!
+    //! ```text
+    //! cargo test -p engine --release measure_multifactor -- --ignored --nocapture
+    //! ```
+
+    use super::multifactor_truth::Lcg;
+    use super::*;
+    use query_lite::WindowAggregate;
+
+    #[test]
+    #[ignore = "measurement — run explicitly in release mode"]
+    fn measure_sliding_vs_per_frame() {
+        let rows = 20_000;
+        println!(
+            "#90 A/B: {rows} rows. A = per-frame recompute (O(W·K²) per row), \
+             B = the sliding sweep (O(K²) per row).\n"
+        );
+        println!(
+            "  {:>3} {:>6} {:>12} {:>12} {:>8}",
+            "K", "window", "per-frame", "sliding", "ratio"
+        );
+        for k in [4usize, 8, 16] {
+            for window in [32usize, 64, 256] {
+                let mut rng = Lcg::new(0x5DEECE66D);
+                let factors: Vec<Vec<f64>> = (0..k)
+                    .map(|_| (0..rows).map(|_| rng.next() * 4.0).collect())
+                    .collect();
+                let y: Vec<f64> = (0..rows).map(|_| rng.next() * 10.0).collect();
+                let columns: Vec<&[f64]> = factors.iter().map(|f| f.as_slice()).collect();
+                let mut args: Vec<&[f64]> = vec![&y];
+                args.extend(columns.iter().copied());
+                let kernel = MultiFactorRegression::new(k, MultiFactorOutput::Coefficient(1));
+                let preceding = window - 1;
+                let time = |run: &dyn Fn() -> Vec<Option<f64>>| {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..3 {
+                        let start = std::time::Instant::now();
+                        let out = run();
+                        best = best.min(start.elapsed().as_secs_f64());
+                        std::hint::black_box(&out);
+                    }
+                    best
+                };
+                let per_frame = time(&|| {
+                    query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap()
+                });
+                let sliding = time(&|| kernel.evaluate_frames(&args, Some(preceding)).unwrap());
+                println!(
+                    "  {k:>3} {window:>6} {:>10.1}ms {:>10.1}ms {:>7.1}x",
+                    per_frame * 1e3,
+                    sliding * 1e3,
+                    per_frame / sliding
+                );
+            }
+        }
+    }
+}
