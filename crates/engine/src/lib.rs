@@ -81,6 +81,7 @@ pub mod database;
 mod driver;
 #[cfg(feature = "oracle-harness")]
 pub mod harness;
+mod multifactor;
 mod partials;
 #[cfg(feature = "lua")]
 mod script;
@@ -90,6 +91,7 @@ pub mod view;
 #[cfg(feature = "lua")]
 pub use compute_lua::{LogSink, PRELUDE};
 pub use database::Database;
+pub use multifactor::{MultiFactorOutput, MultiFactorRegression};
 pub use query_lite::{recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate};
 pub use storage_lite::{store::MANIFEST, RowValue, StoreOptions, WalSync};
 pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
