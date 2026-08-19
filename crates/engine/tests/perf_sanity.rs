@@ -345,7 +345,7 @@ fn blotter_refresh_scales_with_the_batch_not_the_fact_table() {
     );
 }
 
-/// #90's premise, guarded: maintaining the window's moments across the
+/// #90's premise, measured: maintaining the window's moments across the
 /// slide beats refolding each frame, and the gap widens with the window
 /// because per-frame is `O(W·K²)` per row where the sweep is `O(K²)`.
 ///
@@ -355,9 +355,17 @@ fn blotter_refresh_scales_with_the_batch_not_the_fact_table() {
 /// 32 / 64 / 256) exactly as the model predicts, while per-frame scaled
 /// with it (77.1 / 139.2 / 499.4 ms). The guard asks for 3x, well under
 /// the 10.1x observed, because this is a smoke check against an
-/// order-of-magnitude regression and container timing is noisy — and it
-/// still fails outright if the sweep is ever quietly replaced by
-/// recompute.
+/// order-of-magnitude regression and container timing is noisy.
+///
+/// Measured, not guarded: this whole file is `#[ignore]`d by
+/// convention, so none of it runs in CI. The POISONED leg is the one
+/// that earns its keep — non-finite rows send a frame down the exact
+/// per-frame fallback, and an earlier version of the sweep refolded
+/// the window before discovering that, paying for a fold it then threw
+/// away. That measured at roughly HALF the speed of the recompute it
+/// replaces once about one row in a hundred was NaN, and clean-data
+/// timing cannot see it at all. The repo-wide review caught it
+/// (2026-08-03); this leg is what would have.
 #[test]
 #[ignore = "measurement — run explicitly in release mode"]
 fn the_sliding_multifactor_fit_beats_per_frame_recompute() {
@@ -390,25 +398,44 @@ fn the_sliding_multifactor_fit_beats_per_frame_recompute() {
         }
         best
     };
-    let per_frame = time(&|| engine::recompute_frames(&kernel, &args, preceding).unwrap());
-    let sliding = time(&|| kernel.evaluate_frames(&args, preceding).unwrap());
-    let ratio = per_frame / sliding;
-    println!(
-        "multi-factor K={K} window {WINDOW}: per-frame {:.1}ms, sliding {:.1}ms, ratio {ratio:.1}x",
-        per_frame * 1e3,
-        sliding * 1e3
-    );
-    // Both paths must agree on what they answer, or the ratio is
-    // meaningless — a "faster" path that answers less is not faster.
-    let a = engine::recompute_frames(&kernel, &args, preceding).unwrap();
-    let b = kernel.evaluate_frames(&args, preceding).unwrap();
-    assert_eq!(
-        a.iter().flatten().count(),
-        b.iter().flatten().count(),
-        "the two schedules answered a different number of frames"
-    );
-    assert!(
-        ratio > 3.0,
-        "the sliding sweep lost its advantage: {ratio:.1}x"
-    );
+    // A second response column with ~1% non-finite rows: the shape a
+    // real factor panel has, and the one that sends frames down the
+    // fallback path.
+    let mut poisoned_y = y.clone();
+    for row in (0..rows).step_by(97) {
+        poisoned_y[row] = f64::NAN;
+    }
+    let mut poisoned_args: Vec<&[f64]> = vec![&poisoned_y];
+    poisoned_args.extend(factors.iter().map(|f| f.as_slice()));
+
+    for (label, args, floor) in [
+        ("clean", &args, 3.0),
+        // The fallback delegates to the very recompute it is being
+        // timed against, so the bar here is that it must not be
+        // dramatically SLOWER: near parity, not a speedup.
+        ("1% non-finite", &poisoned_args, 0.9),
+    ] {
+        let per_frame = time(&|| engine::recompute_frames(&kernel, args, preceding).unwrap());
+        let sliding = time(&|| kernel.evaluate_frames(args, preceding).unwrap());
+        let ratio = per_frame / sliding;
+        println!(
+            "multi-factor K={K} window {WINDOW} {label}: per-frame {:.1}ms, sliding {:.1}ms, ratio {ratio:.1}x",
+            per_frame * 1e3,
+            sliding * 1e3
+        );
+        // The two paths must agree on WHICH frames they answer, not
+        // merely how many — a "faster" path that answers a different
+        // set is not faster, it is wrong.
+        let a = engine::recompute_frames(&kernel, args, preceding).unwrap();
+        let b = kernel.evaluate_frames(args, preceding).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert!(
+            a.iter().zip(&b).all(|(x, y)| x.is_some() == y.is_some()),
+            "{label}: the two schedules answered a different SET of frames"
+        );
+        assert!(
+            ratio > floor,
+            "{label}: the sliding sweep lost its advantage: {ratio:.1}x (floor {floor})"
+        );
+    }
 }

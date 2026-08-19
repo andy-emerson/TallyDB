@@ -1514,6 +1514,12 @@ fn multifactor_table() -> Table {
         .expect("kernel registers");
     table
         .register_window(
+            "mf_beta_b",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(2)),
+        )
+        .expect("kernel registers");
+    table
+        .register_window(
             "mf_beta_c",
             crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(3)),
         )
@@ -1558,6 +1564,7 @@ pub unsafe extern "C" fn tallydb_multifactor_fits_stream(out: *mut ArrowArrayStr
         "SELECT ts, \
          mf_intercept(y, a, b, c) {frame} AS intercept, \
          mf_beta_a(y, a, b, c) {frame} AS beta_a, \
+         mf_beta_b(y, a, b, c) {frame} AS beta_b, \
          mf_beta_c(y, a, b, c) {frame} AS beta_c, \
          mf_r2(y, a, b, c) {frame} AS r2 \
          FROM factors"

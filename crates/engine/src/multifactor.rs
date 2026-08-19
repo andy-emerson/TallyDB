@@ -58,10 +58,22 @@
 /// window — a factor that is constant across the frame, so its
 /// centered column is all zeros. It does not catch two factors that
 /// are near-duplicates, where the pivot stays positive but tiny and
-/// the fit it produces is noise. Rejecting at `1e-12` of the pivot's
-/// own starting scale draws the line at roughly `κ(X) ≈ 1e6`, beyond
-/// which a normal-equations solve has under six correct digits and
-/// should not be reported as a fit at all.
+/// the fit it produces is noise.
+///
+/// What the floor tests is **near-linear-dependence**, not the
+/// condition number: the pivot at column `j` is that factor's variance
+/// after the earlier factors are projected out, and the floor rejects
+/// when that residual falls below `1e-12` of the factor's own
+/// variance. For collinearity-driven ill-conditioning this does land
+/// near `κ(X) ≈ 1e6` — measured 2026-08-03, this container: a design
+/// whose third factor is the sum of the first two plus relative noise
+/// is accepted at `κ ≈ 3.1e5` and refused at `κ ≈ 3.1e6`
+/// (`the_pivot_floor_refuses_near_dependence_not_mere_scale`). It is
+/// deliberately NOT a bound on `κ` in general: a design that is merely
+/// badly *scaled* but well separated passes at any condition number,
+/// which is right — scale is an equilibration question, not a rank
+/// one, and refusing it would decline fits that are perfectly
+/// recoverable.
 const SPD_PIVOT_FLOOR: f64 = 1e-12;
 
 /// Solves `matrix · x = rhs` for a symmetric positive-definite `k × k`
@@ -145,6 +157,13 @@ pub(crate) struct FactorMoments {
     cross_yy: f64,
     /// Reused across frames so a per-frame solve allocates nothing.
     scratch_matrix: Vec<f64>,
+    /// Holds the centered right-hand side across [`FactorMoments::fit`]'s
+    /// solve, which consumes the caller's copy in place. Separate from
+    /// `deviation` on purpose: sharing one buffer worked but left a
+    /// trap for the next reader.
+    scratch_rhs: Vec<f64>,
+    /// One row's deviations from the anchor, rebuilt on every
+    /// [`FactorMoments::add`] / [`FactorMoments::remove`].
     deviation: Vec<f64>,
 }
 
@@ -163,6 +182,7 @@ impl FactorMoments {
             cross_xy: vec![0.0; k],
             cross_yy: 0.0,
             scratch_matrix: vec![0.0; k * k],
+            scratch_rhs: vec![0.0; k],
             deviation: vec![0.0; k],
         }
     }
@@ -261,7 +281,7 @@ impl FactorMoments {
         let (intercept_slot, betas) = out.split_at_mut(1);
         // The centered right-hand side is consumed by the solve, so the
         // explained sum of squares is accumulated against a copy.
-        let cross = self.deviation.as_mut_slice();
+        let cross = self.scratch_rhs.as_mut_slice();
         cross.copy_from_slice(betas);
         if !solve_spd(&mut self.scratch_matrix, betas, self.k) {
             return None;
@@ -423,7 +443,7 @@ impl query_lite::WindowAggregate for MultiFactorRegression {
         };
         let (y, factors) = columns.split_first().ok_or("no arguments")?;
         let rows = y.len();
-        let window = preceding + 1;
+        let window = preceding.saturating_add(1);
         let poisoned: Vec<bool> = (0..rows)
             .map(|row| !y[row].is_finite() || factors.iter().any(|c| !c[row].is_finite()))
             .collect();
@@ -439,34 +459,47 @@ impl query_lite::WindowAggregate for MultiFactorRegression {
         for row in 0..rows {
             let lo = row.saturating_sub(preceding);
             let hi = row + 1;
-            if since_rebuild >= window {
-                moments.refold(factors, y, lo, hi);
-                since_rebuild = 0;
-                dirty = (lo..hi).filter(|&r| poisoned[r]).count();
-            } else {
-                moments.add(factors, y, row);
-                if poisoned[row] {
-                    dirty += 1;
+            // What the accumulator still holds from the previous frame,
+            // captured before `low` advances to this one.
+            let held_from = low;
+            // The poisoned count tracks the FRAME and is maintained
+            // before any decision about the accumulator — a dirty frame
+            // must not pay for a fold whose result it then discards.
+            // (Doing this inside the branches instead made every
+            // non-finite frame do the work twice, which measured at
+            // roughly HALF the speed of the recompute this replaces on
+            // 1%-NaN data — found by the repo-wide review, 2026-08-03.)
+            if poisoned[row] {
+                dirty += 1;
+            }
+            for &leaving in &poisoned[low..lo] {
+                if leaving {
+                    dirty -= 1;
                 }
-                for (stale, &bad) in (low..lo).zip(&poisoned[low..lo]) {
-                    moments.remove(factors, y, stale);
-                    if bad {
-                        dirty -= 1;
-                    }
-                }
-                since_rebuild += 1;
             }
             low = lo;
 
             if dirty > 0 {
-                // Exact per-frame arithmetic; the accumulator is
-                // poisoned, so the next clean frame must rebuild.
+                // Exact per-frame arithmetic, bit-identical to
+                // recompute. The accumulator is left untouched and
+                // therefore stale, so the next clean frame rebuilds.
                 frame.clear();
                 frame.push(&y[lo..hi]);
                 frame.extend(factors.iter().map(|column| &column[lo..hi]));
                 out.push(self.evaluate(&frame)?);
                 since_rebuild = usize::MAX;
                 continue;
+            }
+
+            if since_rebuild >= window {
+                moments.refold(factors, y, lo, hi);
+                since_rebuild = 0;
+            } else {
+                moments.add(factors, y, row);
+                for stale in held_from..lo {
+                    moments.remove(factors, y, stale);
+                }
+                since_rebuild += 1;
             }
             out.push(match moments.fit(&mut coefficients) {
                 None => None, // the fit is not identified: NULL
@@ -760,6 +793,71 @@ mod tests {
             let tail = swept[60..].iter().flatten().count();
             assert!(tail > 0, "the sweep never recovered after the poison");
         }
+    }
+
+    /// What the pivot floor actually draws a line at: near-linear
+    /// DEPENDENCE, not conditioning in general. A third factor that is
+    /// the sum of the first two plus shrinking noise is accepted while
+    /// the noise still carries information and refused once it does
+    /// not; a design that is merely badly SCALED is accepted at any
+    /// condition number, because scale is recoverable and rank is not.
+    #[test]
+    fn the_pivot_floor_refuses_near_dependence_not_mere_scale() {
+        use super::multifactor_truth::Lcg;
+        let rows = 64usize;
+        let dependent = |noise_scale: f64| {
+            let mut rng = Lcg::new(7);
+            let f1: Vec<f64> = (0..rows).map(|_| rng.next()).collect();
+            let f2: Vec<f64> = (0..rows).map(|_| rng.next()).collect();
+            let f3: Vec<f64> = (0..rows)
+                .map(|row| f1[row] + f2[row] + noise_scale * rng.next())
+                .collect();
+            let y: Vec<f64> = (0..rows)
+                .map(|row| 1.0 + 0.5 * f1[row] - 2.0 * f2[row] + 3.0 * f3[row])
+                .collect();
+            let columns: Vec<&[f64]> = vec![&f1, &f2, &f3];
+            let mut moments = FactorMoments::new(3);
+            moments.refold(&columns, &y, 0, rows);
+            let mut out = vec![0.0; 4];
+            moments.fit(&mut out).is_some()
+        };
+        // Measured bracket (2026-08-03, this container): the design's
+        // condition number is ~3.1e5 at 1e-5 noise and ~3.1e6 at 1e-6,
+        // and the floor falls between them.
+        assert!(
+            dependent(1e-5),
+            "a design still carrying information was refused"
+        );
+        assert!(
+            !dependent(1e-7),
+            "a design whose third factor is the sum of the other two was fitted anyway"
+        );
+
+        // Scale alone must NOT trigger refusal: three orthogonal-ish
+        // factors spanning 1e0..1e8 are enormously ill-conditioned as a
+        // matrix and perfectly recoverable as a fit.
+        let mut rng = Lcg::new(11);
+        let columns_owned: Vec<Vec<f64>> = (0..3)
+            .map(|power| {
+                let scale = 10f64.powi(power * 4);
+                (0..rows).map(|_| rng.next() * scale).collect()
+            })
+            .collect();
+        let y: Vec<f64> = (0..rows)
+            .map(|row| {
+                1.0 + 0.5 * columns_owned[0][row] - 2.0 * columns_owned[1][row]
+                    + 3.0 * columns_owned[2][row]
+            })
+            .collect();
+        let columns: Vec<&[f64]> = columns_owned.iter().map(|c| c.as_slice()).collect();
+        let mut moments = FactorMoments::new(3);
+        moments.refold(&columns, &y, 0, rows);
+        let mut out = vec![0.0; 4];
+        assert!(
+            moments.fit(&mut out).is_some(),
+            "a merely badly-scaled design was refused — scale is an \
+             equilibration question, not a rank one"
+        );
     }
 
     #[test]

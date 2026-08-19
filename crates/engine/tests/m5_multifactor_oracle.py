@@ -89,10 +89,12 @@ def main() -> None:
 
     engine = {
         name: fits[name].to_pylist()
-        for name in ("intercept", "beta_a", "beta_c", "r2")
+        for name in ("intercept", "beta_a", "beta_b", "beta_c", "r2")
     }
     # Which engine column holds which coefficient of [b0, ba, bb, bc].
-    slots = {"intercept": 0, "beta_a": 1, "beta_c": 3}
+    # Every coefficient position is checked. Leaving one out would let a
+    # systematic mis-mapping of that slot pass unnoticed.
+    slots = {"intercept": 0, "beta_a": 1, "beta_b": 2, "beta_c": 3}
 
     compared = 0
     refused = 0
@@ -173,7 +175,7 @@ def main() -> None:
         )
     print(
         f"Multi-factor rolling fit validated end-to-end: {compared} windows "
-        f"x {{intercept, beta_a, beta_c, R2}} against np.linalg.lstsq "
+        f"x {{intercept, beta_a, beta_b, beta_c, R2}} against np.linalg.lstsq "
         f"(QR/SVD, not the engine's normal-equations path), plus {refused} "
         f"rank-deficient windows the engine refused exactly as ruled "
         f"(numpy {np.__version__})"
