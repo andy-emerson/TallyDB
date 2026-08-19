@@ -494,6 +494,137 @@ fn measure_wal_regimes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The eager-to-memory / lazy-to-disk headroom, measured as
+/// CONFIGURATION rather than built (2026-08-03). Each regime removes
+/// one cost from the append path, so the gaps name what a change
+/// could recover:
+///
+/// - default → wal off: the per-row WAL record encoding.
+/// - wal off → no flush in run: the inline segment freeze — exactly
+///   what a background flusher would move off the ingest thread.
+/// - no flush → in-memory store: the residual persistence bookkeeping.
+/// - in-memory → raw buffers: everything the per-row API costs above
+///   pushing into typed vectors — the bulk-ingest headroom, which no
+///   durability change can touch.
+///
+/// The numeric-only line isolates the key column's dictionary lookup.
+/// Ratios within one run are the durable numbers.
+///
+/// ```text
+/// cargo test -p storage-lite --release --test wal measure_ingest_headroom -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement — run explicitly in release mode"]
+fn measure_ingest_headroom() {
+    use std::hint::black_box;
+    const ROWS: i64 = 200_000;
+    // Above ROWS, so no segment is frozen while the clock runs.
+    const NO_FLUSH: usize = 1_000_000;
+
+    let dir = std::env::temp_dir().join(format!("tallydb-ingest-head-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("one row per append, {ROWS} rows, ts/sym/x schema, fs backend:");
+
+    let persistent = |name: &str, wal_sync: WalSync, seg: usize| {
+        let sub = dir.join(name.replace([' ', '(', ')', ','], "-"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(FsBackend::new(&sub).unwrap());
+        let mut store = Store::persistent_with(
+            backend,
+            schema(),
+            0,
+            StoreOptions {
+                segment_rows: Some(seg),
+                wal_sync,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        append_n(&mut store, 0..ROWS);
+        let per = start.elapsed().as_secs_f64() / ROWS as f64;
+        println!("  {name:<38} {:>8.0} ns/append", per * 1e9);
+        per
+    };
+    let default = persistent(
+        "persistent, group 100ms, seg 4096",
+        WalSync::Group(std::time::Duration::from_millis(100)),
+        4096,
+    );
+    let wal_off = persistent("persistent, wal off, seg 4096", WalSync::Off, 4096);
+    let no_flush = persistent(
+        "persistent, wal off, no flush in run",
+        WalSync::Off,
+        NO_FLUSH,
+    );
+
+    let mut store = Store::with_segment_rows(schema(), 0, NO_FLUSH).unwrap();
+    let start = std::time::Instant::now();
+    append_n(&mut store, 0..ROWS);
+    let in_memory = start.elapsed().as_secs_f64() / ROWS as f64;
+    println!(
+        "  {:<38} {:>8.0} ns/append",
+        "in-memory store",
+        in_memory * 1e9
+    );
+
+    // Numeric-only: the same path without the key dictionary lookup.
+    let numeric = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("x", ColumnType::F64, false),
+    ]);
+    let mut store = Store::with_segment_rows(numeric, 0, NO_FLUSH).unwrap();
+    let start = std::time::Instant::now();
+    for i in 0..ROWS {
+        store
+            .append(&[RowValue::I64(i), RowValue::F64(i as f64 * 0.5)])
+            .unwrap();
+    }
+    let numeric_only = start.elapsed().as_secs_f64() / ROWS as f64;
+    println!(
+        "  {:<38} {:>8.0} ns/append",
+        "in-memory store, numeric only (no key)",
+        numeric_only * 1e9
+    );
+
+    // The floor: push the same values into typed vectors.
+    let start = std::time::Instant::now();
+    let mut ts = Vec::with_capacity(ROWS as usize);
+    let mut sym = Vec::with_capacity(ROWS as usize);
+    let mut x = Vec::with_capacity(ROWS as usize);
+    for i in 0..ROWS {
+        ts.push(i);
+        sym.push(if i % 2 == 0 { 0u32 } else { 1u32 });
+        x.push(i as f64 * 0.5);
+    }
+    black_box((&ts, &sym, &x));
+    let raw = start.elapsed().as_secs_f64() / ROWS as f64;
+    println!(
+        "  {:<38} {:>8.0} ns/append",
+        "raw typed vectors (floor)",
+        raw * 1e9
+    );
+
+    println!("\nwhat each change could recover, per append:");
+    println!(
+        "  wal record encoding      {:>8.0} ns",
+        (default - wal_off) * 1e9
+    );
+    println!(
+        "  inline segment freeze    {:>8.0} ns   <- the background flusher's budget",
+        (wal_off - no_flush) * 1e9
+    );
+    println!(
+        "  persistence bookkeeping  {:>8.0} ns",
+        (no_flush - in_memory) * 1e9
+    );
+    println!(
+        "  per-row API above raw    {:>8.0} ns   <- the bulk-ingest budget",
+        (in_memory - raw) * 1e9
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A backend that fails every manifest write once armed — the crash
 /// injection for the window a flush opens between publishing a segment
 /// file and the manifest write that adopts it (tag 1, the residency
