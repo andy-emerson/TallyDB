@@ -15,8 +15,9 @@
 //! Measurement agreed: factor downdating lost to every anchored-moment
 //! carrier on the shapes that decide it and won none of them, even with
 //! a periodic rebuild to rescue it (four candidates against two
-//! baselines; spike table on #90, 2026-08-03). Moments re-solved per frame cost `O(K²)` to maintain and
-//! `O(K³)` to solve, which at these K is nothing.
+//! baselines; spike table on #90, 2026-08-03). Moments re-solved per
+//! frame cost `O(K²)` to maintain and `O(K³)` to solve, which at these
+//! K is nothing.
 //!
 //! ## The three disciplines this inherits from the K ≤ 2 kernels
 //!
@@ -52,12 +53,15 @@
 //! ## The solve seam
 //!
 //! [`solve_spd`] is deliberately the only place a linear system is
-//! solved. The Human ruled (F2(c), 2026-08-03) that TallyDB builds its
-//! own `K × K` solve now rather than wait for MatLua, with the reopen
-//! trigger recorded on #90: when MatLua lands, whichever
-//! implementation measures better wins and the other adapts, then
-//! MatLua is adopted. Keeping the solve behind one function is what
-//! makes that swap a one-line change.
+//! solved — and it is an **interim workaround, not a home**. The
+//! 2026-07-30 ruling that solver-class compute lives in MatLua stands;
+//! F2(c) (2026-08-03) bridges it because MatLua's host endpoints had
+//! not landed and the work could not wait. When they land, the two
+//! implementations are compared, the better one wins, the other
+//! adapts, and MatLua is adopted (recorded on #90; the Human's framing
+//! 2026-08-20: if ours is better, MatLua improves too). Keeping the
+//! solve behind one function is what makes that swap a one-line
+//! change.
 
 /// The relative pivot floor below which a window is declared singular.
 ///

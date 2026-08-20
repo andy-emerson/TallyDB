@@ -9,9 +9,10 @@
 //! are solver-class and do not live here: every statistic the engine
 //! exposes in SQL has an exact closed form at the two parameters or two
 //! dimensions it needs, and a general solver's per-call overhead dwarfs
-//! that arithmetic at window scale. The one solve TallyDB owns is a
-//! fixed-size `K × K` Cholesky in `engine::multifactor` (#90, ruled
-//! 2026-08-03) — deliberately not behind this crate's trait, because it
+//! that arithmetic at window scale. The one solve TallyDB carries — an
+//! interim bridge until MatLua's endpoints land (#90, F2(c),
+//! 2026-08-03; the MatLua ruling stands) — is a fixed-size `K × K`
+//! Cholesky in `engine::multifactor` — deliberately not behind this crate's trait, because it
 //! needs no backend negotiation and putting it here would turn a
 //! private detail into a general solver surface. A solver-class
 //! *dependency* still returns only when an op needs more than that — and the measured candidate for that day is faer's
@@ -58,10 +59,11 @@
 //! No solver-class routines *here*. No autodiff. No general tensor
 //! operations.
 //!
-//! This crate stays multiplication-class. The one solve TallyDB does
-//! own — a fixed-size symmetric `K × K` Cholesky for the rolling
-//! multi-factor fit (#90, ruled 2026-08-03) — deliberately does **not**
-//! live behind this trait: it is a few dozen lines operating on
+//! This crate stays multiplication-class. The one solve TallyDB
+//! carries — a fixed-size symmetric `K × K` Cholesky for the rolling
+//! multi-factor fit, an interim bridge until MatLua's endpoints land
+//! (#90, F2(c), 2026-08-03) — deliberately does **not** live behind
+//! this trait: it is a few dozen lines operating on
 //! moments the window layer already maintains, it needs no backend
 //! negotiation, and putting it here would turn a private detail into a
 //! general solver surface. See `engine::multifactor`.

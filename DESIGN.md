@@ -524,12 +524,11 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
 
 **M5 (desk adoption)** then builds what the target user needs, chosen
 by the moat test: multi-factor curated compute (K > 2 — the recorded
-LAPACK-class-returns trigger firing; **re-ruled 2026-07-30**, then
-**again 2026-08-03** (F2(c): built in the engine, with MatLua adoption
-the standing reopen trigger) — as of 2026-07-30 this
+LAPACK-class-returns trigger firing; **re-ruled 2026-07-30**: this
 goes to MatLua in the Lua tier rather than to a faer dependency of our
-own — see the decision record *where non-standard compute lives*,
-below), the ordered-axis
+own, a ruling that **stands** — bridged 2026-08-03 by an interim
+in-engine solve (F2(c) on #90) until MatLua's endpoints land — see the
+decision record *where non-standard compute lives*, below), the ordered-axis
 dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
 2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
 `LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — **all built
@@ -1644,10 +1643,12 @@ merely badly *scaled* design passes at any κ, which is right — scale is an
 equilibration question, not a rank one.
 
 **Surface.** No SQL name (#77.1 stands): the kernel is reached by
-registration, so the dialect never grew `regr_multi`. The solve is
-ours for now under F2(c) — a hand-rolled `K × K` Cholesky behind a
-single function — with adoption of MatLua the standing reopen trigger
-once its endpoints land and the two can be compared.
+registration, so the dialect never grew `regr_multi`. The solve is an
+**interim workaround** under F2(c) — a hand-rolled `K × K` Cholesky
+behind a single function; the 2026-07-30 MatLua ruling stands, and
+once MatLua's endpoints land the two implementations are compared,
+the better one wins, the other adapts, and MatLua is adopted (Human,
+2026-08-20: the comparison improves MatLua either way).
 
 **Evidence** (2026-08-03, this container). Accuracy is judged against
 two references that share no *solve* with the shipped route:
@@ -1818,26 +1819,29 @@ faer directly: MatLua already depends on it, and Cargo unifies
 semver-compatible versions, so reaching linear algebra *through* MatLua
 costs no second copy.
 
-*Superseded in part, 2026-08-03 (F2(c) on #90) — see the tranche below.*
-When #90 came to be built, MatLua's Rust API had grown a working solver
-family but its host-integration endpoints had not landed, and the Human
-ruled that TallyDB should not wait: build our own `K × K` solve now,
-compare it against MatLua's when that lands, and adopt MatLua once the
-comparison is made. So the sentence above — "the answer is not a faer
-dependency of our own" — still holds (the solve is hand-rolled and calls no faer routine;
-`compute-linalg`'s existing faer dependency is untouched, and #90 added
-none), but
-"TallyDB does not build the solver" no longer describes the tree: a
-hand-rolled Cholesky lives in `engine::multifactor::solve_spd`, behind
-one function precisely so the swap is a one-line change. What survives
-intact is the part that mattered most in this record — the reason the
-solver was kept out was the pressure it would put on item 3, and that
-pressure was answered instead by giving the op **no SQL name at all**:
-it is reachable only by registration, so the dialect never grew a
-`regr_multi`.
+*Interim workaround inside this ruling, 2026-08-03 (F2(c) on #90;
+framing confirmed by the Human 2026-08-20: **this ruling stands — it is
+not superseded**).* When #90 came to be built, MatLua's Rust API had
+grown a working solver family but its host-integration endpoints had
+not landed, and the destination could not wait on them. So TallyDB
+carries its own `K × K` solve *for the meantime* — a hand-rolled
+Cholesky in `engine::multifactor::solve_spd`, behind one function
+precisely so the swap is a one-line change — and MatLua remains where
+this compute lives once its endpoints land: whichever implementation
+measures better wins, the other adapts, then MatLua is adopted. The
+Human's stated rationale for the detour cuts both ways on purpose — if
+ours turns out better, MatLua improves too. The sentence above, "the
+answer is not a faer dependency of our own", still holds (the interim
+solve is hand-rolled and calls no faer routine; #90 added no
+dependency), and the part of this record that mattered most survives
+untouched: the solver was kept out of SQL because of the pressure it
+would put on item 3, and that pressure was answered by giving the op
+**no SQL name at all** — reachable only by registration, so the
+dialect never grew a `regr_multi`.
 
-*Status: ruled, partly built.* The solve is ours for now; the
-adoption of MatLua is the standing reopen trigger, recorded on #90.
+*Status: ruled and standing; bridged in the engine until MatLua's
+endpoints land.* The adoption comparison is the recorded trigger on
+#90.
 A requirements letter is out — what would break TallyDB if
 MatLua chose otherwise (a Lua face that works against a host-owned
 interpreter, no `Drop` value live across a `longjmp`, no panic across

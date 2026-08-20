@@ -39,7 +39,7 @@ constraints change only when the Human says so.
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-08-03: #90 BUILT; reviews done, awaiting merge)
+## Snapshot (2026-08-20: #90 BUILT; reviews done, awaiting merge)
 
 **State:** `main` = `24688cb`. `claude/dev` restarted from it, **6
 commits**, full gate green at every push. #90 — rolling multi-factor
@@ -80,11 +80,12 @@ sweep's cost **flat** in the window exactly as O(K^2)-per-row predicts.
    scope, so `.github/workflows/ci.yml` cannot be modified. Until it
    lands the claim sits at *observed*, not *tested*. The one-line step
    is in the merge proposal.
-2. **A standing decision record was superseded.** DESIGN's 2026-07-30
-   MatLua ruling said TallyDB builds no solver; F2(c) on 2026-08-03
-   ruled that we build our own `K x K` Cholesky now and adopt MatLua
-   after comparing. Both records are updated, but the Human should
-   confirm the supersession reads the way it was meant.
+2. **The MatLua ruling STANDS — F2(c) is an interim bridge, not a
+   supersession** (Human, 2026-08-20). The in-engine `K x K` Cholesky
+   is a temporary workaround until MatLua's endpoints land; then the
+   two are compared, the better one wins, the other adapts, and MatLua
+   is adopted — and the comparison improves MatLua either way. The
+   records are written in that framing.
 
 **Open follow-ups** (living status, none blocking): adopt MatLua's
 solver once its endpoints land (the recorded reopen trigger); a shared
@@ -121,10 +122,11 @@ requirements letter (drafted at `scratchpad/matlua-requirements.md`).
 - **#83 ruling set (2026-08-02, on the issue)**: eligibility (c) full
   reach piecemeal; uniform repair; union read; AS-OF-recomputes;
   API-first; view-as-table; D6 build now.
-- **#90 rulings (2026-08-03)**: F1(b) build now; F2(c) our own K x K
-  solve, with adoption of MatLua the reopen trigger once its endpoints
-  land and the two can be compared; singular windows return NULL for
-  that frame (agent recommendation, taken).
+- **#90 rulings (2026-08-03; framing confirmed 2026-08-20)**: F1(b)
+  build now; F2(c) an INTERIM in-engine K x K solve — the 2026-07-30
+  MatLua ruling stands, the bridge lasts until MatLua's endpoints land,
+  then compare, better wins, other adapts, MatLua adopted; singular
+  windows return NULL for that frame (agent recommendation, taken).
 - **#83 tranche-3 ruling set (2026-08-03, on the issue)**: F1 pair
   stamp; F2 no `AS OF` on join views in v1 (#99 seats two-cut); F3
   the blotter admitted ("a view must fold or match something"); F4
