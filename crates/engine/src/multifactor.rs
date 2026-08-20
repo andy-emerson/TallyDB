@@ -12,9 +12,10 @@
 //! window near-rank-deficient the digits needed were rounded away when
 //! the row was added, and no algorithm holding only the factor and the
 //! row can recover them (Stewart 1979; Pan 1993; Eldén–Park 1996).
-//! Measurement agreed: factor downdating was the worst of six
-//! candidates in every case tried, even with a periodic rebuild to
-//! rescue it. Moments re-solved per frame cost `O(K²)` to maintain and
+//! Measurement agreed: factor downdating lost to every anchored-moment
+//! carrier on the shapes that decide it and won none of them, even with
+//! a periodic rebuild to rescue it (four candidates against two
+//! baselines; spike table on #90, 2026-08-03). Moments re-solved per frame cost `O(K²)` to maintain and
 //! `O(K³)` to solve, which at these K is nothing.
 //!
 //! ## The three disciplines this inherits from the K ≤ 2 kernels
@@ -24,23 +25,29 @@
 //! dwarfs its spread (Chan–Golub–LeVeque 1983), and the error grows
 //! with *stream* length, not window length. PostgreSQL refuses float
 //! inverse transition functions for exactly this reason. What makes it
-//! sound is the discipline [`ShiftedMoments`](crate::table) already
-//! uses at K ≤ 2, generalized here:
+//! sound is the discipline `table::ShiftedMoments` (private) already
+//! uses at K ≤ 2 — its "shift" is this module's "anchor", one idea
+//! under two names — generalized here:
 //!
 //! 1. **Anchoring.** Every value enters and leaves as a deviation from
 //!    an anchor taken from a *data row*, so the accumulated sums stay
 //!    at the window's own scale even when the values sit at 1e12.
-//!    Subtracting nearby representable values is near-exact; the
-//!    measured effect is large — at offset 1e12 the anchored
-//!    incremental path beat a per-frame solve centered on the
-//!    computed mean by nine orders of magnitude, because that mean is
-//!    itself a length-W summation carrying its own error.
+//!    Subtracting nearby representable values is near-exact. The
+//!    effect is large where the window is long: on the #90 spike
+//!    (2026-08-03, K = 16, W = 1024) the anchored path beat a
+//!    per-frame solve centered on a COMPUTED MEAN by nine orders of
+//!    magnitude at offset 1e12, that mean being itself a length-W
+//!    summation carrying its own error. It shrinks with W and is not
+//!    visible at the 64-row windows the guard runs, where the shipped
+//!    per-frame path row-anchors too — what the in-tree test earns is
+//!    the gap against an UNCENTERED solve.
 //! 2. **Periodic rebuild.** The caller re-anchors and refolds the
 //!    whole window every `w` steps, so add/remove rounding drift is
 //!    bounded by one period and cannot accumulate down a column.
 //! 3. **One solve for both schedules.** Per-frame recompute and the
-//!    incremental sweep call the same [`FactorMoments::fit`],
-//!    so the two paths cannot disagree about NULL semantics.
+//!    incremental sweep call the same [`FactorMoments::fit`], so the
+//!    two apply one NULL rule; the numerics guard asserts frame for
+//!    frame that they never split on it.
 //!
 //! ## The solve seam
 //!
@@ -67,8 +74,10 @@
 /// variance. For collinearity-driven ill-conditioning this does land
 /// near `κ(X) ≈ 1e6` — measured 2026-08-03, this container: a design
 /// whose third factor is the sum of the first two plus relative noise
-/// is accepted at `κ ≈ 3.1e5` and refused at `κ ≈ 3.1e6`
-/// (`the_pivot_floor_refuses_near_dependence_not_mere_scale`). It is
+/// is accepted at `κ ≈ 3.1e5` and refused by `κ ≈ 3.1e6`. The test
+/// (`the_pivot_floor_refuses_near_dependence_not_mere_scale`) pins a
+/// looser bracket either side of that crossing, so the crossing itself
+/// is *observed* and the bracket *tested*. It is
 /// deliberately NOT a bound on `κ` in general: a design that is merely
 /// badly *scaled* but well separated passes at any condition number,
 /// which is right — scale is an equilibration question, not a rank

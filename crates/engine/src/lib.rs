@@ -49,15 +49,19 @@
 //! compute crates expose that capability signal on their traits.
 //!
 //! ## No LAPACK on the query path
-//! Every window function this crate registers is solved in closed form:
+//! Every window function this crate registers **in SQL** is solved in
+//! closed form:
 //! a two-parameter regression and a 2 × 2 symmetric eigenvalue both have
 //! exact solutions, and a general solver's per-call overhead dwarfs their
 //! arithmetic at window scale. The engine therefore links no LAPACK
 //! routine at all, which is what lets a WASM build reach parity with the
 //! current feature set without a LAPACK-in-WASM layer. A
 //! LAPACK-class dependency returns only when an op needs more than two
-//! parameters or dimensions — where no closed form exists. See DESIGN.md,
-//! *Curated compute: what the engine calls, and why*.
+//! parameters or dimensions — where no closed form exists. That trigger
+//! has since fired, and no LAPACK came back with it: the K-factor
+//! rolling fit (#90) carries no SQL name, is reached only by
+//! registration, and solves its `K × K` symmetric system in-crate. See
+//! DESIGN.md, *Curated compute: what the engine calls, and why*.
 //!
 //! ## Concurrency: single writer, concurrent snapshot readers
 //! Exactly one `&mut Table` writer exists at a time — a compile-time

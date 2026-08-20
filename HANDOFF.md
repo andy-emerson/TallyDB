@@ -29,8 +29,10 @@ constraints change only when the Human says so.
    `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` · the
    off-leg (`clippy`/`test`/`doc` for `-p engine`, default features) ·
    the Python oracle suites (build with `--features oracle-harness`,
-   run the nine scripts in `crates/*/tests/*.py`; eight are wired into
-   `.github/workflows/ci.yml` — see the snapshot for the ninth).
+   run the nine oracle scripts under `crates/*/tests/`
+   — `m2_compute_latency_bench.py` is a benchmark, not an oracle;
+   eight are wired into `.github/workflows/ci.yml`, see the snapshot
+   for the ninth).
 7. **Never touch the vendored Lua** under `crates/compute-lua/vendor`.
 8. The process is `AGENTS.md`: Plan → Develop → Assess → Review;
    claims at their evidence; code passes and doc passes never mix;
@@ -39,7 +41,7 @@ constraints change only when the Human says so.
 
 ## Snapshot (2026-08-03: #90 BUILT; reviews done, awaiting merge)
 
-**State:** `main` = `24688cb`. `claude/dev` restarted from it, **4
+**State:** `main` = `24688cb`. `claude/dev` restarted from it, **6
 commits**, full gate green at every push. #90 — rolling multi-factor
 regression, the last research-grade item — is built, assessed,
 reviewed, and documented:
@@ -49,7 +51,9 @@ reviewed, and documented:
 | 0a052b5 | the anchored `FactorMoments` carrier, `solve_spd` (the single solve seam), and `MultiFactorRegression` with the incremental `evaluate_frames` sweep |
 | cd08da8 | Assess: the accuracy contract against an in-tree Householder QR reference over eight adversarial corpora, and the sliding-vs-per-frame A/B |
 | 251e0a7 | the ninth oracle — 228 windows diffed against NumPy `lstsq` through the C ABI, plus 12 rank-deficient windows refused as ruled |
-| 78b3443 | repo-wide review fixes: the fallback-ordering defect (below), the pivot floor's real semantics, the missing middle coefficient, a dedicated solve scratch |
+| 688507c | repo-wide code-review fixes: the fallback-ordering defect (below), the pivot floor's real semantics, the missing middle coefficient, a dedicated solve scratch |
+| cf58f6a | doc pass: the DESIGN record, and two decision records the code outgrew |
+| 11688c8 | documentation-review fixes: three spike-imported claims corrected, five stale absolutes elsewhere in the tree |
 
 **The review's severe finding, worth remembering:** the sweep refolded
 the window *before* checking whether the frame was poisoned, so every
@@ -61,7 +65,8 @@ ordering right; the K > 2 copy diverged. Fixed, and the perf test now
 carries a NaN leg (0.54x → 1.4x) because clean-data timing cannot see
 this class of failure at all.
 
-**Evidence:** 10 unit tests plus the numerics guard; nine oracle
+**Evidence:** 9 unit tests plus the numerics guard and an ignored A/B
+measurement (and a doctest, and a perf-sanity leg); nine oracle
 scripts. Accuracy is judged against two references sharing no
 computational path with the shipped route — Householder QR in-tree and
 NumPy `lstsq` through the C ABI. Speed: 4.2x–37.6x over per-frame
@@ -86,7 +91,11 @@ solver once its endpoints land (the recorded reopen trigger); a shared
 sweep skeleton between `shifted_sweep` and the K > 2 sweep, since their
 divergence is what let the ordering bug in; Jacobi equilibration at
 solve time if a scale-spread workload needs it; `RANGE` and unbounded
-frames still take per-frame recompute.
+frames still take per-frame recompute; "poisoned" is overloaded — it
+means a held mutex elsewhere in `table.rs` and a non-finite row in the
+window sweeps, and the documentation review would rather the sweeps
+said "non-finite" (a rename touching both copies, so it waits for the
+shared-skeleton pass).
 
 **Standing ruling from the Human (2026-07-30), important:** decisions
 made ad-hoc while building are *revisitable*; only decisions that
