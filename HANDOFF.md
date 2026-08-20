@@ -53,7 +53,7 @@ reviewed, and documented:
 | 251e0a7 | the ninth oracle — 228 windows diffed against NumPy `lstsq` through the C ABI, plus 12 rank-deficient windows refused as ruled |
 | 688507c | repo-wide code-review fixes: the fallback-ordering defect (below), the pivot floor's real semantics, the missing middle coefficient, a dedicated solve scratch |
 | cf58f6a | doc pass: the DESIGN record, and two decision records the code outgrew |
-| 11688c8 | documentation-review fixes: three spike-imported claims corrected, five stale absolutes elsewhere in the tree |
+| 43a80b2 | documentation-review fixes: three spike-imported claims corrected, five stale absolutes elsewhere in the tree |
 
 **The review's severe finding, worth remembering:** the sweep refolded
 the window *before* checking whether the frame was poisoned, so every
