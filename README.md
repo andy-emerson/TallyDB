@@ -33,7 +33,12 @@
 > aggregates), kept fresh incrementally as data arrives, exact across
 > corrections via the knowledge axis, with refresh cost proportional
 > to what changed (plus, for join views, the dimension's touched
-> history — see DESIGN) rather than to the fact table. The settled
+> history — see DESIGN) rather than to the fact table. Rolling
+> **multi-factor regression** (#90) closes the last research-grade
+> item: above two parameters a fit has no closed form, so the window's
+> moments are maintained across the slide and the small system
+> re-solved per frame — 4x-38x faster than per-frame recompute, with
+> the sweep's cost flat in the window size. The settled
 > design and the reasoning behind it live in [`DESIGN.md`](DESIGN.md); open
 > work and decisions live in the
 > [issues and milestones](https://github.com/andy-emerson/TallyDB/issues).

@@ -6,12 +6,16 @@
 //! This crate wraps dot products, matrix–vector, and matrix–matrix
 //! products, and nothing else. The analytical solves and decompositions —
 //! least squares, symmetric eigendecomposition, general solve, Cholesky —
-//! are solver-class, and TallyDB does not build them: every statistic the
-//! engine currently computes has an exact closed form at the two
-//! parameters or two dimensions it needs, and a general solver's per-call
-//! overhead dwarfs that arithmetic at window scale. A solver-class
-//! dependency returns only when an op needs more than that, where no
-//! closed form exists — and the measured candidate for that day is faer's
+//! are solver-class and do not live here: every statistic the engine
+//! exposes in SQL has an exact closed form at the two parameters or two
+//! dimensions it needs, and a general solver's per-call overhead dwarfs
+//! that arithmetic at window scale. The one solve TallyDB carries — an
+//! interim bridge until MatLua's endpoints land (#90, F2(c),
+//! 2026-08-03; the MatLua ruling stands) — is a fixed-size `K × K`
+//! Cholesky in `engine::multifactor` — deliberately not behind this crate's trait, because it
+//! needs no backend negotiation and putting it here would turn a
+//! private detail into a general solver surface. A solver-class
+//! *dependency* still returns only when an op needs more than that — and the measured candidate for that day is faer's
 //! own solvers, already this crate's kernel source. See DESIGN.md,
 //! *Curated compute: what the engine calls, and why*.
 //!
@@ -52,8 +56,17 @@
 //! a bug in the API shape.
 //!
 //! ## Explicitly NOT in scope
-//! No solver-class routines — TallyDB builds none at all (see the scope
-//! note above). No autodiff. No general tensor operations.
+//! No solver-class routines *here*. No autodiff. No general tensor
+//! operations.
+//!
+//! This crate stays multiplication-class. The one solve TallyDB
+//! carries — a fixed-size symmetric `K × K` Cholesky for the rolling
+//! multi-factor fit, an interim bridge until MatLua's endpoints land
+//! (#90, F2(c), 2026-08-03) — deliberately does **not** live behind
+//! this trait: it is a few dozen lines operating on
+//! moments the window layer already maintains, it needs no backend
+//! negotiation, and putting it here would turn a private detail into a
+//! general solver surface. See `engine::multifactor`.
 
 pub mod backend;
 

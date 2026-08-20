@@ -7,7 +7,8 @@
 //! one of them — `m1_slice_oracle`, `m2_mutation_oracle`,
 //! `m2_differential_oracle`, `m2_lua_window_oracle` (which also covers
 //! the SQL-in-Lua driver pipeline), `m4_asof_oracle`,
-//! `m5_view_oracle`, `m5_join_oracle`, and the latency benchmark — so
+//! `m5_view_oracle`, `m5_join_oracle`, `m5_multifactor_oracle`, and the
+//! latency benchmark — so
 //! nothing in this module is reachable from Rust.
 //!
 //! The fixtures are deterministic (a fixed linear-congruential
@@ -1446,4 +1447,137 @@ pub unsafe extern "C" fn tallydb_join_view_close(context: *mut JoinViewContext) 
     let dir = context.dir.clone();
     drop(context);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------- #90
+// The multi-factor regression family: a fixture whose design matrix is
+// wide enough for a K > 2 fit, so the Python oracle can rebuild every
+// window and solve it independently with `np.linalg.lstsq` (QR/SVD
+// class — deliberately NOT the normal-equations route the engine takes,
+// per the #45 lesson that a diff must never share the implementation's
+// computational path).
+
+/// Rows the multi-factor fixture holds.
+const MULTIFACTOR_ROWS: i64 = 240;
+/// The trailing window the multi-factor family fits over.
+const MULTIFACTOR_PRECEDING: usize = 15;
+/// Rows over which the third factor is held constant, so windows lying
+/// entirely inside the stretch are rank-deficient and the engine must
+/// REFUSE them (return NULL) rather than report noise. Exercising that
+/// path through the C ABI is the point.
+const MULTIFACTOR_FLAT: std::ops::Range<i64> = 100..124;
+
+/// The multi-factor fixture: `y` on three factors, exactly linear plus
+/// a little noise, with one stretch where a factor goes flat.
+fn multifactor_table() -> Table {
+    let schema = Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("y", ColumnType::F64, false),
+        Field::new("a", ColumnType::F64, false),
+        Field::new("b", ColumnType::F64, false),
+        Field::new("c", ColumnType::F64, false),
+    ]);
+    let mut table = Table::with_segment_rows("factors", schema, "ts", 64)
+        .expect("multi-factor schema is valid");
+    for row in 0..MULTIFACTOR_ROWS {
+        let t = row as f64;
+        let a = (t * 0.37).sin() * 4.0 + t * 0.05;
+        let b = (t * 0.11).cos() * 3.0;
+        let c = if MULTIFACTOR_FLAT.contains(&row) {
+            7.0 // flat: windows inside this stretch are singular
+        } else {
+            (t % 13.0) - 6.0
+        };
+        let y = 11.0 + 0.5 * a - 1.25 * b + 3.0 * c + ((t * 0.7).sin() * 0.01);
+        table
+            .append(&[
+                RowValue::I64(row),
+                RowValue::F64(y),
+                RowValue::F64(a),
+                RowValue::F64(b),
+                RowValue::F64(c),
+            ])
+            .expect("multi-factor rows are valid");
+    }
+    table.flush().expect("multi-factor flush succeeds");
+    table
+        .register_window(
+            "mf_intercept",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(0)),
+        )
+        .expect("kernel registers");
+    table
+        .register_window(
+            "mf_beta_a",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(1)),
+        )
+        .expect("kernel registers");
+    table
+        .register_window(
+            "mf_beta_b",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(2)),
+        )
+        .expect("kernel registers");
+    table
+        .register_window(
+            "mf_beta_c",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::Coefficient(3)),
+        )
+        .expect("kernel registers");
+    table
+        .register_window(
+            "mf_r2",
+            crate::MultiFactorRegression::new(3, crate::MultiFactorOutput::R2),
+        )
+        .expect("kernel registers");
+    table
+}
+
+/// Exports the multi-factor fixture's raw inputs (`ts, y, a, b, c`), so
+/// the script can rebuild each window's design matrix itself.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_multifactor_inputs_stream(out: *mut ArrowArrayStream) {
+    let table = multifactor_table();
+    match table.query_stream("SELECT ts, y, a, b, c FROM factors") {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("multi-factor export failed: {error}"),
+    }
+}
+
+/// Exports the fits the engine computed over the trailing window — the
+/// intercept, two coefficients, and `R²`, all through the incremental
+/// sweep the executor picks for `ROWS` frames.
+///
+/// # Safety
+/// As for [`tallydb_m1_inputs_stream`].
+#[no_mangle]
+pub unsafe extern "C" fn tallydb_multifactor_fits_stream(out: *mut ArrowArrayStream) {
+    let table = multifactor_table();
+    let frame = format!(
+        "OVER (ORDER BY ts ROWS BETWEEN {MULTIFACTOR_PRECEDING} PRECEDING AND CURRENT ROW)"
+    );
+    let sql = format!(
+        "SELECT ts, \
+         mf_intercept(y, a, b, c) {frame} AS intercept, \
+         mf_beta_a(y, a, b, c) {frame} AS beta_a, \
+         mf_beta_b(y, a, b, c) {frame} AS beta_b, \
+         mf_beta_c(y, a, b, c) {frame} AS beta_c, \
+         mf_r2(y, a, b, c) {frame} AS r2 \
+         FROM factors"
+    );
+    match table.query_stream(&sql) {
+        // SAFETY: the caller provides a valid, writable destination.
+        Ok(stream) => unsafe { out.write(stream) },
+        Err(error) => panic!("multi-factor fit export failed: {error}"),
+    }
+}
+
+/// The window size, so the script never hard-codes it out of sync.
+#[no_mangle]
+pub extern "C" fn tallydb_multifactor_preceding() -> u64 {
+    MULTIFACTOR_PRECEDING as u64
 }
