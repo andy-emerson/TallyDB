@@ -29,74 +29,41 @@ constraints change only when the Human says so.
    `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` · the
    off-leg (`clippy`/`test`/`doc` for `-p engine`, default features) ·
    the Python oracle suites (build with `--features oracle-harness`,
-   run the nine oracle scripts under `crates/*/tests/`
-   — `m2_compute_latency_bench.py` is a benchmark, not an oracle;
-   eight are wired into `.github/workflows/ci.yml`, see the snapshot
-   for the ninth).
+   run the nine oracle scripts in `.github/workflows/ci.yml` —
+   `m2_compute_latency_bench.py` is a benchmark, not an oracle).
 7. **Never touch the vendored Lua** under `crates/compute-lua/vendor`.
 8. The process is `AGENTS.md`: Plan → Develop → Assess → Review;
    claims at their evidence; code passes and doc passes never mix;
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-08-20: #90 BUILT; reviews done, awaiting merge)
+## Snapshot (2026-08-20: #90 MERGED; research-grade queue EMPTY)
 
-**State:** `main` = `24688cb`. `claude/dev` restarted from it, **6
-commits**, full gate green at every push. #90 — rolling multi-factor
-regression, the last research-grade item — is built, assessed,
-reviewed, and documented:
+**State:** `main` = `585fe31` (the #90 merge, PR #104, which also wired
+the ninth oracle into CI — every oracle claim is now *tested*, re-earned
+on every change). `claude/dev` restarted from it, clean. Nothing is
+awaiting review or merge.
 
-| Commit | What |
-|---|---|
-| 0a052b5 | the anchored `FactorMoments` carrier, `solve_spd` (the single solve seam), and `MultiFactorRegression` with the incremental `evaluate_frames` sweep |
-| cd08da8 | Assess: the accuracy contract against an in-tree Householder QR reference over eight adversarial corpora, and the sliding-vs-per-frame A/B |
-| 251e0a7 | the ninth oracle — 228 windows diffed against NumPy `lstsq` through the C ABI, plus 12 rank-deficient windows refused as ruled |
-| 688507c | repo-wide code-review fixes: the fallback-ordering defect (below), the pivot floor's real semantics, the missing middle coefficient, a dedicated solve scratch |
-| cf58f6a | doc pass: the DESIGN record, and two decision records the code outgrew |
-| 43a80b2 | documentation-review fixes: three spike-imported claims corrected, five stale absolutes elsewhere in the tree |
-
-**The review's severe finding, worth remembering:** the sweep refolded
-the window *before* checking whether the frame was poisoned, so every
-non-finite frame paid for a fold it discarded and then refolded the
-same window again. Answers stayed correct, but the speedup inverted —
-roughly **half** the speed of the recompute it replaces on 1%-NaN data,
-which is ordinary factor-panel data. `shifted_sweep` has always had the
-ordering right; the K > 2 copy diverged. Fixed, and the perf test now
-carries a NaN leg (0.54x → 1.4x) because clean-data timing cannot see
-this class of failure at all.
-
-**Evidence:** 9 unit tests plus the numerics guard and an ignored A/B
-measurement (and a doctest, and a perf-sanity leg); nine oracle
-scripts. Accuracy is judged against two references sharing no
-computational path with the shipped route — Householder QR in-tree and
-NumPy `lstsq` through the C ABI. Speed: 4.2x–37.6x over per-frame
-recompute across K in {4,8,16} and windows {32,64,256}, with the
-sweep's cost **flat** in the window exactly as O(K^2)-per-row predicts.
-
-**Two things the Human needs to see before merging:**
-
-1. **The ninth oracle is not in CI.** The step is written and passes
-   locally, but the push was rejected — this token lacks `workflow`
-   scope, so `.github/workflows/ci.yml` cannot be modified. Until it
-   lands the claim sits at *observed*, not *tested*. The one-line step
-   is in the merge proposal.
-2. **The MatLua ruling STANDS — F2(c) is an interim bridge, not a
-   supersession** (Human, 2026-08-20). The in-engine `K x K` Cholesky
-   is a temporary workaround until MatLua's endpoints land; then the
-   two are compared, the better one wins, the other adapts, and MatLua
-   is adopted — and the comparison improves MatLua either way. The
-   records are written in that framing.
+#90 shipped rolling multi-factor regression: the anchored
+`FactorMoments` carrier, `solve_spd` (a single-function interim solve —
+the MatLua ruling STANDS, see the rulings ledger), and
+`MultiFactorRegression` with the incremental sweep. Accuracy is held
+against Householder QR in-tree and NumPy `lstsq` through the C ABI;
+speed measured 4.2x–37.6x over per-frame recompute with the sweep's
+cost flat in the window. The build's memorable lesson: the sweep
+refolded before checking for non-finite frames, paying for folds it
+discarded — answers stayed right while the speedup inverted to 0.54x
+on 1%-NaN data. Clean-data timing cannot see that failure class; the
+perf test now carries a NaN leg.
 
 **Open follow-ups** (living status, none blocking): adopt MatLua's
-solver once its endpoints land (the recorded reopen trigger); a shared
-sweep skeleton between `shifted_sweep` and the K > 2 sweep, since their
-divergence is what let the ordering bug in; Jacobi equilibration at
-solve time if a scale-spread workload needs it; `RANGE` and unbounded
-frames still take per-frame recompute; "poisoned" is overloaded — it
-means a held mutex elsewhere in `table.rs` and a non-finite row in the
-window sweeps, and the documentation review would rather the sweeps
-said "non-finite" (a rename touching both copies, so it waits for the
-shared-skeleton pass).
+solver once its endpoints land (compare, better wins, other adapts —
+the comparison improves MatLua either way); a shared sweep skeleton
+between `shifted_sweep` and the K > 2 sweep (their divergence caused
+the ordering bug); Jacobi equilibration if a scale-spread workload
+needs it; `RANGE`/unbounded frames still take per-frame recompute;
+rename the sweeps' "poisoned" to "non-finite" (waits for the shared
+skeleton).
 
 **Standing ruling from the Human (2026-07-30), important:** decisions
 made ad-hoc while building are *revisitable*; only decisions that
@@ -136,7 +103,7 @@ requirements letter (drafted at `scratchpad/matlua-requirements.md`).
 - **`_seq` stays `_seq`** — with an open revisit.
 - **Delete-flush cost = (a)** accept and document (done).
 
-### Remaining open decisions (none gate the #90 merge)
+### Remaining open decisions (nothing gates current work)
 
 - **#82** compaction 2x peak: document vs engineer (deferred).
 - **#57** regex menu (deferred by ruling; option-f sketch on issue).

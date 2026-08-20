@@ -1662,9 +1662,8 @@ QR over eight adversarial corpora at 64-row windows, the sweep holds
 on near-collinearity, with windows collinear to 1e-6 refused outright.
 The ninth oracle diffs 228 windows × {intercept, three coefficients,
 R²} against `lstsq`, worst 4.7e-11, plus 12 rank-deficient windows
-refused as ruled — run locally, **not yet wired into CI** (the workflow
-step needs a token scope this session lacked), so that leg sits at
-*observed* rather than *tested* until it lands. Speed: 4.2×–37.6× over per-frame recompute across
+refused as ruled — in CI since the #90 merge (PR #104), so the leg is
+*tested*, re-earned on every change. Speed: 4.2×–37.6× over per-frame recompute across
 K ∈ {4, 8, 16} and windows {32, 64, 256}, and the shape confirms the
 cost model — the sweep's time is **flat** in the window (13.9 / 13.8 /
 14.0 ms at K = 8) where per-frame scales with it (77.1 / 139.2 / 499.4
