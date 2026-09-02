@@ -1122,8 +1122,8 @@ fn decode_column(
                         )));
                     }
                     let mut codes = Buffer::with_capacity(rows);
-                    for chunk in values.chunks_exact(4) {
-                        codes.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                    for chunk in values.as_chunks::<4>().0 {
+                        codes.push(u32::from_le_bytes(*chunk));
                     }
                     codes
                 }
@@ -1161,8 +1161,8 @@ fn decode_f64(bytes: &[u8], rows: usize, name: &str) -> Result<Buffer<f64>, Form
         )));
     }
     let mut buffer = Buffer::with_capacity(rows);
-    for chunk in bytes.chunks_exact(8) {
-        buffer.push(f64::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in bytes.as_chunks::<8>().0 {
+        buffer.push(f64::from_le_bytes(*chunk));
     }
     Ok(buffer)
 }
@@ -1176,8 +1176,8 @@ fn decode_i64(bytes: &[u8], rows: usize, name: &str) -> Result<Buffer<i64>, Form
         )));
     }
     let mut buffer = Buffer::with_capacity(rows);
-    for chunk in bytes.chunks_exact(8) {
-        buffer.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in bytes.as_chunks::<8>().0 {
+        buffer.push(i64::from_le_bytes(*chunk));
     }
     Ok(buffer)
 }
