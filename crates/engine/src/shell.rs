@@ -14,12 +14,12 @@
 //! Everything a user types is either a dot-command (`.help` lists
 //! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
 
+use crate::query_lite::{parse_statement, QueryOutput, Statement};
 use crate::{
     schema_from_create, type_name, Database, LogSink, MaterializedView, RowValue, StoreOptions,
     Table,
 };
 use arrow_lite::{Column, ColumnType, NumericData, Schema};
-use query_lite::{parse_statement, QueryOutput, Statement};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -324,7 +324,7 @@ impl Console {
         }
     }
 
-    fn create_table(&mut self, plan: &query_lite::CreateTablePlan) -> Result<(), String> {
+    fn create_table(&mut self, plan: &crate::query_lite::CreateTablePlan) -> Result<(), String> {
         // The security posture of a filesystem-backed console: table
         // names become directory names, so they stay identifiers.
         if !plan

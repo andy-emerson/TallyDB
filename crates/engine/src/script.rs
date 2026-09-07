@@ -34,8 +34,8 @@ use crate::compute_linalg::{LinalgBackend, RustLinalg};
 use crate::compute_lua::{
     Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
 };
+use crate::query_lite::{Registry, WindowAggregate};
 use arrow_lite::{Bitmap, ColumnType};
-use query_lite::{Registry, WindowAggregate};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
@@ -243,7 +243,7 @@ impl WindowAggregate for LuaWindow {
 }
 
 /// An application-registered Lua *column* kernel behind the
-/// [`query_lite::ColumnFunction`] seam — the vectorized whole-column
+/// [`crate::query_lite::ColumnFunction`] seam — the vectorized whole-column
 /// shape (#53): the arguments bind as whole-column views, the script
 /// fills the preallocated `out` column, and the interpreter is entered
 /// **once per view**, never per row. This is what makes a scripted
@@ -303,7 +303,7 @@ impl LuaColumn {
     }
 }
 
-impl query_lite::ColumnFunction for LuaColumn {
+impl crate::query_lite::ColumnFunction for LuaColumn {
     fn arity(&self) -> usize {
         self.parameters.len()
     }
@@ -386,7 +386,7 @@ mod tests {
     }
 
     /// Flattens an output column of f64 windows (None = SQL NULL).
-    fn f64s(output: &query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
+    fn f64s(output: &crate::query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
         output
             .batches
             .iter()
@@ -506,7 +506,7 @@ mod tests {
         // callable from a Lua kernel by its SQL name — including
         // natives that did not exist when the vocabulary was designed.
         struct SumSq;
-        impl query_lite::WindowAggregate for SumSq {
+        impl crate::query_lite::WindowAggregate for SumSq {
             fn arity(&self) -> usize {
                 1
             }
@@ -607,7 +607,7 @@ mod tests {
             .unwrap();
         let prototype = f64s(&table.query(sql).unwrap(), 0);
         struct Mean;
-        impl query_lite::WindowAggregate for Mean {
+        impl crate::query_lite::WindowAggregate for Mean {
             fn arity(&self) -> usize {
                 1
             }

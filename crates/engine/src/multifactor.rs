@@ -411,7 +411,7 @@ impl MultiFactorRegression {
     }
 }
 
-impl query_lite::WindowAggregate for MultiFactorRegression {
+impl crate::query_lite::WindowAggregate for MultiFactorRegression {
     fn arity(&self) -> usize {
         self.factors + 1 // the response, then the factors
     }
@@ -441,7 +441,7 @@ impl query_lite::WindowAggregate for MultiFactorRegression {
     /// Non-finite values break the sliding identity — `NaN − NaN` is
     /// `NaN`, so a poisoned row outlives its departure — so frames
     /// holding one fall back to the exact per-frame arithmetic of
-    /// [`MultiFactorRegression::evaluate`](query_lite::WindowAggregate::evaluate), which is bit-identical to recompute, and the
+    /// [`MultiFactorRegression::evaluate`](crate::query_lite::WindowAggregate::evaluate), which is bit-identical to recompute, and the
     /// first clean frame afterwards rebuilds from scratch.
     ///
     /// Unbounded frames have no row leaving and nothing to gain, so
@@ -452,7 +452,7 @@ impl query_lite::WindowAggregate for MultiFactorRegression {
         preceding: Option<usize>,
     ) -> Result<Vec<Option<f64>>, String> {
         let Some(preceding) = preceding else {
-            return query_lite::recompute_frames(self, columns, preceding);
+            return crate::query_lite::recompute_frames(self, columns, preceding);
         };
         let (y, factors) = columns.split_first().ok_or("no arguments")?;
         let rows = y.len();
@@ -729,7 +729,7 @@ mod tests {
     /// evidence, not tautology.
     #[test]
     fn the_incremental_sweep_tracks_per_frame_recompute() {
-        use query_lite::WindowAggregate;
+        use crate::query_lite::WindowAggregate;
         let (columns, y, _) = exact_design(400, 1e6);
         let mut args: Vec<&[f64]> = vec![&y];
         args.extend(columns.iter().map(|column| column.as_slice()));
@@ -752,8 +752,9 @@ mod tests {
             ] {
                 let kernel = MultiFactorRegression::new(3, output);
                 let swept = kernel.evaluate_frames(&args, Some(preceding)).unwrap();
-                let recomputed = query_lite::recompute_frames(&kernel, &args, Some(preceding))
-                    .expect("recompute is the reference");
+                let recomputed =
+                    crate::query_lite::recompute_frames(&kernel, &args, Some(preceding))
+                        .expect("recompute is the reference");
                 assert_eq!(swept.len(), recomputed.len());
                 for (row, (a, b)) in swept.iter().zip(&recomputed).enumerate() {
                     match (a, b) {
@@ -777,7 +778,7 @@ mod tests {
     /// recover once the poison leaves the window.
     #[test]
     fn non_finite_rows_agree_with_recompute_and_the_sweep_recovers() {
-        use query_lite::WindowAggregate;
+        use crate::query_lite::WindowAggregate;
         let (mut columns, mut y, _) = exact_design(120, 0.0);
         y[40] = f64::NAN;
         columns[1][41] = f64::INFINITY;
@@ -787,7 +788,8 @@ mod tests {
         let kernel = MultiFactorRegression::new(3, MultiFactorOutput::Coefficient(1));
         for preceding in [3usize, 7] {
             let swept = kernel.evaluate_frames(&args, Some(preceding)).unwrap();
-            let recomputed = query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap();
+            let recomputed =
+                crate::query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap();
             for (row, (a, b)) in swept.iter().zip(&recomputed).enumerate() {
                 assert_eq!(
                     a.is_some(),
@@ -1119,7 +1121,7 @@ mod multifactor_numerics_guard {
 
     use super::multifactor_truth::{corpora, reference_fit};
     use super::*;
-    use query_lite::WindowAggregate;
+    use crate::query_lite::WindowAggregate;
 
     /// Worst relative deviation of a frame sequence from the QR
     /// reference, with the count of frames actually compared — a
@@ -1155,7 +1157,8 @@ mod multifactor_numerics_guard {
             args.extend(columns.iter().copied());
             let kernel = MultiFactorRegression::new(3, MultiFactorOutput::Coefficient(1));
             let swept = kernel.evaluate_frames(&args, Some(preceding)).unwrap();
-            let recomputed = query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap();
+            let recomputed =
+                crate::query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap();
             let answered = swept.iter().flatten().count();
 
             // Collinearity at 1e-6 puts the window past the pivot floor,
@@ -1227,7 +1230,7 @@ mod measure_multifactor {
 
     use super::multifactor_truth::Lcg;
     use super::*;
-    use query_lite::WindowAggregate;
+    use crate::query_lite::WindowAggregate;
 
     #[test]
     #[ignore = "measurement — run explicitly in release mode"]
@@ -1264,7 +1267,7 @@ mod measure_multifactor {
                     best
                 };
                 let per_frame = time(&|| {
-                    query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap()
+                    crate::query_lite::recompute_frames(&kernel, &args, Some(preceding)).unwrap()
                 });
                 let sliding = time(&|| kernel.evaluate_frames(&args, Some(preceding)).unwrap());
                 println!(

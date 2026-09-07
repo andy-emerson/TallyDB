@@ -113,12 +113,12 @@
 //! they compose with everything else. Prose says "maintained view";
 //! the API type is [`MaterializedView`] — one concept, two registers.
 
-use crate::table::{EngineError, Table};
-use arrow_lite::{ColumnType, Field, Schema};
-use query_lite::{
+use crate::query_lite::{
     plan as lower_plan, CmpOp, GroupKey, Number, Plan, Predicate, Projection, QueryError,
     SEQUENCE_COLUMN,
 };
+use crate::table::{EngineError, Table};
+use arrow_lite::{ColumnType, Field, Schema};
 use std::path::Path;
 use storage_lite::format::crc32c;
 use storage_lite::StoreOptions;
@@ -543,7 +543,7 @@ impl MaterializedView {
         source: &Table,
         dimension: Option<&Table>,
         user_plan: &Plan,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         if user_plan.referenced_columns().contains(SEQUENCE_COLUMN) {
             // Found by the repo-wide code review: the union's scratch
             // segments would fabricate sequences, and the fresh path
@@ -816,7 +816,7 @@ impl MaterializedView {
         dimension: &Table,
         definition: &Definition,
         user_plan: &Plan,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         if user_plan.as_of.is_some() {
             return Err(EngineError::Query(QueryError::Unsupported(
                 "ASOF on a join view — one knowledge coordinate cannot span \
@@ -865,7 +865,7 @@ impl MaterializedView {
         definition: &Definition,
         running: &RunningRead,
         user_plan: &Plan,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         let mut current = user_plan.clone();
         current.as_of = None;
         if user_plan.as_of.is_some() || self.width == 0 {
@@ -882,7 +882,7 @@ impl MaterializedView {
         let partials = self.partials_union(source, definition)?;
         let combined = self.over_scratch(
             partials.batches.into_iter(),
-            query_lite::QueryOutput {
+            crate::query_lite::QueryOutput {
                 schema: self.table.schema().clone(),
                 batches: Vec::new(),
             },
@@ -915,7 +915,7 @@ impl MaterializedView {
         definition: &Definition,
         cumulative: &CumulativeRead,
         user_plan: &Plan,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         let mut current = user_plan.clone();
         current.as_of = None;
         let recompute_floor = |floor: Option<i64>| -> Option<i64> {
@@ -958,7 +958,7 @@ impl MaterializedView {
         });
         let combined = self.over_scratch(
             partials.batches.into_iter(),
-            query_lite::QueryOutput {
+            crate::query_lite::QueryOutput {
                 schema: self.table.schema().clone(),
                 batches: Vec::new(),
             },
@@ -993,7 +993,7 @@ impl MaterializedView {
         &self,
         source: &Table,
         definition: &Definition,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         match definition.touched_runs(source, self.stamp)? {
             None => self.table.execute_plan(&select_everything(&self.table)?),
             Some(runs) => {
@@ -1014,9 +1014,9 @@ impl MaterializedView {
     fn over_scratch(
         &self,
         clean: impl Iterator<Item = arrow_lite::RecordBatch>,
-        fresh: query_lite::QueryOutput,
+        fresh: crate::query_lite::QueryOutput,
         user_plan: &Plan,
-    ) -> Result<query_lite::QueryOutput, EngineError> {
+    ) -> Result<crate::query_lite::QueryOutput, EngineError> {
         let okey = self
             .table
             .schema()
@@ -1376,7 +1376,7 @@ impl Definition {
 /// combine plan, and the finalize steps.
 fn synthesize_running(user: Plan, source: &Table, width: i64) -> Result<Definition, EngineError> {
     use crate::partials::{decompose, HIDDEN_BUCKET};
-    use query_lite::{AggItem, Projection as Proj};
+    use crate::query_lite::{AggItem, Projection as Proj};
     let Proj::Aggregate { keys, items, .. } = &user.projection else {
         unreachable!("classified Running from an aggregate projection")
     };
@@ -1543,8 +1543,8 @@ fn synthesize_cumulative(
     width: i64,
 ) -> Result<Definition, EngineError> {
     use crate::partials::{decompose, expanding_window_function, PartialForm, HIDDEN_BUCKET};
-    use query_lite::plan::WindowCall;
-    use query_lite::{AggCall, AggItem, PlanItem, Projection as Proj};
+    use crate::query_lite::plan::WindowCall;
+    use crate::query_lite::{AggCall, AggItem, PlanItem, Projection as Proj};
     let Proj::Items(items) = &user.projection else {
         unreachable!("classified Cumulative from an Items projection")
     };
@@ -1786,7 +1786,7 @@ fn folded_bucket_count(
 
 /// The first cell of a single-column, single-row i64 aggregate — the
 /// shared tail of the structural MIN/MAX probes below.
-fn single_i64_cell(output: &query_lite::QueryOutput) -> Option<i64> {
+fn single_i64_cell(output: &crate::query_lite::QueryOutput) -> Option<i64> {
     use arrow_lite::{Column, NumericData};
     let batch = output
         .batches
@@ -1860,8 +1860,8 @@ fn joined_touched_ranges(
         // (found by the repo-wide code review — the off-by-one left a
         // fact at exactly `next` silently stale under the strict form).
         let high = match join.as_of.expect("ranges with intervals only for ASOF") {
-            query_lite::AsOfMatch::AtOrBefore => next.map_or(i64::MAX, |next| next - 1),
-            query_lite::AsOfMatch::StrictlyBefore => next.unwrap_or(i64::MAX),
+            crate::query_lite::AsOfMatch::AtOrBefore => next.map_or(i64::MAX, |next| next - 1),
+            crate::query_lite::AsOfMatch::StrictlyBefore => next.unwrap_or(i64::MAX),
         };
         if at <= high {
             ranges.push((at, high));
@@ -1882,7 +1882,7 @@ fn next_reference_key(
     value: &str,
     after: i64,
 ) -> Result<Option<i64>, EngineError> {
-    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    use crate::query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
     let plan = Plan {
         table: dimension.name().to_owned(),
         join: None,
@@ -1920,7 +1920,7 @@ fn next_reference_key(
 /// `None` when empty — what a join view's materialization ceiling
 /// advances to.
 fn table_okey_max(table: &Table) -> Result<Option<i64>, EngineError> {
-    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    use crate::query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
     let plan = Plan {
         table: table.name().to_owned(),
         join: None,
@@ -1982,7 +1982,7 @@ fn merge_key_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 /// aggregate; exactness past 2^53 is irrelevant here because the width
 /// is a heuristic, not a semantic.
 fn source_span(source: &Table) -> Result<Option<(i64, i64)>, EngineError> {
-    use query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
+    use crate::query_lite::{AggCall, AggFunction, AggItem, Projection as Proj};
     let call = |function, alias: &str| {
         AggItem::Call(AggCall {
             function,
@@ -2037,7 +2037,7 @@ fn source_span(source: &Table) -> Result<Option<(i64, i64)>, EngineError> {
 /// zero, standard SQL's average of nothing.
 fn finalize_combined(
     running: &RunningRead,
-    combined: &query_lite::QueryOutput,
+    combined: &crate::query_lite::QueryOutput,
 ) -> Result<Option<arrow_lite::RecordBatch>, EngineError> {
     use arrow_lite::{Bitmap, Buffer, Column, NumericColumn, NumericData, RecordBatch};
     // Collapsing stages materialize one batch (QueryOutput's contract);
@@ -2122,8 +2122,8 @@ fn run_over_output(
     output: &Schema,
     batches: Vec<arrow_lite::RecordBatch>,
     user_plan: &Plan,
-    registry: &query_lite::Registry,
-) -> Result<query_lite::QueryOutput, EngineError> {
+    registry: &crate::query_lite::Registry,
+) -> Result<crate::query_lite::QueryOutput, EngineError> {
     use arrow_lite::{Column, NumericColumn, NumericData, RecordBatch};
     let okey = output.fields().len() - 1; // __row, by construction
     let batches = batches
@@ -2212,7 +2212,7 @@ impl Cell {
 /// then adds nothing, which is exactly right.
 fn boundary_rows(
     cumulative: &CumulativeRead,
-    combined: &query_lite::QueryOutput,
+    combined: &crate::query_lite::QueryOutput,
 ) -> std::collections::HashMap<Vec<Option<String>>, Vec<Option<Cell>>> {
     use arrow_lite::{Column, NumericData};
     let mut map = std::collections::HashMap::new();
@@ -2467,8 +2467,8 @@ fn run_over_scratch(
     okey: usize,
     batches: Vec<arrow_lite::RecordBatch>,
     user_plan: &Plan,
-    registry: &query_lite::Registry,
-) -> Result<query_lite::QueryOutput, EngineError> {
+    registry: &crate::query_lite::Registry,
+) -> Result<crate::query_lite::QueryOutput, EngineError> {
     use storage_lite::{Segment, SegmentHandle};
     let handles: Vec<SegmentHandle> = batches
         .into_iter()
@@ -2481,7 +2481,7 @@ fn run_over_scratch(
             )
         })
         .collect();
-    query_lite::execute_with_ordering_key(output, &handles, okey, user_plan, registry)
+    crate::query_lite::execute_with_ordering_key(output, &handles, okey, user_plan, registry)
         .map_err(EngineError::Query)
 }
 
@@ -2492,12 +2492,12 @@ fn select_everything(table: &Table) -> Result<Plan, EngineError> {
     Ok(Plan {
         table: table.name().to_owned(),
         join: None,
-        projection: query_lite::Projection::Items(
+        projection: crate::query_lite::Projection::Items(
             table
                 .schema()
                 .fields()
                 .iter()
-                .map(|field| query_lite::PlanItem::Column {
+                .map(|field| crate::query_lite::PlanItem::Column {
                     name: field.name().to_owned(),
                     alias: None,
                 })
@@ -2709,9 +2709,9 @@ fn eligible_shape(
         // the old code accepted the shape and every partials-path
         // read then failed on the missing column).
         for key in keys {
-            let selected = items
-                .iter()
-                .any(|item| matches!(item, query_lite::AggItem::Key { key: k, .. } if k == key));
+            let selected = items.iter().any(
+                |item| matches!(item, crate::query_lite::AggItem::Key { key: k, .. } if k == key),
+            );
             if !selected {
                 return refuse(
                     "a running view whose SELECT list omits a GROUP BY key — \
@@ -2749,7 +2749,7 @@ fn eligible_shape(
     let name = items
         .iter()
         .find_map(|item| match item {
-            query_lite::AggItem::Key { key, alias } if key == bucket => {
+            crate::query_lite::AggItem::Key { key, alias } if key == bucket => {
                 Some(alias.clone().unwrap_or_else(|| key.output_name()))
             }
             _ => None,
@@ -2775,7 +2775,7 @@ fn classify_joined(
     source: &Table,
     dimension: Option<&Table>,
 ) -> Result<Shape, EngineError> {
-    use query_lite::PlanItem;
+    use crate::query_lite::PlanItem;
     let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
     let join = plan.join.as_ref().expect("routed here on Some");
     let Some(dimension) = dimension else {
@@ -2928,7 +2928,7 @@ fn classify_joined_aggregate(
     let name = items
         .iter()
         .find_map(|item| match item {
-            query_lite::AggItem::Key { key, alias } if key == bucket => {
+            crate::query_lite::AggItem::Key { key, alias } if key == bucket => {
                 Some(alias.clone().unwrap_or_else(|| key.output_name()))
             }
             _ => None,
@@ -2958,24 +2958,24 @@ fn reserved_names_free(plan: &Plan, shape: &str) -> Result<(), EngineError> {
         Projection::Aggregate { items, .. } => {
             for item in items {
                 match item {
-                    query_lite::AggItem::Key {
+                    crate::query_lite::AggItem::Key {
                         alias: Some(alias), ..
                     } => names.push(alias.clone()),
-                    query_lite::AggItem::Call(call) => names.extend(call.alias.clone()),
-                    query_lite::AggItem::Key { alias: None, .. } => {}
+                    crate::query_lite::AggItem::Call(call) => names.extend(call.alias.clone()),
+                    crate::query_lite::AggItem::Key { alias: None, .. } => {}
                 }
             }
         }
         Projection::Items(items) => {
             for item in items {
                 match item {
-                    query_lite::PlanItem::Column {
+                    crate::query_lite::PlanItem::Column {
                         alias: Some(alias), ..
                     }
-                    | query_lite::PlanItem::Window {
+                    | crate::query_lite::PlanItem::Window {
                         alias: Some(alias), ..
                     } => names.push(alias.clone()),
-                    query_lite::PlanItem::Computed { name, .. } => names.push(name.clone()),
+                    crate::query_lite::PlanItem::Computed { name, .. } => names.push(name.clone()),
                     _ => {}
                 }
             }
@@ -2999,8 +2999,8 @@ fn reserved_names_free(plan: &Plan, shape: &str) -> Result<(), EngineError> {
 /// values).
 fn classify_cumulative(plan: &Plan, source: &Table) -> Result<Shape, EngineError> {
     use crate::partials::expanding_window_function;
-    use query_lite::plan::WindowCall;
-    use query_lite::PlanItem;
+    use crate::query_lite::plan::WindowCall;
+    use crate::query_lite::PlanItem;
     let refuse = |what: &str| Err(EngineError::Query(QueryError::Unsupported(what.to_owned())));
     let Projection::Items(items) = &plan.projection else {
         unreachable!("classified from an Items projection")
@@ -3033,7 +3033,7 @@ fn classify_cumulative(plan: &Plan, source: &Table) -> Result<Shape, EngineError
                          partials today",
                     );
                 }
-                if !matches!(frame, query_lite::Frame::Rows(None)) {
+                if !matches!(frame, crate::query_lite::Frame::Rows(None)) {
                     return refuse(
                         "a bounded window frame in a view definition — a \
                          maintained view holds running state; rolling \
@@ -3647,7 +3647,7 @@ mod tests {
     /// comparison currency for "view equals recompute": the view table
     /// may hold its rows in refresh order, so equality is up to row
     /// order, never up to values.
-    fn sorted_rows(output: &query_lite::QueryOutput) -> Vec<String> {
+    fn sorted_rows(output: &crate::query_lite::QueryOutput) -> Vec<String> {
         use arrow_lite::{Column, NumericData};
         let mut rows = Vec::new();
         for batch in &output.batches {

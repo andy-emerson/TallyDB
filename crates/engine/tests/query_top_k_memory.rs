@@ -11,7 +11,7 @@ mod common;
 
 use arrow_lite::{ColumnType, Field, Schema};
 use common::peak_of;
-use query_lite::{execute, plan, Registry};
+use engine::query_lite::{execute, plan, Registry};
 use storage_lite::{RowValue, SegmentHandle, Store};
 
 #[global_allocator]

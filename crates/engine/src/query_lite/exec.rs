@@ -49,11 +49,13 @@
 //! back to hashing — same answers, state proportional to the result —
 //! when the data is not ordered.
 
-use crate::plan::{
+use crate::query_lite::plan::{
     AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
     PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, WindowCall, SEQUENCE_COLUMN,
 };
-use crate::predicate::{can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval};
+use crate::query_lite::predicate::{
+    can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval,
+};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
@@ -323,7 +325,7 @@ pub struct JoinSide<'a> {
 /// a lookup table, and a duplicate key is an error, not a silent row
 /// multiplication.
 ///
-/// An **as-of** join ([`crate::AsOfMatch`], #65) changes exactly that
+/// An **as-of** join ([`crate::query_lite::AsOfMatch`], #65) changes exactly that
 /// last rule and nothing else: the dimension key is deliberately *not*
 /// unique — a quote table has many rows per symbol — and each fact row
 /// takes the most recent of its key's dimension rows on the two
@@ -1565,7 +1567,7 @@ fn resolve<'a>(schema: &'a Schema, name: &str) -> Result<(usize, &'a Field), Que
         // Everything reaching here resolves against the *stored*
         // schema, where the pseudocolumn does not exist: projection
         // intercepts it first, so this is always a refusal.
-        .ok_or_else(|| crate::plan::no_such_column(name))
+        .ok_or_else(|| crate::query_lite::plan::no_such_column(name))
 }
 
 /// The ingest-sequence pseudocolumn, materialized per view: every row's
@@ -3518,7 +3520,7 @@ fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::plan;
+    use crate::query_lite::plan::plan;
     use storage_lite::{RowValue, Store, WriteBuffer};
 
     /// Mean of the first argument — enough to test frame arithmetic
@@ -4019,8 +4021,13 @@ mod tests {
         )];
         let registry = registry();
         let go = |sql: &str| -> Vec<i64> {
-            let output =
-                execute(&schema, &views, &crate::plan::plan(sql).unwrap(), &registry).unwrap();
+            let output = execute(
+                &schema,
+                &views,
+                &crate::query_lite::plan::plan(sql).unwrap(),
+                &registry,
+            )
+            .unwrap();
             output
                 .batches
                 .iter()
@@ -4334,7 +4341,7 @@ mod query1_tests {
         let output = execute(
             &schema,
             &views,
-            &crate::plan::plan("SELECT sum(n) AS s FROM t").unwrap(),
+            &crate::query_lite::plan::plan("SELECT sum(n) AS s FROM t").unwrap(),
             &Registry::new(),
         )
         .unwrap();
@@ -4360,7 +4367,7 @@ mod query1_tests {
             execute(
                 &schema,
                 &views,
-                &crate::plan::plan("SELECT sum(n) FROM t").unwrap(),
+                &crate::query_lite::plan::plan("SELECT sum(n) FROM t").unwrap(),
                 &Registry::new(),
             ),
             Err(QueryError::Compute(_))
@@ -4425,7 +4432,7 @@ mod query1_tests {
         let ascending = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql_asc).unwrap(),
+            &crate::query_lite::plan::plan(sql_asc).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4433,7 +4440,7 @@ mod query1_tests {
         let descending = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql_desc).unwrap(),
+            &crate::query_lite::plan::plan(sql_desc).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4484,7 +4491,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         );
         assert_eq!(
@@ -4497,7 +4504,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         );
         assert_eq!(
@@ -4532,7 +4539,7 @@ mod query1_tests {
         let error = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap_err();
@@ -4555,7 +4562,7 @@ mod query1_tests {
         let all = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4564,7 +4571,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4574,7 +4581,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4589,7 +4596,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4600,7 +4607,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4610,14 +4617,14 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
         assert_eq!(flatten(&output, 0), [Some(0.0), Some(3.0), Some(8.0)]);
         // i64 and key columns are refused loudly (numeric-or-key, #40).
         for sql in ["SELECT ts + 1 FROM t", "SELECT sym * 2 FROM t"] {
-            let error = crate::plan::plan(sql)
+            let error = crate::query_lite::plan::plan(sql)
                 .and_then(|plan| execute(&schema(), &views, &plan, &registry));
             assert!(error.is_err(), "{sql} should be refused");
         }
@@ -4631,7 +4638,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4641,7 +4648,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4665,7 +4672,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
@@ -4676,13 +4683,13 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         )
         .unwrap();
         assert_eq!(output.num_rows(), 2);
         // HAVING without aggregation is refused toward WHERE.
-        assert!(crate::plan::plan("SELECT x FROM t HAVING x > 1").is_err());
+        assert!(crate::query_lite::plan::plan("SELECT x FROM t HAVING x > 1").is_err());
     }
 
     #[test]
@@ -4693,7 +4700,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         );
         assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
@@ -4701,7 +4708,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(sql).unwrap(),
+            &crate::query_lite::plan::plan(sql).unwrap(),
             &registry,
         );
         assert_eq!(flatten(&output.unwrap(), 0), [Some(1.0), Some(3.0)]);
@@ -4727,7 +4734,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(&sql).unwrap(),
+            &crate::query_lite::plan::plan(&sql).unwrap(),
             &registry,
         );
         assert_eq!(flatten(&output.unwrap(), 0), [None, Some(2.0), Some(3.0)]);
@@ -4735,7 +4742,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(&sql).unwrap(),
+            &crate::query_lite::plan::plan(&sql).unwrap(),
             &registry,
         );
         assert_eq!(flatten(&output.unwrap(), 0), [Some(3.0), Some(2.0), None]);
@@ -4780,8 +4787,10 @@ mod query1_tests {
         let output = execute(
             &schema,
             &views,
-            &crate::plan::plan("SELECT a, b, count(*) AS n FROM t GROUP BY a, b ORDER BY n DESC")
-                .unwrap(),
+            &crate::query_lite::plan::plan(
+                "SELECT a, b, count(*) AS n FROM t GROUP BY a, b ORDER BY n DESC",
+            )
+            .unwrap(),
             &Registry::new(),
         )
         .unwrap();
@@ -4842,7 +4851,7 @@ mod query1_tests {
         let output = execute(
             &schema(),
             &views,
-            &crate::plan::plan(
+            &crate::query_lite::plan::plan(
                 "SELECT sum(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
             )
             .unwrap(),
@@ -5202,7 +5211,7 @@ mod query1_tests {
         );
         let schema = schema();
         let predicate = |sql: &str| {
-            crate::plan::plan(sql)
+            crate::query_lite::plan::plan(sql)
                 .unwrap()
                 .predicate
                 .expect("has a WHERE")
@@ -5245,7 +5254,7 @@ mod query1_tests {
         );
         let schema = schema();
         let predicate = |sql: &str| {
-            crate::plan::plan(sql)
+            crate::query_lite::plan::plan(sql)
                 .unwrap()
                 .predicate
                 .expect("has a WHERE")
@@ -5288,7 +5297,7 @@ mod query1_tests {
     fn a_window_in_a_row_predicate_is_refused_by_name() {
         // Standard SQL runs WHERE before the window phase, so there is
         // no window result to test against — a refusal, not a gap.
-        let error = crate::plan::plan("SELECT ts FROM t WHERE sum(x) OVER () > 1")
+        let error = crate::query_lite::plan::plan("SELECT ts FROM t WHERE sum(x) OVER () > 1")
             .unwrap_err()
             .to_string();
         assert!(error.contains("before the"), "{error}");
@@ -5331,7 +5340,7 @@ mod query1_tests {
             "SELECT first(x) OVER (PARTITION BY sym) FROM t",
             "SELECT last(x) OVER () FROM t",
         ] {
-            let error = crate::plan::plan(sql).unwrap_err().to_string();
+            let error = crate::query_lite::plan::plan(sql).unwrap_err().to_string();
             assert!(error.contains("needs an ORDER BY"), "{sql}: {error}");
         }
         // Ordered, they answer.
@@ -5363,7 +5372,7 @@ mod query1_tests {
                 &schema,
                 views,
                 0,
-                &crate::plan::plan(sql).unwrap(),
+                &crate::query_lite::plan::plan(sql).unwrap(),
                 &registry,
             )
         };
@@ -5417,7 +5426,7 @@ mod query1_tests {
         // A frame with nothing to be relative to is a contradiction,
         // refused rather than silently ignored. (Refused by the
         // planner, so it never reaches the executor.)
-        let error = crate::plan::plan(
+        let error = crate::query_lite::plan::plan(
             "SELECT sum(x) OVER (PARTITION BY ts ROWS BETWEEN 1 PRECEDING \
              AND CURRENT ROW) FROM t",
         )
@@ -5425,7 +5434,7 @@ mod query1_tests {
         .to_string();
         assert!(error.contains("needs an ORDER BY"), "{error}");
         // A positional lookup with no order has nowhere to look.
-        let error = crate::plan::plan("SELECT lag(x) OVER (PARTITION BY ts) FROM t")
+        let error = crate::query_lite::plan::plan("SELECT lag(x) OVER (PARTITION BY ts) FROM t")
             .unwrap_err()
             .to_string();
         assert!(error.contains("needs an ORDER BY"), "{error}");
@@ -5529,7 +5538,7 @@ mod query1_tests {
         // quote (sequence 5) sits in the EARLIER segment, a stale
         // version (sequence 2) in the later one — which no table-level
         // ingest can produce today, and a future layout change could.
-        use crate::plan::plan;
+        use crate::query_lite::plan::plan;
         use storage_lite::{RowValue, SequenceInfo, WriteBuffer};
         let quote_schema = Schema::new(vec![
             Field::new("qts", ColumnType::I64, false),

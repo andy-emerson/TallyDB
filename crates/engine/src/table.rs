@@ -28,12 +28,12 @@
 
 #[cfg(feature = "lua")]
 use crate::compute_lua::LogSink;
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
-use query_lite::{
+use crate::query_lite::{
     evaluate_predicate, execute_with_ordering_key, parse_statement, plan, recompute_frames,
     ColumnFunction, DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue,
     Statement, UpdatePlan, ViewScalars, WindowAggregate,
 };
+use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use storage_lite::{
@@ -495,13 +495,13 @@ impl Table {
         plan: &Plan,
         dimension: &Table,
     ) -> Result<QueryOutput, EngineError> {
-        Ok(query_lite::execute_join(
-            query_lite::JoinSide {
+        Ok(crate::query_lite::execute_join(
+            crate::query_lite::JoinSide {
                 schema: self.store.schema(),
                 handles: &[],
                 ordering_key: self.store.ordering_key(),
             },
-            query_lite::JoinSide {
+            crate::query_lite::JoinSide {
                 schema: dimension.store.schema(),
                 handles: &[],
                 ordering_key: dimension.store.ordering_key(),
@@ -520,13 +520,13 @@ impl Table {
     ) -> Result<QueryOutput, EngineError> {
         let fact_views = self.store.snapshot()?;
         let dimension_views = dimension.store.snapshot()?;
-        Ok(query_lite::execute_join(
-            query_lite::JoinSide {
+        Ok(crate::query_lite::execute_join(
+            crate::query_lite::JoinSide {
                 schema: self.store.schema(),
                 handles: &fact_views,
                 ordering_key: self.store.ordering_key(),
             },
-            query_lite::JoinSide {
+            crate::query_lite::JoinSide {
                 schema: dimension.store.schema(),
                 handles: &dimension_views,
                 ordering_key: dimension.store.ordering_key(),
@@ -595,7 +595,10 @@ impl Table {
     /// column exactly or is refused; a float literal never silently
     /// truncates into a `BIGINT` column; strings go to key columns
     /// only. Returns the rows inserted.
-    pub(crate) fn insert(&mut self, plan: &query_lite::InsertPlan) -> Result<u64, EngineError> {
+    pub(crate) fn insert(
+        &mut self,
+        plan: &crate::query_lite::InsertPlan,
+    ) -> Result<u64, EngineError> {
         let schema = self.store.schema().clone();
         let order: Vec<usize> = match &plan.columns {
             None => (0..schema.fields().len()).collect(),
@@ -627,9 +630,9 @@ impl Table {
             for (value, &position) in row.iter().zip(&order) {
                 let field = &schema.fields()[position];
                 cells[position] = match value {
-                    query_lite::InsertValue::Null => RowValue::Null,
-                    query_lite::InsertValue::String(text) => RowValue::Key(text),
-                    query_lite::InsertValue::Number(number) => match field.column_type() {
+                    crate::query_lite::InsertValue::Null => RowValue::Null,
+                    crate::query_lite::InsertValue::String(text) => RowValue::Key(text),
+                    crate::query_lite::InsertValue::Number(number) => match field.column_type() {
                         ColumnType::F64 => match number {
                             Number::Float(value) => RowValue::F64(*value),
                             Number::Int(value) => {
@@ -978,7 +981,7 @@ impl Table {
     fn for_each_match(
         &self,
         views: &[SegmentView],
-        predicate: Option<&query_lite::Predicate>,
+        predicate: Option<&crate::query_lite::Predicate>,
         mut visit: impl FnMut(&SegmentView, usize, u64),
     ) -> Result<(), EngineError> {
         let schema = self.store.schema();
@@ -1060,7 +1063,7 @@ impl Table {
     /// replacements) tombstones.
     pub(crate) fn replace_matching(
         &mut self,
-        predicate: Option<&query_lite::Predicate>,
+        predicate: Option<&crate::query_lite::Predicate>,
         replacements: &QueryOutput,
     ) -> Result<(), EngineError> {
         let views = materialize(&self.store.snapshot()?)?;
@@ -1102,7 +1105,7 @@ impl Table {
     fn matched_row_ids(
         &self,
         views: &[SegmentView],
-        predicate: Option<&query_lite::Predicate>,
+        predicate: Option<&crate::query_lite::Predicate>,
     ) -> Result<Vec<u64>, EngineError> {
         let mut ids = Vec::new();
         self.for_each_match(views, predicate, |_, _, id| ids.push(id))?;
@@ -1259,10 +1262,10 @@ fn validated_ordering_index(schema: &Schema, ordering_key: &str) -> Result<usize
     if schema
         .fields()
         .iter()
-        .any(|field| field.name() == query_lite::SEQUENCE_COLUMN)
+        .any(|field| field.name() == crate::query_lite::SEQUENCE_COLUMN)
     {
         return Err(EngineError::ReservedColumn(
-            query_lite::SEQUENCE_COLUMN.to_owned(),
+            crate::query_lite::SEQUENCE_COLUMN.to_owned(),
         ));
     }
     schema
@@ -1284,7 +1287,7 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 /// column name. Shared by every SQL surface — shell, and later the
 /// server and workbench — so the mapping cannot fork.
 pub fn schema_from_create(
-    plan: &query_lite::CreateTablePlan,
+    plan: &crate::query_lite::CreateTablePlan,
 ) -> Result<(Schema, String), EngineError> {
     let mut fields = Vec::with_capacity(plan.columns.len());
     let mut ordering = None;
@@ -2631,7 +2634,7 @@ pub(crate) mod tests {
         // exactly as `CREATE TABLE` refuses it.
         let shadowing = Schema::new(vec![
             Field::new("ts", ColumnType::I64, false),
-            Field::new(query_lite::SEQUENCE_COLUMN, ColumnType::I64, false),
+            Field::new(crate::query_lite::SEQUENCE_COLUMN, ColumnType::I64, false),
         ]);
         assert!(matches!(
             Table::new("t", shadowing, "ts"),
@@ -3225,7 +3228,7 @@ mod mutation_tests {
     }
 
     /// One output column flattened across batches, nulls preserved.
-    fn f64s(output: &query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
+    fn f64s(output: &crate::query_lite::QueryOutput, index: usize) -> Vec<Option<f64>> {
         output
             .batches
             .iter()
@@ -4061,7 +4064,7 @@ mod window_numerics_guard {
                 let one: [&[f64]; 1] = [&y];
                 let incremental = aggregate.evaluate_frames(&one, Some(preceding)).unwrap();
                 let reference =
-                    query_lite::recompute_frames(aggregate.as_ref(), &one, Some(preceding))
+                    crate::query_lite::recompute_frames(aggregate.as_ref(), &one, Some(preceding))
                         .unwrap();
                 assert_eq!(incremental.len(), reference.len());
                 for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
@@ -4084,9 +4087,12 @@ mod window_numerics_guard {
                 let incremental = aggregate
                     .evaluate_frames(&columns, Some(preceding))
                     .unwrap();
-                let reference =
-                    query_lite::recompute_frames(aggregate.as_ref(), &columns, Some(preceding))
-                        .unwrap();
+                let reference = crate::query_lite::recompute_frames(
+                    aggregate.as_ref(),
+                    &columns,
+                    Some(preceding),
+                )
+                .unwrap();
                 assert_eq!(incremental.len(), reference.len());
                 for (i, (got, want)) in incremental.iter().zip(&reference).enumerate() {
                     match (got, want) {

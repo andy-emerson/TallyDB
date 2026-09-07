@@ -8,7 +8,7 @@
 //! ## What a script's statements mean here
 //!
 //! - `SELECT` runs through [`Database::query`] and is made contiguous
-//!   ([`query_lite::contiguous`]), because a script sees each result
+//!   ([`crate::query_lite::contiguous`]), because a script sees each result
 //!   column as one view. A result that already arrived in one batch is
 //!   moved through untouched, so its views point straight at the
 //!   buffers the query produced; several batches pay one gather, with
@@ -35,8 +35,8 @@
 
 use crate::compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 use crate::database::Database;
+use crate::query_lite::{parse_statement, Statement};
 use arrow_lite::{Column, NumericData, RecordBatch};
-use query_lite::{parse_statement, Statement};
 use storage_lite::RowValue;
 
 /// The [`ScriptHost`] a driving script reaches: statements resolve
@@ -56,7 +56,7 @@ impl ScriptHost for DatabaseHost<'_> {
                     .query(sql)
                     .map_err(|error| error.to_string())?;
                 Ok(SqlOutcome::Rows(Box::new(HeldOutput {
-                    batch: query_lite::contiguous(output),
+                    batch: crate::query_lite::contiguous(output),
                 })))
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
@@ -159,10 +159,10 @@ mod tests {
     //! through the Arrow surface.
 
     use super::*;
+    use crate::query_lite::QueryOutput;
     use crate::table::Table;
     use crate::Database;
     use arrow_lite::{ColumnType, Field, Schema};
-    use query_lite::QueryOutput;
 
     /// Column `index` of every batch, flattened — the hand-staged
     /// concatenation the script's contiguous result is checked against.

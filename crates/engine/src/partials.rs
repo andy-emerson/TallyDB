@@ -26,7 +26,7 @@
 //! revisitable, but exact single-pass equality is impossible under any
 //! partials representation.)
 
-use query_lite::{AggCall, AggFunction};
+use crate::query_lite::{AggCall, AggFunction};
 
 /// The expanding-window functions a cumulative view can maintain,
 /// mapped to the aggregate whose decomposition serves them: the

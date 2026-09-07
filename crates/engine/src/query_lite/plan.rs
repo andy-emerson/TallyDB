@@ -17,7 +17,7 @@
 //! DELETE FROM table [WHERE predicate];
 //! ```
 //!
-//! The predicate fragment is documented in [`crate::predicate`]. A
+//! The predicate fragment is documented in [`crate::query_lite::predicate`]. A
 //! `GROUP BY` key is a symbol column or a monotone bucket of the
 //! ordering key (`ts / 60`, `(ts / 60) * 60`, bare `ts`), optionally
 //! named by its `SELECT` alias; aggregates are `COUNT` / `SUM` / `AVG`
@@ -35,7 +35,7 @@
 //! The per-item documentation below is the authority on any detail;
 //! this block is the shape.
 
-use crate::predicate::{lower_predicate, parse_number, Number, Predicate};
+use crate::query_lite::predicate::{lower_predicate, parse_number, Number, Predicate};
 use sqlparser::ast;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -324,7 +324,7 @@ pub enum ScalarExpr {
     /// missing ELSE yields NULL.
     Case {
         /// The WHEN arms, in order.
-        whens: Vec<(crate::Predicate, ScalarExpr)>,
+        whens: Vec<(crate::query_lite::Predicate, ScalarExpr)>,
         /// The ELSE arm.
         otherwise: Option<Box<ScalarExpr>>,
     },
@@ -997,9 +997,9 @@ fn lower_insert(insert: &ast::Insert) -> Result<InsertPlan, QueryError> {
 fn lower_insert_value(expr: &ast::Expr) -> Result<InsertValue, QueryError> {
     match expr {
         ast::Expr::Value(value) => match &value.value {
-            ast::Value::Number(text, _) => {
-                Ok(InsertValue::Number(crate::predicate::parse_number(text)?))
-            }
+            ast::Value::Number(text, _) => Ok(InsertValue::Number(
+                crate::query_lite::predicate::parse_number(text)?,
+            )),
             ast::Value::SingleQuotedString(text) => Ok(InsertValue::String(text.clone())),
             ast::Value::Null => Ok(InsertValue::Null),
             other => Err(QueryError::Unsupported(format!("INSERT literal '{other}'"))),
@@ -2420,7 +2420,7 @@ pub(crate) fn lower_scalar_expr(
         ast::Expr::Identifier(name) => Ok(ScalarExpr::Column(ident(name))),
         ast::Expr::Value(value) => match &value.value {
             ast::Value::Number(text, _) => {
-                let number = crate::predicate::parse_number(text)?;
+                let number = crate::query_lite::predicate::parse_number(text)?;
                 Ok(ScalarExpr::Literal(match number {
                     Number::Int(value) => value as f64,
                     Number::Float(value) => value,
@@ -2538,7 +2538,7 @@ pub(crate) fn lower_scalar_expr(
             let mut whens = Vec::with_capacity(conditions.len());
             for case_when in conditions {
                 whens.push((
-                    crate::predicate::lower_predicate(&case_when.condition, windows)?,
+                    crate::query_lite::predicate::lower_predicate(&case_when.condition, windows)?,
                     lower_scalar_expr(&case_when.result, windows)?,
                 ));
             }

@@ -4,7 +4,7 @@
 //! evaluation. Observed from outside by counting backend reads.
 
 use arrow_lite::{ColumnType, Field, Schema};
-use query_lite::{execute, plan, Registry};
+use engine::query_lite::{execute, plan, Registry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use storage_lite::{

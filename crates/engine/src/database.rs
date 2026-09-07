@@ -8,10 +8,10 @@
 //! against (`add_table` / `append` / `query` / `mutate`), and it is
 //! where star-schema joins resolve their dimension tables.
 
+use crate::query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use crate::table::{EngineError, Table};
 use crate::view::MaterializedView;
 use arrow_lite::{ArrowArrayStream, Schema};
-use query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use std::collections::HashMap;
 use storage_lite::RowValue;
 
@@ -318,7 +318,7 @@ impl Database {
         &mut self,
         table: &str,
         name: &str,
-        kernel: impl query_lite::WindowAggregate + 'static,
+        kernel: impl crate::query_lite::WindowAggregate + 'static,
     ) -> Result<(), EngineError> {
         self.tables
             .get_mut(table)

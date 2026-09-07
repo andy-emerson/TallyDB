@@ -90,6 +90,7 @@ mod driver;
 pub mod harness;
 mod multifactor;
 mod partials;
+pub mod query_lite;
 #[cfg(feature = "lua")]
 mod script;
 #[cfg(feature = "cli")]
@@ -99,9 +100,11 @@ pub mod view;
 
 #[cfg(feature = "lua")]
 pub use crate::compute_lua::{LogSink, PRELUDE};
+pub use crate::query_lite::{
+    recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate,
+};
 pub use database::Database;
 pub use multifactor::{MultiFactorOutput, MultiFactorRegression};
-pub use query_lite::{recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate};
 pub use storage_lite::{store::MANIFEST, RowValue, StoreOptions, WalSync};
 pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
 pub use view::MaterializedView;

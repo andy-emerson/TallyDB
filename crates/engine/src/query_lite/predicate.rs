@@ -20,7 +20,7 @@
 //! `NOT (a AND b)` is TRUE where a is FALSE even if b is UNKNOWN — with
 //! `WHERE` keeping only the rows that come out TRUE.
 
-use crate::plan::QueryError;
+use crate::query_lite::plan::QueryError;
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
 use std::cmp::Ordering;
@@ -158,11 +158,11 @@ pub enum Predicate {
     /// of `Compare`.
     CompareExpr {
         /// Left operand.
-        left: crate::plan::ScalarExpr,
+        left: crate::query_lite::plan::ScalarExpr,
         /// The operator.
         op: CmpOp,
         /// Right operand.
-        right: crate::plan::ScalarExpr,
+        right: crate::query_lite::plan::ScalarExpr,
     },
     /// `column = 'v'` / `column <> 'v'` on a key column.
     KeyEquals {
@@ -217,7 +217,7 @@ pub enum Predicate {
 /// by name — anything outside the supported fragment.
 pub fn lower_predicate(
     expr: &ast::Expr,
-    windows: &mut Vec<crate::plan::WindowCall>,
+    windows: &mut Vec<crate::query_lite::plan::WindowCall>,
 ) -> Result<Predicate, QueryError> {
     match expr {
         ast::Expr::Nested(inner) => lower_predicate(inner, windows),
@@ -330,7 +330,7 @@ fn lower_comparison(
     left: &ast::Expr,
     op: &ast::BinaryOperator,
     right: &ast::Expr,
-    windows: &mut Vec<crate::plan::WindowCall>,
+    windows: &mut Vec<crate::query_lite::plan::WindowCall>,
 ) -> Result<Predicate, QueryError> {
     // `40 < x` is `x > 40` written backwards. Mirror it before anything
     // else, so it reaches the prunable shape below: otherwise an
@@ -442,12 +442,12 @@ fn compare_expressions(
     left: &ast::Expr,
     op: CmpOp,
     right: &ast::Expr,
-    windows: &mut Vec<crate::plan::WindowCall>,
+    windows: &mut Vec<crate::query_lite::plan::WindowCall>,
 ) -> Result<Predicate, QueryError> {
     Ok(Predicate::CompareExpr {
-        left: crate::plan::lower_scalar_expr(left, windows)?,
+        left: crate::query_lite::plan::lower_scalar_expr(left, windows)?,
         op,
-        right: crate::plan::lower_scalar_expr(right, windows)?,
+        right: crate::query_lite::plan::lower_scalar_expr(right, windows)?,
     })
 }
 
@@ -522,7 +522,10 @@ pub fn evaluate(
 /// the projection machinery.
 pub trait ScalarEval {
     /// `(values, validity)` over the view's rows, in stored order.
-    fn eval(&self, expr: &crate::plan::ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError>;
+    fn eval(
+        &self,
+        expr: &crate::query_lite::plan::ScalarExpr,
+    ) -> Result<(Vec<f64>, Vec<bool>), QueryError>;
 }
 
 /// A `ScalarEval` for predicates that cannot contain expressions —
@@ -531,7 +534,10 @@ pub trait ScalarEval {
 pub struct NoScalars;
 
 impl ScalarEval for NoScalars {
-    fn eval(&self, _expr: &crate::plan::ScalarExpr) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
+    fn eval(
+        &self,
+        _expr: &crate::query_lite::plan::ScalarExpr,
+    ) -> Result<(Vec<f64>, Vec<bool>), QueryError> {
         Err(QueryError::Unsupported(
             "an expression comparison in a position that cannot evaluate one".to_owned(),
         ))
@@ -863,7 +869,7 @@ fn column_index(schema: &Schema, name: &str) -> Result<usize, QueryError> {
         .fields()
         .iter()
         .position(|field| field.name() == name)
-        .ok_or_else(|| crate::plan::no_such_column(name))
+        .ok_or_else(|| crate::query_lite::plan::no_such_column(name))
 }
 
 #[cfg(test)]
