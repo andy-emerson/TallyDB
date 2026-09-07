@@ -4,6 +4,11 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/andy-emerson/TallyDB"
+homepage = "https://tallydb.com"
+readme = "README.md"
+description = "An embeddable, SQL-native time-series database for numeric data, with the numeric compute inside the engine: SQL over Arrow-layout columns, curated statistics, and optional Lua kernels."
+keywords = ["database", "time-series", "sql", "embedded", "arrow"]
+categories = ["database-implementations", "database"]
 
 [lib]
 # cdylib exists solely for the Python oracle scripts, which drive the
