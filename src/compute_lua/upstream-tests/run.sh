@@ -45,4 +45,7 @@ $CC -Wall -std=gnu99 -O2 -I"$vendor" -fPIC -shared -o lib2-v2.so lib22.c
 touch all
 
 cd "$build/testes"
-exec "$build/luatest" all.lua
+# files.lua asserts that a seek on stdin fails, which holds for a
+# terminal or a pipe and not for a file or /dev/null: hand the suite a
+# pipe, so the result does not depend on how this script was invoked.
+: | "$build/luatest" all.lua
