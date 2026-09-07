@@ -17,7 +17,7 @@
 //! variation copies the line and edits it — which is why the source is
 //! printable (`.prelude`) rather than hidden behind the functions.
 
-/// The prelude's source, run in every [`crate::LuaState`] at creation.
+/// The prelude's source, run in every [`crate::compute_lua::LuaState`] at creation.
 ///
 /// Kept deliberately small: a composition earns its place here only if
 /// it is a *named idiom* a desk would otherwise rewrite. Anything

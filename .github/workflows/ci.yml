@@ -63,7 +63,7 @@ jobs:
       - name: Multi-factor oracle — NumPy lstsq over rebuilt design matrices (issue #90)
         run: python3 crates/engine/tests/m5_multifactor_oracle.py target/debug/libengine.so
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
-        run: cargo test -p compute-lua --features apicheck
+        run: cargo test -p engine --features apicheck
 
   # The unsafe core under Miri (issue #63): arrow-lite concentrates the
   # workspace's unsafe (aligned buffers, bitmaps, the C Data Interface),
@@ -88,7 +88,7 @@ jobs:
   # (tracing allocator with failure injection, stack/GC consistency
   # asserts, the T library), built from the exact sources the engine
   # embeds — byte-identical to the upstream v5.4.7 tag; see
-  # crates/compute-lua/upstream-tests/PROVENANCE.md.
+  # crates/engine/src/compute_lua/upstream-tests/PROVENANCE.md.
   lua-suite:
     runs-on: ubuntu-latest
     steps:
@@ -96,7 +96,7 @@ jobs:
       - name: readline headers (main.lua's transcripts assume readline)
         run: sudo apt-get update && sudo apt-get install -y libreadline-dev
       - name: Build the instrumented interpreter, run all.lua
-        run: crates/compute-lua/upstream-tests/run.sh
+        run: crates/engine/src/compute_lua/upstream-tests/run.sh
 
   # The C boundary under the sanitizers: the vendored interpreter and the
   # binding's C accessors compiled with ASan (leaks included — the
@@ -114,4 +114,4 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
           CFLAGS: -fsanitize=address -fsanitize=undefined -fsanitize-undefined-trap-on-error
-        run: cargo +nightly test -p compute-lua --features apicheck --target x86_64-unknown-linux-gnu
+        run: cargo +nightly test -p engine --features apicheck --target x86_64-unknown-linux-gnu

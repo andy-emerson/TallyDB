@@ -17,7 +17,11 @@ crate-type = ["lib", "cdylib"]
 # a library embedder who never asks for an interpreter carries neither
 # the vendored C nor its CI surface. The primary extension path — the
 # `WindowAggregate` trait — needs no feature.
-lua = ["dep:compute-lua"]
+lua = []
+# Compiles the vendored interpreter with LUA_USE_APICHECK: the Lua
+# authors' own C-API-misuse assertions, the binding's discipline oracle.
+# Test builds and CI enable it; release builds do not. Implies `lua`.
+apicheck = ["lua"]
 # Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
 # Implies `lua`: the oracle fixtures include the Lua-window family.
 oracle-harness = ["dep:corpus", "lua"]
@@ -26,8 +30,12 @@ oracle-harness = ["dep:corpus", "lua"]
 arrow-lite = { path = "../arrow-lite" }
 storage-lite = { path = "../storage-lite" }
 query-lite = { path = "../query-lite" }
-compute-lua = { path = "../compute-lua", optional = true }
 faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
 corpus = { path = "../corpus", optional = true }
+
+[build-dependencies]
+# Compiles the vendored PUC Lua 5.4 sources under src/compute_lua/vendor
+# when the `lua` feature is on (build.rs).
+cc = "1"
 
 [dev-dependencies]

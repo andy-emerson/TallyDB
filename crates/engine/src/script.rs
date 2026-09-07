@@ -31,10 +31,10 @@
 //! unsupported (it will not be preserved by future parallel execution).
 
 use crate::compute_linalg::{LinalgBackend, RustLinalg};
-use arrow_lite::{Bitmap, ColumnType};
-use compute_lua::{
+use crate::compute_lua::{
     Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
 };
+use arrow_lite::{Bitmap, ColumnType};
 use query_lite::{Registry, WindowAggregate};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
@@ -409,7 +409,7 @@ mod tests {
     fn log_routes_to_the_installed_table_sink() {
         use std::sync::{Arc, Mutex};
         struct Capture(Arc<Mutex<Vec<String>>>);
-        impl compute_lua::LogSink for Capture {
+        impl crate::compute_lua::LogSink for Capture {
             fn log(&self, message: &str) {
                 self.0.lock().unwrap().push(message.to_owned());
             }

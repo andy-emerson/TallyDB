@@ -5,7 +5,6 @@ members = [
     "crates/storage-lite",
     "crates/query-lite",
     "crates/engine",
-    "crates/compute-lua",
     "crates/corpus",
     "crates/shell",
 ]

@@ -19,8 +19,8 @@
 //! script-only sink (the additive escape hatches are recorded in the
 //! decision).
 
-use crate::ffi;
-use crate::values;
+use crate::compute_lua::ffi;
+use crate::compute_lua::values;
 use std::ffi::{c_char, c_int, c_void};
 
 /// The embedder-installed destination for scripts' `log(...)` output.

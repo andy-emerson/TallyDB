@@ -81,6 +81,8 @@
 //! a rewrite later.
 
 pub mod compute_linalg;
+#[cfg(feature = "lua")]
+pub mod compute_lua;
 pub mod database;
 #[cfg(feature = "lua")]
 mod driver;
@@ -94,7 +96,7 @@ pub mod table;
 pub mod view;
 
 #[cfg(feature = "lua")]
-pub use compute_lua::{LogSink, PRELUDE};
+pub use crate::compute_lua::{LogSink, PRELUDE};
 pub use database::Database;
 pub use multifactor::{MultiFactorOutput, MultiFactorRegression};
 pub use query_lite::{recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate};

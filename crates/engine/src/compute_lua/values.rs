@@ -46,7 +46,7 @@
 //! Rust destructor; nothing here panics — every fallible condition is
 //! checked and raised as a Lua error inside the surrounding `lua_pcall`.
 
-use crate::ffi;
+use crate::compute_lua::ffi;
 use arrow_lite::{Bitmap, Dictionary};
 use std::ffi::{c_char, c_int, CStr};
 
@@ -1007,7 +1007,7 @@ unsafe extern "C" fn mask_newindex(state: *mut ffi::lua_State) -> c_int {
 /// so `NULL * v` and `v * NULL` agree.
 unsafe extern "C" fn null_propagate(state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        if !crate::vector::push_null_arith_result(state) {
+        if !crate::compute_lua::vector::push_null_arith_result(state) {
             push_null(state);
         }
         1

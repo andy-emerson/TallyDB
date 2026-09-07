@@ -33,9 +33,9 @@
 //! [`Database::append`]: crate::Database::append
 //! [`Database::run_script`]: crate::Database::run_script
 
+use crate::compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 use crate::database::Database;
 use arrow_lite::{Column, NumericData, RecordBatch};
-use compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 use query_lite::{parse_statement, Statement};
 use storage_lite::RowValue;
 

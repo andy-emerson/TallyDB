@@ -38,11 +38,11 @@
 //! *The Lua layer*), a kernel that proves hot graduates to a curated
 //! native op rather than the interpreter getting a JIT.
 
-use crate::driver::{self, DriverCall, DriverSlot, ScriptHost};
-use crate::ffi;
-use crate::host::{self, HostFunction, HostSlot};
-use crate::log::{self, LogSink, SinkSlot};
-use crate::values::{self, ColumnView, OutputColumn, ReturnType, ScalarValue};
+use crate::compute_lua::driver::{self, DriverCall, DriverSlot, ScriptHost};
+use crate::compute_lua::ffi;
+use crate::compute_lua::host::{self, HostFunction, HostSlot};
+use crate::compute_lua::log::{self, LogSink, SinkSlot};
+use crate::compute_lua::values::{self, ColumnView, OutputColumn, ReturnType, ScalarValue};
 use std::ffi::{CStr, CString};
 
 /// A compiled kernel, held in its interpreter's registry — the unit
@@ -107,7 +107,7 @@ impl LuaState {
             ffi::luaL_requiref(raw, c"table".as_ptr(), ffi::luaopen_table, 1);
             ffi::lua_settop(raw, 0);
             let generation = values::install(raw);
-            crate::vector::install(raw);
+            crate::compute_lua::vector::install(raw);
             let sink = Box::into_raw(Box::new(SinkSlot(None)));
             log::install(raw, sink);
             let driver_slot = Box::into_raw(Box::new(DriverSlot(std::ptr::null_mut())));
@@ -128,7 +128,7 @@ impl LuaState {
             // over it. A failure here is a bug in our own source, not
             // in anything a caller passed — hence the message.
             let prelude = state
-                .compile(crate::prelude::PRELUDE)
+                .compile(crate::compute_lua::prelude::PRELUDE)
                 .and_then(|chunk| state.run(&chunk, 0));
             if let Err(error) = prelude {
                 return Err(format!("the shipped prelude failed to load: {error}"));
@@ -249,7 +249,7 @@ impl LuaState {
                     values::bind_output(self.raw, self.generation, &mut output);
                     self.run(chunk, 1)
                 })
-                .and_then(|()| crate::vector::read_column_result(self.raw));
+                .and_then(|()| crate::compute_lua::vector::read_column_result(self.raw));
             let result = result.and_then(|column| write_column_result(column, &mut output));
             self.end_call();
             result
@@ -358,12 +358,12 @@ impl LuaState {
 /// the F3 exact-or-loud coercion into a declared `i64` output. With no
 /// returned value, the script's `out[i]` writes stand.
 fn write_column_result(
-    column: crate::vector::ColumnResult,
+    column: crate::compute_lua::vector::ColumnResult,
     output: &mut OutputColumn<'_>,
 ) -> Result<(), String> {
     let elements = match column {
-        crate::vector::ColumnResult::None => return Ok(()),
-        crate::vector::ColumnResult::Dense(dense) => {
+        crate::compute_lua::vector::ColumnResult::None => return Ok(()),
+        crate::compute_lua::vector::ColumnResult::Dense(dense) => {
             // The bulk path: a NULL-free column copies straight in.
             return match output {
                 OutputColumn::F64 { values, validity } => {
@@ -387,7 +387,7 @@ fn write_column_result(
                         ));
                     }
                     for (offset, value) in dense.into_iter().enumerate() {
-                        match crate::values::float_as_i64_exact(value) {
+                        match crate::compute_lua::values::float_as_i64_exact(value) {
                             Some(integer) => {
                                 values[offset] = integer;
                                 validity.set(offset, true);
@@ -406,7 +406,7 @@ fn write_column_result(
                 }
             };
         }
-        crate::vector::ColumnResult::Elements(elements) => elements,
+        crate::compute_lua::vector::ColumnResult::Elements(elements) => elements,
     };
     match output {
         OutputColumn::F64 { values, validity } => {
@@ -438,7 +438,7 @@ fn write_column_result(
             }
             for (offset, element) in elements.into_iter().enumerate() {
                 match element {
-                    Some(value) => match crate::values::float_as_i64_exact(value) {
+                    Some(value) => match crate::compute_lua::values::float_as_i64_exact(value) {
                         Some(integer) => {
                             values[offset] = integer;
                             validity.set(offset, true);
@@ -1433,7 +1433,7 @@ mod tests {
 
     // ---- host functions: engine compute over shared views ----
 
-    use crate::host::HostFunction;
+    use crate::compute_lua::host::HostFunction;
 
     /// Sums its one argument and records the slice pointer it was
     /// handed — the zero-copy probe.
@@ -2236,7 +2236,7 @@ mod tests {
     /// The prelude's advertised names, read from the crate constant so
     /// the list cannot drift from the source it describes.
     fn compute_lua_prelude_names() -> &'static [&'static str] {
-        crate::PRELUDE_NAMES
+        crate::compute_lua::PRELUDE_NAMES
     }
 
     /// Expanding means, computed plainly for comparison.

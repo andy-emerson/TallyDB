@@ -40,10 +40,10 @@
 //! loud error outside [`LuaState::run_driver`]** — a window or scalar
 //! kernel cannot re-enter the engine mid-query.
 //!
-//! [`LuaState::run_driver`]: crate::LuaState::run_driver
+//! [`LuaState::run_driver`]: crate::compute_lua::LuaState::run_driver
 
-use crate::ffi;
-use crate::values::{self, ColumnView};
+use crate::compute_lua::ffi;
+use crate::compute_lua::values::{self, ColumnView};
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 /// One value crossing from a script's row table into an append.
@@ -103,7 +103,7 @@ pub(crate) struct DriverCall {
 /// (which is what makes `query` in a kernel a loud error, not a
 /// re-entrant call).
 ///
-/// [`LuaState::run_driver`]: crate::LuaState::run_driver
+/// [`LuaState::run_driver`]: crate::compute_lua::LuaState::run_driver
 pub(crate) struct DriverSlot(pub(crate) *mut DriverCall);
 
 /// Installs the `query` and `append` globals, both reaching `slot`.
@@ -353,8 +353,8 @@ mod tests {
     //! kernel refusal, and result-view poisoning.
 
     use super::*;
-    use crate::values::ReturnType;
-    use crate::LuaState;
+    use crate::compute_lua::values::ReturnType;
+    use crate::compute_lua::LuaState;
     use arrow_lite::Dictionary;
     use std::sync::{Arc, Mutex};
 

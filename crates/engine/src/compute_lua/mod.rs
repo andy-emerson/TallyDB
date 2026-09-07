@@ -106,7 +106,7 @@ mod smoke_tests {
     //! integer subtype carrying an `i64` beyond 2^53 exactly — the
     //! alignment that decided the interpreter (issue #5).
 
-    use crate::ffi;
+    use crate::compute_lua::ffi;
     use std::ffi::c_int;
 
     /// Runs `chunk`, expecting `results` values back; returns Ok(()) or

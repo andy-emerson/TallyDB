@@ -75,8 +75,8 @@
 //! readable line over natives, so nothing per-element runs in the
 //! interpreter.
 
-use crate::ffi;
-use crate::values::{
+use crate::compute_lua::ffi;
+use crate::compute_lua::values::{
     self, int_as_f64_exact, is_valid, raise, InputPayload, META_INPUT, TAG_F64, TAG_I64, TAG_KEY,
 };
 use arrow_lite::Bitmap;

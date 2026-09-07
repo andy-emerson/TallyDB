@@ -22,8 +22,8 @@
 //! dropped *before* the raise, so `lua_error`'s `longjmp` crosses no
 //! live destructor.
 
-use crate::ffi;
-use crate::values;
+use crate::compute_lua::ffi;
+use crate::compute_lua::values;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 /// The most view arguments a host function may take — a trampoline

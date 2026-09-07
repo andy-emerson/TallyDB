@@ -41,7 +41,7 @@ pub struct Database {
     /// The `log(...)` destination for driver scripts (`run_script`);
     /// kernels use their table's sink.
     #[cfg(feature = "lua")]
-    script_log_sink: Option<std::sync::Arc<dyn compute_lua::LogSink + Sync>>,
+    script_log_sink: Option<std::sync::Arc<dyn crate::compute_lua::LogSink + Sync>>,
 }
 
 impl Database {
@@ -376,7 +376,7 @@ impl Database {
     /// here.
     #[cfg(feature = "lua")]
     pub fn run_script(&mut self, source: &str) -> Result<(), EngineError> {
-        let mut state = compute_lua::LuaState::new().map_err(EngineError::Script)?;
+        let mut state = crate::compute_lua::LuaState::new().map_err(EngineError::Script)?;
         if let Some(sink) = &self.script_log_sink {
             state.set_log_sink(Box::new(crate::script::SharedSink(std::sync::Arc::clone(
                 sink,
@@ -392,7 +392,10 @@ impl Database {
     /// Installs the destination for driver scripts' `log(...)` output
     /// (see [`Database::run_script`]); off (a no-op) until set.
     #[cfg(feature = "lua")]
-    pub fn set_script_log_sink(&mut self, sink: std::sync::Arc<dyn compute_lua::LogSink + Sync>) {
+    pub fn set_script_log_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn crate::compute_lua::LogSink + Sync>,
+    ) {
         self.script_log_sink = Some(sink);
     }
 

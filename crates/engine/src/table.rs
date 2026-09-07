@@ -26,9 +26,9 @@
 //! a two-argument window) — the copy recorded in deferred issue #4
 //! (peak-memory accounting in #56).
 
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 #[cfg(feature = "lua")]
-use compute_lua::LogSink;
+use crate::compute_lua::LogSink;
+use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 use query_lite::{
     evaluate_predicate, execute_with_ordering_key, parse_statement, plan, recompute_frames,
     ColumnFunction, DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue,

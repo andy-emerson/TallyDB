@@ -15,7 +15,12 @@
 //! *The Lua layer*).
 
 fn main() {
-    let sources = std::fs::read_dir("vendor/lua-5.4.7")
+    // The interpreter is compiled only when the `lua` feature is on: a
+    // library embedder who never asks for scripting carries no C.
+    if std::env::var_os("CARGO_FEATURE_LUA").is_none() {
+        return;
+    }
+    let sources = std::fs::read_dir("src/compute_lua/vendor/lua-5.4.7")
         .expect("vendored Lua sources present")
         .filter_map(|entry| {
             let path = entry.expect("readable dir entry").path();
@@ -28,10 +33,12 @@ fn main() {
         sources.len()
     );
     let mut build = cc::Build::new();
-    build.files(&sources).include("vendor/lua-5.4.7");
+    build
+        .files(&sources)
+        .include("src/compute_lua/vendor/lua-5.4.7");
     if std::env::var_os("CARGO_FEATURE_APICHECK").is_some() {
         build.define("LUA_USE_APICHECK", None);
     }
     build.compile("lua54");
-    println!("cargo:rerun-if-changed=vendor/lua-5.4.7");
+    println!("cargo:rerun-if-changed=src/compute_lua/vendor/lua-5.4.7");
 }
