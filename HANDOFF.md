@@ -32,17 +32,26 @@ constraints change only when the Human says so.
    run the nine oracle scripts in `.github/workflows/ci.yml` —
    `m2_compute_latency_bench.py` is a benchmark, not an oracle).
 7. **Never touch the vendored Lua** under `crates/compute-lua/vendor`.
-8. The process is `AGENTS.md`: Plan → Develop → Assess → Review;
+8. The process is `AGENTS.md` (v3.0.0): open → commit → merge;
    claims at their evidence; code passes and doc passes never mix;
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-08-20: #90 MERGED; research-grade queue EMPTY)
+## Snapshot (2026-09-07: agreement v3.0.0 adopted; single-crate collapse ruled, not yet built)
 
-**State:** `main` = `585fe31` (the #90 merge, PR #104, which also wired
-the ninth oracle into CI — every oracle claim is now *tested*, re-earned
-on every change). `claude/dev` restarted from it, clean. Nothing is
-awaiting review or merge.
+**State:** `main` = `b82c350` (#106, clippy 1.98 clean; CI green on
+`main`). `claude/dev` restarted from it and carries two doc commits: the
+post-#90 snapshot that never reached `main`, and this pass — `AGENTS.md`
+is v3.0.0 (open → commit → merge), replaced whole from the upstream
+release asset. Nothing is awaiting review or merge.
+
+**Destination (Human, 2026-09-07):** publish TallyDB to crates.io as
+**one crate** — the workspace's crates become modules of it — with
+`compute-linalg` folded in and `corpus` demoted to a path-only
+dev-dependency. This supersedes DESIGN.md *Workspace layout*; the ruling,
+the rejected rename-and-publish-eight alternative, and the reopen trigger
+are recorded there in the next doc pass, before any code moves. Then the
+collapse itself, one code pass per crate folded, full gate green at each.
 
 #90 shipped rolling multi-factor regression: the anchored
 `FactorMoments` carrier, `solve_spd` (a single-function interim solve —

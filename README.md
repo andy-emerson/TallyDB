@@ -412,7 +412,7 @@ directly.)
 ## How we work
 
 This repository follows the working agreement in [`AGENTS.md`](AGENTS.md)
-(v2.4.0) and the craft conventions in
+(v3.0.0) and the craft conventions in
 [`CONTRIBUTING.md`](CONTRIBUTING.md), both copied unedited from
 [working-agreement](https://github.com/andy-emerson/working-agreement).
 The repo-specific half lives here:
