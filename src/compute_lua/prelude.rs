@@ -17,7 +17,7 @@
 //! variation copies the line and edits it — which is why the source is
 //! printable (`.prelude`) rather than hidden behind the functions.
 
-/// The prelude's source, run in every [`crate::compute_lua::LuaState`] at creation.
+/// The prelude's source, run in every `LuaState` at creation.
 ///
 /// Kept deliberately small: a composition earns its place here only if
 /// it is a *named idiom* a desk would otherwise rewrite. Anything
@@ -60,6 +60,7 @@ end
 
 /// Every name the prelude defines — what `install` must have bound,
 /// and what the test below checks is actually callable.
+#[cfg(test)]
 pub const PRELUDE_NAMES: &[&str] = &[
     "returns",
     "expanding_sum",

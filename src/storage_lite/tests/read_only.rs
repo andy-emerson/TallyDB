@@ -9,9 +9,9 @@
 //! boundary (the directory lock itself is per-file-handle, so the
 //! two-writer refusal is exercised in-process too, in `io`'s tests).
 
+use crate::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use crate::storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store, WalSync};
 use std::sync::Arc;
-use tallydb::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
-use tallydb::storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store, WalSync};
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -122,7 +122,7 @@ fn a_reader_refuses_every_mutation() {
     // And a writer store refuses refresh — it sees its own state.
     let backend: Arc<dyn StorageBackend> = Arc::new(FsBackend::new(&dir).unwrap());
     let mut writer =
-        Store::open_existing(backend, tallydb::storage_lite::StoreOptions::default()).unwrap();
+        Store::open_existing(backend, crate::storage_lite::StoreOptions::default()).unwrap();
     assert!(matches!(writer.refresh(), Err(StorageError::Misuse(_))));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -160,10 +160,10 @@ fn an_unflushed_supersession_shows_the_pre_state_never_the_torn_middle() {
         backend,
         schema(),
         0,
-        tallydb::storage_lite::StoreOptions {
+        crate::storage_lite::StoreOptions {
             segment_rows: Some(100),
             wal_sync: WalSync::Group(std::time::Duration::from_secs(3600)),
-            ..tallydb::storage_lite::StoreOptions::default()
+            ..crate::storage_lite::StoreOptions::default()
         },
     )
     .unwrap();
@@ -226,7 +226,7 @@ fn refresh_follows_a_compaction_into_the_new_generation() {
             .as_of(cut)
             .unwrap()
             .iter()
-            .map(tallydb::storage_lite::SegmentHandle::live_rows)
+            .map(crate::storage_lite::SegmentHandle::live_rows)
             .sum()
     };
     assert_eq!(live_at(5), 6, "before the kill: all six");

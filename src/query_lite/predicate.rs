@@ -531,8 +531,10 @@ pub trait ScalarEval {
 /// A `ScalarEval` for predicates that cannot contain expressions —
 /// used where a caller has no expression evaluator to offer, and any
 /// `CompareExpr` reaching it is a bug rather than a user error.
+#[cfg(test)]
 pub struct NoScalars;
 
+#[cfg(test)]
 impl ScalarEval for NoScalars {
     fn eval(
         &self,
@@ -919,7 +921,8 @@ mod tests {
 
     use super::*;
     use crate::arrow_lite::{ColumnType, Field};
-    use crate::storage_lite::{RowValue, WriteBuffer};
+    use crate::storage_lite::mem::WriteBuffer;
+    use crate::storage_lite::RowValue;
 
     /// A segment mixing NaN with finite values, plus one all-NaN
     /// segment — the D2 ruling's edge cases: NaN is a value, greater
@@ -1303,7 +1306,8 @@ mod pruning_tests {
 
     use super::*;
     use crate::arrow_lite::{ColumnType, Field};
-    use crate::storage_lite::{RowValue, SegmentView, WriteBuffer};
+    use crate::storage_lite::mem::WriteBuffer;
+    use crate::storage_lite::{RowValue, SegmentView};
 
     fn view(ts: &[i64], x: &[f64]) -> (Schema, SegmentView) {
         let schema = Schema::new(vec![

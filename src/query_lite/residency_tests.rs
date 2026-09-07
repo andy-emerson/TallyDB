@@ -3,13 +3,12 @@
 //! segment's file is never read — pruning saves I/O, not just
 //! evaluation. Observed from outside by counting backend reads.
 
+use crate::arrow_lite::{ColumnType, Field, Schema};
+use crate::query_lite::{execute_with_ordering_key, plan, Registry};
+use crate::storage_lite::io::{IoError, MemBackend};
+use crate::storage_lite::{LogWriter, RowValue, StorageBackend, Store, StoreOptions, WalSync};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
-use tallydb::query_lite::{execute, plan, Registry};
-use tallydb::storage_lite::{
-    IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync,
-};
 
 struct CountingBackend {
     inner: Arc<dyn StorageBackend>,
@@ -91,9 +90,10 @@ fn zone_pruning_never_reads_a_pruned_segments_file() {
     // Three segments: ts 0..4, 4..8, 8..12. The predicate can only
     // match the last; the first two prune on their zone maps.
     let handles = store.snapshot().unwrap();
-    let output = execute(
+    let output = execute_with_ordering_key(
         &schema,
         &handles,
+        0,
         &plan("SELECT x FROM t WHERE ts >= 8").unwrap(),
         &Registry::new(),
     )

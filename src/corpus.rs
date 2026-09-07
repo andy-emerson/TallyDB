@@ -39,6 +39,7 @@ pub struct Row {
 }
 
 /// The display label for key `key` (`"K000"`, `"K001"`, …).
+#[cfg(feature = "oracle-harness")]
 pub fn key_label(key: u32) -> String {
     format!("K{key:03}")
 }
@@ -80,6 +81,7 @@ impl Spec {
     /// Trade-tick shape: irregular bursty gaps, 32 symbols, fully
     /// ordered, no nulls, penny-priced (tick size 0.01 — prices are
     /// decimals; see [`Spec::tick_size`]).
+    #[cfg(test)]
     pub fn ticks(rows: usize, seed: u64) -> Spec {
         Spec {
             rows,

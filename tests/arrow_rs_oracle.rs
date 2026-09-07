@@ -21,7 +21,7 @@ use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::record_batch::RecordBatchReader;
 use std::sync::Arc;
-use tallydb::arrow_lite::{
+use tallydb::{
     export_batch, export_stream, import_batch, Bitmap, Buffer, Column, ColumnType, Dictionary,
     Field, KeyColumn, LogicalType, NumericColumn, NumericData, RecordBatch, Schema,
 };
@@ -32,23 +32,23 @@ use tallydb::arrow_lite::{
 fn ffi_structs_are_layout_compatible() {
     use std::mem::{align_of, size_of};
     assert_eq!(
-        size_of::<tallydb::arrow_lite::ArrowSchema>(),
+        size_of::<tallydb::ArrowSchema>(),
         size_of::<FFI_ArrowSchema>()
     );
     assert_eq!(
-        size_of::<tallydb::arrow_lite::ArrowArray>(),
+        size_of::<tallydb::ArrowArray>(),
         size_of::<FFI_ArrowArray>()
     );
     assert_eq!(
-        size_of::<tallydb::arrow_lite::ArrowArrayStream>(),
+        size_of::<tallydb::ArrowArrayStream>(),
         size_of::<FFI_ArrowArrayStream>()
     );
     assert_eq!(
-        align_of::<tallydb::arrow_lite::ArrowSchema>(),
+        align_of::<tallydb::ArrowSchema>(),
         align_of::<FFI_ArrowSchema>()
     );
     assert_eq!(
-        align_of::<tallydb::arrow_lite::ArrowArray>(),
+        align_of::<tallydb::ArrowArray>(),
         align_of::<FFI_ArrowArray>()
     );
 }
@@ -60,8 +60,8 @@ fn oracle_import(batch: RecordBatch) -> StructArray {
     // to arrow-rs, whose drop calls our release callbacks.
     let (ffi_schema, ffi_array) = unsafe {
         (
-            std::mem::transmute::<tallydb::arrow_lite::ArrowSchema, FFI_ArrowSchema>(schema),
-            std::mem::transmute::<tallydb::arrow_lite::ArrowArray, FFI_ArrowArray>(array),
+            std::mem::transmute::<tallydb::ArrowSchema, FFI_ArrowSchema>(schema),
+            std::mem::transmute::<tallydb::ArrowArray, FFI_ArrowArray>(array),
         )
     };
     // SAFETY: a live pair our exporter just produced.
@@ -77,8 +77,8 @@ fn import_from_oracle(expected: &StructArray) -> RecordBatch {
     // releases via arrow-rs's callbacks.
     let (schema, array) = unsafe {
         (
-            std::mem::transmute::<FFI_ArrowSchema, tallydb::arrow_lite::ArrowSchema>(ffi_schema),
-            std::mem::transmute::<FFI_ArrowArray, tallydb::arrow_lite::ArrowArray>(ffi_array),
+            std::mem::transmute::<FFI_ArrowSchema, tallydb::ArrowSchema>(ffi_schema),
+            std::mem::transmute::<FFI_ArrowArray, tallydb::ArrowArray>(ffi_array),
         )
     };
     // SAFETY: a live pair the oracle just produced.
@@ -188,7 +188,7 @@ fn assert_logically_equal(actual: &RecordBatch, expected: &RecordBatch) {
     }
 }
 
-fn assert_numeric_eq<T: tallydb::arrow_lite::Element>(a: &NumericColumn<T>, e: &NumericColumn<T>) {
+fn assert_numeric_eq<T: tallydb::Element>(a: &NumericColumn<T>, e: &NumericColumn<T>) {
     assert_eq!(a.len(), e.len());
     for row in 0..a.len() {
         assert_eq!(a.is_valid(row), e.is_valid(row), "validity row {row}");
@@ -263,9 +263,8 @@ fn oracle_reads_our_stream() {
     let batches: Vec<RecordBatch> = (0..3).map(slice_batch).collect();
     let stream = export_stream(batches[0].schema().clone(), batches.clone().into_iter());
     // SAFETY: layout-compatible; ownership moves to the oracle's reader.
-    let ffi_stream = unsafe {
-        std::mem::transmute::<tallydb::arrow_lite::ArrowArrayStream, FFI_ArrowArrayStream>(stream)
-    };
+    let ffi_stream =
+        unsafe { std::mem::transmute::<tallydb::ArrowArrayStream, FFI_ArrowArrayStream>(stream) };
     let reader = ArrowArrayStreamReader::try_new(ffi_stream).expect("oracle opens stream");
     assert_eq!(
         reader.schema().as_ref(),
@@ -291,12 +290,10 @@ fn we_read_oracle_stream() {
     let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
     // SAFETY: layout-compatible; ownership moves to our reader.
     let stream = unsafe {
-        std::mem::transmute::<FFI_ArrowArrayStream, tallydb::arrow_lite::ArrowArrayStream>(
-            ffi_stream,
-        )
+        std::mem::transmute::<FFI_ArrowArrayStream, tallydb::ArrowArrayStream>(ffi_stream)
     };
     // SAFETY: a live stream the oracle just produced.
-    let reader = unsafe { tallydb::arrow_lite::StreamReader::new(stream) }.expect("we open stream");
+    let reader = unsafe { tallydb::StreamReader::new(stream) }.expect("we open stream");
     let read: Vec<RecordBatch> = reader.collect::<Result<_, _>>().expect("we read");
     assert_eq!(read.len(), 3);
     for (i, batch) in read.iter().enumerate() {

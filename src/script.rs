@@ -143,6 +143,7 @@ impl LuaWindow {
         chunk: &str,
         output: ColumnType,
         log_sink: Option<Arc<dyn LogSink + Sync>>,
+        instruction_budget: Option<u32>,
         ops: &Registry,
     ) -> Result<LuaWindow, String> {
         if output == ColumnType::Key {
@@ -177,6 +178,7 @@ impl LuaWindow {
         if let Some(sink) = log_sink {
             state.set_log_sink(Box::new(SharedSink(sink)));
         }
+        state.set_instruction_budget(instruction_budget);
         // Compiling here is both the loud-early syntax check and the
         // per-window saving: queries call the compiled function.
         let compiled = state.compile(chunk)?;
@@ -267,6 +269,7 @@ impl LuaColumn {
         parameters: &[&str],
         chunk: &str,
         log_sink: Option<Arc<dyn LogSink + Sync>>,
+        instruction_budget: Option<u32>,
         ops: &Registry,
     ) -> Result<LuaColumn, String> {
         if parameters.is_empty() {
@@ -295,6 +298,7 @@ impl LuaColumn {
         if let Some(sink) = log_sink {
             state.set_log_sink(Box::new(SharedSink(sink)));
         }
+        state.set_instruction_budget(instruction_budget);
         let compiled = state.compile(chunk)?;
         Ok(LuaColumn {
             state: Mutex::new((state, compiled)),

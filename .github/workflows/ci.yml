@@ -35,9 +35,9 @@ jobs:
         run: |
           cargo clippy --all-targets --no-default-features -- -D warnings
           cargo test --no-default-features
-          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --no-default-features
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --document-private-items
       - name: PyArrow oracle (issue #15)
         run: |
           cargo build --features oracle-harness

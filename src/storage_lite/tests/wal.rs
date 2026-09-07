@@ -5,12 +5,11 @@
 //! backend is additionally exercised where its semantics differ
 //! (OS-buffered bytes *do* survive a process crash).
 
+use crate::storage_lite::io::MemBackend;
+use crate::storage_lite::{FsBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync};
 use std::sync::Arc;
-use tallydb::storage_lite::{
-    FsBackend, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync,
-};
 
-use tallydb::arrow_lite::{ColumnType, Field, NumericData, Schema};
+use crate::arrow_lite::{ColumnType, Field, NumericData, Schema};
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -50,7 +49,7 @@ fn ts_values(store: &Store) -> Vec<i64> {
     let mut out = Vec::new();
     for view in store.snapshot().unwrap() {
         let view = view.view().unwrap();
-        let tallydb::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+        let crate::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
             &view.segment.batch().columns()[0]
         else {
             panic!("ts is i64")
@@ -638,27 +637,27 @@ struct FailManifestWrites {
 }
 
 impl StorageBackend for FailManifestWrites {
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), tallydb::storage_lite::IoError> {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::storage_lite::io::IoError> {
         if name == "table.tlym" && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(tallydb::storage_lite::IoError::Backend(
+            return Err(crate::storage_lite::io::IoError::Backend(
                 "injected: manifest write lost".to_owned(),
             ));
         }
         self.inner.write(name, bytes)
     }
-    fn read(&self, name: &str) -> Result<Vec<u8>, tallydb::storage_lite::IoError> {
+    fn read(&self, name: &str) -> Result<Vec<u8>, crate::storage_lite::io::IoError> {
         self.inner.read(name)
     }
-    fn list(&self) -> Result<Vec<String>, tallydb::storage_lite::IoError> {
+    fn list(&self) -> Result<Vec<String>, crate::storage_lite::io::IoError> {
         self.inner.list()
     }
-    fn remove(&self, name: &str) -> Result<(), tallydb::storage_lite::IoError> {
+    fn remove(&self, name: &str) -> Result<(), crate::storage_lite::io::IoError> {
         self.inner.remove(name)
     }
     fn open_log(
         &self,
         name: &str,
-    ) -> Result<Box<dyn tallydb::storage_lite::LogWriter>, tallydb::storage_lite::IoError> {
+    ) -> Result<Box<dyn crate::storage_lite::LogWriter>, crate::storage_lite::io::IoError> {
         self.inner.open_log(name)
     }
 }
@@ -711,7 +710,7 @@ fn a_crash_between_the_segment_write_and_its_manifest_write_loses_nothing() {
     );
     // ...and the manifest never adopted it.
     let manifest =
-        tallydb::storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+        crate::storage_lite::format::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
     assert!(manifest.sections.segments.is_empty(), "no record adopted");
     // Reopen on the healed backend: all four rows, exactly once.
     let mut store = Store::persistent_with(
@@ -730,7 +729,7 @@ fn a_crash_between_the_segment_write_and_its_manifest_write_loses_nothing() {
     // And the store is fully live: the next flush adopts the layout.
     store.flush().unwrap();
     let manifest =
-        tallydb::storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+        crate::storage_lite::format::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
     assert_eq!(manifest.sections.segments.len(), 1);
     assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
 }

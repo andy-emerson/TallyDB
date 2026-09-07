@@ -215,7 +215,7 @@ impl MaterializedView {
 
     /// As [`MaterializedView::new`], persisted in `dir`: the
     /// materialization is an ordinary persistent table there, and the
-    /// definition and stamp live beside it in [`DEFINITION_FILE`].
+    /// definition and stamp live beside it in `DEFINITION_FILE`.
     pub fn persistent(
         name: &str,
         sql: &str,
@@ -241,7 +241,7 @@ impl MaterializedView {
     }
 
     /// Opens a persisted view: the definition and stamp from
-    /// [`DEFINITION_FILE`], the materialization from the table files
+    /// `DEFINITION_FILE`, the materialization from the table files
     /// beside it. `source` must be the already-open source table — the
     /// definition is re-validated against it, so a source whose schema
     /// no longer fits the view is a loud error at open, not a wrong

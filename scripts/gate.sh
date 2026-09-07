@@ -59,8 +59,8 @@ run "clippy, no default features" cargo clippy --all-targets --no-default-featur
 run "build" cargo build
 run "test" cargo test
 run "test, no default features" cargo test --no-default-features
-run "doc" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-run "doc, no default features" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
+run "doc" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
+run "doc, no default features" env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --no-default-features
 run "python oracles importable" python3 -c "import pyarrow, duckdb, numpy"
 run "build the oracle harness" cargo build --features oracle-harness
 lib=$target/debug/libtallydb.so

@@ -131,7 +131,7 @@ const SEQUENCE_EXPLICIT: u8 = 2;
 /// Why segment bytes could not be decoded.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FormatError {
-    /// The file does not start with [`MAGIC`].
+    /// The file does not start with `MAGIC`.
     BadMagic,
     /// A version this build does not read.
     UnsupportedVersion(u16),
@@ -788,11 +788,6 @@ impl ManifestSections {
     /// Whether encoding needs the sectioned version at all.
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty() && self.next_sequence.is_none() && self.history.is_empty()
-    }
-
-    /// Whether the table has ever diverged (sequence != row id).
-    pub fn diverged(&self) -> bool {
-        self.next_sequence.is_some()
     }
 }
 

@@ -13,7 +13,7 @@
 //!   per-column builders.
 //! - **Ordered:** the schema names its ordering key (`i64`, `NOT NULL`);
 //!   ingest is *expected* roughly sorted on it, and the frozen segment
-//!   reports [`Segment::is_ordered`] and [`Segment::ordering_bounds`] so
+//!   reports [`Segment::is_ordered`] and `Segment::ordering_bounds` so
 //!   readers that require strict order (the window executor) can check
 //!   instead of silently mis-computing.
 //! - **Numeric-or-key:** rows are checked cell-by-cell against the schema
@@ -70,9 +70,7 @@ pub enum StorageError {
     /// A tombstone names a row id that was never assigned.
     TombstoneOutOfRange { id: u64 },
     /// The call itself is not a legal shape for this operation — the
-    /// store is untouched (see [`Store::supersede`]).
-    ///
-    /// [`Store::supersede`]: crate::storage_lite::Store::supersede
+    /// store is untouched (see `Store::supersede`).
     Misuse(String),
 }
 
@@ -129,9 +127,9 @@ impl std::error::Error for StorageError {}
 ///
 /// Cloning is cheap by design: numeric and code buffers are copy-on-write
 /// handles (O(1)), and the null flags and dictionary are bounded by the
-/// write buffer's row count and distinct-key count. [`WriteBuffer::snapshot`]
-/// leans on this to freeze a point-in-time segment without consuming the
-/// buffer.
+/// write buffer's row count and distinct-key count. The store's snapshot
+/// path leans on this to freeze a point-in-time segment without consuming
+/// the buffer.
 #[derive(Clone)]
 enum ColumnBuilder {
     F64 {
@@ -152,23 +150,7 @@ enum ColumnBuilder {
 /// The append path: one row at a time against a declared schema, frozen
 /// into a [`Segment`] when done.
 ///
-/// ```
-/// use tallydb::arrow_lite::{ColumnType, Field, Schema};
-/// use tallydb::storage_lite::{RowValue, WriteBuffer};
-///
-/// let schema = Schema::new(vec![
-///     Field::new("ts", ColumnType::I64, false),
-///     Field::new("sym", ColumnType::Key, false),
-///     Field::new("x", ColumnType::F64, false),
-/// ]);
-/// let mut buffer = WriteBuffer::new(schema, 0).unwrap();
-/// buffer
-///     .append(&[RowValue::I64(1), RowValue::Key("A"), RowValue::F64(0.5)])
-///     .unwrap();
-/// let segment = buffer.freeze().unwrap();
-/// assert_eq!(segment.batch().num_rows(), 1);
-/// assert!(segment.is_ordered());
-/// ```
+/// The unit test `a_write_buffer_freezes_into_an_ordered_segment` below is the worked example.
 #[derive(Clone)]
 pub struct WriteBuffer {
     schema: Schema,
@@ -748,6 +730,7 @@ impl Segment {
     /// segment is empty. Readers use this to check that a *sequence* of
     /// segments is globally ordered: each segment internally ordered, and
     /// each boundary non-decreasing.
+    #[cfg(test)]
     pub fn ordering_bounds(&self) -> Option<(i64, i64)> {
         let Column::Numeric(NumericData::I64(column)) = &self.batch.columns()[self.ordering_key]
         else {
@@ -760,6 +743,24 @@ impl Segment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_write_buffer_freezes_into_an_ordered_segment() {
+        use crate::{ColumnType, Field, Schema};
+
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        let mut buffer = WriteBuffer::new(schema, 0).unwrap();
+        buffer
+            .append(&[RowValue::I64(1), RowValue::Key("A"), RowValue::F64(0.5)])
+            .unwrap();
+        let segment = buffer.freeze().unwrap();
+        assert_eq!(segment.batch().num_rows(), 1);
+        assert!(segment.is_ordered());
+    }
+
     use super::*;
     use crate::arrow_lite::Field;
 

@@ -92,6 +92,9 @@ pub enum OutputColumn<'a> {
         validity: &'a mut Bitmap,
     },
     /// An `i64` output column.
+    /// Exact-`i64` and key outputs are deferred surface (see the module
+    /// docs): the contract and its tests exist, the engine emits `F64`.
+    #[cfg_attr(not(test), allow(dead_code))]
     I64 {
         /// The value buffer to fill.
         values: &'a mut [i64],
@@ -100,6 +103,7 @@ pub enum OutputColumn<'a> {
     },
     /// A key output column; scripts fill it with strings, which are
     /// interned here — the only way a script produces a key (F3).
+    #[cfg_attr(not(test), allow(dead_code))]
     Key {
         /// The code buffer to fill.
         codes: &'a mut [u32],
@@ -121,6 +125,9 @@ pub enum ReturnType {
     I64,
     /// The result is a key. Scalar key results have no consumer yet and
     /// no dictionary to intern into; `eval_scalar` refuses this loudly.
+    /// Constructed by the value-map contract's tests; the engine's SQL
+    /// surface declares `f64` and `i64` results only.
+    #[cfg_attr(not(test), allow(dead_code))]
     Key,
 }
 
@@ -1118,6 +1125,7 @@ fn tag_name(tag: u8) -> &'static str {
 ///
 /// # Safety
 /// `raw` must be a state [`install`] has prepared.
+#[cfg(test)]
 pub(crate) unsafe fn view_data_pointer(
     raw: *mut ffi::lua_State,
     view_global: &CStr,

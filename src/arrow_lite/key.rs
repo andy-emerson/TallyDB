@@ -37,7 +37,7 @@ use std::collections::HashMap;
 /// never changes — later interning only appends.
 ///
 /// ```
-/// use tallydb::arrow_lite::Dictionary;
+/// use tallydb::Dictionary;
 ///
 /// let mut dict = Dictionary::new();
 /// let a = dict.intern("AAPL");
@@ -142,7 +142,7 @@ impl Dictionary {
 /// `KeyColumn` never holds a dangling code.
 ///
 /// ```
-/// use tallydb::arrow_lite::KeyColumn;
+/// use tallydb::KeyColumn;
 ///
 /// let col = KeyColumn::from_values(["a", "b", "a", "a"]);
 /// assert_eq!(col.codes().as_slice(), &[0, 1, 0, 0]);

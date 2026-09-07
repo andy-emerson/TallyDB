@@ -24,7 +24,7 @@
 /// A fixed-length sequence of bits in Arrow's validity-bitmap layout.
 ///
 /// ```
-/// use tallydb::arrow_lite::Bitmap;
+/// use tallydb::Bitmap;
 ///
 /// let mut bm = Bitmap::new_unset(10);
 /// bm.set(3, true);
@@ -77,7 +77,7 @@ impl Bitmap {
     /// Builds a bitmap from one bool per bit.
     ///
     /// ```
-    /// use tallydb::arrow_lite::Bitmap;
+    /// use tallydb::Bitmap;
     ///
     /// let bm = Bitmap::from_bools([true, false, true]);
     /// assert_eq!(bm.len(), 3);
@@ -165,7 +165,7 @@ impl Bitmap {
     /// Bitwise NOT.
     ///
     /// ```
-    /// use tallydb::arrow_lite::Bitmap;
+    /// use tallydb::Bitmap;
     ///
     /// let bm = Bitmap::from_bools([true, false, true]);
     /// assert_eq!(bm.not(), Bitmap::from_bools([false, true, false]));
