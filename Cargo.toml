@@ -1,13 +1,65 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/engine",
-]
-
-[workspace.package]
+[package]
+name = "tallydb"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/andy-emerson/TallyDB"
 
-# Shared lint/config knobs go here as the project matures.
+[lib]
+# cdylib exists solely for the Python oracle scripts, which drive the
+# `oracle-harness` hooks through ctypes (tests/*.py — the M1 slice, the
+# mutation and differential families, the Lua-window and SQL-in-Lua
+# families, the as-of sweep, and the latency benchmark).
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = ["cli"]
+# The console: line editing, CSV import, table rendering, and the local
+# security measures (#39, ruled 2026-07-27). Its two dependencies live
+# behind this feature and nowhere else, so an embedder that wants a
+# library and not a console writes `default-features = false` and links
+# neither. The console is the one embedding that turns Lua on.
+cli = ["lua", "dep:rustyline", "dep:csv"]
+# Embedded Lua kernels (the console's opt-in scripting front-end —
+# DESIGN.md, *the extension model*, ruled 2026-07-28). Off by default:
+# a library embedder who never asks for an interpreter carries neither
+# the vendored C nor its CI surface. The primary extension path — the
+# `WindowAggregate` trait — needs no feature.
+lua = []
+# Compiles the vendored interpreter with LUA_USE_APICHECK: the Lua
+# authors' own C-API-misuse assertions, the binding's discipline oracle.
+# Test builds and CI enable it; release builds do not. Implies `lua`.
+apicheck = ["lua"]
+# Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
+# Implies `lua`: the oracle fixtures include the Lua-window family.
+oracle-harness = ["lua"]
+
+[dependencies]
+# The SQL parser (GenericDialect); the executor is our own — DESIGN.md on
+# why DataFusion's is neither vendored nor linked.
+sqlparser = "0.62.0"
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+# The console's two dependencies, both mature and narrow (#39): line
+# editing, and CSV whose edge cases are not worth reinventing.
+rustyline = { version = "17", default-features = false, features = ["with-file-history"], optional = true }
+csv = { version = "1", optional = true }
+
+[[bin]]
+name = "tallydb"
+path = "src/bin/tallydb.rs"
+required-features = ["cli"]
+
+[build-dependencies]
+# Compiles the vendored PUC Lua 5.4 sources under src/compute_lua/vendor
+# when the `lua` feature is on (build.rs).
+cc = "1"
+
+[dev-dependencies]
+# arrow (arrow-rs) belongs here, dev-only, as the round-trip oracle for the
+# hand-rolled Arrow layout and C Data Interface export in src/arrow_lite
+# (tests/arrow_rs_oracle.rs). PyArrow round-trips run as a test script/CI.
+# Neither ever becomes a runtime dependency.
+arrow = { version = "59.1.0", features = ["ffi"] }
+# Drives the codec property tests inside storage_lite over the corpus
+# module's generators.
+proptest = "1"

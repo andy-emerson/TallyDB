@@ -1,0 +1,468 @@
+//! Persistence spec tests: what a persistent store promises across a
+//! close-and-reopen, and how it fails when the stored bytes are wrong.
+//! Run against both backends — the contract, not the filesystem, is the
+//! spec.
+
+use std::sync::Arc;
+use tallydb::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use tallydb::storage_lite::{
+    encode_segment, FsBackend, IoError, MemBackend, RowValue, StorageBackend, StorageError, Store,
+    StoreOptions, WalSync,
+};
+
+fn schema() -> Schema {
+    Schema::new(vec![
+        Field::new("ts", ColumnType::I64, false),
+        Field::new("sym", ColumnType::Key, false),
+        Field::new("x", ColumnType::F64, false),
+    ])
+}
+
+fn append_n(store: &mut Store, range: std::ops::Range<i64>) {
+    for i in range {
+        store
+            .append(&[
+                RowValue::I64(i),
+                RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                RowValue::F64(i as f64),
+            ])
+            .unwrap();
+    }
+}
+
+fn ts_values(store: &Store) -> Vec<i64> {
+    // Raw stored values, tombstoned or not.
+    store
+        .snapshot()
+        .unwrap()
+        .iter()
+        .flat_map(|segment| {
+            let segment = segment.view().unwrap();
+            let Column::Numeric(NumericData::I64(ts)) = &segment.segment.batch().columns()[0]
+            else {
+                panic!("ts type")
+            };
+            ts.values().as_slice().to_vec()
+        })
+        .collect()
+}
+
+fn each_backend(test: impl Fn(Arc<dyn StorageBackend>)) {
+    test(Arc::new(MemBackend::new()));
+    let dir = std::env::temp_dir().join(format!(
+        "tallydb-persist-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    test(Arc::new(FsBackend::new(&dir).unwrap()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The flush-boundary contract, which `WalSync::Off` preserves (#43):
+/// without a log, unflushed rows are memory-only.
+#[test]
+fn reopen_sees_exactly_the_flushed_rows() {
+    let no_wal = |backend: Arc<dyn StorageBackend>| {
+        Store::persistent_with(
+            backend,
+            schema(),
+            0,
+            StoreOptions {
+                segment_rows: Some(4),
+                wal_sync: WalSync::Off,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap()
+    };
+    each_backend(|backend| {
+        {
+            let mut store = no_wal(backend.clone());
+            append_n(&mut store, 0..10); // 8 rows auto-flushed, 2 live
+            assert_eq!(store.len(), 10);
+        } // dropped without a final flush — the live rows are gone
+        let mut store = no_wal(backend.clone());
+        assert_eq!(store.len(), 8, "unflushed rows do not survive");
+        assert_eq!(ts_values(&store), (0..8).collect::<Vec<_>>());
+        // Row ids continue where the flushed data ended (#1).
+        let id = store
+            .append(&[RowValue::I64(99), RowValue::Key("A"), RowValue::F64(0.0)])
+            .unwrap();
+        assert_eq!(id, 8);
+    });
+}
+
+#[test]
+fn explicit_flush_makes_everything_durable() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+            append_n(&mut store, 0..7);
+            store.flush().unwrap();
+        }
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        assert_eq!(store.len(), 7);
+        assert_eq!(ts_values(&store), (0..7).collect::<Vec<_>>());
+        assert_eq!(store.segment_count(), 1);
+    });
+}
+
+#[test]
+fn reopened_data_is_bit_identical() {
+    each_backend(|backend| {
+        let before: Vec<Vec<u8>>;
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+            append_n(&mut store, 0..9);
+            before = store
+                .snapshot()
+                .unwrap()
+                .iter()
+                .map(|view| encode_segment(&view.view().unwrap().segment))
+                .collect();
+        }
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+        let after: Vec<Vec<u8>> = store
+            .snapshot()
+            .unwrap()
+            .iter()
+            .map(|view| encode_segment(&view.view().unwrap().segment))
+            .collect();
+        assert_eq!(before, after);
+    });
+}
+
+#[test]
+fn schema_disagreement_is_refused_at_open() {
+    each_backend(|backend| {
+        Store::persistent(backend.clone(), schema(), 0).unwrap();
+        // Different column type.
+        let other = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::I64, false),
+        ]);
+        assert!(matches!(
+            Store::persistent(backend.clone(), other, 0),
+            Err(StorageError::SchemaMismatch { .. })
+        ));
+        // Same schema, different ordering key: `ts` stays a valid choice
+        // of i64 NOT NULL column, but disagrees with the manifest.
+        let reordered = Schema::new(vec![
+            Field::new("other_ts", ColumnType::I64, false),
+            Field::new("sym", ColumnType::Key, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        assert!(matches!(
+            Store::persistent(backend.clone(), reordered, 0),
+            Err(StorageError::SchemaMismatch { .. })
+        ));
+    });
+}
+
+#[test]
+fn missing_segment_is_loud() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..6); // three segments
+        }
+        // Remove the middle segment: rows 2..4 vanish from the backend.
+        let victim = backend
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|name| name.contains("seg-") && name.contains("2"))
+            .unwrap();
+        backend.remove(&victim).unwrap();
+        assert_eq!(
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2)
+                .err()
+                .unwrap(),
+            StorageError::MissingRows { expected_base: 2 }
+        );
+    });
+}
+
+#[test]
+fn the_manifest_names_the_segments_and_a_stray_file_is_invisible() {
+    // The residency design (2026-07-30): the manifest's segment records
+    // (tag 1) are the authoritative layout. A stray segment file — a
+    // crash between a flush's segment write and its manifest write —
+    // is never adopted and never even read: reopen loads exactly the
+    // named files. The stray here is unreadable garbage, which is what
+    // proves it was ignored rather than decoded.
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..4); // two flushed segments
+        }
+        backend
+            .write("seg-g0000000000-00000000000000000004.tlyseg", b"garbage")
+            .unwrap();
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+        assert_eq!(store.len(), 4);
+        assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
+    // A manifest from a writer older than tag 1 names no segments;
+    // reopen falls back to scanning the backend (the original
+    // behavior), then writes the records so the next open takes the
+    // authoritative path. A read-only open on the legacy manifest works
+    // through the same fallback — without writing anything.
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..4);
+        }
+        // Rewind the manifest to its pre-records form.
+        let manifest =
+            tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        assert!(
+            !manifest.sections.segments.is_empty(),
+            "records were written"
+        );
+        let mut legacy = manifest.sections.clone();
+        legacy.segments = Vec::new();
+        backend
+            .write(
+                "table.tlym",
+                &tallydb::storage_lite::encode_manifest(
+                    &manifest.schema,
+                    manifest.ordering_key,
+                    manifest.generation,
+                    &legacy,
+                ),
+            )
+            .unwrap();
+        // A reader sees the rows through the scan fallback, read-only.
+        {
+            let reader = Store::open_read_only(backend.clone()).unwrap();
+            assert_eq!(reader.live_len(), 4);
+            let after =
+                tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap())
+                    .unwrap();
+            assert!(
+                after.sections.segments.is_empty(),
+                "a read-only open writes nothing"
+            );
+        }
+        // The writer adopts by scan and earns the section.
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+        assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
+        let upgraded =
+            tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        assert_eq!(
+            upgraded.sections.segments.len(),
+            2,
+            "reopen recorded the layout it scanned"
+        );
+    });
+}
+
+#[test]
+fn corrupt_segment_is_loud_at_first_fault() {
+    // Under lazy open (the residency design) the open reads metadata
+    // only, so corruption in a segment file surfaces at the first data
+    // access — loud, as a Format error carrying the checksum failure —
+    // never as silently wrong rows.
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+            append_n(&mut store, 0..2);
+        }
+        let name = backend
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|name| name.starts_with("seg-"))
+            .unwrap();
+        let mut bytes = backend.read(&name).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        backend.write(&name, &bytes).unwrap();
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
+        let handles = store.snapshot().unwrap();
+        assert!(matches!(handles[0].view(), Err(StorageError::Format(_))));
+    });
+}
+
+#[test]
+fn in_memory_stores_never_touch_a_backend() {
+    // A plain Store with no backend still works exactly as before —
+    // persistence is opt-in, not a tax.
+    let mut store = Store::with_segment_rows(schema(), 0, 2).unwrap();
+    append_n(&mut store, 0..5);
+    assert_eq!(store.len(), 5);
+    assert_eq!(ts_values(&store), vec![0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn backend_read_errors_surface() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemBackend::new());
+    // A manifest that isn't a segment file at all.
+    backend.write("table.tlym", b"garbage").unwrap();
+    assert!(matches!(
+        Store::persistent(backend.clone(), schema(), 0),
+        Err(StorageError::Format(_))
+    ));
+    // IoError conversion sanity.
+    assert_eq!(
+        StorageError::from(IoError::NotFound("x".into())),
+        StorageError::Io(IoError::NotFound("x".into()))
+    );
+}
+
+#[test]
+fn tombstones_survive_reopen() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+            append_n(&mut store, 0..9);
+            assert_eq!(store.tombstone(&[1, 4, 7]).unwrap(), 3);
+            // Idempotent: killing dead rows writes no new log.
+            assert_eq!(store.tombstone(&[1, 4]).unwrap(), 0);
+            // Two mutations, two logs.
+            assert_eq!(store.tombstone(&[8]).unwrap(), 1);
+        }
+        let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 3).unwrap();
+        assert_eq!(store.len(), 9);
+        assert_eq!(store.live_len(), 5);
+        assert_eq!(ts_values(&store), (0..9).collect::<Vec<_>>()); // raw rows remain
+        let live: Vec<i64> = store
+            .snapshot()
+            .unwrap()
+            .iter()
+            .flat_map(|view| {
+                let view = view.view().unwrap();
+                let tallydb::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+                    &view.segment.batch().columns()[0]
+                else {
+                    panic!("ts type")
+                };
+                (0..view.segment.batch().num_rows())
+                    .filter(|&row| view.is_live(row))
+                    .map(|row| ts.values().as_slice()[row])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(live, vec![0, 2, 3, 5, 6]);
+        assert_eq!(
+            backend
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|name| name.starts_with("del-"))
+                .count(),
+            2
+        );
+    });
+}
+
+// A delete consumes a knowledge coordinate (ruled 2026-07-29), and no
+// row carries it — so on a table whose only mutation was a delete, the
+// delete log is the sole evidence that the coordinate is spent. If
+// reopen did not fold the stamps in, the watermark would rewind and the
+// next appended row would be born at the same coordinate the deletion
+// was stamped with: two knowledge events, one address, and an `AS OF`
+// answer that changes retroactively.
+#[test]
+fn a_consumed_coordinate_survives_reopen() {
+    each_backend(|backend| {
+        {
+            let mut store =
+                Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+            append_n(&mut store, 0..5); // sequences 0..4, watermark 5
+            assert_eq!(store.next_sequence(), 5);
+            assert_eq!(store.tombstone(&[1]).unwrap(), 1);
+            assert_eq!(store.next_sequence(), 6, "the kill spent coordinate 5");
+        }
+        let mut store = Store::persistent(backend.clone(), schema(), 0).unwrap();
+        assert_eq!(store.next_sequence(), 6, "and the reopen knows it");
+        append_n(&mut store, 5..6);
+        store.flush().unwrap();
+        // The new row is born above the kill, not beside it.
+        let knowledge = store.knowledge_snapshot().unwrap();
+        let live_at = |cut: u64| -> usize {
+            knowledge
+                .as_of(cut)
+                .unwrap()
+                .iter()
+                .map(tallydb::storage_lite::SegmentHandle::live_rows)
+                .sum()
+        };
+        assert_eq!(live_at(4), 5, "before the kill: five rows, none dead");
+        assert_eq!(live_at(5), 4, "at the kill: four rows, the new one unborn");
+        assert_eq!(live_at(6), 5, "after it: four survivors plus the arrival");
+    });
+}
+
+#[test]
+fn tombstone_bounds_are_checked() {
+    let mut store = Store::with_segment_rows(schema(), 0, 4).unwrap();
+    append_n(&mut store, 0..3);
+    assert_eq!(
+        store.tombstone(&[3]),
+        Err(StorageError::TombstoneOutOfRange { id: 3 })
+    );
+    // Rows still in the write buffer can be tombstoned (in-memory store:
+    // no delete log, no durability concern).
+    assert_eq!(store.tombstone(&[2]).unwrap(), 1);
+    assert_eq!(store.live_len(), 2);
+    let views = store.snapshot().unwrap();
+    assert!(!views[0].is_live(2));
+    assert!(views[0].is_live(0));
+}
+
+// Regression: tombstoning rows that are still in the write buffer on a
+// PERSISTENT store must flush them durable before writing the delete
+// log — otherwise a crash after the (synced) log leaves a delete
+// naming a row that never reached disk, and reopen underflows/shadow-
+// kills. This reproduces the storage half of the mutation data-loss
+// cluster found by the 2026-07-25 axis re-review.
+#[test]
+fn tombstoning_buffered_rows_persists_them_first() {
+    each_backend(|backend| {
+        // Threshold high enough that nothing auto-flushes: all five rows
+        // sit in the write buffer when the tombstone lands.
+        let mut store =
+            Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 100).unwrap();
+        append_n(&mut store, 0..5);
+        assert_eq!(store.tombstone(&[1, 3]).unwrap(), 2);
+        drop(store); // the crash boundary: only durable state survives
+
+        // Reopen from the backend alone. The tombstone flushed the rows,
+        // so every physical row is present and the live set is exactly
+        // {0, 2, 4} — no TombstoneOutOfRange, no live_len underflow.
+        let reopened = Store::persistent(backend, schema(), 0).unwrap();
+        assert_eq!(reopened.live_len(), 3);
+        assert_eq!(ts_values(&reopened), vec![0, 1, 2, 3, 4]);
+        let views = reopened.snapshot().unwrap();
+        let live: Vec<i64> = views
+            .iter()
+            .flat_map(|view| {
+                let view = view.view().unwrap();
+                let Column::Numeric(NumericData::I64(ts)) = &view.segment.batch().columns()[0]
+                else {
+                    panic!("ts type")
+                };
+                (0..ts.values().as_slice().len())
+                    .filter(|&row| view.is_live(row))
+                    .map(|row| ts.values().as_slice()[row])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(live, vec![0, 2, 4]);
+    });
+}

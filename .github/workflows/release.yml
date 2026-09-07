@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the console binary
-        run: cargo build -p engine --release
+        run: cargo build --release
       - name: Name the artifact (unix)
         if: runner.os != 'Windows'
         run: cp target/release/tallydb ${{ matrix.artifact }}

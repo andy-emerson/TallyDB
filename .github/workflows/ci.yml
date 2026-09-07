@@ -25,45 +25,45 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Build
-        run: cargo build --workspace
+        run: cargo build
       - name: Test (includes doctests and the arrow-rs oracle)
-        run: cargo test --workspace
+        run: cargo test
       - name: Engine without Lua or the console (--no-default-features — the
           library-only embedder build must stay green on its own)
         run: |
-          cargo clippy -p engine --all-targets --no-default-features -- -D warnings
-          cargo test -p engine --no-default-features
-          RUSTDOCFLAGS="-D warnings" cargo doc -p engine --no-deps --no-default-features
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test --no-default-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
       - name: Docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --no-deps
       - name: PyArrow oracle (issue #15)
         run: |
-          cargo build -p engine --features oracle-harness
+          cargo build --features oracle-harness
           pip install pyarrow cffi
-          python3 crates/engine/tests/pyarrow_roundtrip.py target/debug/libengine.so
+          python3 tests/pyarrow_roundtrip.py target/debug/libtallydb.so
       - name: M1 slice oracle — NumPy + DuckDB (issue #27)
         run: |
-          cargo build -p engine --features oracle-harness
+          cargo build --features oracle-harness
           pip install numpy duckdb
-          python3 crates/engine/tests/m1_slice_oracle.py target/debug/libengine.so
+          python3 tests/m1_slice_oracle.py target/debug/libtallydb.so
       - name: M2.3 mutation oracle — DuckDB differential (issue #35)
-        run: python3 crates/engine/tests/m2_mutation_oracle.py target/debug/libengine.so
+        run: python3 tests/m2_mutation_oracle.py target/debug/libtallydb.so
       - name: M2.4 differential harness — generated queries vs DuckDB (issue #36)
-        run: python3 crates/engine/tests/m2_differential_oracle.py target/debug/libengine.so
+        run: python3 tests/m2_differential_oracle.py target/debug/libtallydb.so
       - name: Lua families oracle — NumPy differential (kernels #41, driver #70)
-        run: python3 crates/engine/tests/m2_lua_window_oracle.py target/debug/libengine.so
+        run: python3 tests/m2_lua_window_oracle.py target/debug/libtallydb.so
       - name: M4.4 as-of oracle — DuckDB over an explicit history table (issue #75)
-        run: python3 crates/engine/tests/m4_asof_oracle.py target/debug/libengine.so
+        run: python3 tests/m4_asof_oracle.py target/debug/libtallydb.so
       - name: Maintained-view oracle — DuckDB recompute at scripted checkpoints (issue #83)
-        run: python3 crates/engine/tests/m5_view_oracle.py target/debug/libengine.so
+        run: python3 tests/m5_view_oracle.py target/debug/libtallydb.so
       - name: Join-view oracle — DuckDB's native ASOF JOIN as recompute (issue #83, tranche 3)
-        run: python3 crates/engine/tests/m5_join_oracle.py target/debug/libengine.so
+        run: python3 tests/m5_join_oracle.py target/debug/libtallydb.so
       - name: Multi-factor oracle — NumPy lstsq over rebuilt design matrices (issue #90)
-        run: python3 crates/engine/tests/m5_multifactor_oracle.py target/debug/libengine.so
+        run: python3 tests/m5_multifactor_oracle.py target/debug/libtallydb.so
       - name: Lua apicheck build — the interpreter's own C-API-misuse assertions (issue #41)
-        run: cargo test -p engine --features apicheck
+        run: cargo test --features apicheck
 
   # The unsafe core under Miri (issue #63): arrow-lite concentrates the
   # workspace's unsafe (aligned buffers, bitmaps, the C Data Interface),
@@ -81,14 +81,14 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
           PROPTEST_CASES: "4"
-        run: cargo +nightly miri test -p engine --no-default-features --lib arrow_lite::
+        run: cargo +nightly miri test --no-default-features --lib arrow_lite::
 
   # The official Lua 5.4.7 test suite over the vendored interpreter
   # (issue #69): the release's own ltests instrumentation compiled in
   # (tracing allocator with failure injection, stack/GC consistency
   # asserts, the T library), built from the exact sources the engine
   # embeds — byte-identical to the upstream v5.4.7 tag; see
-  # crates/engine/src/compute_lua/upstream-tests/PROVENANCE.md.
+  # src/compute_lua/upstream-tests/PROVENANCE.md.
   lua-suite:
     runs-on: ubuntu-latest
     steps:
@@ -96,7 +96,7 @@ jobs:
       - name: readline headers (main.lua's transcripts assume readline)
         run: sudo apt-get update && sudo apt-get install -y libreadline-dev
       - name: Build the instrumented interpreter, run all.lua
-        run: crates/engine/src/compute_lua/upstream-tests/run.sh
+        run: src/compute_lua/upstream-tests/run.sh
 
   # The C boundary under the sanitizers: the vendored interpreter and the
   # binding's C accessors compiled with ASan (leaks included — the
@@ -114,4 +114,4 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
           CFLAGS: -fsanitize=address -fsanitize=undefined -fsanitize-undefined-trap-on-error
-        run: cargo +nightly test -p engine --features apicheck --target x86_64-unknown-linux-gnu
+        run: cargo +nightly test --features apicheck --target x86_64-unknown-linux-gnu
