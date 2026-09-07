@@ -3,7 +3,7 @@
 **A small, embeddable, SQL-native database for numeric data — with numeric compute living inside the engine, not bolted on beside it.**
 
 > **Status:** Under construction, and a first thin engine runs. The columnar
-> foundation (`arrow-lite`) is implemented and cross-checked against arrow-rs
+> foundation (the `arrow_lite` module) is implemented and cross-checked against arrow-rs
 > and PyArrow; on top of it, a working vertical slice appends rows one at a
 > time into persistent, crash-safe, multi-segment storage and serves a real
 > SQL subset — `SELECT`/`WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, small-table
@@ -213,18 +213,28 @@ q language, minus the license, minus the server.
   database. But it's proprietary, licensed, and built around q rather than
   SQL. TallyDB replicates the shape, not the language or the licensing.
 
+## Getting it
+
+TallyDB is one Rust crate, `tallydb`: a library an application embeds and
+a console binary of the same name. From a checkout, `cargo install
+--path .` builds and installs the console, and `cargo build
+--no-default-features` builds the library alone — no console, no Lua,
+two direct dependencies. The first release on crates.io makes that `cargo
+install tallydb` and `cargo add tallydb`; until it lands, the checkout
+is the way in.
+
 ## Where things stand
 
-`arrow-lite` is implemented: the shared bitmap, 64-byte-aligned `f64`/`i64`
+The columnar foundation, `arrow_lite`, is implemented: the shared bitmap, 64-byte-aligned `f64`/`i64`
 buffers, `u32`-dictionary key columns, the two-variant column enum with
 zero-copy views, logical-type export annotations, and the C Data Interface
 including `ArrowArrayStream` — every piece round-trip-tested against
 arrow-rs and PyArrow in CI, with the unsafe core additionally checked
-under Miri in CI on every change (issue #63) — `arrow-lite` concentrates
-the workspace's unsafe, so that is where the interpreter is pointed.
+under Miri in CI on every change (issue #63) — `arrow_lite` concentrates
+the crate's unsafe, so that is where the interpreter is pointed.
 
 On top of it runs the vertical slice, now past its M1 write-then-read
-shape: `storage-lite` appends validated rows into a per-table store —
+shape: `storage_lite` appends validated rows into a per-table store —
 a write buffer freezing into immutable segments at a row threshold,
 each row carrying an internal monotonic row id — and persists them
 behind a storage-backend trait (natively, a directory of files) in a
@@ -255,7 +265,7 @@ state, permanently, and `_seq` reads a row's own coordinate back
 through SQL. Reads resolve tombstones through live masks, and
 crash-safe generational compaction merges live rows back into sorted,
 contiguous segments — with end-state semantics validated against DuckDB
-in CI. `query-lite` speaks a real query subset via sqlparser-rs: SELECT with
+in CI. `query_lite` speaks a real query subset via sqlparser-rs: SELECT with
 WHERE (the predicate fragment — numeric comparisons, key string
 equality, `IN` and `LIKE` evaluated once per distinct dictionary value,
 `IS [NOT] NULL`, `AND`/`OR`/`NOT` — with zone-map pruning skipping
@@ -288,7 +298,7 @@ instead — with per-segment key dictionaries remapped at query time
 where grouping or partitioning needs them, and a generated
 differential harness diffs query families against DuckDB over the
 corpus in CI;
-`engine` ties them together behind a
+The crate root ties them together behind a
 multi-table `Database` handle — which also carries **maintained
 views** (#83): a bucketed, running, or cumulative aggregate
 materialized as a real table plus a stamp (the source watermark it
@@ -325,7 +335,7 @@ dimensions, where no closed form exists — see `DESIGN.md`, *Curated
 compute: what the engine calls, and why*. Passthrough results share the stored buffers
 (pointer-verified); the design-matrix and cross-segment window gathers
 are copies proportional to the rows they cover — not bounded by a
-constant, as the crate docs record. `compute-linalg`
+constant, as the crate docs record. `compute_linalg`
 provides the multiplication-class kernels behind the same
 capability-negotiating trait shape (`dot`, matrix–vector, matrix–matrix
 — checked against hand computations; not yet called from query inner
@@ -335,7 +345,7 @@ fastest at window scale, while the matrix products use faer, measured
 3.7–10× ahead of a naive loop (and ahead of reference BLAS) at the Gram
 shapes a future multi-parameter op would need. The engine links no
 system math library at all — no BLAS, no LAPACK — and the compute stack
-compiles for wasm32 as-is. `compute-lua` embeds canonical PUC Lua 5.4 (vendored,
+compiles for wasm32 as-is. `compute_lua` embeds canonical PUC Lua 5.4 (vendored,
 unmodified) behind the frozen value-map contract: nullable columns
 cross as zero-copy views (NULL is the `NULL` sentinel, three-valued
 through arithmetic; keys read as codes with `text()`/`code_of()`),
@@ -438,7 +448,7 @@ The repo-specific half lives here:
   `main` — fmt, clippy, build, tests including doctests, rustdoc with
   warnings as errors, the Python oracle suite (PyArrow round trip;
   DuckDB and NumPy differentials, the Lua-window family included), the
-  Lua `apicheck` build, Miri over `arrow-lite`, the official Lua 5.4.7
+  Lua `apicheck` build, Miri over `arrow_lite`, the official Lua 5.4.7
   test suite (`ltests`) over the vendored interpreter, and an
   ASan/UBSan job over the C boundary. Doctests are this repository's
   preferred executable evidence.

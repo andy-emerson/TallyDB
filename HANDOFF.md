@@ -23,36 +23,61 @@ constraints change only when the Human says so.
    options, user pov and dev pov, a recommendation, and what it gates
    — before building. Never entrench an answer to an open decision.
 5. **kdb+ validates problems, not solutions.**
-6. **Gate before every push:** `cargo fmt --check` ·
-   `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-   · `cargo test --workspace` ·
-   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` · the
-   off-leg (`clippy`/`test`/`doc` for `-p engine`, default features) ·
-   the Python oracle suites (build with `--features oracle-harness`,
-   run the nine oracle scripts in `.github/workflows/ci.yml` —
-   `m2_compute_latency_bench.py` is a benchmark, not an oracle).
-7. **Never touch the vendored Lua** under `crates/compute-lua/vendor`.
+6. **Gate before every push:** `cargo fmt --all --check` ·
+   `cargo clippy --all-targets --all-features -- -D warnings` ·
+   `cargo test` · `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` · the
+   off-leg (`clippy`/`test`/`doc` with `--no-default-features`) · the
+   Python oracle suites (build with `--features oracle-harness`, run
+   the nine oracle scripts in `.github/workflows/ci.yml` against
+   `target/debug/libtallydb.so` — `m2_compute_latency_bench.py` is a
+   benchmark, not an oracle) · `cargo test --features apicheck`.
+7. **Never touch the vendored Lua** under `src/compute_lua/vendor`.
 8. The process is `AGENTS.md` (v3.0.0): open → commit → merge;
    claims at their evidence; code passes and doc passes never mix;
    repo-wide code review then documentation review before every merge
    proposal.
 
-## Snapshot (2026-09-07: agreement v3.0.0 adopted; single-crate collapse ruled, not yet built)
+## Snapshot (2026-09-07: one crate, `tallydb`, at the repository root; not yet merged or published)
 
-**State:** `main` = `b82c350` (#106, clippy 1.98 clean; CI green on
-`main`). `claude/dev` restarted from it and carries two doc commits: the
-post-#90 snapshot that never reached `main`, and this pass — `AGENTS.md`
-is v3.0.0 (open → commit → merge), replaced whole from the upstream
-release asset. Nothing is awaiting review or merge.
+**State:** `main` = `b82c350` (#106; CI green on `main`). `claude/dev`
+carries the collapse ruled in DESIGN.md *Crate layout*: `AGENTS.md`
+v3.0.0; the ruling; seven code passes folding the workspace's crates
+into one — compute-linalg, compute-lua, shell, query-lite,
+storage-lite, corpus, arrow-lite — then the move of the package to the
+repository root as `tallydb`, and a fix quoting the Miri job's command
+so the CI workflow parses; then the doc passes. Every code pass
+carried the full gate green with 521 tests, the count unchanged from
+the workspace; the Miri and Lua-suite jobs were run locally as CI runs
+them. `cargo publish --dry-run` packages and verifies the crate; its
+one warning is the missing description. Awaiting: the publish-metadata
+pass, the merge-scale reviews, the Human's merge, then the tag and
+`cargo publish`.
 
-**Destination (Human, 2026-09-07):** publish TallyDB to crates.io as
-**one crate** — the workspace's crates become modules of it, names kept
-— with `compute-linalg` folded in and `corpus` a module behind the
-`oracle-harness` feature (the oracle hooks are `extern "C"` exports of the
-shared library, so the corpus is library code under a feature, not a
-dev-dependency). Recorded in DESIGN.md *Crate layout* with the rejected
-alternatives and the reopen trigger. Next: the collapse itself, one code
-pass per crate folded, full gate green at each.
+**Open decisions the collapse surfaced (Human closes; none blocks the
+merge, the first two gate the first release):**
+
+- *The published crate's API.* The modules are `pub`, so every public
+  item of every former crate is `tallydb`'s surface, and semver will
+  apply to all of it. Options: (a) leave as is — widest, and every
+  internal signature change is a semver event; (b) root re-exports
+  only, modules `pub(crate)` with the needed types re-exported — the
+  smallest promise, and doc examples and integration tests move to
+  root paths; (c) `pub` modules with internals hidden case by case.
+  User pov: (b) gives one flat, documented surface; (a) lets a power
+  user reach the store or the columnar layer directly. Dev pov: (b)
+  is a one-pass change now and a breaking change later; (a) costs
+  nothing now and a major bump each time an internal moves.
+  Recommendation: (b), before the first release — the one moment the
+  surface shrinks for free. Gates: the first version number.
+- *Package contents.* `cargo package` ships 192 files, among them
+  `src/compute_lua/upstream-tests` (the Lua suite and ltests, CI-only).
+  Options: ship as is; or `exclude` that directory (the interpreter
+  under `vendor/` must ship — build.rs compiles it). Recommendation:
+  exclude. Gates: package size only.
+- *First version.* The manifest says 0.0.1. Gates: the tag.
+- *`Cargo.lock`.* Gitignored today; a crate that ships a binary
+  conventionally commits it so `cargo install` reproduces a known
+  build. Gates: nothing.
 
 #90 shipped rolling multi-factor regression: the anchored
 `FactorMoments` carrier, `solve_spd` (a single-function interim solve —
@@ -80,7 +105,8 @@ made ad-hoc while building are *revisitable*; only decisions that
 undermine **what TallyDB is** are non-negotiable. Give the reason,
 never cite the ruling.
 
-**Toolchain:** Rust 1.97.1, matching CI.
+**Toolchain:** Rust 1.97.1, matching CI; nightly with Miri installed for
+the local Miri run.
 
 ### What comes next (after the #90 merge)
 
@@ -125,18 +151,21 @@ requirements letter (drafted at `scratchpad/matlua-requirements.md`).
 ### Standing session facts
 
 - Gate = fmt | clippy both legs `-D warnings` | test both legs |
-  rustdoc both legs | nine oracle scripts (pyarrow_roundtrip via
-  `-p arrow-lite --features oracle-harness`; the other eight via
-  `-p engine --features oracle-harness`). Check every leg BY EXIT
-  CODE, not by grepping counts. Re-run the counts at each close rather
-  than carrying arithmetic. Doc-only (.md) pushes have gone without
-  the full gate.
+  rustdoc both legs | nine oracle scripts, all against
+  `target/debug/libtallydb.so` from one `cargo build --features
+  oracle-harness` | `cargo test --features apicheck`. Check every leg
+  BY EXIT CODE, not by grepping counts. Re-run the counts at each
+  close rather than carrying arithmetic. Doc-only (.md) pushes have
+  gone without the full gate.
 - CI runs on every pull request **and** on every push to `main`; the
-  jobs are check, miri (`arrow-lite`), lua-suite (official 5.4.7 +
-  `ltests`), sanitize. CI stable moves — if clippy fails there and
-  not here, `rustup update stable` and re-run.
-- The scratchpad probe crate lives under the session scratchpad
-  (path-deps on real crates); rebuild if needed, never in-repo.
+  jobs are check, miri (`cargo +nightly miri test --no-default-features
+  --lib arrow_lite::`), lua-suite (official 5.4.7 + `ltests`;
+  `src/compute_lua/upstream-tests/run.sh` — its `files.lua` asserts
+  that a seek on stdin fails, so run it with stdin a pipe, not a
+  file), sanitize. CI stable moves — if clippy fails there and not
+  here, `rustup update stable` and re-run.
+- The scratchpad probe crate lives under the session scratchpad (a
+  path-dep on the crate); rebuild if needed, never in-repo.
 - sqlparser 0.62.0, GenericDialect. Any new pre-parse lift must
   splice by byte span, skip comments whole, carry adversarial tests.
 - Beta shape: feed-writer process + read-only consoles (`--read-only`,
@@ -144,5 +173,6 @@ requirements letter (drafted at `scratchpad/matlua-requirements.md`).
   prefix, old-or-new per mutation. Read-only view handles serve exact
   answers over stale materializations, including dirty boundary
   buckets.
-- `rm -rf crates/*/tests/__pycache__` after running oracles
-  (gitignored now, but keep the tree clean).
+- `rm -rf tests/__pycache__ src/compute_lua/upstream-tests/build` after
+  running the oracles and the Lua suite (gitignored, but keep the tree
+  clean).

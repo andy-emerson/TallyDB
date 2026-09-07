@@ -7,9 +7,10 @@ repository = "https://github.com/andy-emerson/TallyDB"
 
 [lib]
 # cdylib exists solely for the Python oracle scripts, which drive the
-# `oracle-harness` hooks through ctypes (tests/*.py — the M1 slice, the
-# mutation and differential families, the Lua-window and SQL-in-Lua
-# families, the as-of sweep, and the latency benchmark).
+# `oracle-harness` hooks through ctypes (tests/*.py — the PyArrow round
+# trip, the M1 slice, the mutation and differential families, the
+# Lua-window and SQL-in-Lua families, the as-of sweep, the view, join,
+# and multi-factor families, and the latency benchmark).
 crate-type = ["lib", "cdylib"]
 
 [features]
@@ -30,7 +31,8 @@ lua = []
 # authors' own C-API-misuse assertions, the binding's discipline oracle.
 # Test builds and CI enable it; release builds do not. Implies `lua`.
 apicheck = ["lua"]
-# Compiles the extern "C" oracle hooks (src/harness.rs). Dev/CI only.
+# Compiles the extern "C" oracle hooks (src/harness.rs and
+# src/arrow_lite/harness.rs) and the corpus they draw on. Dev/CI only.
 # Implies `lua`: the oracle fixtures include the Lua-window family.
 oracle-harness = ["lua"]
 
