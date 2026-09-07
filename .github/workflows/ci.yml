@@ -81,7 +81,7 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
           PROPTEST_CASES: "4"
-        run: cargo +nightly miri test --no-default-features --lib arrow_lite::
+        run: "cargo +nightly miri test --no-default-features --lib arrow_lite::"
 
   # The official Lua 5.4.7 test suite over the vendored interpreter
   # (issue #69): the release's own ltests instrumentation compiled in
