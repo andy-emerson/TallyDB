@@ -33,9 +33,10 @@
 //! `storage_lite` + `query_lite` together, and exposing the compute
 //! backends (`compute_lua`, `compute_linalg`) to SQL as callable
 //! functions. Application code reaches the engine through [`Database`]
-//! and [`Table`] and the re-exports beside them; the modules are `pub`
-//! because the API names their types — a schema is an
-//! [`arrow_lite::Schema`], a row a [`RowValue`].
+//! and [`Table`], and the API is exactly what this root re-exports — a
+//! schema is a [`Schema`], a row a [`RowValue`], a result a
+//! [`QueryOutput`]. The modules are crate-private; their essays render
+//! with `cargo doc --document-private-items`.
 //!
 //! ## Compute backend selection
 //! `compute_linalg` is consumed here through its trait interface (see that

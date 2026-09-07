@@ -2529,13 +2529,61 @@ hook: one build with `--features oracle-harness` serves all nine oracle
 scripts. There used to be two libraries — `libarrow_lite` and
 `libengine` — and a script had to know which.
 
-**The public surface.** The modules are `pub`. An embedder writes
-`tallydb::arrow_lite::Schema` and `tallydb::storage_lite::RowValue` (the
-latter also re-exported at the root), and every public item of every
-module is reachable — as the former crates' public items were reachable
-to anyone who depended on them. Which of that the *published* crate
-promises as its API is an open decision (#107 carries it); until it
-is ruled, nothing here is narrowed or widened.
+**The public surface (#107, ruled by the Human 2026-09-07: root
+re-exports only).** The API is what `lib.rs` re-exports, and nothing
+else: the engine (`Database`, `Table`, `TableReader`, `TableSnapshot`,
+`MaterializedView`, the multi-factor types, `EngineError`); the data
+model (`Schema`, `Field`, `ColumnType`, `RecordBatch`, `Column` and its
+parts, `Bitmap`, `Buffer`, `Dictionary`, the logical types) and the
+Arrow C Data Interface (`ArrowSchema`, `ArrowArray`,
+`ArrowArrayStream`, the export and import functions); storage's
+configuration and errors (`RowValue`, `StoreOptions`, `WalSync`,
+`DEFAULT_SEGMENT_ROWS`, `MANIFEST`, `StorageError`, `IoError`,
+`FormatError`, `CodecError`); the extension seams (`WindowAggregate`,
+`ColumnFunction`, `Registry`, `QueryOutput`, `QueryError`,
+`recompute_frames`; `LinalgBackend` with its op and error types and
+`RustLinalg`); the Lua embedder's `LogSink` and `PRELUDE` behind
+`lua`; and the console's `Console` and `Outcome` with their two line
+helpers behind `cli`. The modules are `pub(crate)`: no path into them
+is nameable from outside, so semver applies to that list and to
+nothing else.
+
+*Rejected:* leaving the modules `pub` — every internal signature
+change a semver event; hiding internals item by item — the same audit
+with no line to hold it; `#[doc(hidden)]` modules — a promise nobody
+enforces. *Accepted consequences:* the store's behavioral tests moved
+inside the module (`storage_lite/tests`), since nothing outside the
+crate reaches `Store`; the memory tests measure through `Table` and
+`Database`, which is the surface their claims are about; items only
+tests reached are `#[cfg(test)]`, and items nothing reached are gone;
+the rustdoc legs pass `--document-private-items`, so the modules'
+essays stay link-checked and render for a maintainer. *Reopen
+trigger:* an embedder with a concrete need for something a root
+re-export cannot serve — which is also the crate-boundary trigger
+below.
+
+**The published package (#108, ruled 2026-09-07).** `exclude` names
+what runs the project rather than builds or tests the crate: the Lua
+upstream suite, `.github`, `scripts`, and the process documents
+(AGENTS.md, CONTRIBUTING.md, CLAUDE.md). What ships is the sources
+with the vendored interpreter, `tests/` with its goldens and oracle
+scripts, DESIGN.md, README.md, and LICENSE. *Rejected:* shipping
+everything — a third larger for a suite no installer runs; excluding
+`tests/` too — packagers run them.
+
+**The first version (#109, ruled 2026-09-07).** 0.1.0: usable,
+unstable — within 0.1.x a minor bump is breaking and a patch bump is
+compatible, so the API can still move at 0.2.0. The narrowing above is
+what earns the 1. *Rejected:* 0.0.1 — honest only for the unnarrowed
+surface; a pre-release tag — a second publish to reach the same place;
+1.0.0 — a promise the API has not earned.
+
+**Cargo.lock (#110, ruled 2026-09-07).** Committed, and CI builds with
+`--locked`, so the build CI tested is the build a checkout reproduces
+and a dependency move is a visible diff; `cargo update` is a
+deliberate commit. *Rejected:* ignoring it — breakage found by whoever
+builds next; a second CI lane on fresh resolution — red through
+nobody's fault.
 
 **What the crate boundaries used to guarantee, and what guarantees it now:**
 
@@ -2544,7 +2592,7 @@ is ruled, nothing here is narrowed or widened.
 | The engine carries no console dependency (#39) | `shell` was the only crate depending on rustyline and csv | both are optional, behind `cli`; the `--no-default-features` CI leg builds, tests, and documents the library without them |
 | The corpus is never linked by the engine | `corpus` was `publish = false` and a separate crate | a module under `cfg(test)` and `oracle-harness`, absent from the default build |
 | Miri runs over the columnar layer; sanitizers and `LUA_USE_APICHECK` over the Lua boundary | per-crate CI jobs (`-p arrow-lite`, `-p compute-lua`) | the same jobs: Miri filtered to `arrow_lite::` in the library's test binary, without the default features; the sanitizer job filtered to `compute_lua::` with the vendored C compiled sanitized (the storage tests forget stores on purpose to model power loss, which the leak check would count) |
-| A region can be read and tested on its own | a crate | a `pub` module with the same seam and its own rustdoc root; its unit tests run under its path prefix (`cargo test storage_lite::`) |
+| A region can be read and tested on its own | a crate | a `pub(crate)` module with the same seam; its rustdoc root renders under `--document-private-items`; its tests, the store's behavioral tests included, run under its path prefix (`cargo test storage_lite::`) |
 
 **Decision record — one published crate (Human, 2026-09-07).** The
 workspace's eight crates had earned their keep as *development* boundaries
