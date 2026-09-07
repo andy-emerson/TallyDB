@@ -1,7 +1,7 @@
 //! Host functions: engine-side compute callable from scripts over the
 //! same zero-copy views.
 //!
-//! This is the seam the curated `compute-linalg` and engine ops reach
+//! This is the seam the curated `compute_linalg` and engine ops reach
 //! scripts through (the engine registers them into every kernel
 //! state): a [`HostFunction`] receives its column arguments as plain
 //! `&[f64]` slices pointing **directly at the engine buffers the views
@@ -9,13 +9,13 @@
 //! value, or `None` where the operation is undefined (which scripts see
 //! as `NULL`, the same convention SQL windows use).
 //!
-//! This crate stays backend-agnostic: it defines the seam and the
+//! This module stays backend-agnostic: it defines the seam and the
 //! trampoline; *which* functions exist is the embedder's business
-//! (`engine` ties compute to SQL and installs the curated set).
+//! (the crate root ties compute to SQL and installs the curated set).
 //!
 //! ## Boundary discipline
 //!
-//! The trampoline follows the crate's C-boundary rules: argument
+//! The trampoline follows the module's C-boundary rules: argument
 //! checks raise with static messages and `Copy` locals only; the
 //! embedder's Rust code runs under `catch_unwind` so a panic never
 //! unwinds into C; a dynamic error message is copied into Lua and

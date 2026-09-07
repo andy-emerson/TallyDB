@@ -1,7 +1,7 @@
 //! Script-backed SQL functions: the Lua-in-SQL window slot (#41).
 //!
 //! A [`LuaWindow`] adapts an application-registered Lua kernel to
-//! `query-lite`'s `WindowAggregate` seam — the same seam the curated
+//! `query_lite`'s `WindowAggregate` seam — the same seam the curated
 //! native windows (`regr_slope`, `eigen_max`, …) ship through. The
 //! engine drives the framing; the kernel reduces one frame to one
 //! scalar, reading its arguments as zero-copy column views and
@@ -97,7 +97,7 @@ impl HostFunction for RegistryOp {
 /// over the same view buffers with no copy. Registry-driven rather
 /// than a hardcoded list, so every future native (and every
 /// embedder-registered aggregate that exists at this registration)
-/// flows into scripts for free. `dot` (compute-linalg) rides along as
+/// flows into scripts for free. `dot` (compute_linalg) rides along as
 /// the one op that lives outside the registry.
 ///
 /// **Column functions do not cross** (M4.2's `register_column_function`

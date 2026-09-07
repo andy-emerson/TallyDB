@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""PyArrow round-trip oracle for arrow-lite's C Data Interface (issue #15).
+"""PyArrow round-trip oracle for arrow_lite's C Data Interface (issue #15).
 
 Drives the `oracle-harness` hooks in libarrow_lite as a shared library and
 checks both directions against fixtures defined independently here and in
 `src/harness.rs`:
 
-  1. arrow-lite exports the canonical batch -> PyArrow imports and compares.
-  2. PyArrow exports the same batch          -> arrow-lite imports and compares.
-  3. arrow-lite exports a 3-batch stream     -> PyArrow reads and compares.
-  4. PyArrow exports the same stream         -> arrow-lite reads and compares.
+  1. arrow_lite exports the canonical batch -> PyArrow imports and compares.
+  2. PyArrow exports the same batch          -> arrow_lite imports and compares.
+  3. arrow_lite exports a 3-batch stream     -> PyArrow reads and compares.
+  4. PyArrow exports the same stream         -> arrow_lite reads and compares.
 
 Usage: pyarrow_roundtrip.py [path/to/libtallydb.so]
 Exits nonzero on the first failure.
@@ -112,7 +112,7 @@ def main() -> None:
     lib.tallydb_oracle_verify_batch.restype = ctypes.c_int32
     lib.tallydb_oracle_verify_stream.restype = ctypes.c_int32
 
-    # 1. arrow-lite exports, PyArrow imports.
+    # 1. arrow_lite exports, PyArrow imports.
     c_schema, c_array, schema_ptr, array_ptr = new_ptrs()
     lib.tallydb_oracle_export_batch(
         ctypes.c_void_p(schema_ptr), ctypes.c_void_p(array_ptr)
@@ -121,20 +121,20 @@ def main() -> None:
     imported.validate(full=True)
     expected = canonical_batch()
     check(
-        "arrow-lite -> pyarrow batch",
+        "arrow_lite -> pyarrow batch",
         imported.equals(expected) and imported.schema == expected.schema,
         f"imported {imported!r}, expected {expected!r}",
     )
 
-    # 2. PyArrow exports, arrow-lite imports and verifies.
+    # 2. PyArrow exports, arrow_lite imports and verifies.
     c_schema, c_array, schema_ptr, array_ptr = new_ptrs()
     expected._export_to_c(array_ptr, schema_ptr)
     rc = lib.tallydb_oracle_verify_batch(
         ctypes.c_void_p(schema_ptr), ctypes.c_void_p(array_ptr)
     )
-    check("pyarrow -> arrow-lite batch", rc == 0, f"verify returned {rc}")
+    check("pyarrow -> arrow_lite batch", rc == 0, f"verify returned {rc}")
 
-    # 3. arrow-lite exports a stream, PyArrow reads it.
+    # 3. arrow_lite exports a stream, PyArrow reads it.
     c_stream = ffi.new("struct ArrowArrayStream*")
     stream_ptr = int(ffi.cast("uintptr_t", c_stream))
     lib.tallydb_oracle_export_stream(ctypes.c_void_p(stream_ptr))
@@ -142,13 +142,13 @@ def main() -> None:
     read = list(reader)
     expected_slices = slice_batches()
     check(
-        "arrow-lite -> pyarrow stream",
+        "arrow_lite -> pyarrow stream",
         len(read) == len(expected_slices)
         and all(a.equals(e) for a, e in zip(read, expected_slices)),
         f"read {read!r}",
     )
 
-    # 4. PyArrow exports a stream, arrow-lite reads and verifies.
+    # 4. PyArrow exports a stream, arrow_lite reads and verifies.
     c_stream = ffi.new("struct ArrowArrayStream*")
     stream_ptr = int(ffi.cast("uintptr_t", c_stream))
     reader = pa.RecordBatchReader.from_batches(
@@ -156,7 +156,7 @@ def main() -> None:
     )
     reader._export_to_c(stream_ptr)
     rc = lib.tallydb_oracle_verify_stream(ctypes.c_void_p(stream_ptr))
-    check("pyarrow -> arrow-lite stream", rc == 0, f"verify returned {rc}")
+    check("pyarrow -> arrow_lite stream", rc == 0, f"verify returned {rc}")
 
     print(f"all pyarrow round-trips passed (pyarrow {pa.__version__})")
 

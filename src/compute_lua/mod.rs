@@ -1,20 +1,20 @@
-//! `compute-lua` — embedded Lua scripting, callable from SQL.
+//! `compute_lua` — embedded Lua scripting, callable from SQL.
 //!
-//! ## The one rule that matters most in this crate: batch, not per-row
+//! ## The one rule that matters most in this module: batch, not per-row
 //! Scripts must be handed a whole column (or window) as a single array
 //! per call, and iterate over it themselves inside Lua. Do NOT design an
 //! API that calls into Lua once per row — that throws away interpreter
 //! call overhead savings and defeats the entire point of pairing Lua with
-//! a columnar, vectorized storage engine. If the public API of this crate
+//! a columnar, vectorized storage engine. If the public API of this module
 //! makes it easy to accidentally call per-row, that's a design bug, fix
 //! the API shape, not the caller's usage.
 //!
 //! ## Zero-copy buffer views: this is real, not hand-waved
 //! Scripts reach the engine's buffers through userdata views: the
-//! userdata wraps the live arrow-lite buffer pointer and its accessors
+//! userdata wraps the live arrow_lite buffer pointer and its accessors
 //! are implemented on the Rust side, so no bytes are copied — access is
 //! zero-copy, though each element read is a metamethod dispatch, not a
-//! compiled raw load. The ops in `compute-linalg` (multiplication-class)
+//! compiled raw load. The ops in `compute_linalg` (multiplication-class)
 //! and the engine's own curated statistics are exposed to
 //! scripts as registered functions over those same views, sharing
 //! buffers, not copying between them. Lua 5.4's integer/float number
@@ -43,7 +43,7 @@
 //! - **WASM (future, not current milestone):** `lua.wasm`
 //!   (github.com/andy-emerson/lua-wasi) — also Lua 5.4, so both targets
 //!   share one language semantics and one C API. Both backends sit
-//!   behind the same trait; nothing above this crate should need to know
+//!   behind the same trait; nothing above this module should need to know
 //!   which one is active.
 //!
 //! ## Pure-Lua libraries: yes. Compiled C extensions: no.

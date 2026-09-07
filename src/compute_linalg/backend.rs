@@ -5,7 +5,7 @@
 //! honestly, inputs are borrowed column-major slices, and it never
 //! clobbers a caller's buffer (these routines write only their output
 //! argument). The executor does **not** call these yet — wiring them
-//! into query inner loops is profiling-gated, per the crate docs, and
+//! into query inner loops is profiling-gated, per the module docs, and
 //! lands only with a number that asks for it.
 //!
 //! ## Why `dot` is a plain loop and the matrix ops are faer
@@ -247,7 +247,7 @@ mod measure_kernels {
     //! Run explicitly, in release:
     //!
     //! ```text
-    //! cargo test -p compute-linalg --release measure_kernels -- --ignored --nocapture
+    //! cargo test --release measure_kernels -- --ignored --nocapture
     //! ```
 
     use super::*;

@@ -44,8 +44,8 @@
 //! every `w` steps, the engine's incremental-window discipline — never
 //! the plain cumsum idiom, which is the catastrophic-cancellation form
 //! the engine rejected. The dispersion pair additionally accumulates
-//! about a **shift taken from the data**, for the same reason
-//! `engine`'s pair statistics do.
+//! about a **shift taken from the data**, for the same reason the
+//! engine's pair statistics (`table::ShiftedMoments`) do.
 //!
 //! ## The series transforms (M5.0)
 //!
@@ -699,7 +699,7 @@ unsafe extern "C" fn rolling(state: *mut ffi::lua_State) -> c_int {
 /// functions (M5.0). O(n), one add and one remove per step.
 ///
 /// Deviations are accumulated **about a shift taken from the data**,
-/// exactly as `engine`'s `ShiftedMoments` does for the pair
+/// exactly as the engine's `table::ShiftedMoments` does for the pair
 /// statistics, and for the same reason: `E[x²] − E[x]²` over raw
 /// values is the catastrophic form (it cancels away the answer when
 /// the data sits at a large offset), while the same expression over

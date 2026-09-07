@@ -5,7 +5,7 @@
 //! storage — the buffer validates and accumulates arriving rows, the
 //! segment is the immutable unit readers see. The layers above (the
 //! on-disk format, the backend trait, tombstones, compaction, the WAL)
-//! are built; see the crate docs for the full scope.
+//! are built; see the `storage_lite` module docs for the full scope.
 //!
 //! What this layer holds to:
 //!
@@ -583,7 +583,7 @@ impl Segment {
     }
 
     /// Wraps an already-built batch as a free-standing segment — the
-    /// doorway `query-lite`'s join uses to run the single-table pipeline
+    /// doorway `query_lite`'s join uses to run the single-table pipeline
     /// over a joined intermediate. Zone maps are computed; the row-id
     /// base is 0 (these rows are query-lifetime, not stored).
     pub fn from_batch(batch: RecordBatch, ordering_key: usize, ordered: bool) -> Segment {

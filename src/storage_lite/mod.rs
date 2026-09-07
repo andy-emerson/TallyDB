@@ -1,13 +1,13 @@
-//! `storage-lite` — append-optimized, ordered, columnar storage.
+//! `storage_lite` — append-optimized, ordered, columnar storage.
 //!
 //! This is TallyDB's most original piece of engineering: no existing
 //! mature project shares this exact combination of assumptions, so there
-//! is no differential oracle to test against here (unlike `query-lite`,
+//! is no differential oracle to test against here (unlike `query_lite`,
 //! which can diff against DuckDB/DataFusion). Correctness rests entirely
-//! on this crate's own test suite. Take that seriously — write the tests
+//! on this module's own test suite. Take that seriously — write the tests
 //! before or alongside the implementation, not after.
 //!
-//! ## The three assumptions, as they apply to this crate
+//! ## The three assumptions, as they apply to this module
 //! 1. **Append-optimized.** The write path is a cheap, low-latency append
 //!    of one row at a time. Whether the in-memory write buffer is
 //!    literally row-major or a set of column arrays appended at the tail
@@ -22,8 +22,8 @@
 //!    delta-of-delta compression exploits it to shrink ordered columns. This
 //!    is why "ordered" is load-bearing: lose the clustering and both pruning
 //!    and compression collapse.
-//! 3. **Numeric-or-key.** Every column here is an `arrow-lite` column —
-//!    numeric (`f64` or `i64`) or key, nothing else. This crate should never
+//! 3. **Numeric-or-key.** Every column here is an `arrow_lite` column —
+//!    numeric (`f64` or `i64`) or key, nothing else. This module should never
 //!    need to know about a third type; if it looks like it does, that's a
 //!    signal something is wrong upstream, not a reason to add one here.
 //!
@@ -75,7 +75,7 @@
 //! revision (#87) — an additive format step, not a partial-read path
 //! bolted onto this one.
 //!
-//! ## Scope for this crate
+//! ## Scope for this module
 //! Built: the write buffer and append path ([`mem`]), the multi-segment
 //! per-table [`store::Store`] with internal row ids, the deterministic
 //! golden-locked on-disk format with zone maps and per-column codec
@@ -95,16 +95,16 @@
 //! its configured sync level guards the write buffer;
 //! [`store::Store::flush`] makes segments; under `WalSync::Off` the
 //! flush is the boundary. (Zone maps feed query-time pruning in
-//! `query-lite`.)
+//! `query_lite`.)
 //!
 //! The general-`f64` codec (#30) is no longer ahead: ALP shipped
 //! 2026-07-29, and the raw fallback behind the tag is now the floor
 //! rather than the answer.
 //!
-//! ## Explicitly NOT in scope for this crate
-//! No SQL, no query planning — that's `query-lite`. No schema-level
-//! type decisions — that's `engine`. No linear algebra/Lua — that's the compute
-//! crates.
+//! ## Explicitly NOT in scope for this module
+//! No SQL, no query planning — that's `query_lite`. No schema-level
+//! type decisions — that's the crate root ([`crate::Table`]). No linear
+//! algebra/Lua — that's the compute modules.
 
 pub mod alp;
 pub mod codec;

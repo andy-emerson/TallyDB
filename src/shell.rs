@@ -1,8 +1,8 @@
-//! `tallydb-shell` — the console over the engine: the *shell* layer of
+//! `shell` — the console over the engine: the *shell* layer of
 //! the shell / security / systems separation (#39, ruled 2026-07-27).
 //!
 //! The engine is the *systems* layer and stays dependency-clean; this
-//! crate owns the human-facing conveniences (line editing, CSV import,
+//! module owns the human-facing conveniences (line editing, CSV import,
 //! table rendering) and the *security* measures a **local** attack
 //! surface calls for: a process lock on the storage directory, table
 //! names confined to identifiers (no path tricks), and no code

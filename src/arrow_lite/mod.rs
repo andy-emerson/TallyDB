@@ -1,7 +1,7 @@
-//! `arrow-lite` — hand-rolled, Arrow-layout-compatible columnar in-memory
+//! `arrow_lite` — hand-rolled, Arrow-layout-compatible columnar in-memory
 //! format.
 //!
-//! ## Why this crate exists
+//! ## Why this module exists
 //! TallyDB's numeric-or-key invariant means every value column is a flat,
 //! fixed-width buffer. If that layout matches Apache Arrow's columnar spec,
 //! the *same bytes* serve three consumers with zero copying: compute (raw
@@ -16,14 +16,14 @@
 //! We implement the layout ourselves rather than wrapping `arrow-array`/
 //! `arrow-buffer`. Reasons: the subset we need is tiny and Arrow's layout
 //! spec is frozen; arrow-rs is a large, fast-churning dependency sitting
-//! under every other crate; and the two-variant wrapper layer must exist
+//! under every other module; and the two-variant wrapper layer must exist
 //! either way (arrow-rs happily builds string columns, so it could never be
 //! the public type). The risk this buys — hand-written unsafe C Data
 //! Interface export (release callbacks, LSB bitmaps, buffer counts, format
 //! strings) — is narrow and cold, and is covered by **round-trip tests
 //! against arrow-rs and PyArrow as dev-only oracles** (build → export →
 //! import with the real implementation → diff, and the reverse). They play
-//! the same role DuckDB plays for `query-lite`: validate our output in
+//! the same role DuckDB plays for `query_lite`: validate our output in
 //! tests, never linked at runtime.
 //!
 //! ## The pieces
@@ -36,15 +36,15 @@
 //!   kernel-ready by construction. The ordering key is always `NOT NULL`.
 //! - **`Bitmap` as a first-class shared type:** LSB-ordered per Arrow, with
 //!   and/or/not, popcount, and set-bit iteration. Used for validity here,
-//!   for row selections in `query-lite` (WHERE, dictionary-LIKE bitmaps),
-//!   and plausibly for tombstone masks in `storage-lite` — one
+//!   for row selections in `query_lite` (WHERE, dictionary-LIKE bitmaps),
+//!   and plausibly for tombstone masks in `storage_lite` — one
 //!   implementation, shared by all three.
 //! - **Key columns:** `u32` dictionary codes per row (u32 only — no u64
 //!   variant) plus an interning table of distinct values.
 //! - **Views:** zero-copy slices (offset + length) over any column —
 //!   Arrow-native offsets. The general slicing surface of the format;
 //!   note the engine's window executor currently feeds compute through
-//!   raw value slices directly, so nothing above this crate calls the
+//!   raw value slices directly, so nothing above this module calls the
 //!   view types today (kept as format surface, on the record).
 //! - **Logical-type annotations:** an optional tag (`Timestamp(ns)`,
 //!   `Decimal64(scale)`) over the same physical `i64` buffer, consulted
@@ -65,8 +65,8 @@
 //! not a key.
 //!
 //! ## What NOT to pull in or build
-//! - No `arrow-compute`, no `datafusion` — this crate is the data format
-//!   only. Compute lives in `compute-*`; execution lives in `query-lite`.
+//! - No `arrow-compute`, no `datafusion` — this module is the data format
+//!   only. Compute lives in `compute_*`; execution lives in `query_lite`.
 //! - No Arrow IPC / Flight / Parquet — the C Data Interface is the entire
 //!   interop surface. File formats are the application's job via ecosystem
 //!   tools that already speak C-Data.

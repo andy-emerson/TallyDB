@@ -1,9 +1,9 @@
-//! `compute-linalg` — multiplication-class linear algebra, callable from
-//! the query executor and from `compute-lua`. Pure Rust, no system
+//! `compute_linalg` — multiplication-class linear algebra, callable from
+//! the query executor and from `compute_lua`. Pure Rust, no system
 //! library.
 //!
 //! ## Scope: multiplication-class primitives only
-//! This crate wraps dot products, matrix–vector, and matrix–matrix
+//! This module wraps dot products, matrix–vector, and matrix–matrix
 //! products, and nothing else. The analytical solves and decompositions —
 //! least squares, symmetric eigendecomposition, general solve, Cholesky —
 //! are solver-class and do not live here: every statistic the engine
@@ -12,14 +12,14 @@
 //! that arithmetic at window scale. The one solve TallyDB carries — an
 //! interim bridge until MatLua's endpoints land (#90, F2(c),
 //! 2026-08-03; the MatLua ruling stands) — is a fixed-size `K × K`
-//! Cholesky in `tallydb::multifactor` — deliberately not behind this crate's trait, because it
+//! Cholesky in the private `multifactor` module — deliberately not behind this module's trait, because it
 //! needs no backend negotiation and putting it here would turn a
 //! private detail into a general solver surface. A solver-class
 //! *dependency* still returns only when an op needs more than that — and the measured candidate for that day is faer's
-//! own solvers, already this crate's kernel source. See DESIGN.md,
+//! own solvers, already this module's kernel source. See DESIGN.md,
 //! *Curated compute: what the engine calls, and why*.
 //!
-//! Keeping this crate's scope narrow is still the point: having fast
+//! Keeping this module's scope narrow is still the point: having fast
 //! products is necessary but not sufficient, and "we have the kernels"
 //! is not "we're done."
 //!
@@ -31,7 +31,7 @@
 //! runtime-dispatched SIMD kernel guarantees (see `backend`). Because
 //! all of it is Rust, the same implementation compiles for native and
 //! wasm32 — there is no separate WASM backend to build, and no system
-//! BLAS to install, link, or version. (The predecessor of this crate
+//! BLAS to install, link, or version. (The predecessor of this module
 //! linked system BLAS via FFI; the swap was measured, not assumed —
 //! faer met or beat reference BLAS at every multiplication shape the
 //! engine could plausibly run, and the decision record lives in
@@ -59,14 +59,14 @@
 //! No solver-class routines *here*. No autodiff. No general tensor
 //! operations.
 //!
-//! This crate stays multiplication-class. The one solve TallyDB
+//! This module stays multiplication-class. The one solve TallyDB
 //! carries — a fixed-size symmetric `K × K` Cholesky for the rolling
 //! multi-factor fit, an interim bridge until MatLua's endpoints land
 //! (#90, F2(c), 2026-08-03) — deliberately does **not** live behind
 //! this trait: it is a few dozen lines operating on
 //! moments the window layer already maintains, it needs no backend
 //! negotiation, and putting it here would turn a private detail into a
-//! general solver surface. See `tallydb::multifactor`.
+//! general solver surface. See the `multifactor` module.
 
 pub mod backend;
 

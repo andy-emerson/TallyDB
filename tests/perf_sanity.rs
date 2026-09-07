@@ -3,7 +3,7 @@
 //! increment where it happened. Run explicitly, in release mode:
 //!
 //! ```text
-//! cargo test -p engine --release --test perf_sanity -- --ignored --nocapture
+//! cargo test --release --test perf_sanity -- --ignored --nocapture
 //! ```
 //!
 //! The numbers printed are Observed evidence (one machine, one run) —

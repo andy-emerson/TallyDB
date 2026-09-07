@@ -1,4 +1,4 @@
-//! SQL-in-Lua over a [`Database`]: the engine half of `compute-lua`'s
+//! SQL-in-Lua over a [`Database`]: the engine half of `compute_lua`'s
 //! driver seam (#70). [`Database::run_script`] runs a Lua chunk whose
 //! `query(sql)` and `append(table, row)` reach this database — the
 //! script issues SQL, receives result columns as views, and feeds

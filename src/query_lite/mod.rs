@@ -1,4 +1,4 @@
-//! `query-lite` — scoped SQL parsing and execution over `storage-lite`.
+//! `query_lite` — scoped SQL parsing and execution over `storage_lite`.
 //!
 //! ## Parsing: taken as-is
 //! Use `sqlparser-rs` for parsing. Do not write a parser from scratch and
@@ -6,10 +6,10 @@
 //! narrow-purpose dependency, exactly the kind of thing this project takes
 //! whole rather than reimplementing (see DESIGN.md, "Design philosophy").
 //! We use a *subset* of what it can parse; the subsetting happens in what
-//! AST nodes this crate's executor handles, not in the parser itself.
+//! AST nodes this module's executor handles, not in the parser itself.
 //!
 //! ## Execution: original work, validated against an oracle
-//! The executor (turning a parsed AST into results over `storage-lite`
+//! The executor (turning a parsed AST into results over `storage_lite`
 //! data) is our own code — DataFusion's executor is deliberately NOT
 //! vendored, because its useful parts are coupled to its own general
 //! planner (see DESIGN.md). Instead, DuckDB is used as a **differential
@@ -18,13 +18,13 @@
 //! primary because it has the broadest standard analytic-SQL semantics
 //! (windows, statistical aggregates).
 //!
-//! That differential does **not** live in this crate. It runs from
-//! Python against the `engine` cdylib — `crates/engine/tests/
+//! That differential does **not** live in this module. It runs from
+//! Python against the crate's shared library — `tests/
 //! m2_differential_oracle.py` and its siblings — because an oracle
 //! should exercise the whole vertical slice (storage round trip, Arrow
-//! export) rather than this crate's internals, and because keeping
+//! export) rather than this module's internals, and because keeping
 //! DuckDB out of the dependency graph entirely is a deliberate choice,
-//! not an oversight. This crate's own tests cover planning and
+//! not an oversight. This module's own tests cover planning and
 //! execution units; the cross-checks are external, and that split is
 //! the correctness strategy.
 //!
@@ -40,8 +40,8 @@
 //! joins, window functions, `CREATE TABLE` / `INSERT` (lowered here,
 //! executed by the
 //! embedder), and `UPDATE` / `DELETE` (implemented as tombstone +
-//! reinsert against `storage-lite`, not a separate mutation path — see
-//! that crate's docs). Concretely out of scope for now: general
+//! reinsert against `storage_lite`, not a separate mutation path — see
+//! that module's docs). Concretely out of scope for now: general
 //! subqueries/CTEs, string-*producing* functions (`SUBSTRING`, `CONCAT`,
 //! `CAST AS VARCHAR`, `GROUP_CONCAT` — a produced string is a value that is
 //! neither numeric nor key), and a cost-based join planner beyond
@@ -67,7 +67,7 @@
 //! workload (rolling aggregates over ordered numeric data) and deserve
 //! first-class, hand-written implementations here — not a generic,
 //! bolted-on afterthought. Where a window function's inner loop is
-//! numeric-heavy, this is exactly the shape of work `compute-linalg` is
+//! numeric-heavy, this is exactly the shape of work `compute_linalg` is
 //! built to accelerate; keep that seam in mind rather than reimplementing
 //! matrix-shaped math by hand.
 

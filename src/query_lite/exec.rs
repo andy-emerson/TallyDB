@@ -3,9 +3,9 @@
 //! ## The compute seam
 //!
 //! Window-aggregate *implementations* are not defined here. The embedder
-//! (`engine`) registers them in a [`Registry`] — that is how compute
-//! (regressions, pair statistics, Lua kernels) reaches SQL while this crate
-//! stays compute-free. An implementation sees plain `&[f64]` window
+//! — [`crate::Table`], at the crate root — registers them in a
+//! [`Registry`]; that is how compute (regressions, pair statistics, Lua
+//! kernels) reaches SQL while this module stays compute-free. An implementation sees plain `&[f64]` window
 //! slices and returns one value per window (`None` for windows where the
 //! aggregate is undefined — too few rows, degenerate inputs — which
 //! surfaces as SQL `NULL`, matching standard aggregate semantics).

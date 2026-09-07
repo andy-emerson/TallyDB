@@ -3,8 +3,8 @@
 //!
 //! A [`Table`] owns the whole pipeline for its rows: schema definition
 //! (numeric-or-key and the declared `NOT NULL` ordering key, enforced at
-//! definition time), one-row-at-a-time ingest through `storage-lite`'s
-//! multi-segment [`Store`], SQL through `query-lite`, the rolling
+//! definition time), one-row-at-a-time ingest through `storage_lite`'s
+//! multi-segment [`Store`], SQL through `query_lite`, the rolling
 //! regressions and pair statistics registered as the window functions
 //! `regr_slope(y, x)` / `regr_intercept(y, x)`, and application-
 //! registered Lua window kernels via `Table::register_lua_window`
@@ -165,7 +165,7 @@ pub struct Table {
     /// registration never mutates what a reader already holds.
     registry: Arc<Mutex<Arc<Registry>>>,
     /// Where Lua kernels' `log(...)` goes — `None` (the default) keeps
-    /// `log` a no-op, per compute-lua's off-by-default contract. Applies
+    /// `log` a no-op, per compute_lua's off-by-default contract. Applies
     /// to kernels registered *after* it is set.
     #[cfg(feature = "lua")]
     lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
@@ -401,7 +401,7 @@ impl Table {
 
     #[cfg(feature = "lua")]
     /// Installs the destination for Lua kernels' `log(...)` output.
-    /// Until an embedder calls this, `log` is a no-op (compute-lua's
+    /// Until an embedder calls this, `log` is a no-op (compute_lua's
     /// off-by-default contract); afterwards, every *newly registered*
     /// kernel routes through the sink — install before registering.
     pub fn set_lua_log_sink(&mut self, sink: Arc<dyn LogSink + Sync>) {
@@ -582,7 +582,7 @@ impl Table {
 
     /// Runs one SQL query and exports the result as an
     /// `ArrowArrayStream` — one batch per segment, through the same
-    /// doorway `arrow-lite`'s oracle harness proved against arrow-rs and
+    /// doorway `arrow_lite`'s oracle harness proved against arrow-rs and
     /// PyArrow.
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
@@ -728,7 +728,7 @@ impl Table {
     /// parameter names, a key-typed output.
     ///
     /// Kernels can call the curated native ops over the same views —
-    /// `dot(x, y)` (compute-linalg), `regr_slope(y, x)` / `regr_intercept(y, x)`,
+    /// `dot(x, y)` (compute_linalg), `regr_slope(y, x)` / `regr_intercept(y, x)`,
     /// `covar_pop(y, x)` / `corr(y, x)` / `eigen_max(y, x)` — the very
     /// implementations the SQL windows run, sharing buffers with no
     /// copy; each returns a number, or `NULL` where undefined.
@@ -4227,7 +4227,7 @@ mod measure_incremental_windows {
     //! Run explicitly, in release:
     //!
     //! ```text
-    //! cargo test -p engine --release measure_3b -- --ignored --nocapture
+    //! cargo test --release measure_3b -- --ignored --nocapture
     //! ```
 
     use super::window_truth::{corpora, high_precision, stats_from, Stats};

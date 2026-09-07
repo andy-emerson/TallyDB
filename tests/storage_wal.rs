@@ -449,7 +449,7 @@ fn the_fs_backend_recovers_the_same_way() {
 /// append path. Ratios within one run are the durable numbers.
 ///
 /// ```text
-/// cargo test -p storage-lite --release --test wal measure -- --ignored --nocapture
+/// cargo test --release --test storage_wal measure -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "measurement — run explicitly in release mode"]
@@ -514,7 +514,7 @@ fn measure_wal_regimes() {
 /// Ratios within one run are the durable numbers.
 ///
 /// ```text
-/// cargo test -p storage-lite --release --test wal measure_ingest_headroom -- --ignored --nocapture
+/// cargo test --release --test storage_wal measure_ingest_headroom -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "measurement — run explicitly in release mode"]

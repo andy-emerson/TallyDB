@@ -1,6 +1,6 @@
 //! The Arrow C Data Interface: how batches leave and enter the engine.
 //!
-//! This is the crate's unsafe core and its *entire* interop surface — no
+//! This is `arrow_lite`'s unsafe core and its *entire* interop surface — no
 //! IPC, no Flight, no Parquet (settled no). Three ABI structs cross the
 //! boundary: [`ArrowSchema`] (type description), [`ArrowArray`] (data),
 //! and [`ArrowArrayStream`] (a pull-based stream of batches, matching
@@ -52,7 +52,7 @@ pub struct ArrowSchema {
     pub format: *const c_char,
     /// Field name, or null.
     pub name: *const c_char,
-    /// Binary metadata, or null (this crate emits none).
+    /// Binary metadata, or null (`arrow_lite` emits none).
     pub metadata: *const c_char,
     /// Bit flags (`ARROW_FLAG_*`).
     pub flags: i64,
@@ -672,7 +672,7 @@ unsafe fn parse_field(child: &ArrowSchema) -> Result<Field, ImportError> {
     Ok(field)
 }
 
-/// Parses `d:precision,scale,bitwidth`; only the exact shape this crate
+/// Parses `d:precision,scale,bitwidth`; only the exact shape this module
 /// exports (`d:18,s,64`) is accepted.
 fn parse_decimal(format: &str) -> Result<LogicalType, ImportError> {
     let parts: Vec<&str> = format[2..].split(',').collect();

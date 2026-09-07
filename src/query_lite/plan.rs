@@ -764,7 +764,7 @@ pub struct ColumnSpec {
     /// The column name.
     pub name: String,
     /// `"BIGINT"`, `"DOUBLE"`, or `"SYMBOL"` — resolved to the engine's
-    /// column types by the embedder (query-lite stays schema-agnostic).
+    /// column types by the embedder (query_lite stays schema-agnostic).
     pub type_name: String,
     /// `NOT NULL` present (the ordering key implies it).
     pub not_null: bool,

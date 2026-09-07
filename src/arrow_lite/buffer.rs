@@ -3,12 +3,12 @@
 //!
 //! ## Why not `Vec<T>`
 //!
-//! `Vec` aligns to the element type (8 bytes for `f64`/`i64`); this crate's
+//! `Vec` aligns to the element type (8 bytes for `f64`/`i64`); `arrow_lite`'s
 //! contract promises 64-byte alignment so the same buffer is cache-line
 //! clean for numeric kernels and matches Arrow's recommended allocation
 //! alignment. [`Buffer`] is the one place that owns that promise — a small
 //! `Vec` work-alike over a 64-byte-aligned allocation. All other unsafe in
-//! this crate should stay confined to this module and the C Data Interface.
+//! `arrow_lite` should stay confined to this module and the C Data Interface.
 //!
 //! ## Sharing: clone is O(1), mutation copies on write
 //!

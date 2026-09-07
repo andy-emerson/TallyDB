@@ -1,6 +1,6 @@
 //! The safe wrapper over the thin bindings: an embedded interpreter
 //! whose scripts see engine columns through the value map (`values`).
-//! The module discipline is fixed and does not change as the crate
+//! The module discipline is fixed and does not change as the module
 //! grows:
 //!
 //! 1. Every entry into Lua goes through `lua_pcall` — nothing runs
@@ -10,7 +10,7 @@
 //!    only `Copy` locals, and `lua_error` is the tail call.
 //! 3. The boundary never propagates a Rust panic into C.
 //!
-//! ## The views (the crate's reason to exist)
+//! ## The views (the module's reason to exist)
 //!
 //! A view userdata holds pointers into live engine buffers — a handful
 //! of bytes of handle; **zero bytes of data move**. Scripts index views
@@ -173,7 +173,7 @@ impl LuaState {
 
     /// Registers an engine-side operation as the global `name`,
     /// callable from scripts over zero-copy views — the seam the
-    /// curated `compute-linalg` and engine ops are exposed through. See
+    /// curated `compute_linalg` and engine ops are exposed through. See
     /// [`HostFunction`]. A second registration under the
     /// same name replaces the first (the old function's storage is
     /// retained until the state drops).
@@ -507,7 +507,7 @@ mod tests {
     //! The value-map contract, unit-proven: round-trip fidelity across
     //! all three column types, three-valued logic through the sentinel,
     //! loud coercion at every boundary the contract closes, and the
-    //! zero-copy and lifetime properties the crate exists for.
+    //! zero-copy and lifetime properties the module exists for.
 
     use super::*;
     use crate::arrow_lite::{Bitmap, Dictionary};
@@ -1677,7 +1677,7 @@ mod tests {
     /// kernel (mean absolute deviation, a loop the built-ins don't
     /// cover) over a 4,096-row window — the Observed number feeding
     /// future promote-to-native-op decisions. Run with
-    /// `cargo test -p compute-lua --release -- --ignored measure_41`.
+    /// `cargo test --release -- --ignored measure_41`.
     #[test]
     #[ignore = "measurement, not a check: run explicitly in release"]
     fn measure_41_interpreter_kernel_cost() {
@@ -1716,7 +1716,7 @@ mod tests {
     /// a full output column in ONE call, against the per-row
     /// anti-pattern producing the same column in N calls, with a
     /// native-Rust floor for context. Run:
-    ///   `cargo test -p compute-lua --release -- --ignored measure_vectorized`
+    ///   `cargo test --release -- --ignored measure_vectorized`
     #[test]
     #[ignore = "measurement, not a check: run explicitly in release"]
     fn measure_vectorized_udf_vs_per_row() {

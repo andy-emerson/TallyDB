@@ -1,13 +1,19 @@
-//! `engine` — ties storage, query, and compute together; owns the
-//! numeric-or-key schema invariant.
+//! `tallydb` — an embeddable, append-optimized, ordered, columnar
+//! time-series database for numeric data: SQL over Arrow-layout buffers,
+//! curated statistics, and (behind the `lua` feature) Lua kernels
+//! callable from queries. The crate root ties storage, query, and
+//! compute together and owns the numeric-or-key schema invariant; the
+//! parts are its modules — [`arrow_lite`], [`storage_lite`],
+//! [`query_lite`], [`compute_linalg`], and `compute_lua` — each
+//! documented at its own root.
 //!
 //! ## This crate's one non-negotiable job
 //! Enforce numeric-or-key as a **hard** schema constraint. A column is
 //! either numeric (`f64` or `i64`) or a dictionary-encoded key; anything
 //! that can't be classified as one of those is rejected at schema-definition
 //! time, not silently coerced, not stored as a third type "just this
-//! once." Every other crate in this workspace assumes this invariant
-//! already holds by the time data reaches them — this is the one place
+//! once." Every other module in this crate assumes this invariant
+//! already holds by the time data reaches it — this is the one place
 //! that's actually responsible for making that true. Do not weaken this
 //! to unblock a feature; if something seems to need a third column type,
 //! that's a signal to stop and reconsider the feature, not the invariant.
@@ -17,27 +23,29 @@
 //!
 //! ## The ordering key
 //! The schema also declares the **ordering key** — the column ingest arrives
-//! roughly sorted on, that `storage-lite` partitions and builds zone maps on.
+//! roughly sorted on, that `storage_lite` partitions and builds zone maps on.
 //! It is usually a timestamp but need not be (any monotonic-on-ingest numeric
 //! key works). Treat it as a declared property of the schema, not a hardcoded
 //! "time" column.
 //!
-//! ## What this crate is
+//! ## What the crate root is
 //! The public entry point: schema definition/validation, wiring
-//! `storage-lite` + `query-lite` together, and exposing the compute
-//! backends (`compute-lua`, `compute-linalg`) to SQL as callable
-//! functions. Application code depends on this crate, not on the
-//! lower-level crates directly.
+//! `storage_lite` + `query_lite` together, and exposing the compute
+//! backends (`compute_lua`, `compute_linalg`) to SQL as callable
+//! functions. Application code reaches the engine through [`Database`]
+//! and [`Table`] and the re-exports beside them; the modules are `pub`
+//! because the API names their types — a schema is an
+//! [`arrow_lite::Schema`], a row a [`RowValue`].
 //!
 //! ## Compute backend selection
-//! `compute-linalg` is consumed here through its trait interface (see that
-//! crate), not through a concrete type; `compute-lua` sits behind the
+//! `compute_linalg` is consumed here through its trait interface (see that
+//! module), not through a concrete type; `compute_lua` sits behind the
 //! **non-default `lua` feature** (the console enables it; a library
 //! embedder who never asks for an interpreter carries neither the
 //! vendored C nor its CI surface — DESIGN.md, *the extension model*,
 //! ruled 2026-07-28) and is consumed as its concrete native state (its
 //! backend trait is extracted when the WASM backend starts — see that
-//! crate's docs). The primary extension path — [`WindowAggregate`] via
+//! module's docs). The primary extension path — [`WindowAggregate`] via
 //! [`Table::register_window`] — needs no feature at all. Right now the
 //! implementations (vendored Lua 5.4, pure-Rust linear algebra) are the only
 //! ones that exist — but this crate should never hardcode that
@@ -46,7 +54,7 @@
 //! concrete type is actually needed, not throughout this crate's logic.
 //! Route compute calls so that a backend reporting an op as unavailable
 //! surfaces as a clean "unsupported here" error, not a panic — the
-//! compute crates expose that capability signal on their traits.
+//! compute modules expose that capability signal on their traits.
 //!
 //! ## No LAPACK on the query path
 //! Every window function this crate registers **in SQL** is solved in
@@ -122,7 +130,7 @@ pub use view::MaterializedView;
 // registration, not by editing the Lua binding: the vocabulary
 // invariant makes every registered op reachable from a kernel.
 //
-// TODO: expose the remaining compute-linalg (multiplication-class) ops as
+// TODO: expose the remaining compute_linalg (multiplication-class) ops as
 //       callable SQL functions, with backend-capability errors surfaced
 //       cleanly (not panics)
 // (#53 closed in M4.2: registered column functions — native trait and

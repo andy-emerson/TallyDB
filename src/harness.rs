@@ -2,8 +2,8 @@
 //!
 //! Compiled only under the `oracle-harness` feature so the scripts in
 //! `tests/` can drive the engine from Python: build with `cargo build
-//! -p engine --features oracle-harness`, then run a script against
-//! `target/debug/libengine.so`. Every hook here is called by name from
+//! --features oracle-harness`, then run a script against
+//! `target/debug/libtallydb.so`. Every hook here is called by name from
 //! one of them — `m1_slice_oracle`, `m2_mutation_oracle`,
 //! `m2_differential_oracle`, `m2_lua_window_oracle` (which also covers
 //! the SQL-in-Lua driver pipeline), `m4_asof_oracle`,

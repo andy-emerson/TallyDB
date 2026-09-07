@@ -282,7 +282,7 @@ mod tests {
     /// corpus). Run explicitly, in release mode:
     ///
     /// ```text
-    /// cargo test -p storage-lite --release codec::tests::measure_29 \
+    /// cargo test --release storage_lite::codec::tests::measure_29 \
     ///   -- --ignored --nocapture
     /// ```
     #[test]

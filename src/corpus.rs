@@ -9,8 +9,9 @@
 //! on every platform — which is what lets measurements cite a corpus
 //! instead of a lost one-off dataset.
 //!
-//! This crate is dev-only infrastructure (`publish = false`, no
-//! dependencies): the engine never links it. It grows two ways, per the
+//! This module is test infrastructure, compiled under `cfg(test)` and the
+//! `oracle-harness` feature and never in a default or published build —
+//! the engine never links it. It grows two ways, per the
 //! design: new capabilities add case families, and every closed bug adds
 //! the case that would have caught it.
 //!
@@ -172,7 +173,7 @@ impl Spec {
 }
 
 /// SplitMix64: tiny, well-studied, and exactly reproducible everywhere —
-/// the reason this crate needs no RNG dependency.
+/// the reason this module needs no RNG dependency.
 struct SplitMix64(u64);
 
 impl SplitMix64 {

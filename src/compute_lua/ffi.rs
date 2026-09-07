@@ -1,5 +1,5 @@
 //! Hand-rolled declarations for the slice of the Lua 5.4 C API this
-//! crate uses (issue #5's ruling: no binding dependency; the spec is
+//! module uses (issue #5's ruling: no binding dependency; the spec is
 //! the Lua 5.4 reference manual, and the vendored interpreter built
 //! with `LUA_USE_APICHECK` asserts on misuse in test builds).
 //!

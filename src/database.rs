@@ -923,7 +923,7 @@ mod join_tests {
         // is the latest-KNOWN version — so correcting the LOSER of a
         // tie makes its corrected form win (its rebirth is the newest
         // knowledge), and compaction must never change the answer. The
-        // discriminating storage-vs-sequence case lives in query-lite
+        // discriminating storage-vs-sequence case lives in query_lite
         // (segments built with the orders disagreeing); this is the
         // end-to-end belt over real ingest, correction, and compaction.
         let mut db = asof_database();

@@ -2,8 +2,8 @@
 //! spec.
 //!
 //! One implementation serves three consumers: validity sidecars on nullable
-//! columns (here), row selections in `query-lite` (WHERE results,
-//! dictionary-LIKE matches), and likely tombstone masks in `storage-lite`.
+//! columns (here), row selections in `query_lite` (WHERE results,
+//! dictionary-LIKE matches), and likely tombstone masks in `storage_lite`.
 //!
 //! ## Layout
 //!

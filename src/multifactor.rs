@@ -1225,7 +1225,7 @@ mod measure_multifactor {
     //! frame, and by how much as K grows?
     //!
     //! ```text
-    //! cargo test -p engine --release measure_multifactor -- --ignored --nocapture
+    //! cargo test --release measure_multifactor -- --ignored --nocapture
     //! ```
 
     use super::multifactor_truth::Lcg;

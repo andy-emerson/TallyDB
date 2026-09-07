@@ -1,10 +1,10 @@
 //! `extern "C"` hooks for the PyArrow round-trip script (dev/CI only).
 //!
 //! Compiled only under the `oracle-harness` feature, which exists so
-//! `tests/pyarrow_roundtrip.py` can drive this crate as a shared library:
-//! build with `cargo build -p arrow-lite --features oracle-harness`, then
-//! run the script against `target/debug/libarrow_lite.so`. Nothing here
-//! is part of the engine's API.
+//! `tests/pyarrow_roundtrip.py` can drive `arrow_lite` through the crate's
+//! shared library: build with `cargo build --features oracle-harness`,
+//! then run the script against `target/debug/libtallydb.so`. Nothing here
+//! is part of the crate's API.
 //!
 //! The script and this module agree on two fixtures, defined twice on
 //! purpose — once here, once in Python — so each side is an independent

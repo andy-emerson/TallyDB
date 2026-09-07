@@ -751,7 +751,7 @@ mod tests {
     /// explicitly, in release mode:
     ///
     /// ```text
-    /// cargo test -p storage-lite --release alp::tests::measure_42 \
+    /// cargo test --release storage_lite::alp::tests::measure_42 \
     ///   -- --ignored --nocapture
     /// ```
     #[test]

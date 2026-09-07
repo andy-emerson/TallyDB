@@ -11,11 +11,11 @@
 //!
 //! ## The seam
 //!
-//! This crate stays backend-agnostic: it defines [`ScriptHost`] — the
+//! This module stays backend-agnostic: it defines [`ScriptHost`] — the
 //! two operations a driver script may ask of its embedder — and the
 //! trampolines that expose them as the globals `query` and `append`.
-//! *What* SQL means is the embedder's business (`engine` implements the
-//! trait over its `Database`).
+//! *What* SQL means is the embedder's business (the crate root implements
+//! the trait over its [`Database`](crate::Database)).
 //!
 //! ## The script surface
 //!
