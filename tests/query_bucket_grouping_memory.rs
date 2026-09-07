@@ -17,9 +17,7 @@
 mod common;
 
 use common::peak_of;
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
-use tallydb::query_lite::{execute, plan, Registry};
-use tallydb::storage_lite::{RowValue, SegmentHandle, Store};
+use tallydb::{ColumnType, Field, RowValue, Schema, Table};
 
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
@@ -44,11 +42,11 @@ fn schema() -> Schema {
 /// the midpoint, which leaves the same multiset of rows and the same
 /// buckets but arriving descending — so the segments are not ordered
 /// and the same query must take the hash path.
-fn store(ordered: bool) -> Store {
-    let mut store = Store::with_segment_rows(schema(), 0, 8192).unwrap();
+fn table(ordered: bool) -> Table {
+    let mut table = Table::with_segment_rows("t", schema(), "ts", 8192).unwrap();
     for row in 0..ROWS {
         let ts = if ordered { row } else { ROWS - 1 - row };
-        store
+        table
             .append(&[
                 RowValue::I64(ts),
                 RowValue::Key(SYMBOLS[(row % 8) as usize]),
@@ -56,20 +54,17 @@ fn store(ordered: bool) -> Store {
             ])
             .unwrap();
     }
-    store
+    table
 }
 
 #[test]
 fn a_bucketed_grouping_holds_the_open_bucket_not_the_whole_result() {
-    let registry = Registry::new();
-    let schema = schema();
-    let run = |views: &[SegmentHandle], sql: &str| {
-        let plan = plan(sql).unwrap();
-        let output = execute(&schema, views, &plan, &registry).unwrap();
+    let run = |table: &Table, sql: &str| {
+        let output = table.query(sql).unwrap();
         std::hint::black_box(output.num_rows())
     };
-    let ordered: Vec<SegmentHandle> = store(true).snapshot().unwrap();
-    let disordered: Vec<SegmentHandle> = store(false).snapshot().unwrap();
+    let ordered = table(true);
+    let disordered = table(false);
 
     // The bar query: per symbol, per bucket, four aggregates. Every
     // group's accumulators are live at once on the hash path; only the

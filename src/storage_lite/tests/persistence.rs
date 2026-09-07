@@ -3,12 +3,13 @@
 //! Run against both backends — the contract, not the filesystem, is the
 //! spec.
 
-use std::sync::Arc;
-use tallydb::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
-use tallydb::storage_lite::{
-    encode_segment, FsBackend, IoError, MemBackend, RowValue, StorageBackend, StorageError, Store,
-    StoreOptions, WalSync,
+use crate::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use crate::storage_lite::format::encode_segment;
+use crate::storage_lite::io::{IoError, MemBackend};
+use crate::storage_lite::{
+    FsBackend, RowValue, StorageBackend, StorageError, Store, StoreOptions, WalSync,
 };
+use std::sync::Arc;
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -226,7 +227,8 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         }
         // Rewind the manifest to its pre-records form.
         let manifest =
-            tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+            crate::storage_lite::format::decode_manifest(&backend.read("table.tlym").unwrap())
+                .unwrap();
         assert!(
             !manifest.sections.segments.is_empty(),
             "records were written"
@@ -236,7 +238,7 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         backend
             .write(
                 "table.tlym",
-                &tallydb::storage_lite::encode_manifest(
+                &crate::storage_lite::format::encode_manifest(
                     &manifest.schema,
                     manifest.ordering_key,
                     manifest.generation,
@@ -249,7 +251,7 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
             let reader = Store::open_read_only(backend.clone()).unwrap();
             assert_eq!(reader.live_len(), 4);
             let after =
-                tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap())
+                crate::storage_lite::format::decode_manifest(&backend.read("table.tlym").unwrap())
                     .unwrap();
             assert!(
                 after.sections.segments.is_empty(),
@@ -260,7 +262,8 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
         assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
         let upgraded =
-            tallydb::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+            crate::storage_lite::format::decode_manifest(&backend.read("table.tlym").unwrap())
+                .unwrap();
         assert_eq!(
             upgraded.sections.segments.len(),
             2,
@@ -346,7 +349,7 @@ fn tombstones_survive_reopen() {
             .iter()
             .flat_map(|view| {
                 let view = view.view().unwrap();
-                let tallydb::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+                let crate::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
                     &view.segment.batch().columns()[0]
                 else {
                     panic!("ts type")
@@ -399,7 +402,7 @@ fn a_consumed_coordinate_survives_reopen() {
                 .as_of(cut)
                 .unwrap()
                 .iter()
-                .map(tallydb::storage_lite::SegmentHandle::live_rows)
+                .map(crate::storage_lite::SegmentHandle::live_rows)
                 .sum()
         };
         assert_eq!(live_at(4), 5, "before the kill: five rows, none dead");

@@ -14,7 +14,7 @@
 //! stay in their expected order of magnitude.
 
 use std::time::Instant;
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
+use tallydb::{ColumnType, Field, Schema};
 use tallydb::{RowValue, Table};
 
 const ROWS: i64 = 1_000_000;

@@ -16,10 +16,8 @@
 
 use crate::arrow_lite::{Column, ColumnType, NumericData, Schema};
 use crate::query_lite::{parse_statement, QueryOutput, Statement};
-use crate::{
-    schema_from_create, type_name, Database, LogSink, MaterializedView, RowValue, StoreOptions,
-    Table,
-};
+use crate::table::{schema_from_create, type_name};
+use crate::{Database, LogSink, MaterializedView, RowValue, StoreOptions, Table};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -324,7 +322,10 @@ impl Console {
         }
     }
 
-    fn create_table(&mut self, plan: &crate::query_lite::CreateTablePlan) -> Result<(), String> {
+    fn create_table(
+        &mut self,
+        plan: &crate::query_lite::plan::CreateTablePlan,
+    ) -> Result<(), String> {
         // The security posture of a filesystem-backed console: table
         // names become directory names, so they stay identifiers.
         if !plan

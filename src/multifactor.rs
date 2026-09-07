@@ -352,8 +352,8 @@ pub enum MultiFactorOutput {
 ///
 /// ```
 /// use tallydb::{MultiFactorOutput, MultiFactorRegression, Table};
-/// use tallydb::arrow_lite::{ColumnType, Field, Schema};
-/// use tallydb::storage_lite::RowValue;
+/// use tallydb::{ColumnType, Field, Schema};
+/// use tallydb::RowValue;
 ///
 /// let schema = Schema::new(vec![
 ///     Field::new("ts", ColumnType::I64, false),
@@ -381,7 +381,7 @@ pub enum MultiFactorOutput {
 ///      FROM t",
 /// ).unwrap();
 /// let last = out.batches.last().unwrap();
-/// let tallydb::arrow_lite::Column::Numeric(tallydb::arrow_lite::NumericData::F64(column)) = &last.columns()[0]
+/// let tallydb::Column::Numeric(tallydb::NumericData::F64(column)) = &last.columns()[0]
 /// else { panic!("f64") };
 /// let final_row = column.values().as_slice()[last.num_rows() - 1];
 /// assert!((final_row - 3.0).abs() < 1e-6, "{final_row}");

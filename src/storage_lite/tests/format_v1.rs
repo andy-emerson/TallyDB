@@ -8,11 +8,12 @@
 //! change that moves them is a behavioral change whose review includes
 //! re-blessing `tests/golden/segment_v1.bin`, never a refactor.
 
-use tallydb::arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
-use tallydb::storage_lite::{
-    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError,
-    ManifestSections, RowValue, Segment, SequenceInfo, WriteBuffer,
+use crate::arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
+use crate::storage_lite::format::{
+    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, ManifestSections,
 };
+use crate::storage_lite::mem::WriteBuffer;
+use crate::storage_lite::{RowValue, Segment, SequenceInfo};
 
 /// A fixture exercising every format feature: all three column types, a
 /// logical annotation, nulls (and a nullable column without nulls), an
@@ -412,7 +413,8 @@ fn segment_records_round_trip_with_every_zone_map_and_sequence_shape() {
     // included — that one cannot be compared with `==` (NaN != NaN), so
     // determinism is checked at the byte level: re-encoding the decode
     // reproduces the bytes exactly.
-    use tallydb::storage_lite::{SegmentRecord, SequenceSummary, ZoneMap};
+    use crate::storage_lite::format::{SegmentRecord, SequenceSummary};
+    use crate::storage_lite::ZoneMap;
     let schema = Schema::new(vec![
         Field::new("ts", ColumnType::I64, false),
         Field::new("x", ColumnType::F64, true),

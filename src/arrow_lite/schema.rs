@@ -17,7 +17,7 @@ use crate::arrow_lite::logical::LogicalType;
 /// export annotation.
 ///
 /// ```
-/// use tallydb::arrow_lite::{ColumnType, Field, LogicalType};
+/// use tallydb::{ColumnType, Field, LogicalType};
 ///
 /// let ts = Field::new("ts", ColumnType::I64, false).with_logical(LogicalType::TimestampNs);
 /// assert_eq!(ts.name(), "ts");
@@ -100,7 +100,7 @@ impl Schema {
 /// A schema bound to columns: the unit of data interchange.
 ///
 /// ```
-/// use tallydb::arrow_lite::{
+/// use tallydb::{
 ///     Buffer, Column, ColumnType, Field, KeyColumn, NumericColumn, NumericData, RecordBatch,
 ///     Schema,
 /// };

@@ -10,9 +10,7 @@
 mod common;
 
 use common::peak_of;
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
-use tallydb::query_lite::{execute, plan, Registry};
-use tallydb::storage_lite::{RowValue, SegmentHandle, Store};
+use tallydb::{ColumnType, Field, RowValue, Schema, Table};
 
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
@@ -26,11 +24,11 @@ fn a_bounded_order_by_pays_for_k_not_for_n() {
         Field::new("sym", ColumnType::Key, false),
         Field::new("x", ColumnType::F64, false),
     ]);
-    let mut store = Store::with_segment_rows(schema.clone(), 0, 8192).unwrap();
+    let mut table = Table::with_segment_rows("t", schema, "ts", 8192).unwrap();
     for i in 0..ROWS {
         // A scrambled sort key, so no path can be lucky about order.
         let x = ((i * 2_654_435_761u64 as i64) % 1_000_003) as f64;
-        store
+        table
             .append(&[
                 RowValue::I64(i),
                 RowValue::Key(["A", "B", "C", "D"][(i % 4) as usize]),
@@ -38,11 +36,8 @@ fn a_bounded_order_by_pays_for_k_not_for_n() {
             ])
             .unwrap();
     }
-    let views: Vec<SegmentHandle> = store.snapshot().unwrap();
-    let registry = Registry::new();
     let run = |sql: &str| {
-        let plan = plan(sql).unwrap();
-        let output = execute(&schema, &views, &plan, &registry).unwrap();
+        let output = table.query(sql).unwrap();
         std::hint::black_box(output.num_rows());
     };
     // Warm: first-call allocations (parser tables, dictionaries) are

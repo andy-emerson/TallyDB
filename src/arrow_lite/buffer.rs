@@ -130,7 +130,7 @@ impl<T: Element> Drop for RawBuf<T> {
 /// Clones share the allocation; mutation copies on write.
 ///
 /// ```
-/// use tallydb::arrow_lite::buffer::{Buffer, BUFFER_ALIGN};
+/// use tallydb::{Buffer, BUFFER_ALIGN};
 ///
 /// let mut buf = Buffer::<f64>::new();
 /// buf.extend_from_slice(&[1.0, 2.0, 3.0]);
@@ -333,7 +333,7 @@ impl<T: Element> FromIterator<T> for Buffer<T> {
 /// every row).
 ///
 /// ```
-/// use tallydb::arrow_lite::{Bitmap, NumericColumn};
+/// use tallydb::{Bitmap, NumericColumn};
 ///
 /// let col = NumericColumn::new_non_null([1.5, 2.5].into_iter().collect());
 /// assert_eq!(col.null_count(), 0);

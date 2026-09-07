@@ -379,7 +379,7 @@ impl LuaState {
     /// The data pointer a view userdata carries — the zero-copy proof
     /// hook, compared against the source buffer's pointer in tests
     /// exactly like the engine's passthrough pointer checks.
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn view_data_pointer(&mut self, view_global: &CStr) -> Option<*const u8> {
         unsafe { values::view_data_pointer(self.raw, view_global) }
     }
@@ -2326,7 +2326,7 @@ mod tests {
     /// The prelude's advertised names, read from the crate constant so
     /// the list cannot drift from the source it describes.
     fn compute_lua_prelude_names() -> &'static [&'static str] {
-        crate::compute_lua::PRELUDE_NAMES
+        crate::compute_lua::prelude::PRELUDE_NAMES
     }
 
     /// Expanding means, computed plainly for comparison.

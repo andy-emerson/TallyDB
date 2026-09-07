@@ -524,11 +524,13 @@ impl SegmentHandle {
     }
 
     /// Whether the ordering key arrived non-decreasing.
+    #[cfg(test)]
     pub fn is_ordered(&self) -> bool {
         self.slot.meta().ordered
     }
 
     /// Index of the declared ordering-key column.
+    #[cfg(test)]
     pub fn ordering_key(&self) -> usize {
         self.slot.shared.ordering_key
     }
@@ -560,6 +562,7 @@ impl SegmentHandle {
     }
 
     /// Bit per row, `true` = live; `None` when nothing is tombstoned.
+    #[cfg(test)]
     pub fn live(&self) -> Option<&Bitmap> {
         self.live.as_ref()
     }
@@ -573,6 +576,7 @@ impl SegmentHandle {
     }
 
     /// Whether local row `row` is live.
+    #[cfg(test)]
     pub fn is_live(&self, row: usize) -> bool {
         self.live.as_ref().is_none_or(|mask| mask.get(row))
     }
@@ -589,26 +593,7 @@ impl SegmentHandle {
 
 /// A table's storage: an active write buffer plus frozen segments.
 ///
-/// ```
-/// use tallydb::arrow_lite::{ColumnType, Field, Schema};
-/// use tallydb::storage_lite::{RowValue, Store};
-///
-/// let schema = Schema::new(vec![
-///     Field::new("ts", ColumnType::I64, false),
-///     Field::new("x", ColumnType::F64, false),
-/// ]);
-/// // A tiny threshold so the example spans segments.
-/// let mut store = Store::with_segment_rows(schema, 0, 2).unwrap();
-/// for i in 0..5 {
-///     let id = store.append(&[RowValue::I64(i), RowValue::F64(i as f64)]).unwrap();
-///     assert_eq!(id, i as u64); // row ids are assigned in ingest order
-/// }
-/// let segments = store.snapshot().unwrap();
-/// // Two full segments plus the live buffer's single row.
-/// let rows: Vec<usize> = segments.iter().map(|s| s.rows()).collect();
-/// assert_eq!(rows, [2, 2, 1]);
-/// assert_eq!(segments[2].base_row_id(), 4);
-/// ```
+/// The unit test `a_store_spans_segments_and_assigns_row_ids_in_ingest_order` below is the worked example.
 pub struct Store {
     schema: Schema,
     ordering_key: usize,
@@ -779,7 +764,7 @@ impl Shared {
 /// A cheap, cloneable handle that mints point-in-time snapshots while
 /// the single writer proceeds — the concurrent-reader half of the
 /// single-writer/concurrent-readers cut (#51). `Send`: hand one to a
-/// reader thread; every [`StoreReader::snapshot`] briefly takes the
+/// reader thread; every snapshot a reader mints briefly takes the
 /// same per-store lock the writer takes around its state swaps, and the
 /// returned views are fully detached (`Arc`-backed, immutable).
 #[derive(Clone)]
@@ -788,12 +773,6 @@ pub struct StoreReader {
 }
 
 impl StoreReader {
-    /// A point-in-time view, exactly as [`Store::snapshot`] — callable
-    /// from any thread while the writer appends, mutates, or compacts.
-    pub fn snapshot(&self) -> Result<Vec<SegmentHandle>, StorageError> {
-        snapshot_of(&lock(&self.shared))
-    }
-
     /// As [`Store::knowledge_snapshot`], from any thread.
     pub fn knowledge_snapshot(&self) -> Result<KnowledgeSnapshot, StorageError> {
         knowledge_snapshot_of(&lock(&self.shared))
@@ -807,7 +786,7 @@ impl StoreReader {
 pub struct KnowledgeSnapshot {
     /// The latest-knowledge handles, exactly as [`Store::snapshot`].
     latest: Vec<SegmentHandle>,
-    /// History slots (see [`Store::history`]); faulted by `as_of`.
+    /// History slots (see `Store::history`); faulted by `as_of`.
     history: Vec<Arc<SegmentSlot>>,
     /// Pending tombstones: row id → the sequence its kill landed at.
     stamps: BTreeMap<u64, u64>,
@@ -1275,11 +1254,12 @@ impl Store {
     /// Refresh by [`Store::refresh`], which re-reads the metadata and
     /// keeps every already-decoded segment it can (same names, same
     /// schema — the immutable files guarantee the bytes).
+    #[cfg(test)]
     pub fn open_read_only(backend: Arc<dyn StorageBackend>) -> Result<Store, StorageError> {
         Store::open_read_only_with_cache(backend, None)
     }
 
-    /// As [`Store::open_read_only`], with a residency budget (see
+    /// As `Store::open_read_only`, with a residency budget (see
     /// [`StoreOptions::cache_bytes`]) — the reader-side knob: a console
     /// riding alongside a feed writer bounds what it retains decoded.
     pub fn open_read_only_with_cache(
@@ -1778,7 +1758,8 @@ impl Store {
 
     /// Total rows appended over the store's lifetime, tombstoned or not
     /// — also the id the next appended row will receive.
-    pub fn len(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> u64 {
         self.rows
     }
 
@@ -1786,17 +1767,14 @@ impl Store {
     /// defense in depth — a healthy store never tombstones more than it
     /// appended, and the reopen check rejects any log that would, but an
     /// underflow must degrade to zero rather than wrap.
+    #[cfg(test)]
     pub fn live_len(&self) -> u64 {
         self.rows
             .saturating_sub(lock(&self.shared).tombstones.len() as u64)
     }
 
-    /// Whether no rows have ever been appended.
-    pub fn is_empty(&self) -> bool {
-        self.rows == 0
-    }
-
     /// Frozen segments so far (not counting the live buffer).
+    #[cfg(test)]
     pub fn segment_count(&self) -> usize {
         lock(&self.shared).segments.len()
     }
@@ -1807,6 +1785,7 @@ impl Store {
     /// for them; `AS OF` reads walk them explicitly. **Decodes** every
     /// history segment not already resident (history is lazy — the
     /// residency design).
+    #[cfg(test)]
     pub fn history(&self) -> Result<Vec<Arc<Segment>>, StorageError> {
         let slots = lock(&self.shared).history.clone();
         slots.iter().map(|slot| slot.segment()).collect()
@@ -1817,7 +1796,7 @@ impl Store {
     /// this, so **`AS OF next_sequence() - 1` is the latest state** — in
     /// every mutation shape, since appends, supersessions and kills all
     /// consume exactly one coordinate (the delete-consumes ruling,
-    /// 2026-07-29). Equal to [`Store::len`] until the table diverges.
+    /// 2026-07-29). Equal to `Store::len` until the table diverges.
     ///
     /// That form is the idiom rather than `next_sequence()` itself
     /// because it addresses a coordinate that has been *spent*: its
@@ -2706,6 +2685,29 @@ impl Drop for Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_store_spans_segments_and_assigns_row_ids_in_ingest_order() {
+        use crate::{ColumnType, Field, Schema};
+
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::I64, false),
+            Field::new("x", ColumnType::F64, false),
+        ]);
+        // A tiny threshold so the example spans segments.
+        let mut store = Store::with_segment_rows(schema, 0, 2).unwrap();
+        for i in 0..5 {
+            let id = store
+                .append(&[RowValue::I64(i), RowValue::F64(i as f64)])
+                .unwrap();
+            assert_eq!(id, i as u64); // row ids are assigned in ingest order
+        }
+        let segments = store.snapshot().unwrap();
+        // Two full segments plus the live buffer's single row.
+        let rows: Vec<usize> = segments.iter().map(|s| s.rows()).collect();
+        assert_eq!(rows, [2, 2, 1]);
+        assert_eq!(segments[2].base_row_id(), 4);
+    }
+
     use super::*;
     use crate::arrow_lite::{Column, ColumnType, Field, NumericData};
 
@@ -3020,7 +3022,7 @@ mod tests {
     /// A backend that, once armed, fails delete-log writes — the crash
     /// window between a supersession's appends and its commit record.
     struct FailingDeleteLogs {
-        inner: crate::storage_lite::MemBackend,
+        inner: crate::storage_lite::io::MemBackend,
         armed: std::sync::atomic::AtomicBool,
     }
 
@@ -3028,24 +3030,25 @@ mod tests {
         fn open_log(
             &self,
             name: &str,
-        ) -> Result<Box<dyn crate::storage_lite::LogWriter>, crate::storage_lite::IoError> {
+        ) -> Result<Box<dyn crate::storage_lite::LogWriter>, crate::storage_lite::io::IoError>
+        {
             self.inner.open_log(name)
         }
-        fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::storage_lite::IoError> {
+        fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::storage_lite::io::IoError> {
             if name.starts_with("del-") && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(crate::storage_lite::IoError::Backend(
+                return Err(crate::storage_lite::io::IoError::Backend(
                     "injected log failure".to_owned(),
                 ));
             }
             self.inner.write(name, bytes)
         }
-        fn read(&self, name: &str) -> Result<Vec<u8>, crate::storage_lite::IoError> {
+        fn read(&self, name: &str) -> Result<Vec<u8>, crate::storage_lite::io::IoError> {
             self.inner.read(name)
         }
-        fn list(&self) -> Result<Vec<String>, crate::storage_lite::IoError> {
+        fn list(&self) -> Result<Vec<String>, crate::storage_lite::io::IoError> {
             self.inner.list()
         }
-        fn remove(&self, name: &str) -> Result<(), crate::storage_lite::IoError> {
+        fn remove(&self, name: &str) -> Result<(), crate::storage_lite::io::IoError> {
             self.inner.remove(name)
         }
     }
@@ -3053,7 +3056,7 @@ mod tests {
     #[test]
     fn a_crashed_supersession_recovers_old_never_torn() {
         let backend = Arc::new(FailingDeleteLogs {
-            inner: crate::storage_lite::MemBackend::new(),
+            inner: crate::storage_lite::io::MemBackend::new(),
             armed: std::sync::atomic::AtomicBool::new(false),
         });
         let mut store =
@@ -3097,7 +3100,7 @@ mod tests {
         // records it; reopen must detect divergence from the flushed
         // segment's sequence data alone.
         let backend: Arc<dyn crate::storage_lite::StorageBackend> =
-            Arc::new(crate::storage_lite::MemBackend::new());
+            Arc::new(crate::storage_lite::io::MemBackend::new());
         let mut store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 100).unwrap();
         append_n(&mut store, 0..3);
@@ -3132,7 +3135,7 @@ mod tests {
         // WAL replay hands the buffered rows the same sequences they
         // had before the close.
         let backend: Arc<dyn crate::storage_lite::StorageBackend> =
-            Arc::new(crate::storage_lite::MemBackend::new());
+            Arc::new(crate::storage_lite::io::MemBackend::new());
         let mut store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
         store.diverge(50).unwrap(); // manifest records 50

@@ -26,7 +26,9 @@
 //! a two-argument window) — the copy recorded in deferred issue #4
 //! (peak-memory accounting in #56).
 
-use crate::arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+#[cfg(any(test, feature = "cli"))]
+use crate::arrow_lite::Field;
+use crate::arrow_lite::{ArrowArrayStream, Column, ColumnType, NumericData, Schema};
 #[cfg(feature = "lua")]
 use crate::compute_lua::LogSink;
 use crate::query_lite::{
@@ -112,7 +114,7 @@ impl From<QueryError> for EngineError {
 /// interleaved.
 ///
 /// ```
-/// use tallydb::arrow_lite::{ColumnType, Field, Schema};
+/// use tallydb::{ColumnType, Field, Schema};
 /// use tallydb::{RowValue, Table};
 ///
 /// let schema = Schema::new(vec![
@@ -141,7 +143,7 @@ impl From<QueryError> for EngineError {
 ///     .unwrap();
 /// // Exact data ⇒ exact slope wherever the window has two points.
 /// let batch = &output.batches[0];
-/// let tallydb::arrow_lite::Column::Numeric(tallydb::arrow_lite::NumericData::F64(beta)) = &batch.columns()[0]
+/// let tallydb::Column::Numeric(tallydb::NumericData::F64(beta)) = &batch.columns()[0]
 /// else {
 ///     unreachable!()
 /// };
@@ -169,6 +171,8 @@ pub struct Table {
     /// to kernels registered *after* it is set.
     #[cfg(feature = "lua")]
     lua_log_sink: Option<Arc<dyn LogSink + Sync>>,
+    #[cfg(feature = "lua")]
+    lua_instruction_budget: Option<u32>,
 }
 
 impl Table {
@@ -374,6 +378,8 @@ impl Table {
             registry: Arc::new(Mutex::new(Arc::new(registry))),
             #[cfg(feature = "lua")]
             lua_log_sink: None,
+            #[cfg(feature = "lua")]
+            lua_instruction_budget: None,
         }
     }
 
@@ -406,6 +412,19 @@ impl Table {
     /// kernel routes through the sink — install before registering.
     pub fn set_lua_log_sink(&mut self, sink: Arc<dyn LogSink + Sync>) {
         self.lua_log_sink = Some(sink);
+    }
+
+    #[cfg(feature = "lua")]
+    /// Bounds each call of a Lua kernel to `budget` VM instructions —
+    /// the runaway-kernel guard (#61). A kernel that spends its budget
+    /// fails with `instruction budget exceeded` and the query reports
+    /// that error; the kernel stays usable. `None` (the default) runs
+    /// unbounded, which suits a local console whose kernels are its
+    /// author's; a surface running kernels it did not write sets a
+    /// budget. Like the log sink, it applies to every kernel registered
+    /// *afterwards* — set it before registering.
+    pub fn set_lua_instruction_budget(&mut self, budget: Option<u32>) {
+        self.lua_instruction_budget = budget;
     }
 
     /// Appends one row (see [`RowValue`]); every cell is validated
@@ -545,7 +564,7 @@ impl Table {
     /// microseconds nor observe a torn state (#51).
     ///
     /// ```
-    /// # use tallydb::arrow_lite::{ColumnType, Field, Schema};
+    /// # use tallydb::{ColumnType, Field, Schema};
     /// # use tallydb::{RowValue, Table};
     /// let schema = Schema::new(vec![
     ///     Field::new("ts", ColumnType::I64, false),
@@ -737,7 +756,7 @@ impl Table {
     /// second registration under the same name replaces the first.
     ///
     /// ```
-    /// use tallydb::arrow_lite::{ColumnType, Field, Schema};
+    /// use tallydb::{ColumnType, Field, Schema};
     /// use tallydb::{RowValue, Table};
     ///
     /// let schema = Schema::new(vec![
@@ -772,7 +791,7 @@ impl Table {
     ///     )
     ///     .unwrap();
     /// // A ramp's full 4-row window deviates by exactly 1.0.
-    /// let tallydb::arrow_lite::Column::Numeric(tallydb::arrow_lite::NumericData::F64(m)) =
+    /// let tallydb::Column::Numeric(tallydb::NumericData::F64(m)) =
     ///     &output.batches[0].columns()[0]
     /// else {
     ///     panic!("expected f64")
@@ -802,6 +821,7 @@ impl Table {
             chunk,
             output,
             self.lua_log_sink.clone(),
+            self.lua_instruction_budget,
             &ops,
         )
         .map_err(EngineError::Script)?;
@@ -825,7 +845,7 @@ impl Table {
     /// (see [`Table::reader`]).
     ///
     /// ```
-    /// use tallydb::arrow_lite::{ColumnType, Field, Schema};
+    /// use tallydb::{ColumnType, Field, Schema};
     /// use tallydb::{RowValue, Table, WindowAggregate};
     ///
     /// // The whole extension surface: one trait, ~20 lines.
@@ -865,7 +885,7 @@ impl Table {
     ///          AND CURRENT ROW) AS m FROM t",
     ///     )
     ///     .unwrap();
-    /// let tallydb::arrow_lite::Column::Numeric(tallydb::arrow_lite::NumericData::F64(m)) =
+    /// let tallydb::Column::Numeric(tallydb::NumericData::F64(m)) =
     ///     &output.batches[0].columns()[0]
     /// else {
     ///     panic!("expected f64")
@@ -922,9 +942,14 @@ impl Table {
             )));
         }
         let ops = self.current_registry();
-        let column =
-            crate::script::LuaColumn::new(parameters, chunk, self.lua_log_sink.clone(), &ops)
-                .map_err(EngineError::Script)?;
+        let column = crate::script::LuaColumn::new(
+            parameters,
+            chunk,
+            self.lua_log_sink.clone(),
+            self.lua_instruction_budget,
+            &ops,
+        )
+        .map_err(EngineError::Script)?;
         self.register_column_kernel(name, Arc::new(column))
     }
 
@@ -1289,8 +1314,9 @@ fn fs_backend(dir: impl AsRef<std::path::Path>) -> Result<Arc<dyn StorageBackend
 /// engine's schema types. Returns the schema and the ordering-key
 /// column name. Shared by every SQL surface — shell, and later the
 /// server and workbench — so the mapping cannot fork.
+#[cfg(any(test, feature = "cli"))]
 pub fn schema_from_create(
-    plan: &crate::query_lite::CreateTablePlan,
+    plan: &crate::query_lite::plan::CreateTablePlan,
 ) -> Result<(Schema, String), EngineError> {
     let mut fields = Vec::with_capacity(plan.columns.len());
     let mut ordering = None;
@@ -1324,6 +1350,7 @@ pub fn schema_from_create(
 /// The DDL name of a column type — [`schema_from_create`]'s inverse,
 /// kept beside it so a renderer (the console's `.schema`) cannot fork
 /// its own mapping.
+#[cfg(feature = "cli")]
 pub fn type_name(column_type: ColumnType) -> &'static str {
     match column_type {
         ColumnType::I64 => "BIGINT",
@@ -1815,7 +1842,7 @@ impl PairStatistic {
 /// `evaluate_frames` overrides above. Values enter and leave as
 /// deviations from `(ky, kx)`, so the accumulated sums stay at the
 /// window's own scale even when the data sits at a 1e12 offset; the
-/// E[d²] − E[d]² form is safe here for exactly that reason (about the
+/// `E[d²] − E[d]²` form is safe here for exactly that reason (about the
 /// *raw* values it is bug #45's catastrophic form — see
 /// `measure_incremental_windows`, variant B, rejected permanently).
 #[derive(Default, Clone, Copy)]

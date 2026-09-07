@@ -2,12 +2,11 @@
 //! the next compaction" means — tombstones gone, order restored, row
 //! ids contiguous again, durably and crash-safely.
 
+use crate::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use crate::storage_lite::io::{IoError, MemBackend};
+use crate::storage_lite::{FsBackend, RowValue, SequenceInfo, StorageBackend, Store};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tallydb::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
-use tallydb::storage_lite::{
-    FsBackend, IoError, MemBackend, RowValue, SequenceInfo, StorageBackend, Store,
-};
 
 /// A backend that, once armed, fails every `remove` — used to model a
 /// post-commit cleanup failure during compaction (R1).
@@ -29,7 +28,7 @@ impl FailingRemoves {
 }
 
 impl StorageBackend for FailingRemoves {
-    fn open_log(&self, name: &str) -> Result<Box<dyn tallydb::storage_lite::LogWriter>, IoError> {
+    fn open_log(&self, name: &str) -> Result<Box<dyn crate::storage_lite::LogWriter>, IoError> {
         self.inner.open_log(name)
     }
 
@@ -251,7 +250,8 @@ fn crashed_compaction_before_commit_is_invisible() {
                 .unwrap()
                 .snapshot()
                 .unwrap();
-            let bytes = tallydb::storage_lite::encode_segment(&donor[0].view().unwrap().segment);
+            let bytes =
+                crate::storage_lite::format::encode_segment(&donor[0].view().unwrap().segment);
             backend
                 .write("seg-g0000000001-00000000000000000999.tlyseg", &bytes)
                 .unwrap();
@@ -477,7 +477,7 @@ fn history_survives_reopen_and_unlisted_strays_are_invisible() {
             backend
                 .write(
                     "hist-0000009999.tlyseg",
-                    &tallydb::storage_lite::encode_segment(&donor),
+                    &crate::storage_lite::format::encode_segment(&donor),
                 )
                 .unwrap();
         }

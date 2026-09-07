@@ -10,9 +10,7 @@
 mod common;
 
 use common::peak_of;
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
-use tallydb::query_lite::{execute_join, plan, JoinSide, Registry};
-use tallydb::storage_lite::{RowValue, SegmentHandle, Store};
+use tallydb::{ColumnType, Database, Field, RowValue, Schema, Table};
 
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
@@ -37,7 +35,7 @@ fn a_join_gathers_only_the_columns_the_query_reads() {
     }
     let dimension_schema = Schema::new(attributes);
 
-    let mut fact = Store::with_segment_rows(fact_schema.clone(), 0, 8192).unwrap();
+    let mut fact = Table::with_segment_rows("fact", fact_schema, "ts", 8192).unwrap();
     for i in 0..ROWS {
         fact.append(&[
             RowValue::I64(i),
@@ -46,7 +44,7 @@ fn a_join_gathers_only_the_columns_the_query_reads() {
         ])
         .unwrap();
     }
-    let mut dimension = Store::with_segment_rows(dimension_schema.clone(), 0, 8).unwrap();
+    let mut dimension = Table::with_segment_rows("dim", dimension_schema, "id", 8).unwrap();
     for (id, sym) in ["A", "B", "C", "D"].iter().enumerate() {
         let mut row = vec![RowValue::I64(id as i64), RowValue::Key(sym)];
         for column in 0..ATTRIBUTES {
@@ -54,26 +52,11 @@ fn a_join_gathers_only_the_columns_the_query_reads() {
         }
         dimension.append(&row).unwrap();
     }
-    let fact_views: Vec<SegmentHandle> = fact.snapshot().unwrap();
-    let dimension_views: Vec<SegmentHandle> = dimension.snapshot().unwrap();
-    let registry = Registry::new();
+    let mut database = Database::new();
+    database.add_table(fact).unwrap();
+    database.add_table(dimension).unwrap();
     let run = |sql: &str| {
-        let plan = plan(sql).unwrap();
-        let output = execute_join(
-            JoinSide {
-                schema: &fact_schema,
-                handles: &fact_views,
-                ordering_key: 0,
-            },
-            JoinSide {
-                schema: &dimension_schema,
-                handles: &dimension_views,
-                ordering_key: 0,
-            },
-            &plan,
-            &registry,
-        )
-        .unwrap();
+        let output = database.query(sql).unwrap();
         std::hint::black_box(output.num_rows());
     };
     let join = "FROM fact JOIN dim ON fact.sym = dim.sym";

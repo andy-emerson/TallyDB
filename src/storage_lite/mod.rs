@@ -112,16 +112,12 @@ pub mod format;
 pub mod io;
 pub mod mem;
 pub mod store;
+#[cfg(test)]
+mod tests;
 pub mod tombstone;
 
-pub use codec::{Codec, CodecError};
-pub use format::{
-    decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError, Manifest,
-    ManifestSections, SegmentRecord, SequenceSummary,
-};
-pub use io::{FsBackend, IoError, LogWriter, MemBackend, StorageBackend};
-pub use mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};
+pub use io::{FsBackend, LogWriter, StorageBackend};
+pub use mem::{RowValue, Segment, SequenceInfo, StorageError, ZoneMap};
 pub use store::{
     KnowledgeSnapshot, SegmentHandle, SegmentView, Store, StoreOptions, StoreReader, WalSync,
-    DEFAULT_SEGMENT_ROWS,
 };

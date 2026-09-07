@@ -19,7 +19,7 @@ use std::collections::HashMap;
 /// doorway.
 ///
 /// ```
-/// use tallydb::arrow_lite::{ColumnType, Field, Schema};
+/// use tallydb::{ColumnType, Field, Schema};
 /// use tallydb::{Database, RowValue};
 ///
 /// let mut db = Database::new();
@@ -42,6 +42,8 @@ pub struct Database {
     /// kernels use their table's sink.
     #[cfg(feature = "lua")]
     script_log_sink: Option<std::sync::Arc<dyn crate::compute_lua::LogSink + Sync>>,
+    #[cfg(feature = "lua")]
+    script_instruction_budget: Option<u32>,
 }
 
 impl Database {
@@ -294,8 +296,8 @@ impl Database {
             Statement::CreateTable(_) => {
                 return Err(EngineError::Query(QueryError::Unsupported(
                     "CREATE TABLE makes a table, it doesn't mutate one — \
-                     build it with schema_from_create + a Table constructor \
-                     and add_table (the console does exactly this)"
+                     use Database::create_table or build a Table and \
+                     add_table it (the console does exactly this)"
                         .to_owned(),
                 )))
             }
@@ -385,6 +387,7 @@ impl Database {
                 sink,
             ))));
         }
+        state.set_instruction_budget(self.script_instruction_budget);
         let chunk = state.compile(source).map_err(EngineError::Script)?;
         let mut host = crate::driver::DatabaseHost { database: self };
         state
@@ -400,6 +403,14 @@ impl Database {
         sink: std::sync::Arc<dyn crate::compute_lua::LogSink + Sync>,
     ) {
         self.script_log_sink = Some(sink);
+    }
+
+    /// Bounds a driver script (see [`Database::run_script`]) to `budget`
+    /// VM instructions per run — the runaway-kernel guard (#61); `None`
+    /// (the default) runs unbounded. See [`Table::set_lua_instruction_budget`].
+    #[cfg(feature = "lua")]
+    pub fn set_script_instruction_budget(&mut self, budget: Option<u32>) {
+        self.script_instruction_budget = budget;
     }
 
     /// Compacts the named table or maintained view (see

@@ -211,7 +211,7 @@ impl Registry {
 /// scan produces, but any stage that must see all rows at once
 /// (`ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, `HAVING`, `GROUP BY`)
 /// collapses the result to a single materialized batch. A consumer that
-/// needs one contiguous batch should say so with [`contiguous`] rather
+/// needs one contiguous batch should say so with `contiguous` rather
 /// than test `batches.len() == 1`, and a consumer that wants to stream
 /// should handle any count.
 #[derive(Debug)]
@@ -230,30 +230,7 @@ impl QueryOutput {
 }
 
 /// Runs `plan` over `handles` — one table's snapshot, in append order,
-/// all sharing `schema` — resolving window functions in `registry`.
-///
-/// The snapshot arrives as [`SegmentHandle`]s (the residency design):
-/// zone-map pruning runs on their metadata, and only the segments that
-/// survive are materialized — a pruned segment's file is never read.
-///
-/// The embedder has already resolved the plan's table name to this
-/// snapshot; nothing here re-checks it.
-pub fn execute(
-    schema: &Schema,
-    handles: &[SegmentHandle],
-    plan: &Plan,
-    registry: &Registry,
-) -> Result<QueryOutput, QueryError> {
-    if plan.join.is_some() {
-        return Err(QueryError::Unsupported(
-            "joins execute through the multi-table doorway (Database), not a single table"
-                .to_owned(),
-        ));
-    }
-    execute_single(schema, handles, ordering_key_of(handles), plan, registry)
-}
-
-/// As [`execute`], but told which column the table is ordered on
+/// all sharing `schema` — told which column the table is ordered on
 /// instead of inferring it from the snapshot.
 ///
 /// The difference only shows on an **empty** table. Inferring the
@@ -279,15 +256,36 @@ pub fn execute_with_ordering_key(
     execute_single(schema, handles, Some(ordering_key), plan, registry)
 }
 
-/// As [`ordering_key_of`], over materialized views.
-fn ordering_key_of_views(views: &[&SegmentView]) -> Option<usize> {
-    views.first().map(|view| view.segment.ordering_key())
+/// Test convenience: [`execute_with_ordering_key`] with the key inferred
+/// from the first handle. The engine always knows the key and passes it;
+/// see that function's docs for why inference is not the production path.
+#[cfg(test)]
+pub fn execute(
+    schema: &Schema,
+    handles: &[SegmentHandle],
+    plan: &Plan,
+    registry: &Registry,
+) -> Result<QueryOutput, QueryError> {
+    if plan.join.is_some() {
+        return Err(QueryError::Unsupported(
+            "joins execute through the multi-table doorway (Database), not a single table"
+                .to_owned(),
+        ));
+    }
+    execute_single(schema, handles, ordering_key_of(handles), plan, registry)
 }
 
+#[cfg(test)]
 /// The ordering key a snapshot reveals — `None` when it has no
 /// segments to reveal it.
 fn ordering_key_of(handles: &[SegmentHandle]) -> Option<usize> {
     handles.first().map(SegmentHandle::ordering_key)
+}
+
+/// The ordering key a materialized-view snapshot reveals — `None`
+/// when it has no segments to reveal it.
+fn ordering_key_of_views(views: &[&SegmentView]) -> Option<usize> {
+    views.first().map(|view| view.segment.ordering_key())
 }
 
 /// One side of a join: a table's schema, a snapshot of its segments,
@@ -3399,6 +3397,7 @@ fn limit_output(output: QueryOutput, offset: usize, limit: Option<usize>) -> Que
 /// This lives here, beside the row gather it delegates to, so the
 /// merge-and-remap rule has exactly one implementation in the
 /// workspace.
+#[cfg(feature = "lua")]
 pub fn contiguous(output: QueryOutput) -> RecordBatch {
     let QueryOutput {
         schema,
@@ -3521,7 +3520,8 @@ fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
 mod tests {
     use super::*;
     use crate::query_lite::plan::plan;
-    use crate::storage_lite::{RowValue, Store, WriteBuffer};
+    use crate::storage_lite::mem::WriteBuffer;
+    use crate::storage_lite::{RowValue, Store};
 
     /// Mean of the first argument — enough to test frame arithmetic
     /// without any compute dependency.
@@ -4325,7 +4325,7 @@ mod query1_tests {
             Field::new("ts", ColumnType::I64, false),
             Field::new("n", ColumnType::I64, false),
         ]);
-        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::mem::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, n) in [(1, i64::MAX - 1), (2, 1)] {
             buffer
                 .append(&[
@@ -4350,7 +4350,7 @@ mod query1_tests {
         };
         assert_eq!(s.values().as_slice(), &[i64::MAX]);
         // One more row overflows: a loud error, never a wrong answer.
-        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::mem::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, n) in [(1, i64::MAX), (2, 1)] {
             buffer
                 .append(&[
@@ -4770,7 +4770,7 @@ mod query1_tests {
             Field::new("a", ColumnType::Key, false),
             Field::new("b", ColumnType::Key, false),
         ]);
-        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::mem::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, a, b) in [(1, "x", "p"), (2, "x", "q"), (3, "x", "p"), (4, "y", "q")] {
             buffer
                 .append(&[
@@ -5540,7 +5540,8 @@ mod query1_tests {
         // version (sequence 2) in the later one — which no table-level
         // ingest can produce today, and a future layout change could.
         use crate::query_lite::plan::plan;
-        use crate::storage_lite::{RowValue, SequenceInfo, WriteBuffer};
+        use crate::storage_lite::mem::WriteBuffer;
+        use crate::storage_lite::{RowValue, SequenceInfo};
         let quote_schema = Schema::new(vec![
             Field::new("qts", ColumnType::I64, false),
             Field::new("sym", ColumnType::Key, false),

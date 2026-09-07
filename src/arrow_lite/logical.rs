@@ -35,7 +35,7 @@ pub const DECIMAL64_PRECISION: u8 = 18;
 /// An export-time annotation over a physical `i64` column.
 ///
 /// ```
-/// use tallydb::arrow_lite::{ColumnType, LogicalType};
+/// use tallydb::{ColumnType, LogicalType};
 ///
 /// let ts = LogicalType::TimestampNs;
 /// let money = LogicalType::Decimal64 { scale: 2 };

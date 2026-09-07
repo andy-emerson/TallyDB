@@ -3,8 +3,8 @@
 //! curated statistics, and (behind the `lua` feature) Lua kernels
 //! callable from queries. The crate root ties storage, query, and
 //! compute together and owns the numeric-or-key schema invariant; the
-//! parts are its modules — [`arrow_lite`], [`storage_lite`],
-//! [`query_lite`], [`compute_linalg`], and `compute_lua` — each
+//! parts are its modules — `arrow_lite`, `storage_lite`,
+//! `query_lite`, `compute_linalg`, and `compute_lua` — each
 //! documented at its own root.
 //!
 //! ## This crate's one non-negotiable job
@@ -33,9 +33,10 @@
 //! `storage_lite` + `query_lite` together, and exposing the compute
 //! backends (`compute_lua`, `compute_linalg`) to SQL as callable
 //! functions. Application code reaches the engine through [`Database`]
-//! and [`Table`] and the re-exports beside them; the modules are `pub`
-//! because the API names their types — a schema is an
-//! [`arrow_lite::Schema`], a row a [`RowValue`].
+//! and [`Table`], and the API is exactly what this root re-exports — a
+//! schema is a [`Schema`], a row a [`RowValue`], a result a
+//! [`QueryOutput`]. The modules are crate-private; their essays render
+//! with `cargo doc --document-private-items`.
 //!
 //! ## Compute backend selection
 //! `compute_linalg` is consumed here through its trait interface (see that
@@ -88,37 +89,52 @@
 //! WASM path prematurely; do keep the trait boundaries clean so it isn't
 //! a rewrite later.
 
-pub mod arrow_lite;
-pub mod compute_linalg;
+pub(crate) mod arrow_lite;
+pub(crate) mod compute_linalg;
 #[cfg(feature = "lua")]
-pub mod compute_lua;
+pub(crate) mod compute_lua;
 #[cfg(any(test, feature = "oracle-harness"))]
-pub mod corpus;
-pub mod database;
+pub(crate) mod corpus;
+pub(crate) mod database;
 #[cfg(feature = "lua")]
 mod driver;
 #[cfg(feature = "oracle-harness")]
-pub mod harness;
+pub(crate) mod harness;
 mod multifactor;
 mod partials;
-pub mod query_lite;
+pub(crate) mod query_lite;
 #[cfg(feature = "lua")]
 mod script;
 #[cfg(feature = "cli")]
-pub mod shell;
-pub mod storage_lite;
-pub mod table;
-pub mod view;
+pub(crate) mod shell;
+pub(crate) mod storage_lite;
+pub(crate) mod table;
+pub(crate) mod view;
 
+pub use crate::arrow_lite::{
+    export_batch, export_schema, export_stream, import_batch, ArrowArray, ArrowArrayStream,
+    ArrowSchema, Bitmap, Buffer, Column, ColumnType, Dictionary, Element, Field, ImportError,
+    KeyColumn, KeyView, LogicalType, NumericColumn, NumericData, NumericView, RecordBatch, Schema,
+    StreamReader, BUFFER_ALIGN, DECIMAL64_PRECISION,
+};
+pub use crate::compute_linalg::{LinalgBackend, LinalgError, LinalgOp, RustLinalg};
 #[cfg(feature = "lua")]
 pub use crate::compute_lua::{LogSink, PRELUDE};
 pub use crate::query_lite::{
-    recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate,
+    recompute_frames, ColumnFunction, QueryError, QueryOutput, Registry, WindowAggregate,
 };
-pub use crate::storage_lite::{store::MANIFEST, RowValue, StoreOptions, WalSync};
+#[cfg(feature = "cli")]
+pub use crate::shell::{only_comments, split_statements, Console, Outcome};
+pub use crate::storage_lite::{
+    codec::CodecError,
+    format::FormatError,
+    io::IoError,
+    store::{DEFAULT_SEGMENT_ROWS, MANIFEST},
+    RowValue, StorageError, StoreOptions, WalSync,
+};
 pub use database::Database;
 pub use multifactor::{MultiFactorOutput, MultiFactorRegression};
-pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
+pub use table::{EngineError, Table, TableReader, TableSnapshot};
 pub use view::MaterializedView;
 
 // The Lua-in-SQL window slot is built: `Table::register_lua_window`

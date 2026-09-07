@@ -5,13 +5,13 @@
 //! outside, by counting backend reads: a fault is a read, an eviction
 //! is a re-read on the next touch, and retention is the absence of one.
 
+use crate::arrow_lite::{ColumnType, Field, Schema};
+use crate::storage_lite::io::{IoError, MemBackend};
+use crate::storage_lite::{
+    FsBackend, LogWriter, RowValue, StorageBackend, Store, StoreOptions, WalSync,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tallydb::arrow_lite::{ColumnType, Field, Schema};
-use tallydb::storage_lite::{
-    FsBackend, IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions,
-    WalSync,
-};
 
 fn schema() -> Schema {
     Schema::new(vec![

@@ -4,7 +4,7 @@
 //! above it may assume a real filesystem, blocking I/O, or paths — a
 //! backend is a flat namespace of named byte objects with atomic
 //! publish. [`FsBackend`] (a directory of files) is the native
-//! implementation; [`MemBackend`] backs tests and demonstrates the shape
+//! implementation; `MemBackend` backs tests and demonstrates the shape
 //! an OPFS/WASM backend must fit. Whole-object reads are the contract
 //! by decision, not omission: the working-set cut is owned (DESIGN.md,
 //! *The axes* — the queried working set fits in memory; segments fault
@@ -13,10 +13,12 @@
 //! return, if ever, with column-granular residency and its checksum
 //! revision (#87), at which point this trait grows additively.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 /// Why a backend operation failed.
@@ -316,6 +318,7 @@ impl StorageBackend for FsBackend {
 
 /// An in-memory backend: tests, and the reference shape for future
 /// non-filesystem backends. Ordered map so `list` is deterministic.
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemBackend {
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
@@ -326,12 +329,14 @@ pub struct MemBackend {
 /// shared map, so a "crash" (drop the store, reopen over the same
 /// backend) sees exactly the synced prefix — which is what makes the
 /// crash-injection tests honest about sync levels.
+#[cfg(test)]
 struct MemLogWriter {
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     name: String,
     pending: Vec<u8>,
 }
 
+#[cfg(test)]
 impl LogWriter for MemLogWriter {
     fn append(&mut self, bytes: &[u8]) -> Result<(), IoError> {
         self.pending.extend_from_slice(bytes);
@@ -352,6 +357,7 @@ impl LogWriter for MemLogWriter {
     }
 }
 
+#[cfg(test)]
 impl MemBackend {
     /// An empty backend.
     pub fn new() -> MemBackend {
@@ -359,6 +365,7 @@ impl MemBackend {
     }
 }
 
+#[cfg(test)]
 impl StorageBackend for MemBackend {
     fn write(&self, name: &str, bytes: &[u8]) -> Result<(), IoError> {
         self.objects
