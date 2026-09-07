@@ -30,8 +30,8 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
+use crate::compute_linalg::{LinalgBackend, RustLinalg};
 use arrow_lite::{Bitmap, ColumnType};
-use compute_linalg::{LinalgBackend, RustLinalg};
 use compute_lua::{
     Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
 };
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn dot_from_lua_matches_the_linalg_backend() {
-        use compute_linalg::{LinalgBackend, RustLinalg};
+        use crate::compute_linalg::{LinalgBackend, RustLinalg};
         let mut table = Table::with_segment_rows("t", schema(), "ts", 4).unwrap();
         let data: Vec<f64> = (0..10).map(|i| (i as f64) * 0.75 - 3.0).collect();
         for (i, &x) in data.iter().enumerate() {

@@ -80,6 +80,7 @@
 //! WASM path prematurely; do keep the trait boundaries clean so it isn't
 //! a rewrite later.
 
+pub mod compute_linalg;
 pub mod database;
 #[cfg(feature = "lua")]
 mod driver;
