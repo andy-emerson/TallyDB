@@ -83,6 +83,8 @@
 pub mod compute_linalg;
 #[cfg(feature = "lua")]
 pub mod compute_lua;
+#[cfg(any(test, feature = "oracle-harness"))]
+pub mod corpus;
 pub mod database;
 #[cfg(feature = "lua")]
 mod driver;

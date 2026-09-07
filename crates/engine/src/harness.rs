@@ -155,8 +155,8 @@ fn corpus_table() -> Table {
     ]);
     let mut table =
         Table::with_segment_rows("corpus", schema, "ts", 512).expect("corpus schema is valid");
-    for row in corpus::Spec::telemetry(5_000, 24).generate() {
-        let label = corpus::key_label(row.key);
+    for row in crate::corpus::Spec::telemetry(5_000, 24).generate() {
+        let label = crate::corpus::key_label(row.key);
         table
             .append(&[
                 RowValue::I64(row.ts),
@@ -205,12 +205,12 @@ fn quotes_table() -> Table {
     // quotes back at this family's ~8s per-symbol spacing.
     const LATE: i64 = 30_000_000_000;
     let mut latest: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
-    for (index, row) in corpus::Spec::telemetry(2_500, 91)
+    for (index, row) in crate::corpus::Spec::telemetry(2_500, 91)
         .generate()
         .into_iter()
         .enumerate()
     {
-        let label = corpus::key_label(row.key);
+        let label = crate::corpus::key_label(row.key);
         let previous = latest.get(&row.key).copied();
         let qts = match previous {
             Some(earlier) if index % 17 == 0 => earlier,
@@ -252,7 +252,7 @@ fn corpus_database() -> Database {
     let mut sensors =
         Table::with_segment_rows("sensors", schema, "id", 3).expect("dimension schema is valid");
     for sensor in 0..7u32 {
-        let label = corpus::key_label(sensor);
+        let label = crate::corpus::key_label(sensor);
         sensors
             .append(&[
                 RowValue::I64(i64::from(sensor)),

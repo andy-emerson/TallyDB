@@ -289,8 +289,8 @@ mod tests {
     #[ignore = "measurement — run explicitly in release mode"]
     fn measure_29_delta_of_delta_vs_plain_delta() {
         for (name, spec) in [
-            ("ticks", corpus::Spec::ticks(1_000_000, 29)),
-            ("telemetry", corpus::Spec::telemetry(1_000_000, 29)),
+            ("ticks", crate::corpus::Spec::ticks(1_000_000, 29)),
+            ("telemetry", crate::corpus::Spec::telemetry(1_000_000, 29)),
         ] {
             let timestamps: Vec<i64> = spec.generate().iter().map(|row| row.ts).collect();
             let raw = timestamps.len() * 8;

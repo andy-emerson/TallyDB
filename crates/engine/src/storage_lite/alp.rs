@@ -758,8 +758,8 @@ mod tests {
     #[ignore = "measurement — run explicitly in release mode"]
     fn measure_42_ratio_and_throughput_on_the_corpus() {
         for (name, spec) in [
-            ("ticks", corpus::Spec::ticks(1_000_000, 42)),
-            ("telemetry", corpus::Spec::telemetry(1_000_000, 42)),
+            ("ticks", crate::corpus::Spec::ticks(1_000_000, 42)),
+            ("telemetry", crate::corpus::Spec::telemetry(1_000_000, 42)),
         ] {
             let rows = spec.generate();
             let values: Vec<f64> = rows.iter().map(|row| row.value).collect();
