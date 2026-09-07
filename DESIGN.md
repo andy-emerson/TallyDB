@@ -2263,7 +2263,7 @@ the sink is script-only, so a level parameter would be permanently
 degenerate (every message an `info`), and TallyDB carries no speculative
 machinery. Severity, if a real need appears, is added *additively later* —
 a defaulted `log_at(level, msg)` trait method breaks no existing embedder
-(and at 0.0.1 nothing is frozen) — or the sink is deliberately widened to
+(and before 1.0 nothing is frozen) — or the sink is deliberately widened to
 an engine-wide diagnostic channel, a named scope expansion rather than a
 default. Runaway volume (a kernel logging per row) is bounded by the
 instruction-count hook (#61) and the batch-not-per-row doctrine: log per
