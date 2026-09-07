@@ -2065,9 +2065,13 @@ contract breaks precisely where the ordering key lives (nanosecond
 timestamps exceed 2^53) — and neither targets wasm32; the recorded
 element-loop answer is vocabulary completeness (more registered ops,
 more rolling combinators), not a faster interpreter. The
-runaway-kernel guard (#61) keeps its scoping: required before Lua
-ships in any surface serving untrusted input (the M7 served product),
-optional for a local console.
+runaway-kernel guard (#61) is built — `LuaState::set_instruction_budget`
+arms an instruction-count hook per protected call, and a kernel that
+spends the budget fails with a loud error and leaves the state usable —
+and keeps its scoping for who turns it on: required before Lua ships
+in any surface serving untrusted input (the M7 served product); off by
+default, and optional, for a local console, whose runaway kernel hangs
+only its author.
 
 **The idiom: compose, don't loop (M4.2).** Lua's cost model has three
 tiers, and the documentation teaches the same discipline NumPy's

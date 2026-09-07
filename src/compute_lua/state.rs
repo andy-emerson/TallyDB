@@ -67,7 +67,9 @@ static NEXT_STATE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// An embedded Lua 5.4 interpreter with the curated library set
 /// (base, math, string, table — no io, no os, no debug; the package
 /// library is not even linked, per the ANSI build), the view
-/// metatables, and the `NULL` sentinel installed. Base opens minus
+/// metatables, and the `NULL` sentinel installed; an optional
+/// per-call instruction budget ([`LuaState::set_instruction_budget`])
+/// bounds a runaway kernel. Base opens minus
 /// `print` and `warn` (process streams are not this library's to own);
 /// `log(...)` is the diagnostic, routed to the embedder's [`LogSink`]
 /// via [`LuaState::set_log_sink`].
