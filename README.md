@@ -422,9 +422,11 @@ directly.)
 ## How we work
 
 This repository follows the working agreement in [`AGENTS.md`](AGENTS.md)
-(v3.0.0) and the craft conventions in
-[`CONTRIBUTING.md`](CONTRIBUTING.md), both copied unedited from
-[working-agreement](https://github.com/andy-emerson/working-agreement).
+(v3.0.0), copied unedited from
+[working-agreement](https://github.com/andy-emerson/working-agreement),
+and the craft conventions in [`CONTRIBUTING.md`](CONTRIBUTING.md), which
+came with an earlier release of that agreement and is kept here now that
+the agreement no longer ships it.
 The repo-specific half lives here:
 
 - **Durable documents:** four, each answering one question.
@@ -433,8 +435,9 @@ The repo-specific half lives here:
   invariants, the crate and its module boundaries, settled decisions, and
   the test plan's skeleton. [`CONTRIBUTING.md`](CONTRIBUTING.md) — *how it is
   written*: the conventions of the craft, including the commit shape.
-  This README — *where it is now*, for a user. The first and third are
-  project-agnostic and arrive by replacement; the other two are ours.
+  This README — *where it is now*, for a user. The first is
+  project-agnostic and arrives by replacement; the third is
+  project-agnostic and maintained here; the other two are ours.
 - **Living status:** [GitHub Issues](https://github.com/andy-emerson/TallyDB/issues).
   Open decisions carry the `decision` label; everything else open is a todo
   or a bug. Settled decisions — including rejected alternatives and their

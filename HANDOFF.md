@@ -48,10 +48,10 @@ repository root as `tallydb`, and a fix quoting the Miri job's command
 so the CI workflow parses; then the doc passes. Every code pass
 carried the full gate green with 521 tests, the count unchanged from
 the workspace; the Miri and Lua-suite jobs were run locally as CI runs
-them. `cargo publish --dry-run` packages and verifies the crate; its
-one warning is the missing description. Awaiting: the publish-metadata
-pass, the merge-scale reviews, the Human's merge, then the tag and
-`cargo publish`.
+them. With the registry metadata in, `cargo publish --dry-run` packages
+and verifies the crate without a warning (192 files, 985 KiB
+compressed). The repo-scale code and documentation reviews are done.
+Awaiting: the Human's merge, then the tag and `cargo publish`.
 
 **Open decisions the collapse surfaced (Human closes; none blocks the
 merge, the first two gate the first release):**

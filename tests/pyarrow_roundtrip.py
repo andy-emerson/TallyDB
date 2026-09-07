@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """PyArrow round-trip oracle for arrow_lite's C Data Interface (issue #15).
 
-Drives the `oracle-harness` hooks in libarrow_lite as a shared library and
-checks both directions against fixtures defined independently here and in
-`src/harness.rs`:
+Drives the `oracle-harness` hooks in libtallydb, the crate's shared library,
+and checks both directions against fixtures defined independently here and
+in `src/arrow_lite/harness.rs`:
 
   1. arrow_lite exports the canonical batch -> PyArrow imports and compares.
   2. PyArrow exports the same batch          -> arrow_lite imports and compares.
