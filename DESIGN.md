@@ -2543,7 +2543,7 @@ is ruled, nothing here is narrowed or widened.
 |---|---|---|
 | The engine carries no console dependency (#39) | `shell` was the only crate depending on rustyline and csv | both are optional, behind `cli`; the `--no-default-features` CI leg builds, tests, and documents the library without them |
 | The corpus is never linked by the engine | `corpus` was `publish = false` and a separate crate | a module under `cfg(test)` and `oracle-harness`, absent from the default build |
-| Miri runs over the columnar layer; sanitizers and `LUA_USE_APICHECK` over the Lua boundary | per-crate CI jobs (`-p arrow-lite`, `-p compute-lua`) | the same jobs: Miri filtered to `arrow_lite::` in the library's test binary, without the default features; the sanitizer job over the whole crate with the vendored C compiled sanitized |
+| Miri runs over the columnar layer; sanitizers and `LUA_USE_APICHECK` over the Lua boundary | per-crate CI jobs (`-p arrow-lite`, `-p compute-lua`) | the same jobs: Miri filtered to `arrow_lite::` in the library's test binary, without the default features; the sanitizer job filtered to `compute_lua::` with the vendored C compiled sanitized (the storage tests forget stores on purpose to model power loss, which the leak check would count) |
 | A region can be read and tested on its own | a crate | a `pub` module with the same seam and its own rustdoc root; its unit tests run under its path prefix (`cargo test storage_lite::`) |
 
 **Decision record — one published crate (Human, 2026-09-07).** The
