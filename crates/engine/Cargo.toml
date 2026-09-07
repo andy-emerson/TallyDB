@@ -12,6 +12,13 @@ license.workspace = true
 crate-type = ["lib", "cdylib"]
 
 [features]
+default = ["cli"]
+# The console: line editing, CSV import, table rendering, and the local
+# security measures (#39, ruled 2026-07-27). Its two dependencies live
+# behind this feature and nowhere else, so an embedder that wants a
+# library and not a console writes `default-features = false` and links
+# neither. The console is the one embedding that turns Lua on.
+cli = ["lua", "dep:rustyline", "dep:csv"]
 # Embedded Lua kernels (the console's opt-in scripting front-end —
 # DESIGN.md, *the extension model*, ruled 2026-07-28). Off by default:
 # a library embedder who never asks for an interpreter carries neither
@@ -32,6 +39,15 @@ storage-lite = { path = "../storage-lite" }
 query-lite = { path = "../query-lite" }
 faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
 corpus = { path = "../corpus", optional = true }
+# The console's two dependencies, both mature and narrow (#39): line
+# editing, and CSV whose edge cases are not worth reinventing.
+rustyline = { version = "17", default-features = false, features = ["with-file-history"], optional = true }
+csv = { version = "1", optional = true }
+
+[[bin]]
+name = "tallydb"
+path = "src/bin/tallydb.rs"
+required-features = ["cli"]
 
 [build-dependencies]
 # Compiles the vendored PUC Lua 5.4 sources under src/compute_lua/vendor

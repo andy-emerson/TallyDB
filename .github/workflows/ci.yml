@@ -30,12 +30,12 @@ jobs:
         run: cargo build --workspace
       - name: Test (includes doctests and the arrow-rs oracle)
         run: cargo test --workspace
-      - name: Engine without Lua (the default embedder build — the
-          feature is opt-in, so the off-leg must stay green on its own)
+      - name: Engine without Lua or the console (--no-default-features — the
+          library-only embedder build must stay green on its own)
         run: |
-          cargo clippy -p engine --all-targets -- -D warnings
-          cargo test -p engine
-          RUSTDOCFLAGS="-D warnings" cargo doc -p engine --no-deps
+          cargo clippy -p engine --all-targets --no-default-features -- -D warnings
+          cargo test -p engine --no-default-features
+          RUSTDOCFLAGS="-D warnings" cargo doc -p engine --no-deps --no-default-features
       - name: Docs
         run: cargo doc --workspace --no-deps
       - name: PyArrow oracle (issue #15)

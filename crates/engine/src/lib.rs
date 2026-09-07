@@ -92,6 +92,8 @@ mod multifactor;
 mod partials;
 #[cfg(feature = "lua")]
 mod script;
+#[cfg(feature = "cli")]
+pub mod shell;
 pub mod table;
 pub mod view;
 

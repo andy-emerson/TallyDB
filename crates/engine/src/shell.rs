@@ -14,11 +14,11 @@
 //! Everything a user types is either a dot-command (`.help` lists
 //! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
 
-use arrow_lite::{Column, ColumnType, NumericData, Schema};
-use engine::{
+use crate::{
     schema_from_create, type_name, Database, LogSink, MaterializedView, RowValue, StoreOptions,
     Table,
 };
+use arrow_lite::{Column, ColumnType, NumericData, Schema};
 use query_lite::{parse_statement, QueryOutput, Statement};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -174,18 +174,18 @@ impl Console {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|error| format!("reading {}: {error}", dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir() && path.join(engine::MANIFEST).is_file())
+            .filter(|path| path.is_dir() && path.join(crate::MANIFEST).is_file())
             .collect();
         entries.sort();
         // A directory carrying a view definition is a maintained view,
-        // not a plain table (engine::view::DEFINITION_FILE is the
+        // not a plain table (crate::view::DEFINITION_FILE is the
         // marker): opening it as a table would serve the raw
         // materialization — silently stale, no union read — and let
         // INSERT/UPDATE corrupt it past what any refresh repairs.
         // Views open after every table, since each names its source.
         let (views, tables): (Vec<PathBuf>, Vec<PathBuf>) = entries
             .into_iter()
-            .partition(|path| path.join(engine::view::DEFINITION_FILE).is_file());
+            .partition(|path| path.join(crate::view::DEFINITION_FILE).is_file());
         for path in tables {
             let name = path
                 .file_name()
@@ -249,12 +249,12 @@ impl Console {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(&self.dir)
             .map_err(|error| format!("reading {}: {error}", self.dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.is_dir() && path.join(engine::MANIFEST).is_file())
+            .filter(|path| path.is_dir() && path.join(crate::MANIFEST).is_file())
             .collect();
         entries.sort();
         let (views, tables): (Vec<PathBuf>, Vec<PathBuf>) = entries
             .into_iter()
-            .partition(|path| path.join(engine::view::DEFINITION_FILE).is_file());
+            .partition(|path| path.join(crate::view::DEFINITION_FILE).is_file());
         for path in tables {
             let name = path
                 .file_name()
@@ -398,7 +398,7 @@ impl Console {
                 // #77.3 (a): the prelude is compiled into the binary,
                 // and this prints its source — the read-copy-modify
                 // value of a shipped file, with no file to lose.
-                Ok(Outcome::Note(engine::PRELUDE.trim_end().to_owned()))
+                Ok(Outcome::Note(crate::PRELUDE.trim_end().to_owned()))
             }
             "tables" => Ok(Outcome::Note(self.tables().join("\n"))),
             "schema" => {
@@ -814,7 +814,7 @@ mod tests {
         let printed = note(&mut console, ".prelude");
         assert!(printed.contains("function returns(x)"), "{printed}");
         assert!(printed.contains("function zscore(x, w)"), "{printed}");
-        assert_eq!(printed, engine::PRELUDE.trim_end());
+        assert_eq!(printed, crate::PRELUDE.trim_end());
         // And they are callable: a scalar kernel composed from the
         // prelude runs over a real table.
         note(

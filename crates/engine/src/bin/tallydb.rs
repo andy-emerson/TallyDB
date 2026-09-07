@@ -1,10 +1,10 @@
 //! `tallydb` — the standalone console binary: the thin skin over
-//! [`tallydb_shell::Console`], which a future served product embeds
+//! [`engine::shell::Console`], which a future served product embeds
 //! the same way. Interactive with line editing and history; batch via
 //! `-c "sql"` or piped stdin.
 
+use engine::shell::{only_comments, split_statements, Console, Outcome};
 use std::io::{IsTerminal, Read};
-use tallydb_shell::{only_comments, split_statements, Console, Outcome};
 
 const USAGE: &str = "usage: tallydb DIR [--read-only] [--cache MiB] [-c \"sql\"]\n\
   DIR         the database directory (created if absent)\n\
