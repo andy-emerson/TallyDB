@@ -20,6 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
+          not silently re-resolved)
+        run: cargo fetch --locked
       - name: Rust toolchain versions
         run: rustc --version && cargo --version
       - name: Format
@@ -76,6 +79,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
+          not silently re-resolved)
+        run: cargo fetch --locked
       - name: Nightly toolchain with Miri
         run: rustup toolchain install nightly --profile minimal --component miri
       - name: Miri over arrow_lite
@@ -112,6 +118,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
+          not silently re-resolved)
+        run: cargo fetch --locked
       - name: Nightly toolchain (sanitizers are -Z flags)
         run: rustup toolchain install nightly --profile minimal
       - name: ASan + UBSan over compute_lua (vendored C included)

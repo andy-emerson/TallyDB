@@ -53,6 +53,7 @@ finish() {
     exit 1
 }
 
+run "lockfile is current" cargo fetch --locked
 run "fmt" cargo fmt --all --check
 run "clippy, all features" cargo clippy --all-targets --all-features -- -D warnings
 run "clippy, no default features" cargo clippy --all-targets --no-default-features -- -D warnings
