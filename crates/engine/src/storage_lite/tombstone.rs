@@ -16,8 +16,8 @@
 //! the logs; compaction resolves them into history segments. Nothing
 //! is ever edited in place.
 
-use crate::codec::{decode_delta_of_delta, encode_delta_of_delta};
-use crate::format::FormatError;
+use crate::storage_lite::codec::{decode_delta_of_delta, encode_delta_of_delta};
+use crate::storage_lite::format::FormatError;
 use std::collections::BTreeSet;
 
 /// First bytes of every delete-log file.

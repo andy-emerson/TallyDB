@@ -4,11 +4,11 @@
 //! spec.
 
 use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
-use std::sync::Arc;
-use storage_lite::{
+use engine::storage_lite::{
     encode_segment, FsBackend, IoError, MemBackend, RowValue, StorageBackend, StorageError, Store,
     StoreOptions, WalSync,
 };
+use std::sync::Arc;
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -225,7 +225,8 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
             append_n(&mut store, 0..4);
         }
         // Rewind the manifest to its pre-records form.
-        let manifest = storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        let manifest =
+            engine::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
         assert!(
             !manifest.sections.segments.is_empty(),
             "records were written"
@@ -235,7 +236,7 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         backend
             .write(
                 "table.tlym",
-                &storage_lite::encode_manifest(
+                &engine::storage_lite::encode_manifest(
                     &manifest.schema,
                     manifest.ordering_key,
                     manifest.generation,
@@ -247,8 +248,8 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         {
             let reader = Store::open_read_only(backend.clone()).unwrap();
             assert_eq!(reader.live_len(), 4);
-            let after =
-                storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+            let after = engine::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap())
+                .unwrap();
             assert!(
                 after.sections.segments.is_empty(),
                 "a read-only open writes nothing"
@@ -257,7 +258,8 @@ fn a_legacy_manifest_without_records_adopts_by_scan_and_earns_the_section() {
         // The writer adopts by scan and earns the section.
         let store = Store::persistent_with_segment_rows(backend.clone(), schema(), 0, 2).unwrap();
         assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
-        let upgraded = storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
+        let upgraded =
+            engine::storage_lite::decode_manifest(&backend.read("table.tlym").unwrap()).unwrap();
         assert_eq!(
             upgraded.sections.segments.len(),
             2,
@@ -396,7 +398,7 @@ fn a_consumed_coordinate_survives_reopen() {
                 .as_of(cut)
                 .unwrap()
                 .iter()
-                .map(storage_lite::SegmentHandle::live_rows)
+                .map(engine::storage_lite::SegmentHandle::live_rows)
                 .sum()
         };
         assert_eq!(live_at(4), 5, "before the kill: five rows, none dead");

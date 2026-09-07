@@ -5,11 +5,11 @@
 
 use arrow_lite::{ColumnType, Field, Schema};
 use engine::query_lite::{execute, plan, Registry};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use storage_lite::{
+use engine::storage_lite::{
     IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 struct CountingBackend {
     inner: Arc<dyn StorageBackend>,

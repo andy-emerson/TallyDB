@@ -5,8 +5,10 @@
 //! backend is additionally exercised where its semantics differ
 //! (OS-buffered bytes *do* survive a process crash).
 
+use engine::storage_lite::{
+    FsBackend, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync,
+};
 use std::sync::Arc;
-use storage_lite::{FsBackend, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync};
 
 use arrow_lite::{ColumnType, Field, NumericData, Schema};
 
@@ -635,27 +637,27 @@ struct FailManifestWrites {
 }
 
 impl StorageBackend for FailManifestWrites {
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), storage_lite::IoError> {
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), engine::storage_lite::IoError> {
         if name == "table.tlym" && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(storage_lite::IoError::Backend(
+            return Err(engine::storage_lite::IoError::Backend(
                 "injected: manifest write lost".to_owned(),
             ));
         }
         self.inner.write(name, bytes)
     }
-    fn read(&self, name: &str) -> Result<Vec<u8>, storage_lite::IoError> {
+    fn read(&self, name: &str) -> Result<Vec<u8>, engine::storage_lite::IoError> {
         self.inner.read(name)
     }
-    fn list(&self) -> Result<Vec<String>, storage_lite::IoError> {
+    fn list(&self) -> Result<Vec<String>, engine::storage_lite::IoError> {
         self.inner.list()
     }
-    fn remove(&self, name: &str) -> Result<(), storage_lite::IoError> {
+    fn remove(&self, name: &str) -> Result<(), engine::storage_lite::IoError> {
         self.inner.remove(name)
     }
     fn open_log(
         &self,
         name: &str,
-    ) -> Result<Box<dyn storage_lite::LogWriter>, storage_lite::IoError> {
+    ) -> Result<Box<dyn engine::storage_lite::LogWriter>, engine::storage_lite::IoError> {
         self.inner.open_log(name)
     }
 }
@@ -707,7 +709,8 @@ fn a_crash_between_the_segment_write_and_its_manifest_write_loses_nothing() {
         "the segment file was published before the manifest failure"
     );
     // ...and the manifest never adopted it.
-    let manifest = storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+    let manifest =
+        engine::storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
     assert!(manifest.sections.segments.is_empty(), "no record adopted");
     // Reopen on the healed backend: all four rows, exactly once.
     let mut store = Store::persistent_with(
@@ -725,7 +728,8 @@ fn a_crash_between_the_segment_write_and_its_manifest_write_loses_nothing() {
     assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
     // And the store is fully live: the next flush adopts the layout.
     store.flush().unwrap();
-    let manifest = storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
+    let manifest =
+        engine::storage_lite::decode_manifest(&inner.read("table.tlym").unwrap()).unwrap();
     assert_eq!(manifest.sections.segments.len(), 1);
     assert_eq!(ts_values(&store), vec![0, 1, 2, 3]);
 }

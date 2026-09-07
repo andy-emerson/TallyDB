@@ -6,12 +6,12 @@
 //! is a re-read on the next touch, and retention is the absence of one.
 
 use arrow_lite::{ColumnType, Field, Schema};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use storage_lite::{
+use engine::storage_lite::{
     FsBackend, IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions,
     WalSync,
 };
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn schema() -> Schema {
     Schema::new(vec![

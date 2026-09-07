@@ -42,7 +42,7 @@
 //! and decode happens once per segment at open, not per query: reads
 //! serve from the decoded, zero-copy buffers.
 
-use crate::codec::CodecError;
+use crate::storage_lite::codec::CodecError;
 
 /// Values per vector: each gets its own scheme, exponents, reference
 /// frame and bit width — the adaptivity is per-vector, as in the paper.

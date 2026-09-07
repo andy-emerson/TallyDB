@@ -22,9 +22,9 @@
 //! tests, is what earns the cross-check claims.
 
 use crate::database::Database;
+use crate::storage_lite::RowValue;
 use crate::table::Table;
 use arrow_lite::{ArrowArrayStream, ColumnType, Field, Schema};
-use storage_lite::RowValue;
 
 /// Rows in the fixture.
 const ROWS: i64 = 240;
@@ -933,10 +933,16 @@ impl ViewContext {
             ("totals", VIEW_RUNNING_DEFINITION),
             ("cum", VIEW_CUMULATIVE_DEFINITION),
         ];
-        let existing = source_dir.join(storage_lite::store::MANIFEST).is_file();
+        let existing = source_dir
+            .join(crate::storage_lite::store::MANIFEST)
+            .is_file();
         let mut db = Database::new();
         let table = if existing {
-            Table::open("trades", &source_dir, storage_lite::StoreOptions::default())?
+            Table::open(
+                "trades",
+                &source_dir,
+                crate::storage_lite::StoreOptions::default(),
+            )?
         } else {
             Table::persistent_with_segment_rows(
                 "trades",
@@ -955,7 +961,7 @@ impl ViewContext {
                         dir.join(name),
                         &table,
                         None,
-                        storage_lite::StoreOptions::default(),
+                        crate::storage_lite::StoreOptions::default(),
                     )
                 } else {
                     crate::MaterializedView::persistent(
@@ -1202,9 +1208,9 @@ impl JoinViewContext {
     fn open_at(dir: &std::path::Path) -> Result<Database, crate::EngineError> {
         let existing = dir
             .join("trades")
-            .join(storage_lite::store::MANIFEST)
+            .join(crate::storage_lite::store::MANIFEST)
             .is_file();
-        let options = storage_lite::StoreOptions::default;
+        let options = crate::storage_lite::StoreOptions::default;
         let mut db = Database::new();
         let quote_schema = Schema::new(vec![
             Field::new("qts", ColumnType::I64, false),

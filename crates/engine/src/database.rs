@@ -9,11 +9,11 @@
 //! where star-schema joins resolve their dimension tables.
 
 use crate::query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
+use crate::storage_lite::RowValue;
 use crate::table::{EngineError, Table};
 use crate::view::MaterializedView;
 use arrow_lite::{ArrowArrayStream, Schema};
 use std::collections::HashMap;
-use storage_lite::RowValue;
 
 /// A set of named tables — and maintained views — behind one SQL
 /// doorway.

@@ -56,13 +56,13 @@ use crate::query_lite::plan::{
 use crate::query_lite::predicate::{
     can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval,
 };
+use crate::storage_lite::{Segment, SegmentHandle, SegmentView, SequenceInfo};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use storage_lite::{Segment, SegmentHandle, SegmentView, SequenceInfo};
 
 /// One window-aggregate implementation, registered by the embedder.
 pub trait WindowAggregate: Send + Sync {
@@ -3521,7 +3521,7 @@ fn assemble_i64_from_f64(results: Vec<Option<f64>>) -> Column {
 mod tests {
     use super::*;
     use crate::query_lite::plan::plan;
-    use storage_lite::{RowValue, Store, WriteBuffer};
+    use crate::storage_lite::{RowValue, Store, WriteBuffer};
 
     /// Mean of the first argument — enough to test frame arithmetic
     /// without any compute dependency.
@@ -4325,12 +4325,12 @@ mod query1_tests {
             Field::new("ts", ColumnType::I64, false),
             Field::new("n", ColumnType::I64, false),
         ]);
-        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, n) in [(1, i64::MAX - 1), (2, 1)] {
             buffer
                 .append(&[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::I64(n),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::I64(n),
                 ])
                 .unwrap();
         }
@@ -4350,12 +4350,12 @@ mod query1_tests {
         };
         assert_eq!(s.values().as_slice(), &[i64::MAX]);
         // One more row overflows: a loud error, never a wrong answer.
-        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, n) in [(1, i64::MAX), (2, 1)] {
             buffer
                 .append(&[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::I64(n),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::I64(n),
                 ])
                 .unwrap();
         }
@@ -4770,13 +4770,13 @@ mod query1_tests {
             Field::new("a", ColumnType::Key, false),
             Field::new("b", ColumnType::Key, false),
         ]);
-        let mut buffer = storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
+        let mut buffer = crate::storage_lite::WriteBuffer::new(schema.clone(), 0).unwrap();
         for (ts, a, b) in [(1, "x", "p"), (2, "x", "q"), (3, "x", "p"), (4, "y", "q")] {
             buffer
                 .append(&[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::Key(a),
-                    storage_lite::RowValue::Key(b),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::Key(a),
+                    crate::storage_lite::RowValue::Key(b),
                 ])
                 .unwrap();
         }
@@ -5376,13 +5376,14 @@ mod query1_tests {
                 &registry,
             )
         };
-        let mut store = storage_lite::Store::with_segment_rows(schema.clone(), 0, 8).unwrap();
+        let mut store =
+            crate::storage_lite::Store::with_segment_rows(schema.clone(), 0, 8).unwrap();
         let populated: Vec<SegmentHandle> = {
             store
                 .append(&[
-                    storage_lite::RowValue::I64(1),
-                    storage_lite::RowValue::I64(7),
-                    storage_lite::RowValue::F64(1.0),
+                    crate::storage_lite::RowValue::I64(1),
+                    crate::storage_lite::RowValue::I64(7),
+                    crate::storage_lite::RowValue::F64(1.0),
                 ])
                 .unwrap();
             store.snapshot().unwrap()
@@ -5539,7 +5540,7 @@ mod query1_tests {
         // version (sequence 2) in the later one — which no table-level
         // ingest can produce today, and a future layout change could.
         use crate::query_lite::plan::plan;
-        use storage_lite::{RowValue, SequenceInfo, WriteBuffer};
+        use crate::storage_lite::{RowValue, SequenceInfo, WriteBuffer};
         let quote_schema = Schema::new(vec![
             Field::new("qts", ColumnType::I64, false),
             Field::new("sym", ColumnType::Key, false),

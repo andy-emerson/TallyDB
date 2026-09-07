@@ -33,12 +33,14 @@
 //! executor) check [`Segment::is_ordered`] and the live ordering bounds
 //! instead of assuming.
 
-use crate::format::{
+use crate::storage_lite::format::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, SegmentRecord,
 };
-use crate::io::{IoError, StorageBackend};
-use crate::mem::{RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap};
-use crate::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
+use crate::storage_lite::io::{IoError, StorageBackend};
+use crate::storage_lite::mem::{
+    RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap,
+};
+use crate::storage_lite::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,10 +116,10 @@ fn delete_log_prefix(generation: u64) -> String {
 /// A recovered WAL unit after supersession brackets resolve (see
 /// [`Store::replay_wal`]).
 enum Replayed {
-    Row(Vec<crate::format::WalCell>),
+    Row(Vec<crate::storage_lite::format::WalCell>),
     Supersession {
         sequence: u64,
-        rows: Vec<Vec<crate::format::WalCell>>,
+        rows: Vec<Vec<crate::storage_lite::format::WalCell>>,
     },
 }
 
@@ -131,10 +133,10 @@ impl Replayed {
 }
 
 /// Owned WAL cells as the borrowed row the append path takes.
-fn owned_cells(cells: &[crate::format::WalCell]) -> Vec<RowValue<'_>> {
+fn owned_cells(cells: &[crate::storage_lite::format::WalCell]) -> Vec<RowValue<'_>> {
     cells
         .iter()
-        .map(crate::format::WalCell::as_row_value)
+        .map(crate::storage_lite::format::WalCell::as_row_value)
         .collect()
 }
 
@@ -589,7 +591,7 @@ impl SegmentHandle {
 ///
 /// ```
 /// use arrow_lite::{ColumnType, Field, Schema};
-/// use storage_lite::{RowValue, Store};
+/// use engine::storage_lite::{RowValue, Store};
 ///
 /// let schema = Schema::new(vec![
 ///     Field::new("ts", ColumnType::I64, false),
@@ -618,12 +620,12 @@ pub struct Store {
     generation: u64,
     /// Section content the manifest carries (knowledge state, history
     /// segments) — empty until the table first diverges (M4.4).
-    manifest_sections: crate::format::ManifestSections,
+    manifest_sections: crate::storage_lite::format::ManifestSections,
     /// Where flushed segments also go, if the store is persistent.
     backend: Option<Arc<dyn StorageBackend>>,
     /// The open write-ahead log, when `wal_sync` is not `Off` and the
     /// store is persistent.
-    wal: Option<Box<dyn crate::LogWriter>>,
+    wal: Option<Box<dyn crate::storage_lite::LogWriter>>,
     wal_sync: WalSync,
     last_wal_sync: std::time::Instant,
     /// A read-only handle (F4): opened over a directory another process
@@ -1178,7 +1180,7 @@ impl Store {
             rows: 0,
             delete_log_sequence: 0,
             generation: 0,
-            manifest_sections: crate::format::ManifestSections::default(),
+            manifest_sections: crate::storage_lite::format::ManifestSections::default(),
             backend: None,
             wal: None,
             wal_sync: WalSync::Off,
@@ -1538,7 +1540,7 @@ impl Store {
         schema: Schema,
         ordering_key: usize,
         options: StoreOptions,
-        preloaded: Option<crate::format::Manifest>,
+        preloaded: Option<crate::storage_lite::format::Manifest>,
     ) -> Result<Store, StorageError> {
         let segment_rows = match (options.segment_rows, options.segment_bytes) {
             (Some(_), Some(_)) => {
@@ -1585,7 +1587,7 @@ impl Store {
                         &store.schema,
                         ordering_key,
                         0,
-                        &crate::format::ManifestSections::default(),
+                        &crate::storage_lite::format::ManifestSections::default(),
                     ),
                 )?;
                 0
@@ -1732,7 +1734,9 @@ impl Store {
             for slot in &slots {
                 let name = slot.name.clone().expect("legacy slots are named");
                 let segment = slot.segment()?;
-                records.push(crate::format::SegmentRecord::of(name, &segment));
+                records.push(crate::storage_lite::format::SegmentRecord::of(
+                    name, &segment,
+                ));
             }
             let mut sections = store.manifest_sections.clone();
             sections.segments = records;
@@ -1858,9 +1862,12 @@ impl Store {
             // the header in the same file — so there is nothing to
             // recover, and treating it as corruption would leave the
             // store permanently unopenable over intact segments.
-            Ok(bytes) if bytes.len() < crate::format::WAL_HEADER_LEN => (self.rows, Vec::new()),
+            Ok(bytes) if bytes.len() < crate::storage_lite::format::WAL_HEADER_LEN => {
+                (self.rows, Vec::new())
+            }
             Ok(bytes) => {
-                let wal = crate::format::decode_wal(&bytes, self.schema.fields().len())?;
+                let wal =
+                    crate::storage_lite::format::decode_wal(&bytes, self.schema.fields().len())?;
                 if wal.generation == self.generation {
                     (wal.base_row_id, wal.entries)
                 } else {
@@ -1875,15 +1882,19 @@ impl Store {
         let mut iter = entries.into_iter().peekable();
         while let Some(entry) = iter.next() {
             match entry {
-                crate::format::WalEntry::Row(cells) => units.push(Replayed::Row(cells)),
-                crate::format::WalEntry::Supersession {
+                crate::storage_lite::format::WalEntry::Row(cells) => {
+                    units.push(Replayed::Row(cells))
+                }
+                crate::storage_lite::format::WalEntry::Supersession {
                     sequence,
                     replacements,
                 } => {
                     let mut rows = Vec::new();
                     while (rows.len() as u64) < replacements {
                         match iter.next() {
-                            Some(crate::format::WalEntry::Row(cells)) => rows.push(cells),
+                            Some(crate::storage_lite::format::WalEntry::Row(cells)) => {
+                                rows.push(cells)
+                            }
                             // Truncated mid-bracket: the crash window.
                             _ => break,
                         }
@@ -1943,21 +1954,23 @@ impl Store {
         // publishing rename commits, so a crash at any instant of
         // recovery leaves exactly one complete log to recover from;
         // truncate-then-rewrite would destroy the only copy first.
-        let mut bytes = crate::format::encode_wal_header(self.generation, self.rows);
+        let mut bytes = crate::storage_lite::format::encode_wal_header(self.generation, self.rows);
         for unit in &replay {
             match unit {
                 Replayed::Row(cells) => {
-                    bytes.extend_from_slice(&crate::format::encode_wal_record(&owned_cells(cells)));
+                    bytes.extend_from_slice(&crate::storage_lite::format::encode_wal_record(
+                        &owned_cells(cells),
+                    ));
                 }
                 Replayed::Supersession { sequence, rows } => {
-                    bytes.extend_from_slice(&crate::format::encode_wal_supersession(
+                    bytes.extend_from_slice(&crate::storage_lite::format::encode_wal_supersession(
                         *sequence,
                         rows.len() as u64,
                     ));
                     for cells in rows {
-                        bytes.extend_from_slice(&crate::format::encode_wal_record(&owned_cells(
-                            cells,
-                        )));
+                        bytes.extend_from_slice(&crate::storage_lite::format::encode_wal_record(
+                            &owned_cells(cells),
+                        ));
                     }
                 }
             }
@@ -2004,7 +2017,7 @@ impl Store {
         let backend = self.backend.as_ref().expect("a WAL implies a backend");
         backend.write(
             WAL,
-            &crate::format::encode_wal_header(self.generation, self.rows),
+            &crate::storage_lite::format::encode_wal_header(self.generation, self.rows),
         )?;
         self.wal = Some(backend.open_log(WAL)?);
         self.last_wal_sync = std::time::Instant::now();
@@ -2016,7 +2029,7 @@ impl Store {
         let Some(wal) = self.wal.as_mut() else {
             return Ok(());
         };
-        wal.append(&crate::format::encode_wal_record(row))?;
+        wal.append(&crate::storage_lite::format::encode_wal_record(row))?;
         match self.wal_sync {
             WalSync::Full => {
                 wal.sync()?;
@@ -2099,7 +2112,10 @@ impl Store {
             let mut sections = self.manifest_sections.clone();
             sections
                 .segments
-                .push(crate::format::SegmentRecord::of(name.clone(), &segment));
+                .push(crate::storage_lite::format::SegmentRecord::of(
+                    name.clone(),
+                    &segment,
+                ));
             backend.write(
                 MANIFEST,
                 &encode_manifest(&self.schema, self.ordering_key, self.generation, &sections),
@@ -2280,7 +2296,7 @@ impl Store {
         // The mutation's coordinate (the pre-flush above never moves it).
         let sequence = lock(&self.shared).watermark(self.rows);
         if let Some(wal) = self.wal.as_mut() {
-            wal.append(&crate::format::encode_wal_supersession(
+            wal.append(&crate::storage_lite::format::encode_wal_supersession(
                 sequence,
                 replacements.len() as u64,
             ))?;
@@ -2528,7 +2544,7 @@ impl Store {
             sections.segments = new_segments
                 .iter()
                 .map(|segment| {
-                    crate::format::SegmentRecord::of(
+                    crate::storage_lite::format::SegmentRecord::of(
                         segment_name(next, segment.base_row_id()),
                         segment,
                     )
@@ -2953,7 +2969,7 @@ mod tests {
                 .as_of(cut)
                 .unwrap()
                 .iter()
-                .map(crate::SegmentHandle::live_rows)
+                .map(crate::storage_lite::SegmentHandle::live_rows)
                 .sum()
         };
         assert_eq!(live_at(2), 3);
@@ -3004,27 +3020,32 @@ mod tests {
     /// A backend that, once armed, fails delete-log writes — the crash
     /// window between a supersession's appends and its commit record.
     struct FailingDeleteLogs {
-        inner: crate::MemBackend,
+        inner: crate::storage_lite::MemBackend,
         armed: std::sync::atomic::AtomicBool,
     }
 
-    impl crate::StorageBackend for FailingDeleteLogs {
-        fn open_log(&self, name: &str) -> Result<Box<dyn crate::LogWriter>, crate::IoError> {
+    impl crate::storage_lite::StorageBackend for FailingDeleteLogs {
+        fn open_log(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage_lite::LogWriter>, crate::storage_lite::IoError> {
             self.inner.open_log(name)
         }
-        fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::IoError> {
+        fn write(&self, name: &str, bytes: &[u8]) -> Result<(), crate::storage_lite::IoError> {
             if name.starts_with("del-") && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(crate::IoError::Backend("injected log failure".to_owned()));
+                return Err(crate::storage_lite::IoError::Backend(
+                    "injected log failure".to_owned(),
+                ));
             }
             self.inner.write(name, bytes)
         }
-        fn read(&self, name: &str) -> Result<Vec<u8>, crate::IoError> {
+        fn read(&self, name: &str) -> Result<Vec<u8>, crate::storage_lite::IoError> {
             self.inner.read(name)
         }
-        fn list(&self) -> Result<Vec<String>, crate::IoError> {
+        fn list(&self) -> Result<Vec<String>, crate::storage_lite::IoError> {
             self.inner.list()
         }
-        fn remove(&self, name: &str) -> Result<(), crate::IoError> {
+        fn remove(&self, name: &str) -> Result<(), crate::storage_lite::IoError> {
             self.inner.remove(name)
         }
     }
@@ -3032,7 +3053,7 @@ mod tests {
     #[test]
     fn a_crashed_supersession_recovers_old_never_torn() {
         let backend = Arc::new(FailingDeleteLogs {
-            inner: crate::MemBackend::new(),
+            inner: crate::storage_lite::MemBackend::new(),
             armed: std::sync::atomic::AtomicBool::new(false),
         });
         let mut store =
@@ -3075,7 +3096,8 @@ mod tests {
         // A supersession diverges without a compaction, so no manifest
         // records it; reopen must detect divergence from the flushed
         // segment's sequence data alone.
-        let backend: Arc<dyn crate::StorageBackend> = Arc::new(crate::MemBackend::new());
+        let backend: Arc<dyn crate::storage_lite::StorageBackend> =
+            Arc::new(crate::storage_lite::MemBackend::new());
         let mut store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 100).unwrap();
         append_n(&mut store, 0..3);
@@ -3109,7 +3131,8 @@ mod tests {
         // reopen folds segment ends over the recorded watermark — and
         // WAL replay hands the buffered rows the same sequences they
         // had before the close.
-        let backend: Arc<dyn crate::StorageBackend> = Arc::new(crate::MemBackend::new());
+        let backend: Arc<dyn crate::storage_lite::StorageBackend> =
+            Arc::new(crate::storage_lite::MemBackend::new());
         let mut store =
             Store::persistent_with_segment_rows(Arc::clone(&backend), schema(), 0, 4).unwrap();
         store.diverge(50).unwrap(); // manifest records 50

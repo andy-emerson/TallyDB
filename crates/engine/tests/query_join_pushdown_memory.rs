@@ -12,7 +12,7 @@ mod common;
 use arrow_lite::{ColumnType, Field, Schema};
 use common::peak_of;
 use engine::query_lite::{execute_join, plan, JoinSide, Registry};
-use storage_lite::{RowValue, SegmentHandle, Store};
+use engine::storage_lite::{RowValue, SegmentHandle, Store};
 
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;

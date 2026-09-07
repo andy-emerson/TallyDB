@@ -1,7 +1,7 @@
 //! The in-memory building blocks: an append buffer that freezes into an
 //! immutable segment.
 //!
-//! These are the pieces [`crate::store::Store`] composes into a table's
+//! These are the pieces [`crate::storage_lite::store::Store`] composes into a table's
 //! storage — the buffer validates and accumulates arriving rows, the
 //! segment is the immutable unit readers see. The layers above (the
 //! on-disk format, the backend trait, tombstones, compaction, the WAL)
@@ -59,9 +59,9 @@ pub enum StorageError {
     /// not representable as a `KeyColumn` (known limitation, kept).
     AllNullKeyColumn { column: String },
     /// The storage backend failed.
-    Io(crate::io::IoError),
+    Io(crate::storage_lite::io::IoError),
     /// Stored segment bytes failed to decode.
-    Format(crate::format::FormatError),
+    Format(crate::storage_lite::format::FormatError),
     /// Stored data disagrees with the schema this store was opened with.
     SchemaMismatch { reason: String },
     /// The stored segments do not cover a contiguous row-id range — a
@@ -72,7 +72,7 @@ pub enum StorageError {
     /// The call itself is not a legal shape for this operation — the
     /// store is untouched (see [`Store::supersede`]).
     ///
-    /// [`Store::supersede`]: crate::Store::supersede
+    /// [`Store::supersede`]: crate::storage_lite::Store::supersede
     Misuse(String),
 }
 
@@ -111,14 +111,14 @@ impl fmt::Display for StorageError {
     }
 }
 
-impl From<crate::io::IoError> for StorageError {
-    fn from(error: crate::io::IoError) -> Self {
+impl From<crate::storage_lite::io::IoError> for StorageError {
+    fn from(error: crate::storage_lite::io::IoError) -> Self {
         StorageError::Io(error)
     }
 }
 
-impl From<crate::format::FormatError> for StorageError {
-    fn from(error: crate::format::FormatError) -> Self {
+impl From<crate::storage_lite::format::FormatError> for StorageError {
+    fn from(error: crate::storage_lite::format::FormatError) -> Self {
         StorageError::Format(error)
     }
 }
@@ -154,7 +154,7 @@ enum ColumnBuilder {
 ///
 /// ```
 /// use arrow_lite::{ColumnType, Field, Schema};
-/// use storage_lite::{RowValue, WriteBuffer};
+/// use engine::storage_lite::{RowValue, WriteBuffer};
 ///
 /// let schema = Schema::new(vec![
 ///     Field::new("ts", ColumnType::I64, false),
@@ -232,7 +232,7 @@ impl WriteBuffer {
 
     /// Checks one row against the schema — arity, cell types, and NOT
     /// NULL — without touching the buffer. [`WriteBuffer::append`] runs
-    /// this first; [`crate::Store::append`] runs it *before* logging to
+    /// this first; [`crate::storage_lite::Store::append`] runs it *before* logging to
     /// the WAL, so a rejected row can never leave a phantom log record
     /// behind (a record replay would choke on, or worse, replay).
     pub fn validate(&self, row: &[RowValue<'_>]) -> Result<(), StorageError> {

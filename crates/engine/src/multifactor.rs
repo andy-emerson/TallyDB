@@ -353,7 +353,7 @@ pub enum MultiFactorOutput {
 /// ```
 /// use engine::{MultiFactorOutput, MultiFactorRegression, Table};
 /// use arrow_lite::{ColumnType, Field, Schema};
-/// use storage_lite::RowValue;
+/// use engine::storage_lite::RowValue;
 ///
 /// let schema = Schema::new(vec![
 ///     Field::new("ts", ColumnType::I64, false),

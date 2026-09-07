@@ -10,8 +10,8 @@
 //! two-writer refusal is exercised in-process too, in `io`'s tests).
 
 use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use engine::storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store, WalSync};
 use std::sync::Arc;
-use storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store, WalSync};
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -121,7 +121,8 @@ fn a_reader_refuses_every_mutation() {
     assert!(matches!(reader.flush(), Err(StorageError::Misuse(_))));
     // And a writer store refuses refresh — it sees its own state.
     let backend: Arc<dyn StorageBackend> = Arc::new(FsBackend::new(&dir).unwrap());
-    let mut writer = Store::open_existing(backend, storage_lite::StoreOptions::default()).unwrap();
+    let mut writer =
+        Store::open_existing(backend, engine::storage_lite::StoreOptions::default()).unwrap();
     assert!(matches!(writer.refresh(), Err(StorageError::Misuse(_))));
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -159,10 +160,10 @@ fn an_unflushed_supersession_shows_the_pre_state_never_the_torn_middle() {
         backend,
         schema(),
         0,
-        storage_lite::StoreOptions {
+        engine::storage_lite::StoreOptions {
             segment_rows: Some(100),
             wal_sync: WalSync::Group(std::time::Duration::from_secs(3600)),
-            ..storage_lite::StoreOptions::default()
+            ..engine::storage_lite::StoreOptions::default()
         },
     )
     .unwrap();
@@ -225,7 +226,7 @@ fn refresh_follows_a_compaction_into_the_new_generation() {
             .as_of(cut)
             .unwrap()
             .iter()
-            .map(storage_lite::SegmentHandle::live_rows)
+            .map(engine::storage_lite::SegmentHandle::live_rows)
             .sum()
     };
     assert_eq!(live_at(5), 6, "before the kill: all six");

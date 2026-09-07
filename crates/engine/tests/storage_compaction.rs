@@ -3,9 +3,11 @@
 //! ids contiguous again, durably and crash-safely.
 
 use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use engine::storage_lite::{
+    FsBackend, IoError, MemBackend, RowValue, SequenceInfo, StorageBackend, Store,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage_lite::{FsBackend, IoError, MemBackend, RowValue, SequenceInfo, StorageBackend, Store};
 
 /// A backend that, once armed, fails every `remove` — used to model a
 /// post-commit cleanup failure during compaction (R1).
@@ -27,7 +29,7 @@ impl FailingRemoves {
 }
 
 impl StorageBackend for FailingRemoves {
-    fn open_log(&self, name: &str) -> Result<Box<dyn storage_lite::LogWriter>, IoError> {
+    fn open_log(&self, name: &str) -> Result<Box<dyn engine::storage_lite::LogWriter>, IoError> {
         self.inner.open_log(name)
     }
 
@@ -249,7 +251,7 @@ fn crashed_compaction_before_commit_is_invisible() {
                 .unwrap()
                 .snapshot()
                 .unwrap();
-            let bytes = storage_lite::encode_segment(&donor[0].view().unwrap().segment);
+            let bytes = engine::storage_lite::encode_segment(&donor[0].view().unwrap().segment);
             backend
                 .write("seg-g0000000001-00000000000000000999.tlyseg", &bytes)
                 .unwrap();
@@ -475,7 +477,7 @@ fn history_survives_reopen_and_unlisted_strays_are_invisible() {
             backend
                 .write(
                     "hist-0000009999.tlyseg",
-                    &storage_lite::encode_segment(&donor),
+                    &engine::storage_lite::encode_segment(&donor),
                 )
                 .unwrap();
         }

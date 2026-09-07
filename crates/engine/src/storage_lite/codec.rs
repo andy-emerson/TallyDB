@@ -35,7 +35,7 @@ pub enum Codec {
     /// Delta-of-delta with zigzag + LEB128 varints, for `i64` columns.
     DeltaOfDeltaI64 = 1,
     /// ALP with the RD and raw per-chunk fallbacks, for `f64` columns
-    /// (#42; see [`crate::alp`]).
+    /// (#42; see [`crate::storage_lite::alp`]).
     AlpF64 = 2,
     /// Frame-of-reference + bit-packing for non-clock `i64` columns.
     ForI64 = 3,

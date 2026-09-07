@@ -9,7 +9,7 @@
 //! re-blessing `tests/golden/segment_v1.bin`, never a refactor.
 
 use arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
-use storage_lite::{
+use engine::storage_lite::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError,
     ManifestSections, RowValue, Segment, SequenceInfo, WriteBuffer,
 };
@@ -412,7 +412,7 @@ fn segment_records_round_trip_with_every_zone_map_and_sequence_shape() {
     // included — that one cannot be compared with `==` (NaN != NaN), so
     // determinism is checked at the byte level: re-encoding the decode
     // reproduces the bytes exactly.
-    use storage_lite::{SegmentRecord, SequenceSummary, ZoneMap};
+    use engine::storage_lite::{SegmentRecord, SequenceSummary, ZoneMap};
     let schema = Schema::new(vec![
         Field::new("ts", ColumnType::I64, false),
         Field::new("x", ColumnType::F64, true),

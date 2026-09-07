@@ -36,8 +36,8 @@
 use crate::compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 use crate::database::Database;
 use crate::query_lite::{parse_statement, Statement};
+use crate::storage_lite::RowValue;
 use arrow_lite::{Column, NumericData, RecordBatch};
-use storage_lite::RowValue;
 
 /// The [`ScriptHost`] a driving script reaches: statements resolve
 /// against this database.

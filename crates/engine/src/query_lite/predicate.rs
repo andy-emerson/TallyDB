@@ -21,10 +21,10 @@
 //! `WHERE` keeping only the rows that come out TRUE.
 
 use crate::query_lite::plan::QueryError;
+use crate::storage_lite::{SegmentHandle, SegmentView};
 use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
 use std::cmp::Ordering;
-use storage_lite::{SegmentHandle, SegmentView};
 
 /// A numeric literal, kept as written: integers stay exact `i64`, so an
 /// `i64` column never round-trips through `f64` precision.
@@ -687,7 +687,7 @@ fn leaf_result(rows: usize, verdict: impl Fn(usize) -> (bool, bool)) -> ThreeVal
 /// maps mean nothing is known, which is the opposite of an absent map
 /// for one column of a segment that has them.
 ///
-/// [`Segment::from_batch_unpruned`]: storage_lite::Segment::from_batch_unpruned
+/// [`Segment::from_batch_unpruned`]: crate::storage_lite::Segment::from_batch_unpruned
 pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentHandle) -> bool {
     if !view.zone_maps_present() {
         return true;
@@ -728,7 +728,7 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentHandle) -
                 // whether the segment holds a NaN row. An all-NaN zone
                 // stores NaN bounds, and cmp_f64 makes every bound test
                 // below answer soundly for it.
-                (storage_lite::ZoneMap::F64 { min, max, has_nan }, value) => {
+                (crate::storage_lite::ZoneMap::F64 { min, max, has_nan }, value) => {
                     let target = value.as_f64();
                     if target.is_nan() {
                         // No SQL literal produces NaN today; if one ever
@@ -751,13 +751,13 @@ pub fn can_match(predicate: &Predicate, schema: &Schema, view: &SegmentHandle) -
                         CmpOp::Ge => *has_nan || cmp_f64(*max, target) != Ordering::Less,
                     }
                 }
-                (storage_lite::ZoneMap::I64 { min, max }, Number::Int(target)) => {
+                (crate::storage_lite::ZoneMap::I64 { min, max }, Number::Int(target)) => {
                     interval_may_hold(*op, *min, *max, *target)
                 }
                 // i64 bounds vs a float literal: widening to f64 rounds,
                 // and a rounded bound could prune a matching segment —
                 // soundness beats the optimization, so don't prune.
-                (storage_lite::ZoneMap::I64 { .. }, Number::Float(_)) => true,
+                (crate::storage_lite::ZoneMap::I64 { .. }, Number::Float(_)) => true,
             }
         }
         Predicate::And(left, right) => {
@@ -910,7 +910,7 @@ mod like_tests {
 
 #[cfg(test)]
 mod tests {
-    use storage_lite::SegmentHandle;
+    use crate::storage_lite::SegmentHandle;
 
     /// The pruning probe: `can_match` reads metadata through a handle.
     fn handle_of(view: &SegmentView) -> SegmentHandle {
@@ -918,8 +918,8 @@ mod tests {
     }
 
     use super::*;
+    use crate::storage_lite::{RowValue, WriteBuffer};
     use arrow_lite::{ColumnType, Field};
-    use storage_lite::{RowValue, WriteBuffer};
 
     /// A segment mixing NaN with finite values, plus one all-NaN
     /// segment — the D2 ruling's edge cases: NaN is a value, greater
@@ -1295,15 +1295,15 @@ mod tests {
 
 #[cfg(test)]
 mod pruning_tests {
-    use storage_lite::SegmentHandle;
+    use crate::storage_lite::SegmentHandle;
 
     fn handle_of(view: &SegmentView) -> SegmentHandle {
         SegmentHandle::resident(view.segment.clone(), view.live.clone())
     }
 
     use super::*;
+    use crate::storage_lite::{RowValue, SegmentView, WriteBuffer};
     use arrow_lite::{ColumnType, Field};
-    use storage_lite::{RowValue, SegmentView, WriteBuffer};
 
     fn view(ts: &[i64], x: &[f64]) -> (Schema, SegmentView) {
         let schema = Schema::new(vec![

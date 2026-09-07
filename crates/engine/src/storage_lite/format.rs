@@ -92,11 +92,11 @@
 //! and a manifest without the section (an older writer's) falls back to
 //! scanning the backend.
 
-use crate::alp::{
+use crate::storage_lite::alp::{
     decode_alp_f64, decode_for_i64, decode_for_u32, encode_alp_f64, encode_for_i64, encode_for_u32,
 };
-use crate::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
-use crate::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
+use crate::storage_lite::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
+use crate::storage_lite::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
 use arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
     NumericData, RecordBatch, Schema,
@@ -115,12 +115,12 @@ pub const VERSION: u16 = 1;
 /// uses: `section_count: u16`, then per section `tag: u16, length: u32,
 /// payload`. Readers skip unknown tags. Only diverged tables ever write
 /// v2 segments. Assigned trailer tags (a registry separate from the
-/// manifest's): 1 = birth sequences (see [`crate::mem::SequenceInfo`]) —
+/// manifest's): 1 = birth sequences (see [`crate::storage_lite::mem::SequenceInfo`]) —
 /// a state byte (1 contiguous, 2 explicit), then for contiguous the
 /// `u64` base, for explicit the delta-of-delta-coded per-row array;
 /// 2 = kill coordinates (history segments only) — the delta-of-delta-
 /// coded per-row array of sequences at which each row's tombstone
-/// landed (see [`crate::mem::Segment::superseded`]).
+/// landed (see [`crate::storage_lite::mem::Segment::superseded`]).
 pub const VERSION_TRAILERED: u16 = 2;
 
 const TRAILER_SEQUENCE: u16 = 1;
@@ -417,7 +417,7 @@ fn push_values(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Zone map: the segment's precomputed min/max (see
-/// [`crate::mem::ZoneMap`]), absent when no valid value exists or the
+/// [`crate::storage_lite::mem::ZoneMap`]), absent when no valid value exists or the
 /// column is a key. The presence byte is a small bitfield: bit 0 =
 /// present, bit 1 = the column holds at least one valid NaN (`f64`
 /// only — pruning soundness under the NaN-is-greatest comparison
@@ -1312,7 +1312,7 @@ pub(crate) enum WalCell {
 }
 
 impl WalCell {
-    /// The borrowed view [`crate::Store::append`] takes.
+    /// The borrowed view [`crate::storage_lite::Store::append`] takes.
     pub fn as_row_value(&self) -> RowValue<'_> {
         match self {
             WalCell::Null => RowValue::Null,

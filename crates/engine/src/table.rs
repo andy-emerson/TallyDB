@@ -33,13 +33,13 @@ use crate::query_lite::{
     ColumnFunction, DeletePlan, Number, Plan, QueryError, QueryOutput, Registry, SetValue,
     Statement, UpdatePlan, ViewScalars, WindowAggregate,
 };
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
-use std::fmt;
-use std::sync::{Arc, Mutex};
-use storage_lite::{
+use crate::storage_lite::{
     FsBackend, RowValue, SegmentHandle, SegmentView, StorageBackend, StorageError, Store,
     StoreOptions, StoreReader,
 };
+use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 /// Faults every handle in: the shape mutation planning and export use,
 /// which read all rows by construction. Queries never come through
@@ -1015,7 +1015,7 @@ impl Table {
     /// derivation (see [`KnowledgeSnapshot::touched_ordering_keys`]).
     ///
     /// [`KnowledgeSnapshot::touched_ordering_keys`]:
-    ///     storage_lite::store::KnowledgeSnapshot::touched_ordering_keys
+    ///     crate::storage_lite::store::KnowledgeSnapshot::touched_ordering_keys
     pub(crate) fn touched_ordering_keys(
         &self,
         since: u64,
@@ -1035,7 +1035,7 @@ impl Table {
     /// (see [`KnowledgeSnapshot::touched_rows`]).
     ///
     /// [`KnowledgeSnapshot::touched_rows`]:
-    ///     storage_lite::store::KnowledgeSnapshot::touched_rows
+    ///     crate::storage_lite::store::KnowledgeSnapshot::touched_rows
     pub(crate) fn touched_rows(
         &self,
         since: u64,
@@ -1383,7 +1383,7 @@ pub struct TableSnapshot {
     ordering_key: usize,
     /// The latest-knowledge views plus what an `AS OF` query needs —
     /// history and pending kill stamps — captured at the same instant.
-    knowledge: storage_lite::KnowledgeSnapshot,
+    knowledge: crate::storage_lite::KnowledgeSnapshot,
     registry: Arc<Registry>,
 }
 

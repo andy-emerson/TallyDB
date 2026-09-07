@@ -35,7 +35,6 @@ oracle-harness = ["dep:corpus", "lua"]
 
 [dependencies]
 arrow-lite = { path = "../arrow-lite" }
-storage-lite = { path = "../storage-lite" }
 # The SQL parser (GenericDialect); the executor is our own — DESIGN.md on
 # why DataFusion's is neither vendored nor linked.
 sqlparser = "0.62.0"
@@ -57,3 +56,8 @@ required-features = ["cli"]
 cc = "1"
 
 [dev-dependencies]
+# The corpus generators feed the codec property tests inside storage_lite
+# (and, when the crate folds, become the `corpus` module); proptest drives
+# them.
+corpus = { path = "../corpus" }
+proptest = "1"

@@ -117,11 +117,11 @@ use crate::query_lite::{
     plan as lower_plan, CmpOp, GroupKey, Number, Plan, Predicate, Projection, QueryError,
     SEQUENCE_COLUMN,
 };
+use crate::storage_lite::format::crc32c;
+use crate::storage_lite::StoreOptions;
 use crate::table::{EngineError, Table};
 use arrow_lite::{ColumnType, Field, Schema};
 use std::path::Path;
-use storage_lite::format::crc32c;
-use storage_lite::StoreOptions;
 
 /// The definition sidecar's filename inside the view's directory. Its
 /// presence is what marks a table directory as a maintained view.
@@ -2469,7 +2469,7 @@ fn run_over_scratch(
     user_plan: &Plan,
     registry: &crate::query_lite::Registry,
 ) -> Result<crate::query_lite::QueryOutput, EngineError> {
-    use storage_lite::{Segment, SegmentHandle};
+    use crate::storage_lite::{Segment, SegmentHandle};
     let handles: Vec<SegmentHandle> = batches
         .into_iter()
         .filter(|batch| batch.num_rows() > 0)
@@ -3768,10 +3768,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::Key("A"),
-                    storage_lite::RowValue::F64(ts as f64),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::Key("A"),
+                    crate::storage_lite::RowValue::F64(ts as f64),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -4131,8 +4131,8 @@ mod tests {
         let view_dir = dir.join("ohlc");
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::create_dir_all(&view_dir).unwrap();
-        let off = storage_lite::StoreOptions {
-            wal_sync: storage_lite::WalSync::Off,
+        let off = crate::storage_lite::StoreOptions {
+            wal_sync: crate::storage_lite::WalSync::Off,
             ..Default::default()
         };
         {
@@ -4408,10 +4408,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(i),
-                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
-                    storage_lite::RowValue::F64(i as f64 / 3.0),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(i),
+                    crate::storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    crate::storage_lite::RowValue::F64(i as f64 / 3.0),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -4670,10 +4670,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
-                    storage_lite::RowValue::F64(i as f64),
-                    storage_lite::RowValue::F64(-(i as f64)),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    crate::storage_lite::RowValue::F64(i as f64),
+                    crate::storage_lite::RowValue::F64(-(i as f64)),
                 ],
             )
             .unwrap();
@@ -4708,10 +4708,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(i),
-                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
-                    storage_lite::RowValue::F64(i as f64 / 3.0),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(i),
+                    crate::storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    crate::storage_lite::RowValue::F64(i as f64 / 3.0),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -4997,10 +4997,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(i),
-                    storage_lite::RowValue::Key("A"),
-                    storage_lite::RowValue::F64(x),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(i),
+                    crate::storage_lite::RowValue::Key("A"),
+                    crate::storage_lite::RowValue::F64(x),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -5184,10 +5184,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(i),
-                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
-                    storage_lite::RowValue::F64((i % 97) as f64),
-                    storage_lite::RowValue::F64((i % 13) as f64),
+                    crate::storage_lite::RowValue::I64(i),
+                    crate::storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    crate::storage_lite::RowValue::F64((i % 97) as f64),
+                    crate::storage_lite::RowValue::F64((i % 13) as f64),
                 ],
             )
             .unwrap();
@@ -5269,9 +5269,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -5318,9 +5318,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -5334,9 +5334,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(6),
-                storage_lite::RowValue::Key("B"),
-                storage_lite::RowValue::F64(9.9),
+                crate::storage_lite::RowValue::I64(6),
+                crate::storage_lite::RowValue::Key("B"),
+                crate::storage_lite::RowValue::F64(9.9),
             ],
         )
         .unwrap();
@@ -5385,9 +5385,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(2),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::F64(8.8),
+                crate::storage_lite::RowValue::I64(2),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::F64(8.8),
             ],
         )
         .unwrap();
@@ -5399,9 +5399,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(8),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::F64(4.4),
+                crate::storage_lite::RowValue::I64(8),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::F64(4.4),
             ],
         )
         .unwrap();
@@ -5440,9 +5440,9 @@ mod tests {
         for (qts, sym, bid) in [(0, "A", 1.0), (1, "B", 2.0), (6, "A", 1.6), (7, "B", 2.7)] {
             quotes
                 .append(&[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ])
                 .unwrap();
         }
@@ -5643,9 +5643,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -5658,9 +5658,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(2),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::F64(8.5),
+                crate::storage_lite::RowValue::I64(2),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::F64(8.5),
             ],
         )
         .unwrap();
@@ -5712,9 +5712,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -5727,9 +5727,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(6),
-                storage_lite::RowValue::Key("B"),
-                storage_lite::RowValue::F64(9.9),
+                crate::storage_lite::RowValue::I64(6),
+                crate::storage_lite::RowValue::Key("B"),
+                crate::storage_lite::RowValue::F64(9.9),
             ],
         )
         .unwrap();
@@ -5800,10 +5800,10 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::Key(venue),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::Key(venue),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -5857,10 +5857,10 @@ mod tests {
             db.append(
                 "dim",
                 &[
-                    storage_lite::RowValue::I64(id),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::Key(sector),
-                    storage_lite::RowValue::F64(weight),
+                    crate::storage_lite::RowValue::I64(id),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::Key(sector),
+                    crate::storage_lite::RowValue::F64(weight),
                 ],
             )
             .unwrap();
@@ -5920,20 +5920,20 @@ mod tests {
         db.append(
             "trades",
             &[
-                storage_lite::RowValue::I64(20),
-                storage_lite::RowValue::Key("C"),
-                storage_lite::RowValue::F64(7.0),
-                storage_lite::RowValue::F64(0.0),
+                crate::storage_lite::RowValue::I64(20),
+                crate::storage_lite::RowValue::Key("C"),
+                crate::storage_lite::RowValue::F64(7.0),
+                crate::storage_lite::RowValue::F64(0.0),
             ],
         )
         .unwrap();
         db.append(
             "dim",
             &[
-                storage_lite::RowValue::I64(2),
-                storage_lite::RowValue::Key("C"),
-                storage_lite::RowValue::Key("bio"),
-                storage_lite::RowValue::F64(1.0),
+                crate::storage_lite::RowValue::I64(2),
+                crate::storage_lite::RowValue::Key("C"),
+                crate::storage_lite::RowValue::Key("bio"),
+                crate::storage_lite::RowValue::F64(1.0),
             ],
         )
         .unwrap();
@@ -5949,10 +5949,10 @@ mod tests {
         db.append(
             "dim",
             &[
-                storage_lite::RowValue::I64(3),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::Key("dup"),
-                storage_lite::RowValue::F64(9.0),
+                crate::storage_lite::RowValue::I64(3),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::Key("dup"),
+                crate::storage_lite::RowValue::F64(9.0),
             ],
         )
         .unwrap();
@@ -5973,10 +5973,10 @@ mod tests {
         db.append(
             "trades",
             &[
-                storage_lite::RowValue::I64(16),
-                storage_lite::RowValue::Key("C"),
-                storage_lite::RowValue::F64(1.0),
-                storage_lite::RowValue::F64(0.0),
+                crate::storage_lite::RowValue::I64(16),
+                crate::storage_lite::RowValue::Key("C"),
+                crate::storage_lite::RowValue::F64(1.0),
+                crate::storage_lite::RowValue::F64(0.0),
             ],
         )
         .unwrap();
@@ -6038,10 +6038,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::Key("A"),
-                    storage_lite::RowValue::F64(ts as f64),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::Key("A"),
+                    crate::storage_lite::RowValue::F64(ts as f64),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -6050,9 +6050,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key("A"),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key("A"),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -6071,9 +6071,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(80),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::F64(3.0),
+                crate::storage_lite::RowValue::I64(80),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::F64(3.0),
             ],
         )
         .unwrap();
@@ -6111,10 +6111,10 @@ mod tests {
         db.append(
             "trades",
             &[
-                storage_lite::RowValue::I64(20),
-                storage_lite::RowValue::Key("A"),
-                storage_lite::RowValue::F64(1.0),
-                storage_lite::RowValue::F64(0.0),
+                crate::storage_lite::RowValue::I64(20),
+                crate::storage_lite::RowValue::Key("A"),
+                crate::storage_lite::RowValue::F64(1.0),
+                crate::storage_lite::RowValue::F64(0.0),
             ],
         )
         .unwrap();
@@ -6122,9 +6122,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key("A"),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key("A"),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -6187,9 +6187,9 @@ mod tests {
         for (qts, sym, bid) in [(0, "A", 1.0), (1, "B", 2.0), (10, "A", 1.5), (11, "B", 2.5)] {
             quotes
                 .append(&[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ])
                 .unwrap();
         }
@@ -6269,10 +6269,10 @@ mod tests {
             db.append(
                 "trades",
                 &[
-                    storage_lite::RowValue::I64(ts),
-                    storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
-                    storage_lite::RowValue::F64(i as f64),
-                    storage_lite::RowValue::F64(0.0),
+                    crate::storage_lite::RowValue::I64(ts),
+                    crate::storage_lite::RowValue::Key(if i % 2 == 0 { "A" } else { "B" }),
+                    crate::storage_lite::RowValue::F64(i as f64),
+                    crate::storage_lite::RowValue::F64(0.0),
                 ],
             )
             .unwrap();
@@ -6287,9 +6287,9 @@ mod tests {
             db.append(
                 "quotes",
                 &[
-                    storage_lite::RowValue::I64(qts),
-                    storage_lite::RowValue::Key(sym),
-                    storage_lite::RowValue::F64(bid),
+                    crate::storage_lite::RowValue::I64(qts),
+                    crate::storage_lite::RowValue::Key(sym),
+                    crate::storage_lite::RowValue::F64(bid),
                 ],
             )
             .unwrap();
@@ -6301,9 +6301,9 @@ mod tests {
         db.append(
             "quotes",
             &[
-                storage_lite::RowValue::I64(-20),
-                storage_lite::RowValue::Key("B"),
-                storage_lite::RowValue::F64(9.9),
+                crate::storage_lite::RowValue::I64(-20),
+                crate::storage_lite::RowValue::Key("B"),
+                crate::storage_lite::RowValue::F64(9.9),
             ],
         )
         .unwrap();

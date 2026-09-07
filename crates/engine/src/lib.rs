@@ -95,6 +95,7 @@ pub mod query_lite;
 mod script;
 #[cfg(feature = "cli")]
 pub mod shell;
+pub mod storage_lite;
 pub mod table;
 pub mod view;
 
@@ -103,9 +104,9 @@ pub use crate::compute_lua::{LogSink, PRELUDE};
 pub use crate::query_lite::{
     recompute_frames, ColumnFunction, QueryOutput, Registry, WindowAggregate,
 };
+pub use crate::storage_lite::{store::MANIFEST, RowValue, StoreOptions, WalSync};
 pub use database::Database;
 pub use multifactor::{MultiFactorOutput, MultiFactorRegression};
-pub use storage_lite::{store::MANIFEST, RowValue, StoreOptions, WalSync};
 pub use table::{schema_from_create, type_name, EngineError, Table, TableReader, TableSnapshot};
 pub use view::MaterializedView;
 

@@ -62,11 +62,11 @@ pub enum QueryError {
     /// Storage failed to materialize a segment the query needs — a
     /// fault-in error under the residency design (I/O, checksum, or a
     /// reader racing a compaction).
-    Storage(storage_lite::StorageError),
+    Storage(crate::storage_lite::StorageError),
 }
 
-impl From<storage_lite::StorageError> for QueryError {
-    fn from(error: storage_lite::StorageError) -> QueryError {
+impl From<crate::storage_lite::StorageError> for QueryError {
+    fn from(error: crate::storage_lite::StorageError) -> QueryError {
         QueryError::Storage(error)
     }
 }
