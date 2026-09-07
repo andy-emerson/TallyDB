@@ -46,12 +46,13 @@ is v3.0.0 (open → commit → merge), replaced whole from the upstream
 release asset. Nothing is awaiting review or merge.
 
 **Destination (Human, 2026-09-07):** publish TallyDB to crates.io as
-**one crate** — the workspace's crates become modules of it — with
-`compute-linalg` folded in and `corpus` demoted to a path-only
-dev-dependency. This supersedes DESIGN.md *Workspace layout*; the ruling,
-the rejected rename-and-publish-eight alternative, and the reopen trigger
-are recorded there in the next doc pass, before any code moves. Then the
-collapse itself, one code pass per crate folded, full gate green at each.
+**one crate** — the workspace's crates become modules of it, names kept
+— with `compute-linalg` folded in and `corpus` a module behind the
+`oracle-harness` feature (the oracle hooks are `extern "C"` exports of the
+shared library, so the corpus is library code under a feature, not a
+dev-dependency). Recorded in DESIGN.md *Crate layout* with the rejected
+alternatives and the reopen trigger. Next: the collapse itself, one code
+pass per crate folded, full gate green at each.
 
 #90 shipped rolling multi-factor regression: the anchored
 `FactorMoments` carrier, `solve_spd` (a single-function interim solve —

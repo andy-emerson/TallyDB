@@ -420,8 +420,8 @@ The repo-specific half lives here:
 - **Durable documents:** four, each answering one question.
   [`AGENTS.md`](AGENTS.md) — *how we work*: phases, claims, reviews,
   merges. [`DESIGN.md`](DESIGN.md) — *what we build and why*: philosophy,
-  invariants, crate boundaries, settled decisions, build order, and the
-  test plan's skeleton. [`CONTRIBUTING.md`](CONTRIBUTING.md) — *how it is
+  invariants, the crate and its module boundaries, settled decisions, and
+  the test plan's skeleton. [`CONTRIBUTING.md`](CONTRIBUTING.md) — *how it is
   written*: the conventions of the craft, including the commit shape.
   This README — *where it is now*, for a user. The first and third are
   project-agnostic and arrive by replacement; the other two are ours.

@@ -407,7 +407,7 @@ shell / security / systems separation is the architecture: the engine
 (systems) stays dependency-clean; `tallydb-shell`'s `Console` is a
 reusable module a future served product embeds; `main.rs` is a thin
 skin. Rulings, each with its losing alternatives: **dependencies** —
-rustyline and csv only, confined to the shell crate (zero-dep
+rustyline and csv only, confined to the console's `cli` feature (zero-dep
 hand-rolling rejected as reinvention; a CLI framework rejected as
 surface without need). **DDL grammar** — `BIGINT` / `DOUBLE` / the
 coined `KEY`, one `ORDERING KEY` column constraint; `VARCHAR`/`TEXT`
@@ -1738,7 +1738,7 @@ decision to make silently inside an implementation PR.
 
 Compute sits behind trait boundaries the `engine` calls through, so native
 implementations can eventually be joined by WASM ones without changing
-anything above. Today there is **one** compute library crate plus the
+anything above. Today there is **one** compute module plus the
 script layer:
 
 - **`compute-linalg`** — multiplication-class primitives (dot,
@@ -2057,7 +2057,7 @@ M4's closing increment — the second direction earned by the first —
 and the no-coined-SQL-names reopen trigger does **not** fire (the
 scripting layer remains the home for novel compute names). The
 rejected fail-branch stays recorded for its reopen value: removal
-whole (crate, feature flag, console `.lua`), tier 3 query-only, SQL
+whole (module, feature flag, console `.lua`), tier 3 query-only, SQL
 naming re-decided. Interpreter swaps were examined for the element-
 loop gap and rejected on invariants, not taste: LuaJIT/Luau descend
 from Lua 5.1 — **no 64-bit integer subtype**, so the `i64` exactness
@@ -2456,77 +2456,115 @@ bug adds the case that would have caught it.
    differential testing.
 4. Everything else.
 
-## Workspace layout
+## Crate layout
 
-TallyDB is a single Cargo workspace — each crate has a clean boundary and
-can be reasoned about and tested in isolation, but they share one version
-history and one build.
+TallyDB is **one crate**, `tallydb`, with a library target and a binary
+target. The library is what an application links, like SQLite or DuckDB.
+The binary is the console. The parts of the system are modules of that
+crate, each keeping the boundary it had as a workspace crate; the module
+names are the former crate names, so that this document's references and
+the code's `use` paths stay legible across the change.
 
 ```
 tallydb/
-  crates/
-    arrow-lite/     # hand-rolled Arrow-compatible columnar format (f64/i64
-                    #   buffers, u32-dictionary keys, C Data Interface export;
-                    #   arrow-rs/PyArrow as dev-only round-trip oracles)
-    storage-lite/   # append-optimized segments partitioned on the ordering
-                    #   key; compaction; zone maps; the WAL; I/O behind a
-                    #   backend trait (native = a directory of files;
-                    #   lazy fault-in under a byte budget is the working-set
-                    #   cut — see *The residency design*; OPFS/WASM later)
-    query-lite/     # scoped SQL parser (via sqlparser-rs) + our own executor;
-                    #   validated against DuckDB/DataFusion as an oracle
-    engine/         # ties storage + query + compute together; enforces
-                    #   numeric-or-key as a hard schema rule
-    compute-lua/    # Lua scripting behind a trait; vendored PUC Lua 5.4,
-                    #   hand-rolled bindings (lua.wasm, also 5.4, later)
-    compute-linalg/ # multiplication-class kernels behind a trait; pure
-                    #   Rust (faer + a source-fixed dot), wasm32-ready
-    shell/          # the tallydb console binary: rustyline + csv live here,
-                    #   the engine stays dependency-clean (#39's separation)
-    corpus/         # dev-only: the seeded synthetic generators of "The
-                    #   corpus" above; measurement and differential-test
-                    #   data, never linked by the engine
   Cargo.toml
+  src/
+    lib.rs             # the public surface: what an embedder reaches
+    arrow_lite/        # hand-rolled Arrow-compatible columnar format (f64/i64
+                       #   buffers, u32-dictionary keys, C Data Interface
+                       #   export; arrow-rs/PyArrow as dev-only oracles).
+                       #   A SEAM: the standalone arrow-lite crate — a
+                       #   broader design, specified in its own repository —
+                       #   replaces this module when it exists.
+    storage_lite/      # append-optimized segments partitioned on the ordering
+                       #   key; compaction; zone maps; the WAL; I/O behind a
+                       #   backend trait; lazy fault-in under a byte budget
+                       #   (see *The residency design*)
+    query_lite/        # scoped SQL parser (via sqlparser-rs) + our own
+                       #   executor; DuckDB/DataFusion as differential oracles
+    engine/            # ties storage + query + compute together; enforces
+                       #   numeric-or-key as a hard schema rule
+    compute_lua/       # Lua scripting behind a trait; vendored PUC Lua 5.4
+                       #   under compute_lua/vendor, hand-rolled bindings.
+                       #   Feature `lua`, off by default; the console turns
+                       #   it on.
+    compute_linalg/    # multiplication-class kernels behind `LinalgBackend`
+                       #   (faer). A SEAM: the interim solve the 2026-07-30
+                       #   MatLua ruling names; MatLua takes this module's
+                       #   place when its endpoints land.
+    corpus/            # the seeded synthetic generators of "The corpus"
+                       #   above. Feature `oracle-harness` only — compiled
+                       #   when the Python oracles run, never in the default
+                       #   build, never reachable from Rust.
+    harness.rs         # the `extern "C"` oracle hooks the Python scripts
+                       #   drive through the shared library; same feature
+    bin/tallydb.rs     # the console. Feature `cli`: rustyline and csv live
+                       #   behind it and nowhere else.
+  tests/               # integration tests and the Python oracle scripts
 ```
 
-## Build order (recommended, not mandatory)
+**Features.** `cli` (default) enables the console and its two
+dependencies, and implies `lua`. `lua` enables the scripting layer. An
+embedder that wants neither writes `default-features = false` and links a
+library whose only dependencies are sqlparser and faer — #39's separation
+of the console's dependencies from the engine's, kept by a feature instead
+of a crate. `oracle-harness` compiles the corpus
+and the C hooks for CI's differential oracles; it is never on in a
+published build.
 
-The dependency graph is shallow and wide, not a deep chain: everything
-depends on `arrow-lite`, almost nothing else depends on anything else. So
-the only *order-critical* thing is locking `arrow-lite`'s layout first;
-after that the rest is a wide front, and the ordering below is a
-**risk**-ordering (front-load the unoracled crates), not a dependency chain.
+**One shared library.** The crate has one `cdylib` target, and it carries
+both the Arrow C Data Interface export and the oracle hooks. There used to
+be two — `libarrow_lite` and `libengine` — and an embedder needed to know
+which; now there is `libtallydb`.
 
-1. `arrow-lite` — smallest, clearest spec (Arrow's public layout), no
-   internal dependencies. Lock its two interfaces early: the raw-pointer/FFI
-   view (for compute) and the serialize-to-segment view (for storage).
-   **Resolved (issue #2):** hand-rolled, no runtime arrow-rs dependency;
-   `u32` dictionary codes; optional validity bitmaps (`NOT NULL` columns
-   have none; the ordering key is always `NOT NULL`); logical-type export
-   annotations (`Timestamp(ns)`, `Decimal64(scale)`); C Data Interface
-   only, including the batch-stream variant. Round-trip test against
-   arrow-rs/PyArrow (dev-only). Get this right before anything else.
-2. `storage-lite` — the highest-risk, most original crate. Deserves the
-   most scrutiny and the most tests, precisely because there's no oracle.
-   (Its two format-gating decisions are settled — row identity by internal
-   row id, per-segment dictionaries; see *Storage* above.)
-3. `query-lite` — can lean on DuckDB/DataFusion as a differential oracle
-   once `storage-lite` is stable enough to query.
-4. `compute-lua` / `compute-linalg` — compute backends
-   (vendored Lua 5.4, faer); can be developed in parallel with
-   `query-lite` once `arrow-lite`'s buffer format is stable, since they
-   consume it directly.
-5. `engine` — last, since it's the integration point for everything above.
+**What the crate boundaries used to guarantee, and what guarantees it now:**
 
-**The one sequencing constraint that matters most:** the differentiator is
-compute-fusion (zero-copy numeric ops on stored buffers), and that's the
-riskiest, least-trodden part. Reach a thin end-to-end proof of it *early* —
-ingest numeric+key rows → a windowed query that calls a curated numeric op
-on stored buffers with no copy → Arrow out — rather than leaving it for
-last. Building the storage engine beautifully while the compute story slips
-just yields "another embeddable TSDB" and misses the point.
+| Guarantee | Then | Now |
+|---|---|---|
+| The engine carries no console dependency (#39) | `shell` was the only crate depending on rustyline and csv | both are optional, behind `cli` |
+| The corpus is never linked by the engine | `corpus` was `publish = false` and a separate crate | a module behind `oracle-harness`, absent from the default build |
+| Miri runs over the columnar layer; sanitizers and `LUA_USE_APICHECK` over the Lua boundary | per-crate CI jobs (`-p arrow-lite`, `-p compute-lua`) | the same jobs, filtered by module path |
+| A region can be read and tested on its own | a crate | a module with the same seam; `pub(crate)` at the boundary |
 
-Don't try to scaffold all eight crates' real implementations in one pass.
+**Decision record — one published crate (Human, 2026-09-07).** The
+workspace's eight crates had earned their keep as *development* boundaries
+while the layout was being locked — each could be built, oracled and
+reasoned about alone, and the build order front-loaded the unoracled ones.
+That work is done. As *distribution* units they cost more than they
+return: publishing to crates.io would mean eight crates in dependency
+order at every release, six registry pages for plumbing no user names,
+and generic names (`engine`, `storage-lite`) that a global registry
+cannot take. The user-facing unit is one — `cargo install tallydb`, or
+one dependency line — and the crate matches that.
+
+*Rejected:* publish all eight under a `tallydb-` prefix. It works, and it
+is the smaller change today; every later release pays for it, and it
+freezes the internal decomposition as public surface. *Also rejected:*
+literate sources tangled into a single `.rs` — orthogonal to this
+question (Rust modules already give organization without new crates),
+and costly in Rust specifically, where the compiler's diagnostics and
+rust-analyzer are the development loop and would point at generated
+code. The literate reading TallyDB wants is rustdoc's — prose in `//!`
+and `///` woven from the source, with the code as the single source of
+truth.
+
+*Accepted cost:* one compilation unit. A workspace compiles crates in
+parallel; a crate does not. On this code base that is a modest, measured
+slowdown of the developer build, not of the product.
+
+*Reopen trigger:* a second downstream consumer — something other than
+TallyDB itself — wanting to depend on one internal module without the
+rest. That is the one thing a crate boundary provides and a module
+cannot. The planned extraction of `arrow-lite` is **not** this trigger: it
+leaves as its own design in its own repository, and TallyDB takes it back
+as an external dependency at the `arrow_lite` seam.
+
+**The one sequencing constraint that still matters:** the differentiator
+is compute-fusion (zero-copy numeric ops on stored buffers), and every
+change to the layout is judged by whether that path stays a straight line
+from stored buffer to curated op to Arrow out, with no copy. Building the
+storage engine beautifully while the compute story slips would yield
+"another embeddable TSDB" and miss the point.
 
 ## Who we write for
 
