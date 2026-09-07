@@ -27,9 +27,20 @@ pub(crate) type lua_Number = f64;
 pub(crate) type lua_Integer = i64;
 /// A C function callable from Lua.
 pub(crate) type lua_CFunction = unsafe extern "C" fn(*mut lua_State) -> c_int;
+/// An activation record, as hooks receive it; opaque here — the one
+/// hook this module installs never reads it.
+#[repr(C)]
+pub(crate) struct lua_Debug {
+    _opaque: [u8; 0],
+}
+/// A debug hook. `Option` because the API takes NULL to remove one.
+pub(crate) type lua_Hook = unsafe extern "C" fn(*mut lua_State, *mut lua_Debug);
 
 /// `lua_pcall` status: success.
 pub(crate) const LUA_OK: c_int = 0;
+/// `lua_sethook` mask bit: the count hook, fired after every `count`
+/// VM instructions.
+pub(crate) const LUA_MASKCOUNT: c_int = 1 << 3;
 /// Pseudo-index of the registry table.
 pub(crate) const LUA_REGISTRYINDEX: c_int = -1_001_000;
 /// `lua_type` tags used by the wrapper.
@@ -60,6 +71,9 @@ unsafe extern "C" {
         ctx: isize,
         k: *const c_void,
     ) -> c_int;
+
+    // The instruction-count hook — the runaway-kernel guard (#61).
+    pub(crate) fn lua_sethook(L: *mut lua_State, f: Option<lua_Hook>, mask: c_int, count: c_int);
 
     // Stack discipline.
     pub(crate) fn lua_gettop(L: *mut lua_State) -> c_int;

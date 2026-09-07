@@ -90,6 +90,9 @@ pub struct LuaState {
     id: u64,
     /// Serial for registry keys of compiled chunks.
     next_chunk: u64,
+    /// The per-call instruction bound, armed before every protected
+    /// call; `None` runs unbounded (the default).
+    instruction_budget: Option<std::ffi::c_int>,
 }
 
 impl LuaState {
@@ -120,6 +123,7 @@ impl LuaState {
                 driver: driver_slot,
                 id: NEXT_STATE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 next_chunk: 0,
+                instruction_budget: None,
             };
             // The shipped prelude, compiled into the binary (#77.3 = a):
             // every state gets the compositions, so a kernel and a
@@ -203,6 +207,23 @@ impl LuaState {
         unsafe {
             (*self.sink).0 = Some(sink);
         }
+    }
+
+    /// Bounds every protected call this state makes to `budget` VM
+    /// instructions — the runaway-kernel guard (#61). A chunk that runs
+    /// past the budget is stopped with the error `instruction budget
+    /// exceeded`; the call returns that `Err` like any other script
+    /// error, and the state stays usable. The count starts fresh at each
+    /// call, so it bounds one kernel invocation, not a session. `None`
+    /// removes the bound, and is the default: a local console's runaway
+    /// kernel hangs only its author, and Ctrl-C works; a surface that
+    /// runs scripts it did not write sets a budget before running any.
+    /// The hook is installed from the host side, so a script cannot
+    /// reach it — the `debug` library is not loaded. A budget of zero
+    /// counts as one; budgets above `c_int::MAX` are clamped to it.
+    pub fn set_instruction_budget(&mut self, budget: Option<u32>) {
+        self.instruction_budget =
+            budget.map(|b| std::ffi::c_int::try_from(b.max(1)).unwrap_or(std::ffi::c_int::MAX));
     }
 
     /// Runs `chunk` (text only) with `inputs` bound to global names and
@@ -320,6 +341,15 @@ impl LuaState {
         unsafe {
             if chunk.state_id != self.id {
                 return Err("chunk belongs to a different interpreter".to_owned());
+            }
+            // Armed per call: `lua_sethook` resets the interpreter's
+            // instruction counter, which otherwise carries over between
+            // protected calls.
+            match self.instruction_budget {
+                Some(budget) => {
+                    ffi::lua_sethook(self.raw, Some(budget_hook), ffi::LUA_MASKCOUNT, budget)
+                }
+                None => ffi::lua_sethook(self.raw, None, 0, 0),
             }
             ffi::lua_getfield(self.raw, ffi::LUA_REGISTRYINDEX, chunk.key.as_ptr());
             if ffi::lua_pcall(self.raw, 0, results, 0) != ffi::LUA_OK {
@@ -487,6 +517,22 @@ fn write_column_result(
 // wraps the state in a `Mutex` (the engine's Lua-backed window does).
 unsafe impl Send for LuaState {}
 
+/// The error a spent instruction budget raises.
+const BUDGET_MESSAGE: &[u8] = b"instruction budget exceeded";
+
+/// The count hook: the budget is the hook's count, so its first firing
+/// *is* the budget being spent, and it raises. It follows the module's
+/// C-boundary rules — `Copy` locals only, `lua_error` the tail call —
+/// and the interpreter re-enables hooks when the protected call it
+/// unwinds recovers, so the state is whole afterwards (the same route
+/// the reference interpreter's own Ctrl-C handler takes).
+unsafe extern "C" fn budget_hook(raw: *mut ffi::lua_State, _ar: *mut ffi::lua_Debug) {
+    unsafe {
+        ffi::lua_pushlstring(raw, BUDGET_MESSAGE.as_ptr().cast(), BUDGET_MESSAGE.len());
+        ffi::lua_error(raw);
+    }
+}
+
 impl Drop for LuaState {
     fn drop(&mut self) {
         unsafe {
@@ -543,6 +589,48 @@ mod tests {
     }
 
     // ---- zero-copy and exactness (the #41 spike, kept green) ----
+
+    #[test]
+    fn instruction_budget_stops_a_runaway_kernel_and_the_state_survives() {
+        let mut state = LuaState::new().unwrap();
+        state.set_instruction_budget(Some(1_000_000));
+        let error = eval(&mut state, "while true do end", &[], ReturnType::F64).unwrap_err();
+        assert!(error.contains("instruction budget exceeded"), "{error}");
+        // The next call on the same state: the error left nothing
+        // behind, and a kernel within budget never meets the guard.
+        assert_eq!(
+            eval(&mut state, "return 3", &[], ReturnType::F64).unwrap(),
+            ScalarValue::F64(3.0)
+        );
+        let sum = eval(
+            &mut state,
+            "local s = 0\nfor i = 1, 1000 do s = s + i end\nreturn s",
+            &[],
+            ReturnType::F64,
+        )
+        .unwrap();
+        assert_eq!(sum, ScalarValue::F64(500_500.0));
+    }
+
+    #[test]
+    fn instruction_budget_counts_per_call_and_lifts_when_removed() {
+        let mut state = LuaState::new().unwrap();
+        state.set_instruction_budget(Some(5_000));
+        // A thousand iterations are a few thousand instructions: under
+        // the budget twice in a row only if the count restarts per call.
+        let small = "local s = 0\nfor i = 1, 1000 do s = s + i end\nreturn s";
+        eval(&mut state, small, &[], ReturnType::F64).unwrap();
+        eval(&mut state, small, &[], ReturnType::F64).unwrap();
+        // Ten times the work trips it; without the budget it finishes.
+        let large = "local s = 0\nfor i = 1, 10000 do s = s + i end\nreturn s";
+        let error = eval(&mut state, large, &[], ReturnType::F64).unwrap_err();
+        assert!(error.contains("instruction budget exceeded"), "{error}");
+        state.set_instruction_budget(None);
+        assert_eq!(
+            eval(&mut state, large, &[], ReturnType::F64).unwrap(),
+            ScalarValue::F64(50_005_000.0)
+        );
+    }
 
     #[test]
     fn f64_view_is_zero_copy_and_reads_exactly() {
