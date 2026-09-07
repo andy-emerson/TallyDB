@@ -9,6 +9,17 @@ readme = "README.md"
 description = "An embeddable, SQL-native time-series database for numeric data, with the numeric compute inside the engine: SQL over Arrow-layout columns, curated statistics, and optional Lua kernels."
 keywords = ["database", "time-series", "sql", "embedded", "arrow"]
 categories = ["database-implementations", "database"]
+# What ships is what builds or tests the crate. Excluded is what runs the
+# project: the Lua upstream suite (the CI lua-suite job), CI and the gate
+# script, and the process documents.
+exclude = [
+    "src/compute_lua/upstream-tests",
+    ".github",
+    "scripts",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "CLAUDE.md",
+]
 
 [lib]
 # cdylib exists solely for the Python oracle scripts, which drive the
