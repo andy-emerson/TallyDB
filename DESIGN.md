@@ -2530,7 +2530,7 @@ scripts. There used to be two libraries — `libarrow_lite` and
 latter also re-exported at the root), and every public item of every
 module is reachable — as the former crates' public items were reachable
 to anyone who depended on them. Which of that the *published* crate
-promises as its API is an open decision (HANDOFF.md carries it); until it
+promises as its API is an open decision (#107 carries it); until it
 is ruled, nothing here is narrowed or widened.
 
 **What the crate boundaries used to guarantee, and what guarantees it now:**

@@ -438,6 +438,27 @@ The repo-specific half lives here:
   This README — *where it is now*, for a user. The first is
   project-agnostic and arrives by replacement; the third is
   project-agnostic and maintained here; the other two are ours.
+- **Conventions the Human has set for agent sessions** (they override any
+  tool's defaults):
+  1. No pull requests from the agent. Work lands on `claude/dev`,
+     restarted from `main` after every merge; the Human opens the pull
+     request and performs every merge.
+  2. Authorship is Andy Emerson only —
+     `Andy Emerson <156483017+andy-emerson@users.noreply.github.com>` on
+     every commit, and no agent attribution anywhere: commits, trailers,
+     pull-request bodies, comments, artifacts.
+  3. The license is MIT and frozen.
+  4. The Human owns and closes decisions. Surface each fork as an issue
+     with the `decision` label — options, the user's and the developer's
+     point of view, a recommendation, what it gates — before building,
+     and never entrench an answer to an open one. Decisions made ad hoc
+     while building are revisitable; only what would undermine what
+     TallyDB is is non-negotiable. Give the reason, never cite the ruling.
+  5. kdb+ validates problems, not solutions.
+  6. `scripts/gate.sh` green before every push, on the stable toolchain
+     CI uses. CI's stable moves: a clippy failure there and not here
+     means `rustup update stable` and run again.
+  7. Never touch the vendored Lua under `src/compute_lua/vendor`.
 - **Living status:** [GitHub Issues](https://github.com/andy-emerson/TallyDB/issues).
   Open decisions carry the `decision` label; everything else open is a todo
   or a bug. Settled decisions — including rejected alternatives and their
@@ -453,8 +474,9 @@ The repo-specific half lives here:
   DuckDB and NumPy differentials, the Lua-window family included), the
   Lua `apicheck` build, Miri over `arrow_lite`, the official Lua 5.4.7
   test suite (`ltests`) over the vendored interpreter, and an
-  ASan/UBSan job over the C boundary. Doctests are this repository's
-  preferred executable evidence.
+  ASan/UBSan job over the C boundary. `scripts/gate.sh` runs every
+  stable-toolchain leg locally, in CI's order, judged by exit code.
+  Doctests are this repository's preferred executable evidence.
 - **Audience:** documentation is written for a reader with a BS in applied
   mathematics and a CS minor; code for the CS-minor side — see DESIGN.md,
   *Who we write for*. `CONTRIBUTING.md` leaves that fluency setting to the
