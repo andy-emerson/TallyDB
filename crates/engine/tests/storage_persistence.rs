@@ -3,7 +3,7 @@
 //! Run against both backends — the contract, not the filesystem, is the
 //! spec.
 
-use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use engine::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 use engine::storage_lite::{
     encode_segment, FsBackend, IoError, MemBackend, RowValue, StorageBackend, StorageError, Store,
     StoreOptions, WalSync,
@@ -345,7 +345,7 @@ fn tombstones_survive_reopen() {
             .iter()
             .flat_map(|view| {
                 let view = view.view().unwrap();
-                let arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+                let engine::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
                     &view.segment.batch().columns()[0]
                 else {
                     panic!("ts type")

@@ -8,18 +8,18 @@
 //! against (`add_table` / `append` / `query` / `mutate`), and it is
 //! where star-schema joins resolve their dimension tables.
 
+use crate::arrow_lite::{ArrowArrayStream, Schema};
 use crate::query_lite::{parse_statement, plan, QueryError, QueryOutput, Statement};
 use crate::storage_lite::RowValue;
 use crate::table::{EngineError, Table};
 use crate::view::MaterializedView;
-use arrow_lite::{ArrowArrayStream, Schema};
 use std::collections::HashMap;
 
 /// A set of named tables — and maintained views — behind one SQL
 /// doorway.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, Field, Schema};
+/// use engine::arrow_lite::{ColumnType, Field, Schema};
 /// use engine::{Database, RowValue};
 ///
 /// let mut db = Database::new();
@@ -278,7 +278,10 @@ impl Database {
     /// As [`Database::query`], exported as an `ArrowArrayStream`.
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
-        Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+        Ok(crate::arrow_lite::export_stream(
+            schema,
+            batches.into_iter(),
+        ))
     }
 
     /// Runs one SQL mutation (`UPDATE` / `DELETE`) against the table it
@@ -335,7 +338,7 @@ impl Database {
         name: &str,
         parameters: &[&str],
         chunk: &str,
-        output: arrow_lite::ColumnType,
+        output: crate::arrow_lite::ColumnType,
     ) -> Result<(), EngineError> {
         self.tables
             .get_mut(table)
@@ -425,7 +428,7 @@ fn derived_refusal(name: &str, verb: &str) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_lite::{ColumnType, Field};
+    use crate::arrow_lite::{ColumnType, Field};
 
     fn schema() -> Schema {
         Schema::new(vec![
@@ -490,7 +493,7 @@ mod tests {
 #[cfg(test)]
 mod join_tests {
     use super::*;
-    use arrow_lite::{Column, ColumnType, Field, NumericData};
+    use crate::arrow_lite::{Column, ColumnType, Field, NumericData};
 
     fn fact_schema() -> Schema {
         Schema::new(vec![

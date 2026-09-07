@@ -26,8 +26,8 @@
 //! decision (issue #6). Nothing here entrenches it: [`Dictionary`] is a
 //! standalone value type, and who owns one is the caller's business.
 
-use crate::bitmap::Bitmap;
-use crate::buffer::Buffer;
+use crate::arrow_lite::bitmap::Bitmap;
+use crate::arrow_lite::buffer::Buffer;
 use std::collections::HashMap;
 
 /// An interning table of distinct string values, in Arrow Utf8 layout.
@@ -37,7 +37,7 @@ use std::collections::HashMap;
 /// never changes — later interning only appends.
 ///
 /// ```
-/// use arrow_lite::Dictionary;
+/// use engine::arrow_lite::Dictionary;
 ///
 /// let mut dict = Dictionary::new();
 /// let a = dict.intern("AAPL");
@@ -142,7 +142,7 @@ impl Dictionary {
 /// `KeyColumn` never holds a dangling code.
 ///
 /// ```
-/// use arrow_lite::KeyColumn;
+/// use engine::arrow_lite::KeyColumn;
 ///
 /// let col = KeyColumn::from_values(["a", "b", "a", "a"]);
 /// assert_eq!(col.codes().as_slice(), &[0, 1, 0, 0]);

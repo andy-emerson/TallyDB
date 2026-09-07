@@ -510,7 +510,7 @@ mod tests {
     //! zero-copy and lifetime properties the crate exists for.
 
     use super::*;
-    use arrow_lite::{Bitmap, Dictionary};
+    use crate::arrow_lite::{Bitmap, Dictionary};
 
     /// Compile-and-run, for tests that exercise one chunk once. The
     /// production path compiles at registration and calls per window.

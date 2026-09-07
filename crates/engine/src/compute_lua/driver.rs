@@ -353,9 +353,9 @@ mod tests {
     //! kernel refusal, and result-view poisoning.
 
     use super::*;
+    use crate::arrow_lite::Dictionary;
     use crate::compute_lua::values::ReturnType;
     use crate::compute_lua::LuaState;
-    use arrow_lite::Dictionary;
     use std::sync::{Arc, Mutex};
 
     /// Everything `append` received: `(table, row)` per call.

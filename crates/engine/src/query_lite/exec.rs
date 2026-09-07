@@ -49,6 +49,10 @@
 //! back to hashing — same answers, state proportional to the result —
 //! when the data is not ordered.
 
+use crate::arrow_lite::{
+    Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
+    RecordBatch, Schema,
+};
 use crate::query_lite::plan::{
     AggCall, AggFunction, AggItem, ArithOp, AsOfMatch, Frame, GroupKey, JoinPlan, OrderBy, Plan,
     PlanItem, Projection, QueryError, ScalarExpr, ScalarFunction, WindowCall, SEQUENCE_COLUMN,
@@ -57,10 +61,6 @@ use crate::query_lite::predicate::{
     can_match, cmp_f64, evaluate as evaluate_predicate, Predicate, ScalarEval,
 };
 use crate::storage_lite::{Segment, SegmentHandle, SegmentView, SequenceInfo};
-use arrow_lite::{
-    Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, NumericColumn, NumericData,
-    RecordBatch, Schema,
-};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1541,7 +1541,7 @@ fn evaluate_scalar(
 /// Builds a numeric column from parallel values/validity — the one
 /// values-plus-bitmap assembly every output path shares. The bitmap
 /// exists only if some value is actually absent, same as storage.
-fn assemble_numeric<T: arrow_lite::Element>(
+fn assemble_numeric<T: crate::arrow_lite::Element>(
     values: Buffer<T>,
     validity: Vec<bool>,
 ) -> NumericColumn<T> {

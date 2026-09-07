@@ -40,9 +40,9 @@ jobs:
         run: cargo doc --workspace --no-deps
       - name: PyArrow oracle (issue #15)
         run: |
-          cargo build -p arrow-lite --features oracle-harness
+          cargo build -p engine --features oracle-harness
           pip install pyarrow cffi
-          python3 crates/arrow-lite/tests/pyarrow_roundtrip.py target/debug/libarrow_lite.so
+          python3 crates/engine/tests/pyarrow_roundtrip.py target/debug/libengine.so
       - name: M1 slice oracle — NumPy + DuckDB (issue #27)
         run: |
           cargo build -p engine --features oracle-harness
@@ -77,11 +77,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Nightly toolchain with Miri
         run: rustup toolchain install nightly --profile minimal --component miri
-      - name: Miri over arrow-lite
+      - name: Miri over arrow_lite
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
           PROPTEST_CASES: "4"
-        run: cargo +nightly miri test -p arrow-lite --lib
+        run: cargo +nightly miri test -p engine --no-default-features --lib arrow_lite::
 
   # The official Lua 5.4.7 test suite over the vendored interpreter
   # (issue #69): the release's own ltests instrumentation compiled in

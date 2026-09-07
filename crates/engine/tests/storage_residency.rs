@@ -5,7 +5,7 @@
 //! outside, by counting backend reads: a fault is a read, an eviction
 //! is a re-read on the next touch, and retention is the absence of one.
 
-use arrow_lite::{ColumnType, Field, Schema};
+use engine::arrow_lite::{ColumnType, Field, Schema};
 use engine::storage_lite::{
     FsBackend, IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions,
     WalSync,

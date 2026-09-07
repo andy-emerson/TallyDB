@@ -13,7 +13,7 @@
 //! DuckDB+NumPy stack; this file is only a smoke check that the shapes
 //! stay in their expected order of magnitude.
 
-use arrow_lite::{ColumnType, Field, Schema};
+use engine::arrow_lite::{ColumnType, Field, Schema};
 use engine::{RowValue, Table};
 use std::time::Instant;
 

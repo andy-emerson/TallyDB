@@ -8,7 +8,7 @@
 //! change that moves them is a behavioral change whose review includes
 //! re-blessing `tests/golden/segment_v1.bin`, never a refactor.
 
-use arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
+use engine::arrow_lite::{Column, ColumnType, Field, LogicalType, NumericData, Schema};
 use engine::storage_lite::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, FormatError,
     ManifestSections, RowValue, Segment, SequenceInfo, WriteBuffer,

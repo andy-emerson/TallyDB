@@ -20,9 +20,9 @@
 //! `NOT (a AND b)` is TRUE where a is FALSE even if b is UNKNOWN — with
 //! `WHERE` keeping only the rows that come out TRUE.
 
+use crate::arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use crate::query_lite::plan::QueryError;
 use crate::storage_lite::{SegmentHandle, SegmentView};
-use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use sqlparser::ast;
 use std::cmp::Ordering;
 
@@ -918,8 +918,8 @@ mod tests {
     }
 
     use super::*;
+    use crate::arrow_lite::{ColumnType, Field};
     use crate::storage_lite::{RowValue, WriteBuffer};
-    use arrow_lite::{ColumnType, Field};
 
     /// A segment mixing NaN with finite values, plus one all-NaN
     /// segment — the D2 ruling's edge cases: NaN is a value, greater
@@ -1302,8 +1302,8 @@ mod pruning_tests {
     }
 
     use super::*;
+    use crate::arrow_lite::{ColumnType, Field};
     use crate::storage_lite::{RowValue, SegmentView, WriteBuffer};
-    use arrow_lite::{ColumnType, Field};
 
     fn view(ts: &[i64], x: &[f64]) -> (Schema, SegmentView) {
         let schema = Schema::new(vec![

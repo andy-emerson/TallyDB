@@ -33,6 +33,7 @@
 //! executor) check [`Segment::is_ordered`] and the live ordering bounds
 //! instead of assuming.
 
+use crate::arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use crate::storage_lite::format::{
     decode_manifest, decode_segment, encode_manifest, encode_segment, SegmentRecord,
 };
@@ -41,7 +42,6 @@ use crate::storage_lite::mem::{
     RowValue, Segment, SequenceInfo, StorageError, WriteBuffer, ZoneMap,
 };
 use crate::storage_lite::tombstone::{decode_tombstones, encode_tombstones, DeleteLog};
-use arrow_lite::{Bitmap, Column, ColumnType, NumericData, Schema};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -590,7 +590,7 @@ impl SegmentHandle {
 /// A table's storage: an active write buffer plus frozen segments.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, Field, Schema};
+/// use engine::arrow_lite::{ColumnType, Field, Schema};
 /// use engine::storage_lite::{RowValue, Store};
 ///
 /// let schema = Schema::new(vec![
@@ -937,7 +937,7 @@ impl KnowledgeSnapshot {
                             .get(key_column)
                             .map(|field| field.name().to_owned())
                             .unwrap_or_else(|| format!("column {key_column}")),
-                        expected: arrow_lite::ColumnType::Key,
+                        expected: crate::arrow_lite::ColumnType::Key,
                     })
                 }
             }
@@ -2707,7 +2707,7 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_lite::{Column, ColumnType, Field, NumericData};
+    use crate::arrow_lite::{Column, ColumnType, Field, NumericData};
 
     fn schema() -> Schema {
         Schema::new(vec![

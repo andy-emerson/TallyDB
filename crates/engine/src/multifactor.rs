@@ -352,7 +352,7 @@ pub enum MultiFactorOutput {
 ///
 /// ```
 /// use engine::{MultiFactorOutput, MultiFactorRegression, Table};
-/// use arrow_lite::{ColumnType, Field, Schema};
+/// use engine::arrow_lite::{ColumnType, Field, Schema};
 /// use engine::storage_lite::RowValue;
 ///
 /// let schema = Schema::new(vec![
@@ -381,7 +381,7 @@ pub enum MultiFactorOutput {
 ///      FROM t",
 /// ).unwrap();
 /// let last = out.batches.last().unwrap();
-/// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(column)) = &last.columns()[0]
+/// let engine::arrow_lite::Column::Numeric(engine::arrow_lite::NumericData::F64(column)) = &last.columns()[0]
 /// else { panic!("f64") };
 /// let final_row = column.values().as_slice()[last.num_rows() - 1];
 /// assert!((final_row - 3.0).abs() < 1e-6, "{final_row}");

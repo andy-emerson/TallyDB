@@ -3,7 +3,7 @@
 //! segment's file is never read — pruning saves I/O, not just
 //! evaluation. Observed from outside by counting backend reads.
 
-use arrow_lite::{ColumnType, Field, Schema};
+use engine::arrow_lite::{ColumnType, Field, Schema};
 use engine::query_lite::{execute, plan, Registry};
 use engine::storage_lite::{
     IoError, LogWriter, MemBackend, RowValue, StorageBackend, Store, StoreOptions, WalSync,

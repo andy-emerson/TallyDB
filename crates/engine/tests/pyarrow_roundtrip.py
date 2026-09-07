@@ -10,7 +10,7 @@ checks both directions against fixtures defined independently here and in
   3. arrow-lite exports a 3-batch stream     -> PyArrow reads and compares.
   4. PyArrow exports the same stream         -> arrow-lite reads and compares.
 
-Usage: pyarrow_roundtrip.py [path/to/libarrow_lite.so]
+Usage: pyarrow_roundtrip.py [path/to/libengine.so]
 Exits nonzero on the first failure.
 """
 
@@ -28,7 +28,7 @@ def load_library() -> ctypes.CDLL:
         path = Path(sys.argv[1])
     else:
         repo = Path(__file__).resolve().parents[3]
-        path = repo / "target" / "debug" / "libarrow_lite.so"
+        path = repo / "target" / "debug" / "libengine.so"
     if not path.exists():
         sys.exit(
             f"{path} not found - build it with "

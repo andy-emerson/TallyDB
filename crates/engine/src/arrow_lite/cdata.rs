@@ -27,12 +27,12 @@
 //! (issue #15) — arrow-rs and PyArrow importing our exports and vice
 //! versa — not these unit tests alone.
 
-use crate::bitmap::Bitmap;
-use crate::buffer::{Buffer, Element, NumericColumn};
-use crate::column::{Column, ColumnType, NumericData};
-use crate::key::{Dictionary, KeyColumn};
-use crate::logical::{LogicalType, DECIMAL64_PRECISION};
-use crate::schema::{Field, RecordBatch, Schema};
+use crate::arrow_lite::bitmap::Bitmap;
+use crate::arrow_lite::buffer::{Buffer, Element, NumericColumn};
+use crate::arrow_lite::column::{Column, ColumnType, NumericData};
+use crate::arrow_lite::key::{Dictionary, KeyColumn};
+use crate::arrow_lite::logical::{LogicalType, DECIMAL64_PRECISION};
+use crate::arrow_lite::schema::{Field, RecordBatch, Schema};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
 use std::sync::Arc;
@@ -1157,7 +1157,7 @@ impl Drop for StreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Buffer;
+    use crate::arrow_lite::buffer::Buffer;
 
     fn test_batch() -> RecordBatch {
         let schema = Schema::new(vec![

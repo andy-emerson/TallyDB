@@ -2,7 +2,7 @@
 //! the next compaction" means — tombstones gone, order restored, row
 //! ids contiguous again, durably and crash-safely.
 
-use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use engine::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 use engine::storage_lite::{
     FsBackend, IoError, MemBackend, RowValue, SequenceInfo, StorageBackend, Store,
 };

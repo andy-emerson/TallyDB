@@ -25,7 +25,7 @@
 //! empty one (which uses a non-null, 64-aligned placeholder address and
 //! performs no allocation).
 
-use crate::bitmap::Bitmap;
+use crate::arrow_lite::bitmap::Bitmap;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::fmt;
 use std::marker::PhantomData;
@@ -130,7 +130,7 @@ impl<T: Element> Drop for RawBuf<T> {
 /// Clones share the allocation; mutation copies on write.
 ///
 /// ```
-/// use arrow_lite::buffer::{Buffer, BUFFER_ALIGN};
+/// use engine::arrow_lite::buffer::{Buffer, BUFFER_ALIGN};
 ///
 /// let mut buf = Buffer::<f64>::new();
 /// buf.extend_from_slice(&[1.0, 2.0, 3.0]);
@@ -333,7 +333,7 @@ impl<T: Element> FromIterator<T> for Buffer<T> {
 /// every row).
 ///
 /// ```
-/// use arrow_lite::{Bitmap, NumericColumn};
+/// use engine::arrow_lite::{Bitmap, NumericColumn};
 ///
 /// let col = NumericColumn::new_non_null([1.5, 2.5].into_iter().collect());
 /// assert_eq!(col.null_count(), 0);

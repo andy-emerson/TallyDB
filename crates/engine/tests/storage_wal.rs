@@ -10,7 +10,7 @@ use engine::storage_lite::{
 };
 use std::sync::Arc;
 
-use arrow_lite::{ColumnType, Field, NumericData, Schema};
+use engine::arrow_lite::{ColumnType, Field, NumericData, Schema};
 
 fn schema() -> Schema {
     Schema::new(vec![
@@ -50,7 +50,8 @@ fn ts_values(store: &Store) -> Vec<i64> {
     let mut out = Vec::new();
     for view in store.snapshot().unwrap() {
         let view = view.view().unwrap();
-        let arrow_lite::Column::Numeric(NumericData::I64(ts)) = &view.segment.batch().columns()[0]
+        let engine::arrow_lite::Column::Numeric(NumericData::I64(ts)) =
+            &view.segment.batch().columns()[0]
         else {
             panic!("ts is i64")
         };

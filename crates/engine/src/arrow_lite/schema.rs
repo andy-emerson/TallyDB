@@ -10,14 +10,14 @@
 //! the no-bitmap-when-`NOT NULL` rule — so an exported batch is consistent
 //! by construction.
 
-use crate::column::{Column, ColumnType};
-use crate::logical::LogicalType;
+use crate::arrow_lite::column::{Column, ColumnType};
+use crate::arrow_lite::logical::LogicalType;
 
 /// One column's declaration: name, physical type, nullability, optional
 /// export annotation.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, Field, LogicalType};
+/// use engine::arrow_lite::{ColumnType, Field, LogicalType};
 ///
 /// let ts = Field::new("ts", ColumnType::I64, false).with_logical(LogicalType::TimestampNs);
 /// assert_eq!(ts.name(), "ts");
@@ -100,7 +100,7 @@ impl Schema {
 /// A schema bound to columns: the unit of data interchange.
 ///
 /// ```
-/// use arrow_lite::{
+/// use engine::arrow_lite::{
 ///     Buffer, Column, ColumnType, Field, KeyColumn, NumericColumn, NumericData, RecordBatch,
 ///     Schema,
 /// };
@@ -193,9 +193,9 @@ impl RecordBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{Buffer, NumericColumn};
-    use crate::column::NumericData;
-    use crate::Bitmap;
+    use crate::arrow_lite::buffer::{Buffer, NumericColumn};
+    use crate::arrow_lite::column::NumericData;
+    use crate::arrow_lite::Bitmap;
 
     fn f64_column(values: &[f64]) -> Column {
         Column::Numeric(NumericData::F64(NumericColumn::new_non_null(

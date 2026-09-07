@@ -30,12 +30,12 @@
 //! within a partition is not a contract, and cross-frame state is
 //! unsupported (it will not be preserved by future parallel execution).
 
+use crate::arrow_lite::{Bitmap, ColumnType};
 use crate::compute_linalg::{LinalgBackend, RustLinalg};
 use crate::compute_lua::{
     Chunk, ColumnView, HostFunction, LogSink, LuaState, OutputColumn, ReturnType, ScalarValue,
 };
 use crate::query_lite::{Registry, WindowAggregate};
-use arrow_lite::{Bitmap, ColumnType};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
@@ -364,8 +364,8 @@ mod tests {
     //! same executor path as the native windows — plus the loud edges of
     //! registration and execution.
 
+    use crate::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
     use crate::{Database, RowValue, Table};
-    use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 
     /// The mean-absolute-deviation kernel — the crate's running example
     /// of a loop the built-ins don't cover.

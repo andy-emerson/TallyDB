@@ -113,6 +113,7 @@
 //! they compose with everything else. Prose says "maintained view";
 //! the API type is [`MaterializedView`] — one concept, two registers.
 
+use crate::arrow_lite::{ColumnType, Field, Schema};
 use crate::query_lite::{
     plan as lower_plan, CmpOp, GroupKey, Number, Plan, Predicate, Projection, QueryError,
     SEQUENCE_COLUMN,
@@ -120,7 +121,6 @@ use crate::query_lite::{
 use crate::storage_lite::format::crc32c;
 use crate::storage_lite::StoreOptions;
 use crate::table::{EngineError, Table};
-use arrow_lite::{ColumnType, Field, Schema};
 use std::path::Path;
 
 /// The definition sidecar's filename inside the view's directory. Its
@@ -1013,7 +1013,7 @@ impl MaterializedView {
     /// stances).
     fn over_scratch(
         &self,
-        clean: impl Iterator<Item = arrow_lite::RecordBatch>,
+        clean: impl Iterator<Item = crate::arrow_lite::RecordBatch>,
         fresh: crate::query_lite::QueryOutput,
         user_plan: &Plan,
     ) -> Result<crate::query_lite::QueryOutput, EngineError> {
@@ -1787,7 +1787,7 @@ fn folded_bucket_count(
 /// The first cell of a single-column, single-row i64 aggregate — the
 /// shared tail of the structural MIN/MAX probes below.
 fn single_i64_cell(output: &crate::query_lite::QueryOutput) -> Option<i64> {
-    use arrow_lite::{Column, NumericData};
+    use crate::arrow_lite::{Column, NumericData};
     let batch = output
         .batches
         .first()
@@ -2013,7 +2013,7 @@ fn source_span(source: &Table) -> Result<Option<(i64, i64)>, EngineError> {
         return Ok(None);
     };
     let cell = |index: usize| -> Option<i64> {
-        use arrow_lite::{Column, NumericData};
+        use crate::arrow_lite::{Column, NumericData};
         match &batch.columns()[index] {
             Column::Numeric(NumericData::I64(column)) => {
                 column.is_valid(0).then(|| column.values().as_slice()[0])
@@ -2038,8 +2038,8 @@ fn source_span(source: &Table) -> Result<Option<(i64, i64)>, EngineError> {
 fn finalize_combined(
     running: &RunningRead,
     combined: &crate::query_lite::QueryOutput,
-) -> Result<Option<arrow_lite::RecordBatch>, EngineError> {
-    use arrow_lite::{Bitmap, Buffer, Column, NumericColumn, NumericData, RecordBatch};
+) -> Result<Option<crate::arrow_lite::RecordBatch>, EngineError> {
+    use crate::arrow_lite::{Bitmap, Buffer, Column, NumericColumn, NumericData, RecordBatch};
     // Collapsing stages materialize one batch (QueryOutput's contract);
     // an empty result has none, and finalizes to none.
     let Some(batch) = combined.batches.first() else {
@@ -2120,11 +2120,11 @@ fn finalize_combined(
 /// is ordered on `__row` by construction (it counts rows).
 fn run_over_output(
     output: &Schema,
-    batches: Vec<arrow_lite::RecordBatch>,
+    batches: Vec<crate::arrow_lite::RecordBatch>,
     user_plan: &Plan,
     registry: &crate::query_lite::Registry,
 ) -> Result<crate::query_lite::QueryOutput, EngineError> {
-    use arrow_lite::{Column, NumericColumn, NumericData, RecordBatch};
+    use crate::arrow_lite::{Column, NumericColumn, NumericData, RecordBatch};
     let okey = output.fields().len() - 1; // __row, by construction
     let batches = batches
         .into_iter()
@@ -2135,7 +2135,9 @@ fn run_over_output(
                 let rows = batch.num_rows() as i64;
                 let mut columns = batch.columns().to_vec();
                 columns.push(Column::Numeric(NumericData::I64(
-                    NumericColumn::new_non_null((0..rows).collect::<arrow_lite::Buffer<i64>>()),
+                    NumericColumn::new_non_null(
+                        (0..rows).collect::<crate::arrow_lite::Buffer<i64>>(),
+                    ),
                 )));
                 RecordBatch::new(output.clone(), columns)
             }
@@ -2214,7 +2216,7 @@ fn boundary_rows(
     cumulative: &CumulativeRead,
     combined: &crate::query_lite::QueryOutput,
 ) -> std::collections::HashMap<Vec<Option<String>>, Vec<Option<Cell>>> {
-    use arrow_lite::{Column, NumericData};
+    use crate::arrow_lite::{Column, NumericData};
     let mut map = std::collections::HashMap::new();
     // Collapsing stages materialize one batch (QueryOutput's contract);
     // an empty result has none.
@@ -2254,10 +2256,10 @@ fn boundary_rows(
 /// output batches carry the user-facing schema.
 fn adjust_batches(
     cumulative: &CumulativeRead,
-    batches: Vec<arrow_lite::RecordBatch>,
+    batches: Vec<crate::arrow_lite::RecordBatch>,
     boundaries: &std::collections::HashMap<Vec<Option<String>>, Vec<Option<Cell>>>,
-) -> Vec<arrow_lite::RecordBatch> {
-    use arrow_lite::{Bitmap, Column, NumericColumn, NumericData, RecordBatch};
+) -> Vec<crate::arrow_lite::RecordBatch> {
+    use crate::arrow_lite::{Bitmap, Column, NumericColumn, NumericData, RecordBatch};
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         let rows = batch.num_rows();
@@ -2374,12 +2376,12 @@ enum Fold {
 /// in the column's own numeric domain. A row missing either side keeps
 /// the other; a row missing both is NULL.
 fn folded(
-    column: &arrow_lite::Column,
+    column: &crate::arrow_lite::Column,
     rows: usize,
     boundary: impl Fn(usize) -> Option<Cell>,
     fold: Fold,
-) -> arrow_lite::Column {
-    use arrow_lite::{Bitmap, Column, NumericColumn, NumericData};
+) -> crate::arrow_lite::Column {
+    use crate::arrow_lite::{Bitmap, Column, NumericColumn, NumericData};
     match column {
         Column::Numeric(NumericData::F64(assembled)) => {
             let mut values = Vec::with_capacity(rows);
@@ -2465,7 +2467,7 @@ fn folded(
 fn run_over_scratch(
     output: &Schema,
     okey: usize,
-    batches: Vec<arrow_lite::RecordBatch>,
+    batches: Vec<crate::arrow_lite::RecordBatch>,
     user_plan: &Plan,
     registry: &crate::query_lite::Registry,
 ) -> Result<crate::query_lite::QueryOutput, EngineError> {
@@ -2514,8 +2516,8 @@ fn select_everything(table: &Table) -> Result<Plan, EngineError> {
 
 /// Whether `batch`'s column `index` is non-decreasing — the honest
 /// per-batch orderedness of a scratch segment.
-fn is_non_decreasing(batch: &arrow_lite::RecordBatch, index: usize) -> bool {
-    use arrow_lite::{Column, NumericData};
+fn is_non_decreasing(batch: &crate::arrow_lite::RecordBatch, index: usize) -> bool {
+    use crate::arrow_lite::{Column, NumericData};
     let Column::Numeric(NumericData::I64(column)) = &batch.columns()[index] else {
         return false;
     };
@@ -3474,10 +3476,10 @@ mod tests {
         let source = source();
         let dim = Table::new(
             "dim",
-            arrow_lite::Schema::new(vec![
-                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                arrow_lite::Field::new("w", arrow_lite::ColumnType::F64, false),
+            crate::arrow_lite::Schema::new(vec![
+                crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                crate::arrow_lite::Field::new("w", crate::arrow_lite::ColumnType::F64, false),
             ]),
             "qts",
         )
@@ -3615,10 +3617,10 @@ mod tests {
         // A view in a join is refused by name on either side.
         db.create_table(
             "dim",
-            arrow_lite::Schema::new(vec![
-                arrow_lite::Field::new("ts", arrow_lite::ColumnType::I64, false),
-                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                arrow_lite::Field::new("w", arrow_lite::ColumnType::F64, false),
+            crate::arrow_lite::Schema::new(vec![
+                crate::arrow_lite::Field::new("ts", crate::arrow_lite::ColumnType::I64, false),
+                crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                crate::arrow_lite::Field::new("w", crate::arrow_lite::ColumnType::F64, false),
             ]),
             "ts",
         )
@@ -3648,7 +3650,7 @@ mod tests {
     /// may hold its rows in refresh order, so equality is up to row
     /// order, never up to values.
     fn sorted_rows(output: &crate::query_lite::QueryOutput) -> Vec<String> {
-        use arrow_lite::{Column, NumericData};
+        use crate::arrow_lite::{Column, NumericData};
         let mut rows = Vec::new();
         for batch in &output.batches {
             for row in 0..batch.num_rows() {
@@ -5060,10 +5062,10 @@ mod tests {
         // repo-wide code review, which probed a source column named
         // '__p0' selected as a running key). One prefix rule closes
         // the whole family.
-        let schema = arrow_lite::Schema::new(vec![
-            arrow_lite::Field::new("ts", arrow_lite::ColumnType::I64, false),
-            arrow_lite::Field::new("__p0", arrow_lite::ColumnType::Key, false),
-            arrow_lite::Field::new("x", arrow_lite::ColumnType::F64, false),
+        let schema = crate::arrow_lite::Schema::new(vec![
+            crate::arrow_lite::Field::new("ts", crate::arrow_lite::ColumnType::I64, false),
+            crate::arrow_lite::Field::new("__p0", crate::arrow_lite::ColumnType::Key, false),
+            crate::arrow_lite::Field::new("x", crate::arrow_lite::ColumnType::F64, false),
         ]);
         let source = Table::new("t", schema, "ts").unwrap();
         let refused = |sql: &str| {
@@ -5241,10 +5243,10 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,
@@ -5425,10 +5427,10 @@ mod tests {
         let mut trades = Table::persistent("trades", m1_schema(), "ts", &trades_dir).unwrap();
         let mut quotes = Table::persistent(
             "quotes",
-            arrow_lite::Schema::new(vec![
-                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            crate::arrow_lite::Schema::new(vec![
+                crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
             ]),
             "qts",
             &quotes_dir,
@@ -5543,10 +5545,10 @@ mod tests {
         let mut trades = Table::new("trades", m1_schema(), "ts").unwrap();
         let mut quotes_alone = Table::new(
             "quotes",
-            arrow_lite::Schema::new(vec![
-                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            crate::arrow_lite::Schema::new(vec![
+                crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
             ]),
             "qts",
         )
@@ -5618,10 +5620,10 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,
@@ -5774,11 +5776,15 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("venue", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new(
+                        "venue",
+                        crate::arrow_lite::ColumnType::Key,
+                        false,
+                    ),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,
@@ -5838,11 +5844,19 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "dim",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("id", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("sector", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("weight", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("id", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new(
+                        "sector",
+                        crate::arrow_lite::ColumnType::Key,
+                        false,
+                    ),
+                    crate::arrow_lite::Field::new(
+                        "weight",
+                        crate::arrow_lite::ColumnType::F64,
+                        false,
+                    ),
                 ]),
                 "id",
                 4,
@@ -6023,10 +6037,10 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,
@@ -6097,10 +6111,10 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,
@@ -6172,10 +6186,10 @@ mod tests {
         let mut trades = Table::persistent("trades", m1_schema(), "ts", &trades_dir).unwrap();
         let mut quotes = Table::persistent(
             "quotes",
-            arrow_lite::Schema::new(vec![
-                arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+            crate::arrow_lite::Schema::new(vec![
+                crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
             ]),
             "qts",
             &quotes_dir,
@@ -6253,10 +6267,10 @@ mod tests {
         db.add_table(
             Table::with_segment_rows(
                 "quotes",
-                arrow_lite::Schema::new(vec![
-                    arrow_lite::Field::new("qts", arrow_lite::ColumnType::I64, false),
-                    arrow_lite::Field::new("sym", arrow_lite::ColumnType::Key, false),
-                    arrow_lite::Field::new("bid", arrow_lite::ColumnType::F64, false),
+                crate::arrow_lite::Schema::new(vec![
+                    crate::arrow_lite::Field::new("qts", crate::arrow_lite::ColumnType::I64, false),
+                    crate::arrow_lite::Field::new("sym", crate::arrow_lite::ColumnType::Key, false),
+                    crate::arrow_lite::Field::new("bid", crate::arrow_lite::ColumnType::F64, false),
                 ]),
                 "qts",
                 4,

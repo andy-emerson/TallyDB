@@ -46,8 +46,8 @@
 //! Rust destructor; nothing here panics — every fallible condition is
 //! checked and raised as a Lua error inside the surrounding `lua_pcall`.
 
+use crate::arrow_lite::{Bitmap, Dictionary};
 use crate::compute_lua::ffi;
-use arrow_lite::{Bitmap, Dictionary};
 use std::ffi::{c_char, c_int, CStr};
 
 /// A borrowed input column for one script call, in the engine's own

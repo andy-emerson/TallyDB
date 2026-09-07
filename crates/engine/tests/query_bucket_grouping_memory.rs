@@ -16,8 +16,8 @@
 
 mod common;
 
-use arrow_lite::{ColumnType, Field, Schema};
 use common::peak_of;
+use engine::arrow_lite::{ColumnType, Field, Schema};
 use engine::query_lite::{execute, plan, Registry};
 use engine::storage_lite::{RowValue, SegmentHandle, Store};
 

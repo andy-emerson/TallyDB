@@ -26,6 +26,7 @@
 //! a two-argument window) — the copy recorded in deferred issue #4
 //! (peak-memory accounting in #56).
 
+use crate::arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 #[cfg(feature = "lua")]
 use crate::compute_lua::LogSink;
 use crate::query_lite::{
@@ -37,7 +38,6 @@ use crate::storage_lite::{
     FsBackend, RowValue, SegmentHandle, SegmentView, StorageBackend, StorageError, Store,
     StoreOptions, StoreReader,
 };
-use arrow_lite::{ArrowArrayStream, Column, ColumnType, Field, NumericData, Schema};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -112,7 +112,7 @@ impl From<QueryError> for EngineError {
 /// interleaved.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, Field, Schema};
+/// use engine::arrow_lite::{ColumnType, Field, Schema};
 /// use engine::{RowValue, Table};
 ///
 /// let schema = Schema::new(vec![
@@ -141,7 +141,7 @@ impl From<QueryError> for EngineError {
 ///     .unwrap();
 /// // Exact data ⇒ exact slope wherever the window has two points.
 /// let batch = &output.batches[0];
-/// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(beta)) = &batch.columns()[0]
+/// let engine::arrow_lite::Column::Numeric(engine::arrow_lite::NumericData::F64(beta)) = &batch.columns()[0]
 /// else {
 ///     unreachable!()
 /// };
@@ -545,7 +545,7 @@ impl Table {
     /// microseconds nor observe a torn state (#51).
     ///
     /// ```
-    /// # use arrow_lite::{ColumnType, Field, Schema};
+    /// # use engine::arrow_lite::{ColumnType, Field, Schema};
     /// # use engine::{RowValue, Table};
     /// let schema = Schema::new(vec![
     ///     Field::new("ts", ColumnType::I64, false),
@@ -586,7 +586,10 @@ impl Table {
     /// PyArrow.
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
-        Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+        Ok(crate::arrow_lite::export_stream(
+            schema,
+            batches.into_iter(),
+        ))
     }
 
     /// Applies an `INSERT ... VALUES` plan: rows validate and append
@@ -734,7 +737,7 @@ impl Table {
     /// second registration under the same name replaces the first.
     ///
     /// ```
-    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::arrow_lite::{ColumnType, Field, Schema};
     /// use engine::{RowValue, Table};
     ///
     /// let schema = Schema::new(vec![
@@ -769,7 +772,7 @@ impl Table {
     ///     )
     ///     .unwrap();
     /// // A ramp's full 4-row window deviates by exactly 1.0.
-    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    /// let engine::arrow_lite::Column::Numeric(engine::arrow_lite::NumericData::F64(m)) =
     ///     &output.batches[0].columns()[0]
     /// else {
     ///     panic!("expected f64")
@@ -822,7 +825,7 @@ impl Table {
     /// (see [`Table::reader`]).
     ///
     /// ```
-    /// use arrow_lite::{ColumnType, Field, Schema};
+    /// use engine::arrow_lite::{ColumnType, Field, Schema};
     /// use engine::{RowValue, Table, WindowAggregate};
     ///
     /// // The whole extension surface: one trait, ~20 lines.
@@ -862,7 +865,7 @@ impl Table {
     ///          AND CURRENT ROW) AS m FROM t",
     ///     )
     ///     .unwrap();
-    /// let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(m)) =
+    /// let engine::arrow_lite::Column::Numeric(engine::arrow_lite::NumericData::F64(m)) =
     ///     &output.batches[0].columns()[0]
     /// else {
     ///     panic!("expected f64")
@@ -1419,7 +1422,10 @@ impl TableSnapshot {
     /// As [`TableSnapshot::query`], exported as an `ArrowArrayStream`.
     pub fn query_stream(&self, sql: &str) -> Result<ArrowArrayStream, EngineError> {
         let QueryOutput { schema, batches } = self.query(sql)?;
-        Ok(arrow_lite::export_stream(schema, batches.into_iter()))
+        Ok(crate::arrow_lite::export_stream(
+            schema,
+            batches.into_iter(),
+        ))
     }
 
     /// The snapshot's schema.
@@ -1934,7 +1940,7 @@ fn shifted_sweep(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use arrow_lite::{Column, ColumnType, Field, NumericColumn, NumericData, RecordBatch};
+    use crate::arrow_lite::{Column, ColumnType, Field, NumericColumn, NumericData, RecordBatch};
 
     pub(crate) fn m1_schema() -> Schema {
         Schema::new(vec![
@@ -2041,8 +2047,9 @@ pub(crate) mod tests {
                 .batches
                 .iter()
                 .flat_map(|batch| {
-                    let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(column)) =
-                        &batch.columns()[0]
+                    let crate::arrow_lite::Column::Numeric(crate::arrow_lite::NumericData::I64(
+                        column,
+                    )) = &batch.columns()[0]
                     else {
                         panic!("_seq is i64")
                     };
@@ -2451,7 +2458,7 @@ pub(crate) mod tests {
             .query_stream("SELECT ts, sym, x, y FROM trades")
             .unwrap();
         // SAFETY: a live stream our own engine just exported.
-        let reader = unsafe { arrow_lite::StreamReader::new(stream) }.unwrap();
+        let reader = unsafe { crate::arrow_lite::StreamReader::new(stream) }.unwrap();
         let batches: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(batches, expected.batches);
     }
@@ -2670,7 +2677,8 @@ mod ddl_and_insert {
         assert_eq!(output.num_rows(), 2);
         // Integer literal -3 landed exactly in the f64 column.
         let batch = &output.batches[0];
-        let arrow_lite::Column::Numeric(arrow_lite::NumericData::F64(x)) = &batch.columns()[1]
+        let crate::arrow_lite::Column::Numeric(crate::arrow_lite::NumericData::F64(x)) =
+            &batch.columns()[1]
         else {
             panic!("x is f64")
         };
@@ -2685,7 +2693,8 @@ mod ddl_and_insert {
             .unwrap();
         let output = table.query("SELECT ts, x FROM t").unwrap();
         let batch = &output.batches[0];
-        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(ts)) = &batch.columns()[0]
+        let crate::arrow_lite::Column::Numeric(crate::arrow_lite::NumericData::I64(ts)) =
+            &batch.columns()[0]
         else {
             panic!("ts is i64")
         };
@@ -2804,7 +2813,7 @@ mod snapshot_concurrency {
     /// COUNT over the snapshot — one number summarizing what it sees.
     fn count(snapshot: &TableSnapshot) -> f64 {
         let output = snapshot.query("SELECT COUNT(x) AS c FROM t").unwrap();
-        let arrow_lite::Column::Numeric(arrow_lite::NumericData::I64(c)) =
+        let crate::arrow_lite::Column::Numeric(crate::arrow_lite::NumericData::I64(c)) =
             &output.batches[0].columns()[0]
         else {
             panic!("COUNT returns i64");
@@ -3609,9 +3618,9 @@ mod mutation_tests {
     #[test]
     fn update_can_rewrite_keys_and_set_null() {
         let schema = Schema::new(vec![
-            arrow_lite::Field::new("ts", ColumnType::I64, false),
-            arrow_lite::Field::new("sym", ColumnType::Key, false),
-            arrow_lite::Field::new("y", ColumnType::F64, true),
+            crate::arrow_lite::Field::new("ts", ColumnType::I64, false),
+            crate::arrow_lite::Field::new("sym", ColumnType::Key, false),
+            crate::arrow_lite::Field::new("y", ColumnType::F64, true),
         ]);
         let mut table = Table::with_segment_rows("t", schema, "ts", 2).unwrap();
         for i in 0..4i64 {

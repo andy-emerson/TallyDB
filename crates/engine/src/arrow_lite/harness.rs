@@ -15,16 +15,16 @@
 //!   (decimal64(18, 2));
 //! - the **stream slices**: three two-column (`x` f64, `n` i64) batches.
 
-use crate::bitmap::Bitmap;
-use crate::buffer::{Buffer, Element, NumericColumn};
-use crate::cdata::{
+use crate::arrow_lite::bitmap::Bitmap;
+use crate::arrow_lite::buffer::{Buffer, Element, NumericColumn};
+use crate::arrow_lite::cdata::{
     export_batch, export_stream, import_batch, ArrowArray, ArrowArrayStream, ArrowSchema,
     StreamReader,
 };
-use crate::column::{Column, ColumnType, NumericData};
-use crate::key::KeyColumn;
-use crate::logical::LogicalType;
-use crate::schema::{Field, RecordBatch, Schema};
+use crate::arrow_lite::column::{Column, ColumnType, NumericData};
+use crate::arrow_lite::key::KeyColumn;
+use crate::arrow_lite::logical::LogicalType;
+use crate::arrow_lite::schema::{Field, RecordBatch, Schema};
 
 /// The canonical batch, in our types.
 fn canonical_batch() -> RecordBatch {

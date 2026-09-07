@@ -31,14 +31,14 @@
 //! functions feed numeric kernels with pointer arithmetic instead of a copy
 //! per window.
 
-use crate::bitmap::Bitmap;
-use crate::buffer::{Element, NumericColumn};
-use crate::key::{Dictionary, KeyColumn};
+use crate::arrow_lite::bitmap::Bitmap;
+use crate::arrow_lite::buffer::{Element, NumericColumn};
+use crate::arrow_lite::key::{Dictionary, KeyColumn};
 
 /// The physical column types, as their frozen serialization tags.
 ///
 /// ```
-/// use arrow_lite::ColumnType;
+/// use engine::arrow_lite::ColumnType;
 ///
 /// // The registry: these numbers are the format, frozen forever.
 /// assert_eq!(ColumnType::F64 as u8, 0);
@@ -131,7 +131,7 @@ impl NumericData {
 /// A column: numeric or key. There is no third variant, by design.
 ///
 /// ```
-/// use arrow_lite::{Buffer, Column, ColumnType, KeyColumn, NumericColumn, NumericData};
+/// use engine::arrow_lite::{Buffer, Column, ColumnType, KeyColumn, NumericColumn, NumericData};
 ///
 /// let price = Column::Numeric(NumericData::F64(NumericColumn::new_non_null(
 ///     Buffer::from_slice(&[101.5, 102.0]),
@@ -190,7 +190,7 @@ impl Column {
     /// If `index >= len`.
     ///
     /// ```
-    /// use arrow_lite::{Buffer, Column, NumericColumn, NumericData, Bitmap};
+    /// use engine::arrow_lite::{Buffer, Column, NumericColumn, NumericData, Bitmap};
     ///
     /// let values = Buffer::from_slice(&[1.0, 2.0]);
     /// let validity = Bitmap::from_bools(vec![true, false]);
@@ -227,7 +227,7 @@ fn check_range(offset: usize, len: usize, outer: usize) {
 /// no data.
 ///
 /// ```
-/// use arrow_lite::{Buffer, NumericColumn};
+/// use engine::arrow_lite::{Buffer, NumericColumn};
 ///
 /// let col = NumericColumn::new_non_null(Buffer::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0]));
 /// let view = col.view(1, 3);
@@ -311,7 +311,7 @@ impl<'a, T: Element> NumericView<'a, T> {
 /// A zero-copy window over a [`KeyColumn`].
 ///
 /// ```
-/// use arrow_lite::KeyColumn;
+/// use engine::arrow_lite::KeyColumn;
 ///
 /// let col = KeyColumn::from_values(["a", "b", "c", "b"]);
 /// let view = col.view(1, 2);
@@ -388,7 +388,7 @@ impl<'a> KeyView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Buffer;
+    use crate::arrow_lite::buffer::Buffer;
     use proptest::prelude::*;
 
     fn f64_col(n: usize) -> NumericColumn<f64> {

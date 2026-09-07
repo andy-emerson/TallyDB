@@ -9,7 +9,7 @@
 //! boundary (the directory lock itself is per-file-handle, so the
 //! two-writer refusal is exercised in-process too, in `io`'s tests).
 
-use arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
+use engine::arrow_lite::{Column, ColumnType, Field, NumericData, Schema};
 use engine::storage_lite::{FsBackend, RowValue, StorageBackend, StorageError, Store, WalSync};
 use std::sync::Arc;
 

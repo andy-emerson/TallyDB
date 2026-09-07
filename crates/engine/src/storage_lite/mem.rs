@@ -20,7 +20,7 @@
 //!   on append — wrong type, null into `NOT NULL`, wrong arity are all
 //!   errors at the door, not corruption later.
 
-use arrow_lite::{
+use crate::arrow_lite::{
     Bitmap, Buffer, Column, ColumnType, Dictionary, KeyColumn, NumericColumn, NumericData,
     RecordBatch, Schema,
 };
@@ -153,7 +153,7 @@ enum ColumnBuilder {
 /// into a [`Segment`] when done.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, Field, Schema};
+/// use engine::arrow_lite::{ColumnType, Field, Schema};
 /// use engine::storage_lite::{RowValue, WriteBuffer};
 ///
 /// let schema = Schema::new(vec![
@@ -761,7 +761,7 @@ impl Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_lite::Field;
+    use crate::arrow_lite::Field;
 
     fn m1_schema() -> Schema {
         Schema::new(vec![

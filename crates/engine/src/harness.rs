@@ -21,10 +21,10 @@
 //! DuckDB — and diff. That external recomputation, not this crate's own
 //! tests, is what earns the cross-check claims.
 
+use crate::arrow_lite::{ArrowArrayStream, ColumnType, Field, Schema};
 use crate::database::Database;
 use crate::storage_lite::RowValue;
 use crate::table::Table;
-use arrow_lite::{ArrowArrayStream, ColumnType, Field, Schema};
 
 /// Rows in the fixture.
 const ROWS: i64 = 240;

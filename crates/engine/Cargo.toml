@@ -34,7 +34,6 @@ apicheck = ["lua"]
 oracle-harness = ["lua"]
 
 [dependencies]
-arrow-lite = { path = "../arrow-lite" }
 # The SQL parser (GenericDialect); the executor is our own — DESIGN.md on
 # why DataFusion's is neither vendored nor linked.
 sqlparser = "0.62.0"
@@ -55,6 +54,11 @@ required-features = ["cli"]
 cc = "1"
 
 [dev-dependencies]
+# arrow (arrow-rs) belongs here, dev-only, as the round-trip oracle for the
+# hand-rolled Arrow layout and C Data Interface export in src/arrow_lite
+# (tests/arrow_rs_oracle.rs). PyArrow round-trips run as a test script/CI.
+# Neither ever becomes a runtime dependency.
+arrow = { version = "59.1.0", features = ["ffi"] }
 # Drives the codec property tests inside storage_lite over the corpus
 # module's generators.
 proptest = "1"

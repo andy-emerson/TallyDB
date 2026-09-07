@@ -33,11 +33,11 @@
 //! [`Database::append`]: crate::Database::append
 //! [`Database::run_script`]: crate::Database::run_script
 
+use crate::arrow_lite::{Column, NumericData, RecordBatch};
 use crate::compute_lua::{ColumnView, ResultColumns, ScriptHost, ScriptValue, SqlOutcome};
 use crate::database::Database;
 use crate::query_lite::{parse_statement, Statement};
 use crate::storage_lite::RowValue;
-use arrow_lite::{Column, NumericData, RecordBatch};
 
 /// The [`ScriptHost`] a driving script reaches: statements resolve
 /// against this database.
@@ -159,10 +159,10 @@ mod tests {
     //! through the Arrow surface.
 
     use super::*;
+    use crate::arrow_lite::{ColumnType, Field, Schema};
     use crate::query_lite::QueryOutput;
     use crate::table::Table;
     use crate::Database;
-    use arrow_lite::{ColumnType, Field, Schema};
 
     /// Column `index` of every batch, flattened — the hand-staged
     /// concatenation the script's contiguous result is checked against.

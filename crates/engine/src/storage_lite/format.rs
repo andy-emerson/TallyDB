@@ -92,15 +92,15 @@
 //! and a manifest without the section (an older writer's) falls back to
 //! scanning the backend.
 
+use crate::arrow_lite::{
+    Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
+    NumericData, RecordBatch, Schema,
+};
 use crate::storage_lite::alp::{
     decode_alp_f64, decode_for_i64, decode_for_u32, encode_alp_f64, encode_for_i64, encode_for_u32,
 };
 use crate::storage_lite::codec::{decode_delta_of_delta, encode_delta_of_delta, Codec, CodecError};
 use crate::storage_lite::mem::{RowValue, Segment, SequenceInfo, ZoneMap};
-use arrow_lite::{
-    Bitmap, Buffer, Column, ColumnType, Dictionary, Field, KeyColumn, LogicalType, NumericColumn,
-    NumericData, RecordBatch, Schema,
-};
 use std::fmt;
 
 /// First bytes of every segment file.

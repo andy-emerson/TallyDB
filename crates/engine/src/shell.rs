@@ -14,12 +14,12 @@
 //! Everything a user types is either a dot-command (`.help` lists
 //! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
 
+use crate::arrow_lite::{Column, ColumnType, NumericData, Schema};
 use crate::query_lite::{parse_statement, QueryOutput, Statement};
 use crate::{
     schema_from_create, type_name, Database, LogSink, MaterializedView, RowValue, StoreOptions,
     Table,
 };
-use arrow_lite::{Column, ColumnType, NumericData, Schema};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1111,8 +1111,8 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::create_dir_all(&view_dir).unwrap();
         let schema = Schema::new(vec![
-            arrow_lite::Field::new("ts", ColumnType::I64, false),
-            arrow_lite::Field::new("x", ColumnType::F64, false),
+            crate::arrow_lite::Field::new("ts", ColumnType::I64, false),
+            crate::arrow_lite::Field::new("x", ColumnType::F64, false),
         ]);
         {
             let mut source = Table::persistent("trades", schema, "ts", &source_dir).unwrap();

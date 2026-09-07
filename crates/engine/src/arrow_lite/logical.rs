@@ -26,7 +26,7 @@
 //! | 1 | `TimestampNs` | — |
 //! | 2 | `Decimal64` | scale |
 
-use crate::column::ColumnType;
+use crate::arrow_lite::column::ColumnType;
 
 /// Maximum decimal digits a 64-bit decimal can carry; also the precision
 /// exported for every `Decimal64` column.
@@ -35,7 +35,7 @@ pub const DECIMAL64_PRECISION: u8 = 18;
 /// An export-time annotation over a physical `i64` column.
 ///
 /// ```
-/// use arrow_lite::{ColumnType, LogicalType};
+/// use engine::arrow_lite::{ColumnType, LogicalType};
 ///
 /// let ts = LogicalType::TimestampNs;
 /// let money = LogicalType::Decimal64 { scale: 2 };
