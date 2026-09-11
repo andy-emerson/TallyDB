@@ -1,7 +1,8 @@
 # Release builds — the M3 GA deliverable (#39): one static-feeling
 # binary per platform, attached to the GitHub Release for a version
 # tag. The binary is the console; the library ships as the crate, which
-# is published to crates.io by hand — this workflow never uploads there.
+# publish.yml uploads on a manual run — this workflow never uploads
+# to crates.io.
 name: Release
 on:
   push:
