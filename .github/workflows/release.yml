@@ -1,6 +1,7 @@
 # Release builds — the M3 GA deliverable (#39): one static-feeling
 # binary per platform, attached to the GitHub Release for a version
-# tag. The binary is the shell; the library ships as the crates.
+# tag. The binary is the console; the library ships as the crate, which
+# is published to crates.io by hand — this workflow never uploads there.
 name: Release
 on:
   push:
@@ -21,8 +22,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # --locked so the shipped binary is built from the committed
+      # lockfile — the dependency set CI tested (#110) — rather than
+      # from whatever cargo would resolve on release day.
       - name: Build the console binary
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Name the artifact (unix)
         if: runner.os != 'Windows'
         run: cp target/release/tallydb ${{ matrix.artifact }}
