@@ -1,0 +1,43 @@
+# Publishing the crate to crates.io, from CI rather than from a laptop.
+#
+# Deliberately manual: nothing here fires on a push or a tag. A version
+# number is spent permanently the moment this succeeds — yanking hides a
+# release but never frees its number — so publishing is always someone
+# choosing to. Run it from the Actions tab: pick Publish, choose main,
+# press Run workflow.
+#
+# Needs one repository secret, CARGO_REGISTRY_TOKEN, holding a crates.io
+# API token (crates.io, Account Settings, API Tokens). Scope it
+# publish-new to claim a name for the first time, publish-update after.
+#
+# The companion to .github/workflows/release.yml, which fires on a `v*`
+# tag and attaches the console binaries to a GitHub Release. That one
+# ships the program; this one ships the library.
+name: Publish
+on:
+  workflow_dispatch:
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # A version is permanent once uploaded, so refuse to spend one from
+      # a branch that has not been through review and CI.
+      - name: Refuse to publish from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Publish runs only from main; got ${GITHUB_REF}."
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Rust toolchain versions
+        run: rustc --version && cargo --version
+      # Same check every other job opens with (#110): the published
+      # crate is built from the committed lockfile, not from whatever
+      # cargo would resolve today.
+      - name: Lockfile is current
+        run: cargo fetch --locked
+      # `cargo publish` packages the crate, runs a full verification
+      # build of the packaged source, and only then uploads.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
