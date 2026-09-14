@@ -6,7 +6,8 @@
 //! engine drives the framing; the kernel reduces one frame to one
 //! scalar, reading its arguments as zero-copy column views and
 //! returning a number or `NULL` — the window half of the vectorized
-//! calling convention (DESIGN.md, *The Lua layer*).
+//! calling convention (DECISIONS.md, *A Lua-backed function is a
+//! vectorized UDF called once per segment*).
 //!
 //! This is the promotion ladder's first rung made concrete: write the
 //! kernel in Lua to get it correct — against the same executor, frames,

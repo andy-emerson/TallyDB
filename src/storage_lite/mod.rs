@@ -69,7 +69,8 @@
 //! are the contract by decision: the working-set cut is owned (the
 //! *queried* working set fits in memory — the table need not: opens are
 //! metadata-only and segments fault in whole on first touch under the
-//! residency design, 2026-07-30 — DESIGN.md, "The axes"), so mmap and
+//! residency design, 2026-07-30 — DECISIONS.md, *A table bigger than
+//! memory gets segment-granular lazy residency*), so mmap and
 //! ranged reads are **retired**, not deferred. Ranged reads return, if
 //! ever, with column-granular residency and its per-section checksum
 //! revision (#87) — an additive format step, not a partial-read path

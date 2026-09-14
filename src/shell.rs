@@ -12,7 +12,7 @@
 //! security its network surface needs; nothing here presumes one.
 //!
 //! Everything a user types is either a dot-command (`.help` lists
-//! them) or SQL — the surface tabulated in DESIGN.md's stdlib table.
+//! them) or SQL — the surface tabulated in DESIGN.md, *The SQL surface*.
 
 use crate::arrow_lite::{Column, ColumnType, NumericData, Schema};
 use crate::query_lite::{parse_statement, QueryOutput, Statement};
@@ -730,7 +730,7 @@ fn render_schema(name: &str, schema: &Schema, ordering_key: &str) -> String {
     format!("CREATE TABLE {name} ({})", columns.join(", "))
 }
 
-/// `.help`'s text; the SQL surface itself is DESIGN.md's stdlib table.
+/// `.help`'s text; the surface itself is DESIGN.md, *The SQL surface*.
 pub const HELP: &str = "\
 Statements end with ';' and may span lines. SQL surface: SELECT (WHERE
 — comparisons between columns, literals or whole expressions; GROUP BY

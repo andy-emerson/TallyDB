@@ -11,8 +11,8 @@
 //!
 //! The `apicheck` feature compiles the interpreter with
 //! `LUA_USE_APICHECK`, turning C API misuse into assertions — the
-//! binding-discipline oracle used by test builds and CI (DESIGN.md,
-//! *The Lua layer*).
+//! binding-discipline oracle used by test builds and CI (DECISIONS.md,
+//! *The interpreter is canonical PUC Lua 5.4*).
 
 fn main() {
     // The interpreter is compiled only when the `lua` feature is on: a

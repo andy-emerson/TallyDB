@@ -43,8 +43,8 @@
 //! module), not through a concrete type; `compute_lua` sits behind the
 //! **non-default `lua` feature** (the console enables it; a library
 //! embedder who never asks for an interpreter carries neither the
-//! vendored C nor its CI surface — DESIGN.md, *the extension model*,
-//! ruled 2026-07-28) and is consumed as its concrete native state (its
+//! vendored C nor its CI surface — DECISIONS.md, *User compute reaches
+//! the engine through one mechanism per host*, ruled 2026-07-28) and is consumed as its concrete native state (its
 //! backend trait is extracted when the WASM backend starts — see that
 //! module's docs). The primary extension path — [`WindowAggregate`] via
 //! [`Table::register_window`] — needs no feature at all. Right now the
@@ -70,7 +70,7 @@
 //! has since fired, and no LAPACK came back with it: the K-factor
 //! rolling fit (#90) carries no SQL name, is reached only by
 //! registration, and solves its `K × K` symmetric system in-crate. See
-//! DESIGN.md, *Curated compute: what the engine calls, and why*.
+//! DECISIONS.md, *Non-standard compute lives in the Lua tier, via MatLua*.
 //!
 //! ## Concurrency: single writer, concurrent snapshot readers
 //! Exactly one `&mut Table` writer exists at a time — a compile-time

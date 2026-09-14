@@ -29,8 +29,9 @@
 //!   the unmodified upstream sources compiled into the engine, with
 //!   hand-rolled thin bindings to the 5.4 C API (settled 2026-07-24; the
 //!   full decision record, including LuaJIT and `mlua` as rejected
-//!   alternatives with reopen conditions, lives in DESIGN.md, *The Lua
-//!   layer*). Binding discipline is checked with Lua's own enforcement
+//!   alternatives with reopen conditions, lives in DECISIONS.md, *The
+//!   interpreter is canonical PUC Lua 5.4*). Binding discipline is checked
+//!   with Lua's own enforcement
 //!   and the sanitizers, both in CI on every change: `LUA_USE_APICHECK`
 //!   test builds (the `apicheck` feature) and an ASan/UBSan job with
 //!   the vendored C compiled sanitized. The official Lua test suite and
@@ -62,7 +63,7 @@
 //! No autodiff, no general tensor/NN framework (i.e. no "build our own
 //! Torch"). If a real, specific, repeatedly-requested need shows up later,
 //! it gets a narrow, scoped addition — not a new paradigm bolted on. See
-//! DESIGN.md for the reasoning.
+//! DECISIONS.md, *Things that are settled “no”s*.
 
 mod driver;
 mod ffi;

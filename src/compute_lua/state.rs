@@ -35,7 +35,7 @@
 //! numbers are hardware-bound and not comparable to earlier runs on
 //! other machines; the ratios are the durable part. That cost is the
 //! price of the ad-hoc layer; per the promotion ladder (DESIGN.md,
-//! *The Lua layer*), a kernel that proves hot graduates to a curated
+//! *Compute*), a kernel that proves hot graduates to a curated
 //! native op rather than the interpreter getting a JIT.
 
 use crate::compute_lua::driver::{self, DriverCall, DriverSlot, ScriptHost};
