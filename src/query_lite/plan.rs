@@ -1113,16 +1113,19 @@ fn rewrite_ordering_key(sql: &str) -> Result<String, QueryError> {
     Ok(out)
 }
 
-/// Whether the statement's first two words are `CREATE TABLE` — the
-/// rewrite gate. Word-wise, not a byte prefix: `CREATE  TABLE` and
-/// `CREATE\tTABLE` are the same statement and must hit the same gate,
-/// or user-typed `PRIMARY KEY` would slip past its refusal.
+/// Whether the statement's first two *tokens* are `CREATE TABLE` — the
+/// rewrite gate. Through [`tokenize_with_spans`] like every lift, not
+/// `split_whitespace`: a leading comment is not part of the statement,
+/// and splitting on whitespace made `-- anything` the first word, so
+/// the gate missed the statement entirely. That cost twice over (#116):
+/// `ORDERING KEY` reached a parser that does not know the phrase, and
+/// user-typed `PRIMARY KEY` slipped past its refusal and silently
+/// became the ordering key it is not allowed to name.
 fn is_create_table(sql: &str) -> bool {
-    let mut words = sql.split_whitespace();
+    let (_, _, lower) = tokenize_with_spans(sql);
     matches!(
-        (words.next(), words.next()),
-        (Some(create), Some(table))
-            if create.eq_ignore_ascii_case("create") && table.eq_ignore_ascii_case("table")
+        (lower.first(), lower.get(1)),
+        (Some(create), Some(table)) if create == "create" && table == "table"
     )
 }
 
@@ -3166,6 +3169,36 @@ mod tests {
     #[test]
     fn parse_errors_surface() {
         assert!(matches!(plan("SELEKT nope"), Err(QueryError::Parse(_))));
+    }
+
+    #[test]
+    fn a_leading_comment_does_not_hide_the_ddl_gate() {
+        // #116: the gate split on whitespace, so `--` became the first
+        // word and the statement behind it was never recognised. Two
+        // things broke at once, and both are asserted here.
+        for sql in [
+            "-- header\nCREATE TABLE t (ts BIGINT ORDERING KEY)",
+            "-- header\n\nCREATE TABLE t (ts BIGINT ORDERING KEY)",
+            "/* header */ CREATE TABLE t (ts BIGINT ORDERING KEY)",
+            "/* two\nlines */\nCREATE TABLE t (ts BIGINT ORDERING KEY)",
+        ] {
+            assert!(
+                matches!(parse_statement(sql), Ok(Statement::CreateTable(_))),
+                "ORDERING KEY must still lower behind a comment: {sql:?}"
+            );
+        }
+        // The worse half: the refusal must still fire, or a comment
+        // turns PRIMARY KEY into an ordering key nobody declared.
+        for sql in [
+            "-- header\nCREATE TABLE t (ts BIGINT PRIMARY KEY)",
+            "/* header */ CREATE TABLE t (ts BIGINT PRIMARY KEY)",
+        ] {
+            let error = parse_statement(sql).expect_err(sql).to_string();
+            assert!(
+                error.contains("ORDERING KEY"),
+                "PRIMARY KEY must still be refused behind a comment: {sql:?}: {error}"
+            );
+        }
     }
 
     #[test]
