@@ -164,7 +164,11 @@ language of its own. TallyDB is the combination that was missing: compute
 inside an embeddable, SQL-native engine, over off-the-shelf numeric libraries
 on zero-copy shared buffers.
 
-*(Peer columns hand-checked 2026-09.)*
+The peer columns state structural facts rather than benchmark results, and
+they go stale as those projects move. If one is wrong,
+[open an issue](https://github.com/andy-emerson/TallyDB/issues) — being
+accurate about the neighbours matters more here than looking good next to
+them.
 
 ## The SQL surface
 

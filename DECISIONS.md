@@ -1172,8 +1172,8 @@ user-facing builds on it. The plan of record, approved 2026-07-28:
   record: old-or-new for crashes and readers, recovery
   auto-completes), #63 (Miri in CI), #69 (the upstream Lua test
   suite), the review-noted redundancies.
-- **The Lua trial** — ruled 2026-07-28, **pass** (see *The Lua
-  layer*): the Agent brought the evidence brief (#76), the Human
+- **The Lua trial** — ruled 2026-07-28, **pass** (see *Lua stays: the
+  trial passed and the sunset clause dissolved*): the Agent brought the evidence brief (#76), the Human
   ruled Lua stays. The sunset clause dissolved.
 - **M4.6 SQL-in-Lua (#70)** — built on the pass: driver scripts
   (`query`/`append` through the `ScriptHost` seam, the console's
@@ -1192,8 +1192,8 @@ decision record *where non-standard compute lives*, below), the ordered-axis
 dividends (cross-sectional partitioning, time bucketing — F1 ruled (d)
 2026-07-29, monotone ordering-key arithmetic in `GROUP BY`,
 `LAG`/`LEAD`, `RANGE` frames, the `ASOF` join — **all built
-2026-08-01**, see *The M5 ruling batch* for the rulings and the
-stdlib table for what shipped), segment-lazy open (F3), cross-process
+2026-08-01**, see the thirteen M5 entries above for the
+rulings, and DESIGN.md, *The SQL surface*, for what shipped), segment-lazy open (F3), cross-process
 readers (F4 —
 **built 2026-07-29**: read-only opens over a live writer's directory
 see the durable prefix consistently, old-or-new per mutation;
@@ -1473,7 +1473,7 @@ inside a Lua table a `nil` *deletes* the slot, destroying both the value
 and the row's structure, and that failure cannot be prevented inside
 arbitrary user scripts. A distinct sentinel is a real value that survives
 in a table, so the mapping stays total and faithful; it is kept distinct
-from NaN (a computed value — see *Null, NaN, and ordering*) and
+from NaN (a computed value — DESIGN.md, *Null and NaN*) and
 propagates over both numeric subtypes, so `i64` exactness holds. This was
 chosen by a bake-off spike against the `nil` alternative, not by
 argument.
@@ -1892,12 +1892,13 @@ there, anchored or not, and the K > 2 path measures 3.3e-5 on a design
 whose third factor is nearly the sum of the other two. That is the
 accuracy caveat this record asked to see documented, and it is
 enforced rather than merely written down — near-dependent windows are
-refused outright (see the tranche below). At K ≤ 2 nothing changed: the
+refused outright (see *Rolling multi-factor regression carries anchored
+moments, not a factorization*). At K ≤ 2 nothing changed: the
 closed form still ships, because a two-parameter fit solves exactly off
 the same shifted moments — there is no linear system to form.
 
 *Updated 2026-07-27:* the factorization is gone — the window solves in
-closed form (see *Curated compute*) — and the centering it required
+closed form (see *No LAPACK on the query path*) — and the centering it required
 remains, now in **corrected** two-pass form in every window statistic
 (`RollingRegression` and `PairStatistic` alike; the uncorrected form
 carried up to 4.9e-8 relative error at a 1e12 offset). Accuracy is
@@ -2109,8 +2110,8 @@ Kimball vocabulary was considered and set aside because "dimension" and
   logical-annotation mechanism (`TimestampNs`-style); storage is
   pre-settled for it: a nullable boolean is 2 bits/row.
 - **Compiled Lua C extensions** (`package.loadlib`). Pure-Lua libraries are
-  fine and need no special handling. (See *The Lua layer* below for the full
-  reasoning.)
+  fine and need no special handling. (See *The interpreter is canonical PUC
+  Lua 5.4, with hand-rolled bindings* for the full reasoning.)
 - **A LAPACK dependency, at all, until an op needs more than two
   parameters or two dimensions.** Not "a general LAPACK surface" — any
   LAPACK surface. Every statistic the engine exposes *in SQL* has an exact
@@ -2121,8 +2122,7 @@ Kimball vocabulary was considered and set aside because "dimension" and
   build from a LAPACK-in-WASM layer that does not exist. When a wider op
   is committed, the rule that governed the old curated set still governs
   its replacement: don't add routines because LAPACK has them; add them
-  because a named workflow needs them. See *Curated compute: what the
-  engine calls, and why*.
+  because a named workflow needs them. See *No LAPACK on the query path*.
 - **Autodiff / a Torch-style tensor framework.** Different computational
   paradigm than anything the target workload (closed-form / classical
   numerical methods) needs. If a specific, repeated, real need shows up
