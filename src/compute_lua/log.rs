@@ -1,5 +1,6 @@
 //! Script observability: `log(...)`, the one host-routed diagnostic
-//! (decision record 2026-07-26; DESIGN.md, *The Lua layer*).
+//! (DECISIONS.md, *Scripts get one host-routed diagnostic function,
+//! `log()`*, 2026-07-26).
 //!
 //! `log(...)` replaces Lua's `print` — removed not for the string
 //! invariant (its text never becomes a column) but because its

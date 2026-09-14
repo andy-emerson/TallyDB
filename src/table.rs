@@ -829,7 +829,8 @@ impl Table {
     }
 
     /// Registers a native window kernel — **the primary extension
-    /// path** (DESIGN.md, *the extension model*): implement
+    /// path** (DECISIONS.md, *User compute reaches the engine through
+    /// one mechanism per host*): implement
     /// [`WindowAggregate`], register it, call it from SQL at native
     /// speed. No interpreter is involved; the kernel is engine code,
     /// compiled into the embedding application. The built-in
@@ -1401,7 +1402,7 @@ impl TableReader {
 ///
 /// Scope: single-table `SELECT`s. Joins resolve dimension tables
 /// through a [`crate::Database`], and no cross-table snapshot
-/// consistency is promised (by design — see DESIGN.md); mutation is
+/// consistency is promised (by design — DESIGN.md, *The axes*); mutation is
 /// the writer's alone.
 pub struct TableSnapshot {
     name: String,
@@ -1498,8 +1499,8 @@ pub(crate) enum RegressionOutput {
 /// 64 × 2 problem's arithmetic — measured at roughly 2.3µs of the 2.5µs
 /// per window. Decision #20 (QR fast path, SVD fallback) still governs
 /// the `least_squares` op itself; it no longer governs this window,
-/// because this window no longer solves a general system. See DESIGN.md,
-/// *Curated compute: what the engine calls, and why*.
+/// because this window no longer solves a general system. See
+/// DECISIONS.md, *No LAPACK on the query path*.
 pub(crate) struct RollingRegression {
     pub(crate) output: RegressionOutput,
 }
@@ -1826,8 +1827,8 @@ impl PairStatistic {
                 // carries no cancellation — this is the well-conditioned
                 // half of the quadratic (λ_min, the differenced one, is
                 // not computed here). A general eigensolver on a 2 × 2 is
-                // dominated by its own call overhead; see DESIGN.md, the
-                // curated-op cost record.
+                // dominated by its own call overhead; see DECISIONS.md,
+                // *No LAPACK on the query path*.
                 let half_trace = (var_y + var_x) / 2.0;
                 let half_gap = (var_y - var_x) / 2.0;
                 let radius = half_gap.hypot(covar);

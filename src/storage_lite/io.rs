@@ -6,8 +6,8 @@
 //! publish. [`FsBackend`] (a directory of files) is the native
 //! implementation; `MemBackend` backs tests and demonstrates the shape
 //! an OPFS/WASM backend must fit. Whole-object reads are the contract
-//! by decision, not omission: the working-set cut is owned (DESIGN.md,
-//! *The axes* — the queried working set fits in memory; segments fault
+//! by decision, not omission: the working-set cut is owned (DECISIONS.md,
+//! *The working set cut is owned* — the queried rows fit in memory; segments fault
 //! in whole on first touch under the residency design, 2026-07-30), so
 //! ranged reads and mmap are retired as follow-ups. Ranged reads
 //! return, if ever, with column-granular residency and its checksum

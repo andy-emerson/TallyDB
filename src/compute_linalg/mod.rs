@@ -16,8 +16,8 @@
 //! needs no backend negotiation and putting it here would turn a
 //! private detail into a general solver surface. A solver-class
 //! *dependency* still returns only when an op needs more than that — and the measured candidate for that day is faer's
-//! own solvers, already this module's kernel source. See DESIGN.md,
-//! *Curated compute: what the engine calls, and why*.
+//! own solvers, already this module's kernel source. See DECISIONS.md,
+//! *No LAPACK on the query path*.
 //!
 //! Keeping this module's scope narrow is still the point: having fast
 //! products is necessary but not sufficient, and "we have the kernels"
@@ -35,14 +35,14 @@
 //! linked system BLAS via FFI; the swap was measured, not assumed —
 //! faer met or beat reference BLAS at every multiplication shape the
 //! engine could plausibly run, and the decision record lives in
-//! DESIGN.md.)
+//! DECISIONS.md, *System BLAS is replaced by pure-Rust kernels*.)
 //!
 //! ## Numeric type: `f64`
 //! The kernels operate on `f64` contiguous buffers, and the analytics
 //! that consume these primitives are floating-point anyway. `i64`
 //! columns (timestamps, money, counts) are the exact/stored type — they
 //! are converted to `f64` before being handed to a kernel, not passed in
-//! raw. See the numeric-type discussion in DESIGN.md.
+//! raw. See *Numbers have roles* in DESIGN.md.
 //!
 //! ## Capability negotiation
 //! Ops are exposed through [`backend::LinalgBackend`], which answers
@@ -52,7 +52,7 @@
 //!
 //! ## Batch, not per-row
 //! Every entry point takes whole columns / windows per call, per the
-//! batch rule in DESIGN.md. If the API makes per-row calls easy, that's
+//! batch rule in DESIGN.md, *The axes*. If per-row calls are easy, that's
 //! a bug in the API shape.
 //!
 //! ## Explicitly NOT in scope

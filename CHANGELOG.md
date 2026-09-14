@@ -8,7 +8,7 @@ a minor bump may break the API and a patch bump may not.
 The reasoning behind any entry here lives in [DESIGN.md](DESIGN.md), which
 records decisions, their rejected alternatives, and what would reopen them.
 
-## [Unreleased]
+## [0.1.1] — 2026-09-14
 
 ### Fixed
 
@@ -143,5 +143,6 @@ milestones M0 to M5, and arrives together.
   `LUA_USE_APICHECK` and under ASan and UBSan; the official Lua 5.4.7 test
   suite and its `ltests` torture harness run against the vendored interpreter.
 
-[Unreleased]: https://github.com/andy-emerson/TallyDB/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/andy-emerson/TallyDB/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/andy-emerson/TallyDB/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/andy-emerson/TallyDB/releases/tag/v0.1.0

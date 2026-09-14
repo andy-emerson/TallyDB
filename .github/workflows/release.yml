@@ -22,7 +22,7 @@ jobs:
             artifact: tallydb-windows-x86_64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # --locked so the shipped binary is built from the committed
       # lockfile — the dependency set CI tested (#110) — rather than
       # from whatever cargo would resolve on release day.

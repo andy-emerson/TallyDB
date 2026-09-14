@@ -4,7 +4,7 @@
 //! Use `sqlparser-rs` for parsing. Do not write a parser from scratch and
 //! do not fork/vendor `sqlparser-rs` — it's a mature, MIT-licensed,
 //! narrow-purpose dependency, exactly the kind of thing this project takes
-//! whole rather than reimplementing (see DESIGN.md, "Design philosophy").
+//! whole rather than reimplementing (see DESIGN.md, *Dependencies*).
 //! We use a *subset* of what it can parse; the subsetting happens in what
 //! AST nodes this module's executor handles, not in the parser itself.
 //!
@@ -12,7 +12,7 @@
 //! The executor (turning a parsed AST into results over `storage_lite`
 //! data) is our own code — DataFusion's executor is deliberately NOT
 //! vendored, because its useful parts are coupled to its own general
-//! planner (see DESIGN.md). Instead, DuckDB is used as a **differential
+//! planner (DESIGN.md, *Dependencies*). Instead, DuckDB is a **differential
 //! correctness oracle**: the same query runs against the oracle and
 //! against this executor, and the outputs are diffed. DuckDB earns
 //! primary because it has the broadest standard analytic-SQL semantics

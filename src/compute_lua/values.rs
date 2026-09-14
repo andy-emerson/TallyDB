@@ -1,6 +1,6 @@
 //! The value map — how engine values and script values convert at the
-//! Lua boundary, implementing the frozen contract (DESIGN.md, *The Lua
-//! layer*, decision records of 2026-07-26):
+//! Lua boundary, implementing the frozen contract (DECISIONS.md, *The
+//! value map* and *NULL crosses to Lua as a sentinel*, 2026-07-26):
 //!
 //! - **F1 — NULL is a sentinel.** SQL NULL crosses to Lua as the global
 //!   `NULL`, a pd.NA-style singleton — not `nil` (which deletes table
