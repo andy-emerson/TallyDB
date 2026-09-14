@@ -64,7 +64,12 @@ fn main() {
             }
             run_statements(&mut console, sql, &mut run);
         }
-        if piped && !run.quit {
+        // Only when no `-c` was given. An explicit statement means run
+        // it and exit, the convention `sqlite3 db "..."` set and the
+        // usage line above implies. Reading stdin as well hung any
+        // script whose stdin was an open pipe — forever, holding the
+        // writer lock the whole time (#117).
+        if piped && batch.is_empty() && !run.quit {
             let mut input = String::new();
             if std::io::stdin().read_to_string(&mut input).is_ok() {
                 run_statements(&mut console, &input, &mut run);
