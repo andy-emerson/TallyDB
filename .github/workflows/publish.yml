@@ -27,7 +27,7 @@ jobs:
         run: |
           echo "Publish runs only from main; got ${GITHUB_REF}."
           exit 1
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Rust toolchain versions
         run: rustc --version && cargo --version
       # Same check every other job opens with (#110): the published

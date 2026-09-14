@@ -19,7 +19,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
           not silently re-resolved)
         run: cargo fetch --locked
@@ -78,7 +78,7 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
           not silently re-resolved)
         run: cargo fetch --locked
@@ -99,7 +99,7 @@ jobs:
   lua-suite:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: readline headers (main.lua's transcripts assume readline)
         run: sudo apt-get update && sudo apt-get install -y libreadline-dev
       - name: Build the instrumented interpreter, run all.lua
@@ -117,7 +117,7 @@ jobs:
   sanitize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Lockfile is current (Cargo.lock is committed; a stale one fails here,
           not silently re-resolved)
         run: cargo fetch --locked

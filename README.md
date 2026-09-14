@@ -166,7 +166,7 @@ bespoke array language or a serialization boundary.
 
 ## Status
 
-Version 0.1.0 is published and usable. The API is not yet stable: before 1.0,
+Version 0.1.1 is published and usable. The API is not yet stable: before 1.0,
 a minor bump may break it. Milestones M0 through M5 are merged, taking the
 engine from a locked layout to desk adoption. WASM parity and a served product
 are the milestones ahead.
