@@ -95,29 +95,55 @@ struct Run {
     quit: bool,
 }
 
+/// One thing for the console to do, in the order the input asked.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// A whole dot-command line, run as it stands.
+    Dot(String),
+    /// A complete SQL statement, its `;` already consumed.
+    Sql(String),
+}
+
+/// Turns one chunk of input into the steps it asks for, leaving whatever
+/// is still incomplete in `buffer`.
+///
+/// **Chunk-shaped, and decided per line inside.** A chunk is not a line:
+/// rustyline hands a pasted block back as one string with embedded
+/// newlines. Deciding dot-command-or-SQL once for the whole chunk let
+/// the block's first line speak for all of it — a `CREATE TABLE` left a
+/// following `.import` stranded in the SQL buffer, and a leading `.lua`
+/// swallowed the `SELECT` beneath it into its own Lua chunk (#118). So
+/// the decision happens per line, here, and both input paths come
+/// through this function to get it.
+fn plan_chunk(buffer: &mut String, chunk: &str) -> Vec<Step> {
+    let mut steps = Vec::new();
+    for line in chunk.lines() {
+        if buffer.trim().is_empty() && line.trim_start().starts_with('.') {
+            buffer.clear();
+            steps.push(Step::Dot(line.to_owned()));
+            continue;
+        }
+        buffer.push_str(line);
+        buffer.push('\n');
+        let (complete, rest) = split_statements(buffer);
+        *buffer = rest;
+        steps.extend(complete.into_iter().map(Step::Sql));
+    }
+    steps
+}
+
 /// Executes `input` statement by statement — `;` boundaries via
 /// [`split_statements`] (several statements on one line included),
 /// whole dot-command lines — recording errors and `.quit` in `run`.
 fn run_statements(console: &mut Console, input: &str, run: &mut Run) {
     let mut buffer = String::new();
-    for line in input.lines() {
+    for step in plan_chunk(&mut buffer, input) {
         if run.quit {
             return;
         }
-        if buffer.trim().is_empty() && line.trim_start().starts_with('.') {
-            buffer.clear();
-            execute(console, line, run);
-            continue;
-        }
-        buffer.push_str(line);
-        buffer.push('\n');
-        let (complete, rest) = split_statements(&buffer);
-        buffer = rest;
-        for statement in complete {
-            if run.quit {
-                return;
-            }
-            execute(console, &statement, run);
+        match step {
+            Step::Dot(line) => execute(console, &line, run),
+            Step::Sql(statement) => execute(console, &statement, run),
         }
     }
     // A trailing statement without its `;` still runs at end of input;
@@ -160,29 +186,24 @@ fn interactive(console: &mut Console, dir: &str) {
     let _ = editor.load_history(&history);
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() {
+        // Trimmed, like the branch that consumes the buffer: after a
+        // statement the buffer holds a leftover newline, and testing it
+        // untrimmed showed a continuation prompt with nothing pending.
+        let prompt = if buffer.trim().is_empty() {
             "tally> "
         } else {
             "  ...> "
         };
         match editor.readline(prompt) {
             Ok(line) => {
-                if buffer.trim().is_empty() && line.trim_start().starts_with('.') {
-                    buffer.clear();
-                    let _ = editor.add_history_entry(&line);
-                    if execute_interactive(console, &line) {
-                        break;
-                    }
-                    continue;
-                }
-                buffer.push_str(&line);
-                buffer.push('\n');
-                let (complete, rest) = split_statements(&buffer);
-                buffer = rest;
                 let mut quit = false;
-                for statement in complete {
-                    let _ = editor.add_history_entry(&statement);
-                    if execute_interactive(console, &statement) {
+                for step in plan_chunk(&mut buffer, &line) {
+                    let text = match &step {
+                        Step::Dot(line) => line,
+                        Step::Sql(statement) => statement,
+                    };
+                    let _ = editor.add_history_entry(text);
+                    if execute_interactive(console, text) {
                         quit = true;
                         break;
                     }
@@ -216,5 +237,91 @@ fn execute_interactive(console: &mut Console, statement: &str) -> bool {
             eprintln!("error: {error}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_chunk, Step};
+
+    /// The steps a chunk asks for, as one string. Note that
+    /// [`split_statements`] consumes the terminating `;`, so a
+    /// planned statement does not carry it.
+    fn steps(chunk: &str) -> Vec<Step> {
+        let mut buffer = String::new();
+        plan_chunk(&mut buffer, chunk)
+    }
+
+    /// The steps the same text asks for, delivered a line at a time.
+    fn steps_by_line(chunk: &str) -> Vec<Step> {
+        let mut buffer = String::new();
+        let mut all = Vec::new();
+        for line in chunk.lines() {
+            all.extend(plan_chunk(&mut buffer, line));
+        }
+        all
+    }
+
+    /// #118: rustyline returns a pasted block as one string with
+    /// embedded newlines. A paste must do what typing the same lines
+    /// does — before the fix the block's first line decided for all of
+    /// it, and everything under it was swallowed.
+    #[test]
+    fn a_pasted_block_does_what_the_same_lines_typed_do() {
+        for chunk in [
+            // A statement, then a dot command: the dot command was left
+            // stranded in the SQL buffer and never ran.
+            "CREATE TABLE t (ts BIGINT ORDERING KEY);\n.import t.csv t",
+            // A dot command, then a statement: `.lua` takes the rest of
+            // its line as the chunk, so the SELECT was compiled as Lua.
+            ".lua f(r) return 1 end\nSELECT f(x) FROM t;",
+            // Two dot commands.
+            ".tables\n.schema t",
+            // Two statements on separate lines.
+            "SELECT 1 FROM t;\nSELECT 2 FROM t;",
+        ] {
+            assert_eq!(
+                steps(chunk),
+                steps_by_line(chunk),
+                "pasted and typed must agree: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dot_command_after_a_statement_runs_as_a_dot_command() {
+        let planned = steps("CREATE TABLE t (ts BIGINT ORDERING KEY);\n.import t.csv t");
+        assert_eq!(
+            planned,
+            vec![
+                Step::Sql("CREATE TABLE t (ts BIGINT ORDERING KEY)".to_owned()),
+                Step::Dot(".import t.csv t".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_statement_under_a_dot_command_is_not_swallowed_by_it() {
+        let planned = steps(".lua f(r) return 1 end\nSELECT f(x) FROM t;");
+        assert_eq!(
+            planned,
+            vec![
+                Step::Dot(".lua f(r) return 1 end".to_owned()),
+                Step::Sql("SELECT f(x) FROM t".to_owned()),
+            ]
+        );
+    }
+
+    /// A statement spanning lines still accumulates; only a `;` ends it.
+    #[test]
+    fn a_statement_may_still_span_lines() {
+        let mut buffer = String::new();
+        assert!(plan_chunk(&mut buffer, "SELECT sym,").is_empty());
+        assert!(plan_chunk(&mut buffer, "       count(*)").is_empty());
+        assert_eq!(
+            plan_chunk(&mut buffer, "FROM t;"),
+            vec![Step::Sql("SELECT sym,\n       count(*)\nFROM t".to_owned())]
+        );
+        assert!(buffer.trim().is_empty(), "nothing left pending");
     }
 }

@@ -10,6 +10,22 @@ records decisions, their rejected alternatives, and what would reopen them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A leading `--` comment no longer hides `CREATE TABLE` from the rewrite that
+  carries `ORDERING KEY` through the parser, so a commented DDL statement is
+  accepted rather than rejected as unsupported syntax (#116).
+- `tallydb DIR -c "sql"` runs its statements and exits instead of going on to
+  read stdin, which hung any script whose stdin was an open pipe — forever, and
+  holding the writer lock the whole time (#117).
+- A multi-line paste into the interactive console is handled line by line, as
+  the piped path always was. Pasting a statement followed by a dot command left
+  the dot command stranded in the SQL buffer, and pasting `.lua` followed by a
+  query compiled the query into the Lua chunk (#118).
+- The continuation prompt appears only when a statement is actually pending.
+  A leftover newline in the buffer used to show `  ...>` after every statement
+  (#118).
+
 ## [0.1.0] — 2026-09-14
 
 First published release. Everything below was built before it, through
